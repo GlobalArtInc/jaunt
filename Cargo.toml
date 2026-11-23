@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/GlobalArtInc/jaunt"
+publish = false
+rust-version = "1.99"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "2.2.0"
+jaunt-proto = { path = "crates/jaunt-proto" }
+jaunt-ca = { path = "crates/jaunt-ca" }
+jaunt-policy = { path = "crates/jaunt-policy" }
+jaunt-store = { path = "crates/jaunt-store" }
+jaunt-oidc = { path = "crates/jaunt-oidc" }
+jaunt-record = { path = "crates/jaunt-record" }
+jaunt-audit = { path = "crates/jaunt-audit" }
+jaunt-tunnel = { path = "crates/jaunt-tunnel" }
+jaunt-ssh = { path = "crates/jaunt-ssh" }
+jaunt-control = { path = "crates/jaunt-control" }
+jaunt-gate = { path = "crates/jaunt-gate" }

@@ -1,0 +1,18 @@
+[package]
+name = "jauntd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+jaunt-control = { workspace = true }
+jaunt-gate = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "jaunt-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+jaunt-proto = { workspace = true }
+jaunt-tunnel = { workspace = true }
+jaunt-ssh = { workspace = true }
+jaunt-record = { workspace = true }

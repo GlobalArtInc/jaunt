@@ -1,0 +1,21 @@
+[package]
+name = "jaunt-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jaunt-proto = { workspace = true }
+jaunt-ca = { workspace = true }
+jaunt-policy = { workspace = true }
+jaunt-store = { workspace = true }
+jaunt-oidc = { workspace = true }
+jaunt-audit = { workspace = true }
+jaunt-tunnel = { workspace = true }
+jaunt-ssh = { workspace = true }
