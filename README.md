@@ -18,4 +18,4 @@ Early design. Nothing here is usable yet.
 
 ## License
 
-To be decided.
+MIT. See [LICENSE](LICENSE).
