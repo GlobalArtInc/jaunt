@@ -23,6 +23,7 @@ fn new_user(email: &str) -> NewUser {
         issuer: "https://idp.example".to_string(),
         subject: "subject-1".to_string(),
         email: email.to_string(),
+        username: "ada".to_string(),
         display_name: Some("Ada".to_string()),
         groups: vec!["ops".to_string(), "dev".to_string()],
     }

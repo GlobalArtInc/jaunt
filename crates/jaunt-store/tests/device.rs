@@ -33,6 +33,7 @@ async fn user_id(store: &Store) -> String {
                 issuer: "https://idp.example".to_owned(),
                 subject: "subject-1".to_owned(),
                 email: "ada@example.com".to_owned(),
+                username: "ada".to_owned(),
                 display_name: None,
                 groups: Vec::new(),
             },

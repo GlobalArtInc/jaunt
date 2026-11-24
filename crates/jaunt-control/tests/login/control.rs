@@ -1,5 +1,6 @@
 use jaunt_ca::CaKind;
 use jaunt_control::ControlError;
+use jaunt_policy::{Identity, NodeInfo, PolicySet};
 
 use crate::support::{Harness, Options};
 
@@ -51,4 +52,22 @@ async fn the_public_origin_and_the_client_header_must_be_usable() {
     })
     .await;
     assert!(accepted.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn control_exposes_the_policy_it_was_given() {
+    let harness = Harness::new().await;
+    let policy = harness.control.policy().snapshot();
+    assert_ne!(policy.hash(), PolicySet::empty().hash());
+    let alice = Identity {
+        email: "alice@example.com".to_owned(),
+        username: "alice".to_owned(),
+        groups: vec!["ops".to_owned()],
+    };
+    let node = NodeInfo {
+        name: "web-1".to_owned(),
+        labels: [("env".to_owned(), "prod".to_owned())].into(),
+    };
+    assert!(policy.authorize_ssh(&alice, &node, "alice").allowed);
+    assert!(!policy.authorize_ssh(&alice, &node, "root").allowed);
 }

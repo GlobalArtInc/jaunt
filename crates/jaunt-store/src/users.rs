@@ -9,6 +9,7 @@ pub struct NewUser {
     pub issuer: String,
     pub subject: String,
     pub email: String,
+    pub username: String,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
 }
@@ -19,6 +20,7 @@ pub struct User {
     pub issuer: String,
     pub subject: String,
     pub email: String,
+    pub username: String,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
     pub created_at: i64,
@@ -26,17 +28,18 @@ pub struct User {
 }
 
 const UPSERT: &str = "INSERT INTO users \
-    (id, issuer, subject, email, display_name, groups, created_at, updated_at) \
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+    (id, issuer, subject, email, username, display_name, groups, created_at, updated_at) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
     ON CONFLICT (issuer, subject) DO UPDATE SET \
     email = excluded.email, \
+    username = excluded.username, \
     display_name = excluded.display_name, \
     groups = excluded.groups, \
     updated_at = excluded.updated_at \
-    RETURNING id, issuer, subject, email, display_name, groups, created_at, updated_at";
+    RETURNING id, issuer, subject, email, username, display_name, groups, created_at, updated_at";
 
-const GET: &str = "SELECT id, issuer, subject, email, display_name, groups, created_at, updated_at \
-    FROM users WHERE id = ?";
+const GET: &str = "SELECT id, issuer, subject, email, username, display_name, groups, \
+    created_at, updated_at FROM users WHERE id = ?";
 
 #[derive(Clone)]
 pub struct Users {
@@ -56,6 +59,7 @@ impl Users {
             .bind(&user.issuer)
             .bind(&user.subject)
             .bind(&user.email)
+            .bind(&user.username)
             .bind(&user.display_name)
             .bind(groups)
             .bind(now)
@@ -80,6 +84,7 @@ pub(crate) fn user_from_row(row: &SqliteRow) -> Result<User, StoreError> {
         issuer: row.try_get("issuer")?,
         subject: row.try_get("subject")?,
         email: row.try_get("email")?,
+        username: row.try_get("username")?,
         display_name: row.try_get("display_name")?,
         groups,
         created_at: row.try_get("created_at")?,

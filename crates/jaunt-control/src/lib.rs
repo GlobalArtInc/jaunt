@@ -11,6 +11,7 @@ mod enroll_secrets;
 mod error;
 mod finish;
 mod http;
+mod identity;
 mod issuance;
 mod labels;
 mod naming;

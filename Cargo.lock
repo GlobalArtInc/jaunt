@@ -2152,6 +2152,7 @@ dependencies = [
  "jaunt-control",
  "jaunt-gate",
  "jaunt-oidc",
+ "jaunt-policy",
  "jaunt-store",
  "serde",
  "serde-saphyr",

@@ -3,6 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use axum::Router;
 use axum::body::Body;
@@ -16,6 +17,7 @@ use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
 use jaunt_control::{
     AgentEndpoint, Clock, Control, ControlError, ControlParts, DeviceSettings, SshSuffix,
 };
+use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,6 +31,17 @@ pub const LOGIN_TTL_SECS: u64 = 300;
 pub const PUBLIC_ORIGIN: &str = "https://jaunt.example";
 pub const DEFAULT_PEER: &str = "198.51.100.7:50000";
 pub const UNISSUED_CODE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const POLICY_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\nspec:\n  members: { groups: [ops] }\n  ssh: { nodes: { env: [prod] }, logins: [\"{username}\"] }\n";
+
+fn loaded_policy(dir: &Path) -> PolicyHandle {
+    let policy_dir = dir.join("policy");
+    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::write(policy_dir.join("roles.yaml"), POLICY_ROLE).unwrap();
+    let handle = PolicyHandle::empty();
+    let outcome = handle.reload(&policy_dir);
+    assert!(outcome.applied, "{:?}", outcome.errors);
+    handle
+}
 
 #[derive(Clone)]
 pub struct TestClock {
@@ -259,6 +272,7 @@ impl Harness {
                 public_origin: options.public_origin.to_owned(),
                 client_ip_header: options.client_ip_header.map(str::to_owned),
             },
+            policy: loaded_policy(dir.path()),
             clock: clock.clock(),
         })?;
         Ok(Harness {

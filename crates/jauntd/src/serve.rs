@@ -12,6 +12,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::ca::{self, Authorities};
 use crate::config::{self, ConfigError, EnvLookup, RunSettings};
 use crate::logging::{self, LoggingError};
+use crate::policy::{self, PolicyError};
 use crate::storage::{self, Exposure, StorageError};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +29,8 @@ pub enum ServeError {
     Runtime(#[source] io::Error),
     #[error("cannot install the signal handlers: {0}")]
     Signals(#[source] io::Error),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("cannot open the database {}: {source}", path.display())]
@@ -67,6 +70,8 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
     let mut terminate = signal(SignalKind::terminate()).map_err(ServeError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(ServeError::Signals)?;
 
+    let policy = policy::load_at_startup(&settings.policy_dir)?;
+
     let prepared = storage::prepare(&settings.data_dir)?;
     for exposure in &prepared.exposures {
         log_exposure(&prepared.database, &settings.data_dir, *exposure);
@@ -94,6 +99,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         cert_ttl: settings.cert_ttl,
         pending_capacity: PENDING_CAPACITY,
         device: settings.device,
+        policy: policy.clone(),
         clock: system_clock(),
     })?;
 
@@ -110,6 +116,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
     })?;
     tracing::info!(target: "jaunt::daemon", listen = %bound, "serving plain http");
 
+    let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
     control
         .serve(listener, async move {
             tokio::select! {
@@ -117,6 +124,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
                 _ = interrupt.recv() => {}
             }
             tracing::info!(target: "jaunt::daemon", "shutting down");
+            policy::stop_watcher(watcher).await;
         })
         .await?;
     Ok(())
@@ -142,8 +150,15 @@ fn log_exposure(database: &Path, data_dir: &Path, exposure: Exposure) {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::time::SystemTime;
 
-    use super::{ServeError, run};
+    use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa};
+
+    use super::{ServeError, run, serve};
+    use crate::ca::Authorities;
+    use crate::config;
+    use crate::policy::PolicyError;
 
     fn secret_only(name: &str) -> Option<OsString> {
         (name == "JAUNT_OIDC_CLIENT_SECRET").then(|| OsString::from("never-printed-secret"))
@@ -181,6 +196,54 @@ mod tests {
         let err = run(&config, &secret_only).err().unwrap();
 
         assert!(matches!(err, ServeError::Settings(_)), "{err}");
+        assert!(!dir.path().join("jaunt.db").exists());
+    }
+
+    fn authorities(dir: &std::path::Path) -> Authorities {
+        let root = dir.join("test-ca");
+        let identity = AgeIdentity::generate();
+        for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
+            FileBackend::init(&root, kind, &identity.recipient()).unwrap();
+        }
+        let (_, user) = FileBackend::load(&root, CaKind::User, &identity).unwrap();
+        let (host_trust, host) = FileBackend::load(&root, CaKind::Host, &identity).unwrap();
+        let (_, internal) = FileBackend::load(&root, CaKind::Internal, &identity).unwrap();
+        let certificate = InternalCa::create_root(&internal, SystemTime::now()).unwrap();
+        Authorities {
+            user,
+            host_trust,
+            host,
+            internal: InternalCa::new(Arc::new(internal), certificate.certificate_der).unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_invalid_policy_stops_startup_before_the_database_and_the_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("roles.yaml"), "kind: Role\nbogus: 1\n").unwrap();
+        let path = write_config(dir.path(), "");
+        let settings = config::load(&path)
+            .unwrap()
+            .into_run_settings(&secret_only)
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = runtime
+            .block_on(serve(settings, authorities(dir.path())))
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(err, ServeError::Policy(PolicyError::Invalid { .. })),
+            "{err}"
+        );
+        let shown = err.to_string();
+        assert!(shown.contains("roles.yaml"), "{shown}");
         assert!(!dir.path().join("jaunt.db").exists());
     }
 }

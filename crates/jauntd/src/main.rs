@@ -2,6 +2,7 @@ mod ca;
 mod config;
 mod logging;
 mod node;
+mod policy;
 mod serve;
 mod storage;
 

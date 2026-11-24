@@ -28,6 +28,7 @@ pub struct Identity {
     pub subject: String,
     pub email: String,
     pub email_verified: bool,
+    pub username: String,
 }
 
 impl Identity {
@@ -36,6 +37,7 @@ impl Identity {
             subject: "user-1".to_owned(),
             email: "alice@example.com".to_owned(),
             email_verified: true,
+            username: "alice".to_owned(),
         }
     }
 }
@@ -215,7 +217,7 @@ fn mint_id_token(shared: &Shared, grant: &Grant) -> String {
     claims.insert("nonce".into(), json!(grant.nonce));
     claims.insert("email".into(), json!(identity.email));
     claims.insert("email_verified".into(), json!(identity.email_verified));
-    claims.insert("preferred_username".into(), json!("alice"));
+    claims.insert("preferred_username".into(), json!(identity.username));
     claims.insert("name".into(), json!("Alice Example"));
     claims.insert("groups".into(), json!(["dev", "ops"]));
     let mut header = Header::new(Algorithm::EdDSA);

@@ -16,6 +16,10 @@ const MIN_CERT_TTL_SECS: u64 = 60;
 const MAX_CERT_TTL_SECS: u64 = 86_400;
 const CALLBACK_PATH: &str = "/v1/login/callback";
 const MAX_HEADER_NAME_LEN: usize = 64;
+const DEFAULT_POLICY_POLL_SECS: u64 = 5;
+const MIN_POLICY_POLL_SECS: u64 = 1;
+const MAX_POLICY_POLL_SECS: u64 = 3600;
+const DEFAULT_POLICY_DIR: &str = "policy";
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
@@ -33,6 +37,9 @@ pub struct Config {
     pub client_ip_header: Option<String>,
     pub ssh_suffix: Option<String>,
     pub agent_endpoint: Option<String>,
+    pub policy_dir: Option<PathBuf>,
+    #[serde(default = "default_policy_poll_secs")]
+    pub policy_poll_secs: u64,
     pub oidc: Option<OidcSection>,
 }
 
@@ -56,6 +63,8 @@ pub struct RunSettings {
     pub device: DeviceSettings,
     pub ssh_suffix: SshSuffix,
     pub agent_endpoint: AgentEndpoint,
+    pub policy_dir: PathBuf,
+    pub policy_poll: Duration,
     pub oidc: OidcConfig,
 }
 
@@ -67,6 +76,8 @@ pub enum ConfigError {
     InvalidPublicUrl(&'static str),
     #[error("cert_ttl_secs must be between {MIN_CERT_TTL_SECS} and {MAX_CERT_TTL_SECS}")]
     CertTtlOutOfRange,
+    #[error("policy_poll_secs must be between {MIN_POLICY_POLL_SECS} and {MAX_POLICY_POLL_SECS}")]
+    PolicyPollOutOfRange,
     #[error("client_ip_header must be a header name of letters, digits and hyphens")]
     InvalidClientIpHeader,
     #[error("ssh_suffix is required to run the daemon")]
@@ -112,6 +123,10 @@ fn default_device_login() -> bool {
     true
 }
 
+fn default_policy_poll_secs() -> u64 {
+    DEFAULT_POLICY_POLL_SECS
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let options = serde_saphyr::options! { with_snippet: false };
@@ -125,6 +140,9 @@ impl Config {
         let origin = validate_public_url(&public_url)?;
         if !(MIN_CERT_TTL_SECS..=MAX_CERT_TTL_SECS).contains(&self.cert_ttl_secs) {
             return Err(ConfigError::CertTtlOutOfRange);
+        }
+        if !(MIN_POLICY_POLL_SECS..=MAX_POLICY_POLL_SECS).contains(&self.policy_poll_secs) {
+            return Err(ConfigError::PolicyPollOutOfRange);
         }
         let client_ip_header = self
             .client_ip_header
@@ -167,6 +185,9 @@ impl Config {
             oidc.extra_root_certificates_pem = vec![pem];
         }
 
+        let policy_dir = self
+            .policy_dir
+            .unwrap_or_else(|| self.data_dir.join(DEFAULT_POLICY_DIR));
         Ok(RunSettings {
             data_dir: self.data_dir,
             listen: self.listen,
@@ -178,6 +199,8 @@ impl Config {
             },
             ssh_suffix,
             agent_endpoint,
+            policy_dir,
+            policy_poll: Duration::from_secs(self.policy_poll_secs),
             oidc,
         })
     }
@@ -522,6 +545,38 @@ cert_ttl_secs: {SECRET}
                 ),
                 "{given:?}"
             );
+        }
+    }
+
+    #[test]
+    fn the_policy_directory_defaults_into_the_data_dir_and_can_be_moved() {
+        let defaults = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(defaults.policy_dir, Path::new("/var/lib/jaunt/policy"));
+        assert_eq!(defaults.policy_poll, Duration::from_secs(5));
+
+        let moved = parse("policy_dir: /etc/jaunt/policy\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(moved.policy_dir, Path::new("/etc/jaunt/policy"));
+    }
+
+    #[test]
+    fn policy_poll_secs_is_bounded() {
+        for (secs, ok) in [
+            (0, false),
+            (1, true),
+            (5, true),
+            (3600, true),
+            (3601, false),
+        ] {
+            let mut config = parse("");
+            config.policy_poll_secs = secs;
+            let result = config.into_run_settings(&secret_env);
+            assert_eq!(result.is_ok(), ok, "{secs}");
+            match result {
+                Ok(settings) => assert_eq!(settings.policy_poll, Duration::from_secs(secs)),
+                Err(err) => assert!(matches!(err, ConfigError::PolicyPollOutOfRange), "{err}"),
+            }
         }
     }
 

@@ -138,6 +138,10 @@ impl PolicySet {
         self.roles.is_empty() && self.tests.is_empty()
     }
 
+    pub fn role_count(&self) -> usize {
+        self.roles.len()
+    }
+
     pub fn hash(&self) -> &str {
         &self.hash
     }

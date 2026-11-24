@@ -204,6 +204,7 @@ async fn a_browser_mismatch_stops_before_the_provider_exchange_and_creates_no_us
                 issuer: harness.provider.base.clone(),
                 subject: "user-1".to_owned(),
                 email: "alice@example.com".to_owned(),
+                username: "alice".to_owned(),
                 display_name: None,
                 groups: Vec::new(),
             },

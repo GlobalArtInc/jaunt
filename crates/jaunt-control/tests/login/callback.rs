@@ -54,8 +54,41 @@ async fn successful_callback_approves_the_request_and_redirects_to_the_stored_po
     assert_eq!(user.issuer, harness.provider.base);
     assert_eq!(user.subject, "user-1");
     assert_eq!(user.email, "alice@example.com");
+    assert_eq!(user.username, "alice");
     assert_eq!(user.display_name.as_deref(), Some("Alice Example"));
     assert_eq!(user.groups, ["dev", "ops"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_provider_username_replaces_the_stored_one_at_the_next_login() {
+    let harness = Harness::new().await;
+    let mut user_ids = Vec::new();
+    for username in ["alice", "alice.renamed"] {
+        let session = harness.begin().await;
+        let code = harness.provider.grant(
+            &session.authorize_url,
+            Identity {
+                username: username.to_owned(),
+                ..Identity::alice()
+            },
+        );
+        let reply = harness
+            .callback(&format!("code={code}&state={}", session.state))
+            .await;
+        completion_code_in(reply.location(), &session);
+        let stored = harness
+            .store
+            .login_requests()
+            .get(&session.login_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_id = stored.user_id.unwrap();
+        let user = harness.store.users().get(&user_id).await.unwrap().unwrap();
+        assert_eq!(user.username, username);
+        user_ids.push(user_id);
+    }
+    assert_eq!(user_ids[0], user_ids[1]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

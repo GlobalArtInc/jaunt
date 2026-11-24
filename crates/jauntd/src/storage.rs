@@ -124,6 +124,7 @@ mod tests {
                         issuer: "https://idp.example".to_owned(),
                         subject: "subject".to_owned(),
                         email: "ada@example.com".to_owned(),
+                        username: "ada".to_owned(),
                         display_name: None,
                         groups: Vec::new(),
                     },

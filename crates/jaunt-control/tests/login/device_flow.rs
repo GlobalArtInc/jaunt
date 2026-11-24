@@ -4,6 +4,7 @@ use jaunt_ca::ssh_key::Certificate;
 use jaunt_store::LoginRequestState;
 use serde_json::json;
 
+use crate::provider::Identity;
 use crate::support::{Harness, LOGIN_TTL_SECS, Options, ed25519_public_key_line, sha256_hex};
 
 const RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCbq8RTZjt4CE3S8rO3jTGFkWZNb/VU4RKaU7as+YNXyAP7sB2MGZBYgM/zsaJM4QJqOyiIWaXGKaSV2jPK0zjEZ+G1yAGKKutJuHInAw+zZYCdcZsKMPyENxGarTBfziudWiQVVdjf0QBuWDF0UOFgwRe2JMWgP8fz/9Gin3ZdLIIZGiCdZbwLmGMHEy8WIwV+PtdJ2xy2uP+5+bAcoP/TTg4i3yvmrf/POnL5GoXimJYc/1X3YXCc2KmO/wJBeoyVc2FbScDpGQJRZN8feRqzTeevM/vT9D2P86z7JKNgDgH0wDXIOKDnkPzjegvTMrf/6Vc9fczxZpPElguEAQyN";
@@ -100,6 +101,36 @@ async fn a_certificate_is_issued_only_after_the_person_presses_approve() {
     let again = harness.poll(&session, &key).await;
     assert_eq!(again.status, StatusCode::BAD_REQUEST);
     assert_eq!(again.error_code(), "invalid_grant");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_device_sign_in_stores_the_provider_username() {
+    let harness = Harness::new().await;
+    let session = harness.device_start().await;
+    let identity = Identity {
+        username: "alice.device".to_owned(),
+        ..Identity::alice()
+    };
+
+    let page = harness.sign_in_as(&session, identity).await;
+    let approved = harness.approve_device(&session.login_id, &page.token).await;
+    assert_eq!(approved.status, StatusCode::OK);
+
+    let stored = harness
+        .store
+        .login_requests()
+        .get(&session.login_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let user = harness
+        .store
+        .users()
+        .get(stored.user_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user.username, "alice.device");
 }
 
 #[tokio::test(flavor = "multi_thread")]

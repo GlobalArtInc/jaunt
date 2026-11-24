@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
     DeviceSettings, NodeAdmin, SshSuffix,
 };
+use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -270,6 +271,19 @@ pub fn host_certificate_is_valid(line: &str, host_ca: &PublicKey, at_secs: i64) 
     certificate
 }
 
+fn loaded_policy(policy_dir: &Path) -> PolicyHandle {
+    std::fs::create_dir(policy_dir).unwrap();
+    std::fs::write(
+        policy_dir.join("roles.yaml"),
+        "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: approvers }\nspec:\n  members: { users: [alice@example.com] }\n  admin: [nodes.approve]\n",
+    )
+    .unwrap();
+    let handle = PolicyHandle::empty();
+    let outcome = handle.reload(policy_dir);
+    assert!(outcome.applied, "{:?}", outcome.errors);
+    handle
+}
+
 impl Harness {
     pub async fn new() -> Harness {
         Harness::with(Options::default()).await
@@ -332,6 +346,7 @@ impl Harness {
                 public_origin: "https://jaunt.example.test".to_owned(),
                 client_ip_header: None,
             },
+            policy: loaded_policy(&dir.path().join("policy")),
             clock: clock.clock(),
         })?;
         Ok(Harness {

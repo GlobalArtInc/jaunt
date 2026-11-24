@@ -35,7 +35,7 @@ const CREATE: &str = "INSERT INTO api_tokens \
 const FIND_VALID: &str = "SELECT t.token_hash AS token_hash, t.cert_serial AS cert_serial, \
     t.created_at AS token_created_at, t.expires_at AS token_expires_at, \
     u.id AS id, u.issuer AS issuer, u.subject AS subject, u.email AS email, \
-    u.display_name AS display_name, u.groups AS groups, \
+    u.username AS username, u.display_name AS display_name, u.groups AS groups, \
     u.created_at AS created_at, u.updated_at AS updated_at \
     FROM api_tokens t JOIN users u ON u.id = t.user_id \
     WHERE t.token_hash = ? AND t.expires_at > ?";

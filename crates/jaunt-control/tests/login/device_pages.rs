@@ -162,6 +162,7 @@ async fn labels_and_identities_are_escaped_wherever_they_are_shown() {
         subject: "user-2".to_owned(),
         email: "o'brien&co@example.com".to_owned(),
         email_verified: true,
+        username: "obrien".to_owned(),
     };
 
     let confirmation = harness.enter_code(&session.user_code).await.text();

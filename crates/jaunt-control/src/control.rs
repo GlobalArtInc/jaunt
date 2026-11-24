@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::Router;
 use jaunt_ca::{CaKind, InternalCa, MAX_USER_VALIDITY, Signer, TrustSet};
 use jaunt_oidc::OidcClient;
+use jaunt_policy::{PolicyHandle, PolicySet};
 use jaunt_store::{EnrollmentState, Store};
 use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
@@ -40,6 +41,7 @@ pub struct ControlParts {
     pub cert_ttl: Duration,
     pub pending_capacity: usize,
     pub device: DeviceSettings,
+    pub policy: PolicyHandle,
     pub clock: Clock,
 }
 
@@ -57,6 +59,7 @@ pub struct Inner {
     pub(crate) device: DeviceState,
     pub(crate) poll_limiter: RateLimiter,
     pub(crate) enroll_limiter: RateLimiter,
+    policy: PolicyHandle,
     clock: Clock,
 }
 
@@ -112,6 +115,7 @@ impl Control {
                 device,
                 poll_limiter: RateLimiter::polls(),
                 enroll_limiter: RateLimiter::enrollments(),
+                policy: parts.policy,
                 clock: parts.clock,
             }),
         })
@@ -123,6 +127,15 @@ impl Control {
 
     pub fn agent_router(&self) -> Router {
         http::agent_router(self.clone())
+    }
+
+    pub fn policy(&self) -> &PolicyHandle {
+        &self.inner.policy
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn policy_snapshot(&self) -> Arc<PolicySet> {
+        self.inner.policy.snapshot()
     }
 
     pub fn node_admin(&self) -> NodeAdmin {

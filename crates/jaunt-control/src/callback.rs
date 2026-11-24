@@ -288,6 +288,7 @@ async fn sign_in(
                 issuer: identity.issuer,
                 subject: identity.subject,
                 email: identity.email,
+                username: identity.username,
                 display_name: identity.display_name,
                 groups: identity.groups,
             },
