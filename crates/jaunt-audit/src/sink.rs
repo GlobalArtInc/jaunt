@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn the_file_mode_constant_is_0640_and_world_writable_files_are_flagged() {
-        assert_eq!(u32::from(LOG_FILE_MODE.as_raw_mode()), 0o640);
+        assert_eq!(LOG_FILE_MODE, Mode::from_raw_mode(0o640));
         for (mode, flagged) in [
             (0o640, false),
             (0o600, false),
