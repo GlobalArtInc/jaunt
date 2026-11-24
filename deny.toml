@@ -1,3 +1,9 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side channel affects private-key operations only; jaunt-oidc verifies signatures with provider public keys and never signs or decrypts with RSA; no fixed version is reachable through openidconnect 4.1; revisit if another crate starts using rsa 0.9 for signing or decryption" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained notice without a vulnerability; required by openidconnect and oauth2; revisit when they drop it" },
+]
+
 [licenses]
 unused-allowed-license = "allow"
 allow = [
@@ -9,6 +15,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

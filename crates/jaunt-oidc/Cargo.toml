@@ -11,4 +11,22 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 jaunt-proto = { workspace = true }
+openidconnect = { version = "4.1.0", default-features = false, features = ["accept-string-booleans", "reqwest", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = "1.0.154"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "form"] }
+base64 = "0.23.1"
+hyper-util = { version = "0.1.21", features = ["server-auto", "service", "tokio"] }
+jsonwebtoken = { version = "12.0.0", default-features = false, features = ["rust_crypto"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
