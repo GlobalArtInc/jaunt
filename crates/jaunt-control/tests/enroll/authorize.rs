@@ -46,20 +46,15 @@ async fn authorize_grants_the_union_of_the_matching_roles_and_activates_the_sess
         ],
     );
     let cases = [
-        ("plain", vec!["plain"], true, permissions(false, false)),
-        ("forward", vec!["forward"], false, permissions(true, false)),
-        ("record", vec!["record"], true, permissions(false, true)),
-        (
-            "both",
-            vec!["forward", "record"],
-            false,
-            permissions(true, true),
-        ),
+        ("plain", vec!["plain"], permissions(false, false)),
+        ("forward", vec!["forward"], permissions(true, false)),
+        ("record", vec!["record"], permissions(false, true)),
+        ("both", vec!["forward", "record"], permissions(true, true)),
     ];
-    for (subject, groups, term, expected) in cases {
+    for (subject, groups, expected) in cases {
         let holder = holder(harness, subject, &groups).await;
         let session_id = routed(harness, &holder).await;
-        let decision = s.decide(holder.authorize(&session_id, LOGIN, term)).await;
+        let decision = s.decide(holder.authorize(&session_id, LOGIN)).await;
         assert_eq!(
             decision,
             AuthorizeDecision::Allow {
@@ -85,28 +80,28 @@ async fn authorize_requires_the_same_holder_on_both_hops_and_a_fresh_unused_bind
     let session_id = s.fresh_session().await;
     let other_user = AuthorizeRequest {
         user_id: bob.user_id.clone(),
-        ..s.alice.authorize(&session_id, LOGIN, true)
+        ..s.alice.authorize(&session_id, LOGIN)
     };
     assert_eq!(s.decide(other_user).await, deny(DenyReason::UserMismatch));
-    let other_serial = second_certificate.authorize(&session_id, LOGIN, true);
+    let other_serial = second_certificate.authorize(&session_id, LOGIN);
     assert_eq!(
         s.decide(other_serial).await,
         deny(DenyReason::SerialMismatch)
     );
     assert_eq!(
-        s.decide(bob.authorize(&session_id, LOGIN, true)).await,
+        s.decide(bob.authorize(&session_id, LOGIN)).await,
         deny(DenyReason::UserMismatch)
     );
 
-    let first = s.decide(s.alice.authorize(&session_id, LOGIN, true)).await;
+    let first = s.decide(s.alice.authorize(&session_id, LOGIN)).await;
     assert!(matches!(first, AuthorizeDecision::Allow { .. }));
-    let replay = s.decide(s.alice.authorize(&session_id, LOGIN, true)).await;
+    let replay = s.decide(s.alice.authorize(&session_id, LOGIN)).await;
     assert_eq!(replay, deny(DenyReason::SessionUsed));
 
     let late = s.fresh_session().await;
     harness.clock.advance(ROUTED_TTL_SECS);
     assert_eq!(
-        s.decide(s.alice.authorize(&late, LOGIN, true)).await,
+        s.decide(s.alice.authorize(&late, LOGIN)).await,
         deny(DenyReason::SessionExpired)
     );
     assert_eq!(
@@ -123,7 +118,7 @@ async fn authorize_rechecks_the_login_the_policy_and_the_node() {
     for login in ["root", "bad login", ""] {
         let session_id = s.fresh_session().await;
         assert_eq!(
-            s.decide(s.alice.authorize(&session_id, login, true)).await,
+            s.decide(s.alice.authorize(&session_id, login)).await,
             deny(DenyReason::PolicyDenied),
             "{login:?}"
         );
@@ -133,17 +128,19 @@ async fn authorize_rechecks_the_login_the_policy_and_the_node() {
     let before_removal = s.fresh_session().await;
     apply_policy(harness, &[role("ops", "someone-else", false, false)]);
     assert_eq!(
-        s.decide(s.alice.authorize(&before_reload, LOGIN, true))
-            .await,
+        s.decide(s.alice.authorize(&before_reload, LOGIN)).await,
         deny(DenyReason::PolicyDenied)
     );
 
     apply_policy(harness, &[role("ops", "ops", false, false)]);
     harness.admin.remove_node(NODE_NAME).await.unwrap();
     assert_eq!(
-        s.decide(s.alice.authorize(&before_removal, LOGIN, true))
-            .await,
-        deny(DenyReason::NodeUnknown)
+        s.decide(s.alice.authorize(&before_removal, LOGIN)).await,
+        deny(DenyReason::NodeInactive)
+    );
+    assert_eq!(
+        stored(harness, &before_removal).await.unwrap().state,
+        SessionState::Routed
     );
 }
 
@@ -164,7 +161,7 @@ async fn only_the_owning_node_ends_an_active_session_and_a_repeat_is_idempotent(
     );
 
     let session_id = s.fresh_session().await;
-    let allowed = s.decide(s.alice.authorize(&session_id, LOGIN, true)).await;
+    let allowed = s.decide(s.alice.authorize(&session_id, LOGIN)).await;
     assert!(matches!(allowed, AuthorizeDecision::Allow { .. }));
     assert_eq!(
         end(harness, &other_node, end_request(&session_id, 7)).await,

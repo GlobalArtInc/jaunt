@@ -7,18 +7,14 @@ use axum::response::Response;
 use jaunt_proto::RenewRequest;
 use jaunt_store::NodeKeys;
 
-use crate::agent::AuthenticatedNode;
+use crate::agent::{AuthenticatedNode, active_node, node_removed};
 use crate::control::Control;
 use crate::enroll::Invalid;
-use crate::http::{empty_response, error_response, json_body, json_response, server_error};
+use crate::http::{empty_response, json_body, json_response, server_error};
 use crate::issuance;
 use crate::node_audit::{self, Renewed};
 use crate::node_keys::{self, SshHostKey, TlsKey};
 use crate::poll::certificates_of;
-
-fn node_removed() -> Response {
-    error_response(StatusCode::FORBIDDEN, "node_removed")
-}
 
 pub(crate) async fn handle(
     State(control): State<Control>,
@@ -37,13 +33,9 @@ pub(crate) async fn handle(
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return server_error();
     };
-    let node = match control.store.nodes().get_active(&node_id).await {
-        Ok(Some(node)) => node,
-        Ok(None) => return node_removed(),
-        Err(err) => {
-            tracing::error!(target: "jaunt::control", error = %err, "loading the node failed");
-            return server_error();
-        }
+    let node = match active_node(&control, &node_id).await {
+        Ok(node) => node,
+        Err(refusal) => return refusal.into_response(),
     };
 
     let tls = match request.tls_public_key.as_deref() {

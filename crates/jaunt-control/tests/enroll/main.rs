@@ -12,6 +12,7 @@ mod session_http;
 mod session_support;
 mod support;
 mod sweep;
+mod trust;
 
 #[allow(dead_code)]
 #[path = "../login/provider.rs"]

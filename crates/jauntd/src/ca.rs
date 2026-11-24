@@ -30,14 +30,15 @@ struct Initialized {
     warnings: Vec<String>,
 }
 
-struct Output {
-    code: u8,
-    stdout: String,
+pub struct Output {
+    pub code: u8,
+    pub stdout: String,
     stderr: String,
 }
 
 pub struct Authorities {
     pub user: FileBackend,
+    pub user_trust: TrustSet,
     pub host_trust: TrustSet,
     pub host: FileBackend,
     pub internal: InternalCa,
@@ -46,7 +47,7 @@ pub struct Authorities {
 pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authorities, String> {
     let ca_dir = data_dir.join(CA_DIR);
     let identity = resolve_identity(&ca_dir, env)?;
-    let (_user_trust, user) =
+    let (user_trust, user) =
         FileBackend::load(&ca_dir, CaKind::User, &identity).map_err(|err| err.to_string())?;
     let (host_trust, host) =
         FileBackend::load(&ca_dir, CaKind::Host, &identity).map_err(|err| err.to_string())?;
@@ -57,6 +58,7 @@ pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authoriti
         InternalCa::new(Arc::new(internal_signer), root).map_err(|err| err.to_string())?;
     Ok(Authorities {
         user,
+        user_trust,
         host_trust,
         host,
         internal,
@@ -109,7 +111,12 @@ fn emit(output: &Output) -> ExitCode {
     }
 }
 
-fn run(data_dir: &Path, generate_identity: bool, env: EnvLookup<'_>, now: SystemTime) -> Output {
+pub fn run(
+    data_dir: &Path,
+    generate_identity: bool,
+    env: EnvLookup<'_>,
+    now: SystemTime,
+) -> Output {
     let source = if generate_identity {
         IdentitySource::Generate
     } else {

@@ -98,6 +98,15 @@ pub(crate) fn node_removed(node_id: &str, name: &str, reason: &'static str) {
     );
 }
 
+pub(crate) fn trust_served(node_id: &str, keys: usize) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "agent.trust.served",
+        node_id,
+        keys
+    );
+}
+
 pub(crate) fn cert_renewed(event: &Renewed<'_>) {
     tracing::info!(
         target: "jaunt::audit",

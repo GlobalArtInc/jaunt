@@ -1,3 +1,4 @@
+mod agent_trust;
 mod client;
 mod device;
 mod enroll;
@@ -7,6 +8,7 @@ mod plane;
 mod session;
 mod whoami;
 
+pub use agent_trust::AgentTrust;
 pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};
 pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
 pub use enroll::{

@@ -232,7 +232,7 @@ async fn the_sweeper_purges_routed_sessions_an_hour_after_expiry_and_keeps_the_r
     let active = routed(harness, &s.alice).await;
     let ended = routed(harness, &s.alice).await;
     for session_id in [&active, &ended] {
-        let request = s.alice.authorize(session_id, "deploy", true);
+        let request = s.alice.authorize(session_id, "deploy");
         assert!(matches!(
             authorize(harness, &s.node_id, request).await,
             jaunt_proto::AuthorizeDecision::Allow { .. }

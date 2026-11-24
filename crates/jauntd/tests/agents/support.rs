@@ -116,7 +116,7 @@ impl Harness {
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
         }
-        let (_, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
+        let (user_trust, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
         let (host_trust, host) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (internal_ca, issuer) = internal_cas(&ca_root, &identity);
         let db_path = dir.path().join("jaunt.db");
@@ -127,6 +127,7 @@ impl Harness {
             store: store.clone(),
             oidc: discovery.client().await,
             user_authority: Arc::new(user),
+            user_trust,
             host_trust,
             host_authority: Arc::new(host),
             internal_ca,

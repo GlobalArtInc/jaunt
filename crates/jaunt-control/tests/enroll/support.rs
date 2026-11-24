@@ -12,7 +12,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
-use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
+use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer, TrustSet};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
     DeviceSettings, GateEndpoint, NodeAdmin, SshSuffix,
@@ -80,8 +80,16 @@ pub enum HostAuthority {
     NotTheTrustedKey,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserTrust {
+    Matching,
+    RetiredKeyFirst,
+    NotTheSigningKey,
+}
+
 pub struct Options {
     pub host_authority: HostAuthority,
+    pub user_trust: UserTrust,
     pub empty_policy: bool,
     pub gate_endpoint: Option<&'static str>,
 }
@@ -90,6 +98,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             host_authority: HostAuthority::Matching,
+            user_trust: UserTrust::Matching,
             empty_policy: false,
             gate_endpoint: None,
         }
@@ -180,6 +189,7 @@ pub struct Harness {
     pub clock: TestClock,
     pub root_der: Vec<u8>,
     pub host_ca: PublicKey,
+    pub user_trust: TrustSet,
     pub db_path: PathBuf,
     _provider: FakeProvider,
     _dir: TempDir,
@@ -309,7 +319,9 @@ impl Harness {
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
         }
-        let (_, user_authority) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
+        let (loaded_user_trust, user_authority) =
+            FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
+        let user_trust = user_trust_for(options.user_trust, loaded_user_trust);
         let (host_trust, host_signer) =
             FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (_, internal_signer) =
@@ -344,6 +356,7 @@ impl Harness {
             store: store.clone(),
             oidc: provider.oidc_client().await,
             user_authority: Arc::new(user_authority),
+            user_trust: user_trust.clone(),
             host_trust,
             host_authority,
             internal_ca,
@@ -373,6 +386,7 @@ impl Harness {
             clock,
             root_der,
             host_ca,
+            user_trust,
             db_path,
             _provider: provider,
             _dir: dir,
@@ -442,6 +456,30 @@ impl Harness {
         assert_eq!(reply.state(), "approved", "{}", reply.text());
         let body = reply.json();
         (enrolled, body)
+    }
+}
+
+fn user_trust_for(choice: UserTrust, loaded: TrustSet) -> TrustSet {
+    let signing = loaded.active().clone();
+    let stranger = PublicKey::from(
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+            .unwrap()
+            .public_key()
+            .key_data()
+            .clone(),
+    );
+    match choice {
+        UserTrust::Matching => loaded,
+        UserTrust::RetiredKeyFirst => TrustSet::new(
+            vec![stranger, signing.clone()],
+            signing.fingerprint(HashAlg::Sha256),
+        )
+        .unwrap(),
+        UserTrust::NotTheSigningKey => TrustSet::new(
+            vec![signing, stranger.clone()],
+            stranger.fingerprint(HashAlg::Sha256),
+        )
+        .unwrap(),
     }
 }
 

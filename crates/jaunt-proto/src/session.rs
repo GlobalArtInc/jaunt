@@ -38,6 +38,7 @@ pub enum DenyReason {
     CertificateNotIssued,
     CertificateExpired,
     NodeUnknown,
+    NodeInactive,
     NodeUnavailable,
     PolicyDenied,
     Revoked,
@@ -56,6 +57,7 @@ impl DenyReason {
             DenyReason::CertificateNotIssued => "certificate_not_issued",
             DenyReason::CertificateExpired => "certificate_expired",
             DenyReason::NodeUnknown => "node_unknown",
+            DenyReason::NodeInactive => "node_inactive",
             DenyReason::NodeUnavailable => "node_unavailable",
             DenyReason::PolicyDenied => "policy_denied",
             DenyReason::Revoked => "revoked",
@@ -80,7 +82,6 @@ pub struct AuthorizeRequest {
     pub serial: u64,
     pub key_id: String,
     pub login: String,
-    pub term: bool,
     pub client_addr: String,
 }
 
@@ -92,7 +93,6 @@ impl fmt::Debug for AuthorizeRequest {
             .field("serial", &self.serial)
             .field("key_id", &REDACTED)
             .field("login", &self.login)
-            .field("term", &self.term)
             .field("client_addr", &self.client_addr)
             .finish()
     }
@@ -199,9 +199,13 @@ mod tests {
     fn agent_bodies_reject_a_node_id_and_any_other_unknown_field() {
         let authorize = json!({
             "session_id": "s", "user_id": "u", "serial": 7, "key_id": "k",
-            "login": "deploy", "term": true, "client_addr": "203.0.113.5:4000",
+            "login": "deploy", "client_addr": "203.0.113.5:4000",
         });
-        assert!(serde_json::from_value::<AuthorizeRequest>(authorize.clone()).is_ok());
+        let parsed: AuthorizeRequest = serde_json::from_value(authorize.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), authorize);
+        let mut with_term = authorize.clone();
+        with_term["term"] = json!(false);
+        assert!(serde_json::from_value::<AuthorizeRequest>(with_term).is_err());
         let mut with_node = authorize;
         with_node["node_id"] = json!("other-node");
         assert!(serde_json::from_value::<AuthorizeRequest>(with_node).is_err());
@@ -227,6 +231,7 @@ mod tests {
             json!({"outcome": "rejected"})
         );
         assert_eq!(DenyReason::WrongNode.code(), "wrong_node");
+        assert_eq!(DenyReason::NodeInactive.code(), "node_inactive");
         assert_eq!(
             DenyReason::CertificateNotIssued.code(),
             "certificate_not_issued"
@@ -249,7 +254,6 @@ mod tests {
             serial: 7,
             key_id: key_id.to_owned(),
             login: "deploy".to_owned(),
-            term: true,
             client_addr: "203.0.113.5:4000".to_owned(),
         };
         let end = SessionEnd {

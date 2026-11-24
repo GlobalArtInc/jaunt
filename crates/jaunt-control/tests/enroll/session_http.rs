@@ -20,7 +20,6 @@ fn authorize_body(holder: &Holder, session_id: &str) -> Value {
         "serial": holder.serial,
         "key_id": holder.key_id,
         "login": LOGIN,
-        "term": true,
         "client_addr": CLIENT,
     })
 }
@@ -204,7 +203,7 @@ async fn the_session_lifecycle_emits_stable_audit_events_without_credentials() {
     assert_eq!(field(2, "session_id"), Some(session_id.clone()));
 
     assert_eq!(field(3, "login"), some(LOGIN));
-    assert_eq!(field(3, "term"), some("true"));
+    assert_eq!(field(3, "term"), None);
     assert_eq!(field(3, "pty"), some("true"));
     assert_eq!(field(3, "port_forwarding"), some("false"));
     assert_eq!(field(3, "record_input"), some("false"));
@@ -231,4 +230,93 @@ async fn the_session_lifecycle_emits_stable_audit_events_without_credentials() {
             assert!(!value.contains("ssh-ed25519"), "{event:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn a_removed_node_is_refused_before_its_session_is_looked_up() {
+    let s = scenario().await;
+    let harness = &s.harness;
+    let other_node = node(harness, "web-02").await;
+    let foreign = crate::session_support::route(harness, s.alice.route_to("web-02")).await;
+    let foreign = match foreign {
+        jaunt_proto::RouteDecision::Allow {
+            session_id,
+            node_id,
+        } => {
+            assert_eq!(node_id, other_node);
+            session_id
+        }
+        other => panic!("the route was denied: {other:?}"),
+    };
+    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    start_recording();
+
+    let unknown = s.authorize_over_http(&s.node_id, UNKNOWN_SESSION).await;
+    let misrouted = s.authorize_over_http(&s.node_id, &foreign).await;
+
+    for reply in [&unknown, &misrouted] {
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json(), json!({"decision": "deny"}));
+    }
+    let reasons: Vec<String> = audit_events(take_recording())
+        .into_iter()
+        .map(|event| event["reason"].clone())
+        .collect();
+    assert_eq!(reasons, ["node_inactive", "node_inactive"]);
+    assert_eq!(
+        stored(harness, &foreign).await.unwrap().state,
+        SessionState::Routed
+    );
+}
+
+#[tokio::test]
+async fn an_authorize_body_that_still_carries_term_is_rejected() {
+    let s = scenario().await;
+    let session_id = routed(&s.harness, &s.alice).await;
+    let mut body = authorize_body(&s.alice, &session_id);
+    body["term"] = json!(false);
+
+    let rejected = agent_call(&s.harness, AUTHORIZE, Some(&s.node_id), &body).await;
+
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.error_code(), "invalid_request");
+    assert_eq!(
+        stored(&s.harness, &session_id).await.unwrap().state,
+        SessionState::Routed
+    );
+}
+
+#[tokio::test]
+async fn a_removed_node_is_refused_on_connections_opened_before_the_removal() {
+    let s = scenario().await;
+    let harness = &s.harness;
+    let waiting = routed(harness, &s.alice).await;
+    let running = routed(harness, &s.alice).await;
+    let allowed = s.authorize_over_http(&s.node_id, &running).await;
+    assert_eq!(allowed.json()["decision"], "allow");
+    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    start_recording();
+
+    let denied = s.authorize_over_http(&s.node_id, &waiting).await;
+    let ended = agent_call(harness, END, Some(&s.node_id), &end_body(&running)).await;
+
+    assert_eq!(denied.status, StatusCode::OK);
+    assert_eq!(denied.json(), json!({"decision": "deny"}));
+    assert_eq!(ended.status, StatusCode::FORBIDDEN);
+    assert_eq!(ended.json(), json!({"error": "node_removed"}));
+    let events = audit_events(take_recording());
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "authz.deny");
+    assert_eq!(events[0]["phase"], "authorize");
+    assert_eq!(events[0]["reason"], "node_inactive");
+    assert_eq!(events[0]["node_id"], s.node_id);
+    assert_eq!(events[0]["session_id"], waiting);
+    assert_eq!(
+        stored(harness, &waiting).await.unwrap().state,
+        SessionState::Routed
+    );
+    assert_eq!(
+        stored(harness, &running).await.unwrap().state,
+        SessionState::Active
+    );
 }

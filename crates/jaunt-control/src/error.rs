@@ -23,6 +23,10 @@ pub enum ControlError {
     HostAuthorityNotTrusted,
     #[error("the host authority keys cannot be listed: {0}")]
     HostKeys(#[source] CaError),
+    #[error("the user signing authority is not the active key of the user trust set")]
+    UserAuthorityNotTrusted,
+    #[error("the user authority keys cannot be listed: {0}")]
+    UserKeys(#[source] CaError),
     #[error("the http server failed: {0}")]
     Serve(#[source] std::io::Error),
     #[error("the clock is before the unix epoch")]

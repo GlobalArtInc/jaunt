@@ -1,5 +1,6 @@
 mod admin;
 mod agent;
+mod agent_trust;
 mod audit;
 mod authorize;
 mod callback;

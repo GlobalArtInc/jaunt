@@ -31,6 +31,15 @@ pub(crate) async fn authorize(
     let policy = control.policy_snapshot();
     let deny = |reason| denied(&request, &node_id, policy.hash(), reason);
 
+    let Some(node) = control
+        .store
+        .nodes()
+        .get_active(&node_id)
+        .await
+        .map_err(store_failure("loading the node"))?
+    else {
+        return Ok(deny(DenyReason::NodeInactive));
+    };
     let sessions = control.store.sessions();
     let binding = match sessions
         .get(&request.session_id)
@@ -63,15 +72,6 @@ pub(crate) async fn authorize(
         Ok(holder) => holder,
         Err(reason) => return Ok(deny(reason)),
     };
-    let Some(node) = control
-        .store
-        .nodes()
-        .get_active(&node_id)
-        .await
-        .map_err(store_failure("loading the node"))?
-    else {
-        return Ok(deny(DenyReason::NodeUnknown));
-    };
     let decision = policy.authorize_ssh(
         &policy_identity(&holder.user),
         &node_info(&node),
@@ -102,7 +102,6 @@ pub(crate) async fn authorize(
         serial: holder.serial,
         node_id: &node_id,
         login: &request.login,
-        term: request.term,
         permissions,
         roles: &decision.roles,
         client_addr: &request.client_addr,

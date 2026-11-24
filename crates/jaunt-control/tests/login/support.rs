@@ -240,7 +240,7 @@ impl Harness {
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
         }
-        let (_user_trust, user_authority) =
+        let (user_trust, user_authority) =
             FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
         let (host_trust, host_authority) =
             FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
@@ -270,6 +270,7 @@ impl Harness {
             store: store.clone(),
             oidc: provider.oidc_client().await,
             user_authority: authority,
+            user_trust,
             host_trust,
             host_authority: Arc::new(host_signer),
             internal_ca,

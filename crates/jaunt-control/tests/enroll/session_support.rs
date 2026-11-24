@@ -34,14 +34,13 @@ impl Holder {
         }
     }
 
-    pub fn authorize(&self, session_id: &str, login: &str, term: bool) -> AuthorizeRequest {
+    pub fn authorize(&self, session_id: &str, login: &str) -> AuthorizeRequest {
         AuthorizeRequest {
             session_id: session_id.to_owned(),
             user_id: self.user_id.clone(),
             serial: self.serial,
             key_id: self.key_id.clone(),
             login: login.to_owned(),
-            term,
             client_addr: CLIENT.to_owned(),
         }
     }

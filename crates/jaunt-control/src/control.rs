@@ -39,6 +39,7 @@ pub struct ControlParts {
     pub store: Store,
     pub oidc: OidcClient,
     pub user_authority: Arc<dyn Signer>,
+    pub user_trust: TrustSet,
     pub host_trust: TrustSet,
     pub host_authority: Arc<dyn Signer>,
     pub internal_ca: InternalCa,
@@ -57,6 +58,7 @@ pub struct Inner {
     pub(crate) store: Store,
     pub(crate) oidc: OidcClient,
     pub(crate) user_authority: Arc<dyn Signer>,
+    pub(crate) user_ca_keys: Vec<String>,
     pub(crate) host_ca_keys: Vec<String>,
     pub(crate) host_authority: Arc<dyn Signer>,
     pub(crate) internal_ca: InternalCa,
@@ -91,6 +93,7 @@ impl Control {
         if parts.user_authority.kind() != CaKind::User {
             return Err(ControlError::NotUserAuthority);
         }
+        let user_ca_keys = active_first(&parts.user_trust, parts.user_authority.as_ref())?;
         if parts.cert_ttl < Duration::from_secs(1) {
             return Err(ControlError::CertificateTtlTooShort);
         }
@@ -116,6 +119,7 @@ impl Control {
                 store: parts.store,
                 oidc: parts.oidc,
                 user_authority: parts.user_authority,
+                user_ca_keys,
                 host_ca_keys,
                 host_authority: parts.host_authority,
                 internal_ca: parts.internal_ca,
@@ -287,6 +291,26 @@ impl Control {
     }
 }
 
+fn active_first(trust: &TrustSet, authority: &dyn Signer) -> Result<Vec<String>, ControlError> {
+    let signing = authority.public_key();
+    if trust.active().key_data() != signing.key_data() {
+        return Err(ControlError::UserAuthorityNotTrusted);
+    }
+    let lines = trust
+        .to_authorized_lines()
+        .map_err(ControlError::UserKeys)?;
+    let (active, retired): (Vec<_>, Vec<_>) = trust
+        .keys()
+        .iter()
+        .zip(lines)
+        .partition(|(key, _)| key.key_data() == signing.key_data());
+    Ok(active
+        .into_iter()
+        .chain(retired)
+        .map(|(_, line)| line)
+        .collect())
+}
+
 async fn sweep_forever(control: Control) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -381,7 +405,7 @@ mod tests {
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
         }
-        let (_, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
+        let (user_trust, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
         let (host_trust, host) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (_, internal) = FileBackend::load(&ca_root, CaKind::Internal, &identity).unwrap();
         let root = InternalCa::create_root(&internal, SystemTime::now()).unwrap();
@@ -401,6 +425,7 @@ mod tests {
             store,
             oidc,
             user_authority: Arc::new(user),
+            user_trust,
             host_trust,
             host_authority: Arc::new(host),
             internal_ca,

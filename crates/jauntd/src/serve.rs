@@ -186,6 +186,7 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         store,
         oidc,
         user_authority: Arc::new(authorities.user),
+        user_trust: authorities.user_trust,
         host_trust: authorities.host_trust,
         host_authority: Arc::new(authorities.host),
         internal_ca: authorities.internal,
@@ -257,6 +258,8 @@ mod tests {
     use crate::config;
     use crate::policy::PolicyError;
 
+    mod trust;
+
     fn secret_only(name: &str) -> Option<OsString> {
         (name == "JAUNT_OIDC_CLIENT_SECRET").then(|| OsString::from("never-printed-secret"))
     }
@@ -302,12 +305,13 @@ mod tests {
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&root, kind, &identity.recipient()).unwrap();
         }
-        let (_, user) = FileBackend::load(&root, CaKind::User, &identity).unwrap();
+        let (user_trust, user) = FileBackend::load(&root, CaKind::User, &identity).unwrap();
         let (host_trust, host) = FileBackend::load(&root, CaKind::Host, &identity).unwrap();
         let (_, internal) = FileBackend::load(&root, CaKind::Internal, &identity).unwrap();
         let certificate = InternalCa::create_root(&internal, SystemTime::now()).unwrap();
         Authorities {
             user,
+            user_trust,
             host_trust,
             host,
             internal: InternalCa::new(Arc::new(internal), certificate.certificate_der).unwrap(),

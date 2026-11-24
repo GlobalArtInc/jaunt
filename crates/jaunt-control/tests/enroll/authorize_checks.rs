@@ -38,17 +38,12 @@ async fn authorize_rechecks_the_certificate_and_the_user_recorded_at_route() {
     harness.clock.advance(31);
 
     assert_eq!(
-        authorize(
-            harness,
-            &s.node_id,
-            short_lived.authorize(&expiring, LOGIN, true)
-        )
-        .await,
+        authorize(harness, &s.node_id, short_lived.authorize(&expiring, LOGIN)).await,
         deny(DenyReason::CertificateExpired)
     );
     let other_key = AuthorizeRequest {
         key_id: format!("{}0", s.alice.key_id),
-        ..s.alice.authorize(&rekeyed, LOGIN, true)
+        ..s.alice.authorize(&rekeyed, LOGIN)
     };
     assert_eq!(
         authorize(harness, &s.node_id, other_key).await,
@@ -60,7 +55,7 @@ async fn authorize_rechecks_the_certificate_and_the_user_recorded_at_route() {
         .await
         .unwrap();
     assert_eq!(
-        authorize(harness, &s.node_id, carol.authorize(&orphaned, LOGIN, true)).await,
+        authorize(harness, &s.node_id, carol.authorize(&orphaned, LOGIN)).await,
         deny(DenyReason::UnknownUser)
     );
 }
@@ -73,7 +68,7 @@ async fn authorize_allows_in_the_last_second_of_the_binding() {
     let decision = authorize(
         &s.harness,
         &s.node_id,
-        s.alice.authorize(&session_id, LOGIN, false),
+        s.alice.authorize(&session_id, LOGIN),
     )
     .await;
     assert!(matches!(decision, AuthorizeDecision::Allow { .. }));
@@ -88,12 +83,7 @@ async fn a_re_enrolled_node_with_the_same_name_cannot_take_the_old_nodes_session
     let successor = node(harness, NODE_NAME).await;
     assert_ne!(successor, s.node_id);
     assert_eq!(
-        authorize(
-            harness,
-            &successor,
-            s.alice.authorize(&session_id, LOGIN, true)
-        )
-        .await,
+        authorize(harness, &successor, s.alice.authorize(&session_id, LOGIN)).await,
         deny(DenyReason::WrongNode)
     );
 }
@@ -122,12 +112,7 @@ async fn an_empty_policy_denies_authorize() {
         .await
         .unwrap();
     assert_eq!(
-        authorize(
-            &harness,
-            &node_id,
-            alice.authorize(&binding.id, LOGIN, true)
-        )
-        .await,
+        authorize(&harness, &node_id, alice.authorize(&binding.id, LOGIN)).await,
         deny(DenyReason::PolicyDenied)
     );
 }
@@ -137,7 +122,7 @@ async fn authorize_rejects_unsafe_fields_before_any_decision() {
     let s = scenario().await;
     let harness = &s.harness;
     let session_id = routed(harness, &s.alice).await;
-    let base = s.alice.authorize(&session_id, LOGIN, true);
+    let base = s.alice.authorize(&session_id, LOGIN);
     start_recording();
 
     for bad in unacceptable_values() {
@@ -207,12 +192,7 @@ async fn session_end_rejects_unsafe_fields_and_counters_beyond_the_store_range()
     let s = scenario().await;
     let harness = &s.harness;
     let session_id = routed(harness, &s.alice).await;
-    let allowed = authorize(
-        harness,
-        &s.node_id,
-        s.alice.authorize(&session_id, LOGIN, true),
-    )
-    .await;
+    let allowed = authorize(harness, &s.node_id, s.alice.authorize(&session_id, LOGIN)).await;
     assert!(matches!(allowed, AuthorizeDecision::Allow { .. }));
     let base = end_request(&session_id, 7);
     start_recording();
