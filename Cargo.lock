@@ -2094,7 +2094,20 @@ dependencies = [
 name = "jaunt-tunnel"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "h2",
+ "http",
  "jaunt-proto",
+ "rand 0.10.4",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
 ]
 
 [[package]]
