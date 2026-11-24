@@ -17,6 +17,7 @@ clap = { workspace = true }
 h2 = "0.4.20"
 hostname = "0.4.2"
 http = "1.5.0"
+httpdate = "1.0.3"
 jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
@@ -43,7 +44,9 @@ zeroize = "1.9.2"
 
 [dev-dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+jaunt-gate = { workspace = true }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }
+russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", default-features = false }
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }

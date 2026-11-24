@@ -1,8 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -21,8 +21,9 @@ use jaunt_proto::{
 };
 use jaunt_tunnel::{
     AcceptorConfig, AgentApiConnection, AgentRegistry, BoxFuture, Gate, GateAcceptor, GateStats,
-    Handover, MainConnection, NodeId, PeerAuthenticator, RegistryEvent, RejectReason, Rejection,
-    TunnelOptions, agent_server_config, main_server_config,
+    Handover, Keepalive, MainConnection, NodeId, PeerAuthenticator, RegistryEvent, RejectReason,
+    Rejection, SwappableClientCert, TunnelOptions, agent_client_config_swappable,
+    agent_server_config, main_server_config,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -43,6 +44,8 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 
 use crate::clock::Clock;
+use crate::endpoint::AgentEndpoint;
+use crate::run::api::{API_KEEPALIVE, AgentApi};
 
 pub const NODE_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
 pub const NODE_NAME: &str = "web-01";
@@ -612,18 +615,59 @@ pub struct NodeIdentity {
 #[derive(Clone, Debug)]
 pub struct SeenRenewal {
     pub node: NodeId,
+    pub method: String,
     pub path: String,
     pub content_type: Option<String>,
     pub request: Option<RenewRequest>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ApiStep {
+    Json(u16, serde_json::Value),
+    Oversized,
+    RefuseStream,
+}
+
+pub const RENEW_PATH: &str = "/v1/agent/renew";
+pub const TRUST_PATH: &str = "/v1/agent/trust";
+pub const AUTHORIZE_PATH: &str = "/v1/agent/authorize";
+pub const SESSION_END_PATH: &str = "/v1/agent/session/end";
+
+pub fn user_ca_line() -> String {
+    PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap()
+}
+
+pub fn trust_reply(lines: &[String]) -> ApiStep {
+    ApiStep::Json(200, serde_json::json!({ "user_ca_keys": lines }))
 }
 
 struct ApiInner {
     pki: Arc<TestPki>,
     identity: Mutex<NodeIdentity>,
     script: Mutex<VecDeque<RenewStep>>,
+    scripts: Mutex<HashMap<String, VecDeque<ApiStep>>>,
+    standing: Mutex<HashMap<String, ApiStep>>,
+    server_time: Mutex<Option<SystemTime>>,
     requests: Mutex<Vec<SeenRenewal>>,
     connections: AtomicUsize,
     open: AtomicUsize,
+}
+
+impl ApiInner {
+    fn next_step(&self, path: &str) -> Option<ApiStep> {
+        let scripted = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get_mut(path)
+            .and_then(VecDeque::pop_front);
+        scripted.or_else(|| self.standing.lock().unwrap().get(path).cloned())
+    }
 }
 
 #[derive(Default)]
@@ -709,24 +753,50 @@ async fn serve_api(api: Arc<ApiInner>, connection: AgentApiConnection, stop: Can
                 }
                 bytes.extend_from_slice(&chunk);
             }
+            let path = parts.uri.path().to_owned();
             api.requests.lock().unwrap().push(SeenRenewal {
                 node,
-                path: parts.uri.path().to_owned(),
+                method: parts.method.to_string(),
+                path: path.clone(),
                 content_type: parts
                     .headers
                     .get("content-type")
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned),
                 request: serde_json::from_slice(&bytes).ok(),
+                body: bytes,
             });
-            let step = api.script.lock().unwrap().pop_front();
-            if step == Some(RenewStep::RefuseStream) {
-                respond.send_reset(h2::Reason::REFUSED_STREAM);
-                return;
+            let (status, reply) = if path == RENEW_PATH {
+                let step = api.script.lock().unwrap().pop_front();
+                if step == Some(RenewStep::RefuseStream) {
+                    respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    return;
+                }
+                renew_reply(&api, step)
+            } else {
+                match api.next_step(&path) {
+                    Some(ApiStep::Json(status, value)) => {
+                        (status, serde_json::to_vec(&value).unwrap())
+                    }
+                    Some(ApiStep::Oversized) => (200, vec![b' '; OVERSIZED_BODY]),
+                    Some(ApiStep::RefuseStream) => {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                        return;
+                    }
+                    None => (
+                        404,
+                        serde_json::to_vec(&ErrorBody {
+                            error: "not_found".to_owned(),
+                        })
+                        .unwrap(),
+                    ),
+                }
+            };
+            let mut response = http::Response::builder().status(status);
+            if let Some(time) = *api.server_time.lock().unwrap() {
+                response = response.header("date", httpdate::fmt_http_date(time));
             }
-            let (status, reply) = renew_reply(&api, step);
-            let response = http::Response::builder().status(status).body(()).unwrap();
-            if let Ok(mut send) = respond.send_response(response, false) {
+            if let Ok(mut send) = respond.send_response(response.body(()).unwrap(), false) {
                 drop(send.send_data(reply.into(), true));
             }
         });
@@ -791,10 +861,14 @@ pub struct FakeGate {
 
 impl FakeGate {
     pub async fn start(pki: Arc<TestPki>, identity: NodeIdentity, renewals: &[RenewStep]) -> Self {
+        let standing = HashMap::from([(TRUST_PATH.to_owned(), trust_reply(&[user_ca_line()]))]);
         let api = Arc::new(ApiInner {
             pki,
             identity: Mutex::new(identity),
             script: Mutex::new(renewals.iter().cloned().collect()),
+            scripts: Mutex::new(HashMap::new()),
+            standing: Mutex::new(standing),
+            server_time: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
             open: AtomicUsize::new(0),
@@ -869,7 +943,54 @@ impl FakeGate {
     }
 
     pub fn renewals(&self) -> Vec<SeenRenewal> {
-        self.api.requests.lock().unwrap().clone()
+        self.requests(RENEW_PATH)
+    }
+
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .api
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|seen| seen.path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    pub fn requests(&self, path: &str) -> Vec<SeenRenewal> {
+        self.api
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.path == path)
+            .cloned()
+            .collect()
+    }
+
+    pub fn script(&self, path: &str, steps: Vec<ApiStep>) {
+        self.api
+            .scripts
+            .lock()
+            .unwrap()
+            .entry(path.to_owned())
+            .or_default()
+            .extend(steps);
+    }
+
+    pub fn set_standing(&self, path: &str, step: ApiStep) {
+        self.api
+            .standing
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), step);
+    }
+
+    pub fn set_server_time(&self, time: Option<SystemTime>) {
+        *self.api.server_time.lock().unwrap() = time;
     }
 
     pub async fn restart(self) -> Self {
@@ -957,4 +1078,50 @@ impl Drop for RawTlsServer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+pub fn agent_api(pki: &TestPki, endpoint: &str, keepalive: Keepalive) -> (AgentApi, NodeIdentity) {
+    let tls = crate::keys::TlsKey::generate().unwrap();
+    let host = crate::keys::HostKey::generate().unwrap();
+    let certificates = pki.node_certificates(tls.spki_der(), host.key_data(), NODE_ID, NODE_NAME);
+    let x509 = STANDARD.decode(&certificates.x509_certificate_der).unwrap();
+    let identity = Arc::new(
+        SwappableClientCert::new(vec![CertificateDer::from(x509)], tls.rustls_key()).unwrap(),
+    );
+    let config = agent_client_config_swappable(pki.roots(), identity).unwrap();
+    let api = AgentApi::new(
+        &config,
+        &AgentEndpoint::parse(endpoint).unwrap(),
+        keepalive,
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let node = NodeIdentity {
+        spki: tls.spki_der().to_vec(),
+        host_key: host.key_data().clone(),
+    };
+    (api, node)
+}
+
+pub async fn gate_and_api() -> (FakeGate, Arc<AgentApi>) {
+    let pki = Arc::new(TestPki::new());
+    let placeholder = NodeIdentity {
+        spki: Vec::new(),
+        host_key: crate::keys::HostKey::generate().unwrap().key_data().clone(),
+    };
+    let gate = FakeGate::start(pki.clone(), placeholder, &[]).await;
+    let (api, node) = agent_api(&pki, &gate.endpoint(), API_KEEPALIVE);
+    gate.set_identity(node);
+    (gate, Arc::new(api))
+}
+
+pub fn sshd_host_key_file(dir: &Path) -> PathBuf {
+    let path = dir.join("ssh_host_ed25519_key.pub");
+    let line = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
+    std::fs::write(&path, format!("{line}\n")).unwrap();
+    path
 }

@@ -3,6 +3,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::clock::compact_utc;
 use crate::fsio::{DirError, DirHandle, FsError, Owner, effective_uid, normalize};
@@ -18,7 +19,8 @@ pub const SSH_CERTIFICATE_FILE: &str = "ssh_host_ed25519-cert.pub";
 pub const CA_ROOT_FILE: &str = "ca-root.der";
 pub const LOCK_FILE: &str = ".enroll.lock";
 const PROBE_NAME: &str = "write-check";
-const INSTALLER_FILES: [&str; 1] = ["inner-ca.pub"];
+pub const INNER_CA_FILE: &str = "inner-ca.pub";
+const INSTALLER_FILES: [&str; 1] = [INNER_CA_FILE];
 const PREVIOUS_PREFIX: &str = "previous-";
 const MANAGED_FILES: [&str; 6] = [
     STATE_FILE,
@@ -29,6 +31,7 @@ const MANAGED_FILES: [&str; 6] = [
     CA_ROOT_FILE,
 ];
 const MAX_PREVIOUS_ATTEMPTS: usize = 100;
+pub const MAX_SSH_HOST_FILE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +132,11 @@ pub struct Loaded {
     pub ca_root_der: Vec<u8>,
 }
 
+pub struct SshHostFiles {
+    pub private_key: Zeroizing<Vec<u8>>,
+    pub certificate: Zeroizing<Vec<u8>>,
+}
+
 pub struct EnrollLock {
     _file: File,
 }
@@ -159,7 +167,8 @@ fn is_temp_name(name: &str) -> bool {
     let Some((base, pid)) = inner.rsplit_once('.') else {
         return false;
     };
-    is_digits(pid) && (MANAGED_FILES.contains(&base) || base == PROBE_NAME)
+    is_digits(pid)
+        && (MANAGED_FILES.contains(&base) || INSTALLER_FILES.contains(&base) || base == PROBE_NAME)
 }
 
 fn is_previous_name(name: &str) -> bool {
@@ -320,6 +329,26 @@ impl StateDir {
             self.owner,
         )?;
         self.dir.write_private(STATE_FILE, &encoded, self.owner)?;
+        Ok(())
+    }
+
+    pub fn read_ssh_host_files(&self) -> Result<SshHostFiles, StateError> {
+        Ok(SshHostFiles {
+            private_key: self
+                .dir
+                .read_at_most(SSH_HOST_KEY_FILE, MAX_SSH_HOST_FILE_BYTES)?,
+            certificate: self
+                .dir
+                .read_at_most(SSH_CERTIFICATE_FILE, MAX_SSH_HOST_FILE_BYTES)?,
+        })
+    }
+
+    pub fn store_inner_ca(&self, public_line: &str) -> Result<(), StateError> {
+        self.dir.write_readable(
+            INNER_CA_FILE,
+            certificate_line(public_line).as_bytes(),
+            self.owner,
+        )?;
         Ok(())
     }
 

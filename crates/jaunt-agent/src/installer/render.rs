@@ -38,7 +38,7 @@ mod tests {
 
     use super::{agent_config, carries_header, dropin, is_foreign, unit};
     use crate::paths::check_state_dir;
-    use crate::run::config::{AgentConfig, load};
+    use crate::run::config::{AgentConfig, InnerConfig, load};
 
     #[test]
     fn only_a_non_empty_file_without_the_exact_header_line_is_foreign() {
@@ -87,6 +87,7 @@ mod tests {
                 AgentConfig {
                     state_dir: Some(PathBuf::from(state_dir)),
                     log_level: Some("info".to_owned()),
+                    inner: InnerConfig::default(),
                 },
                 "{state_dir}"
             );

@@ -1,8 +1,8 @@
 mod support;
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jaunt_tunnel::{
@@ -11,6 +11,7 @@ use jaunt_tunnel::{
 };
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 fn gate_options(hello_timeout: Duration) -> GateOptions {
     GateOptions {
@@ -197,6 +198,63 @@ async fn terminate_session_resets_exactly_that_stream() {
     spared.read_exact(&mut echoed).await.unwrap();
     assert_eq!(echoed, b"still here");
     assert_eq!(gate.registry.connected_nodes(), [node("node-a")]);
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminate_session_cancels_the_token_handed_to_the_handler() {
+    let (pki, leaf, mut gate) = started(GateOptions::default()).await;
+    let tokens: Arc<Mutex<Vec<(String, CancellationToken)>>> = Arc::default();
+    let seen = tokens.clone();
+    let agent = spawn_agent(
+        gate.addr,
+        &pki,
+        &leaf,
+        handler(move |stream: IncomingStream| {
+            let seen = seen.clone();
+            async move {
+                let session = stream.meta.session().as_str().to_owned();
+                seen.lock().unwrap().push((session, stream.cancel.clone()));
+                stream.cancel.cancelled().await;
+            }
+        }),
+        AgentOptions::default(),
+    );
+    wait_connected(&mut gate, "node-a").await;
+    let _doomed = gate
+        .registry
+        .open_stream(&node("node-a"), &meta("doomed"))
+        .await
+        .unwrap();
+    let _spared = gate
+        .registry
+        .open_stream(&node("node-a"), &meta("spared"))
+        .await
+        .unwrap();
+    eventually("both handlers to start", || {
+        tokens.lock().unwrap().len() == 2
+    })
+    .await;
+
+    gate.registry
+        .terminate_session(&node("node-a"), &SessionId::new("doomed").unwrap())
+        .unwrap();
+    eventually("the doomed token to be cancelled", || {
+        tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(session, token)| session == "doomed" && token.is_cancelled())
+    })
+    .await;
+    assert!(
+        tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(session, token)| session == "doomed" || !token.is_cancelled())
+    );
     agent.stop().await;
     gate.stop().await;
 }

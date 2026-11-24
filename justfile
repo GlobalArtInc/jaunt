@@ -24,5 +24,8 @@ ci:
 installer-containers:
     scripts/test-installer.sh debian:12 debian:13 rockylinux:9
 
+ssh-containers:
+    scripts/test-ssh-bridge.sh debian:13
+
 pg-migrations:
     : "${DATABASE_URL:?DATABASE_URL is required}"; for file in crates/jaunt-store/migrations/*.sql; do psql "$DATABASE_URL" -1 -v ON_ERROR_STOP=1 -q -f "$file" || exit 1; done

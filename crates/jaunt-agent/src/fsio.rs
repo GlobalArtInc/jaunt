@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
+pub const READABLE_FILE_MODE: u32 = 0o644;
 const PARENT_DIR_MODE: u32 = 0o755;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
 
@@ -235,6 +236,10 @@ impl DirHandle {
     }
 
     pub fn read(&self, name: &str) -> Result<Zeroizing<Vec<u8>>, FsError> {
+        self.read_at_most(name, u64::MAX)
+    }
+
+    pub fn read_at_most(&self, name: &str, limit: u64) -> Result<Zeroizing<Vec<u8>>, FsError> {
         let path = self.checked(name)?;
         let fd = rustix::fs::openat(
             &self.dir,
@@ -243,11 +248,15 @@ impl DirHandle {
             Mode::empty(),
         )
         .map_err(errno_error("open", &path))?;
-        let mut file = File::from(fd);
+        let file = File::from(fd);
         require_regular(&file, &path, false)?;
         let mut content = Zeroizing::new(Vec::new());
-        file.read_to_end(&mut content)
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut content)
             .map_err(fs_error("read", &path))?;
+        if u64::try_from(content.len()).unwrap_or(u64::MAX) > limit {
+            return Err(refused("read", &path, "is larger than allowed"));
+        }
         Ok(content)
     }
 
@@ -312,9 +321,28 @@ impl DirHandle {
         content: &[u8],
         owner: Option<Owner>,
     ) -> Result<(), FsError> {
+        self.write_with_mode(name, content, owner, PRIVATE_FILE_MODE)
+    }
+
+    pub fn write_readable(
+        &self,
+        name: &str,
+        content: &[u8],
+        owner: Option<Owner>,
+    ) -> Result<(), FsError> {
+        self.write_with_mode(name, content, owner, READABLE_FILE_MODE)
+    }
+
+    fn write_with_mode(
+        &self,
+        name: &str,
+        content: &[u8],
+        owner: Option<Owner>,
+        mode: u32,
+    ) -> Result<(), FsError> {
         self.checked(name)?;
         let temp = temp_name(name);
-        if let Err(error) = self.write_temp_and_rename(&temp, name, content, owner) {
+        if let Err(error) = self.write_temp_and_rename(&temp, name, content, owner, mode) {
             if let Err(cleanup) = self.remove_if_present(&temp) {
                 tracing::warn!(
                     target: "jaunt::agent",
@@ -333,6 +361,7 @@ impl DirHandle {
         name: &str,
         content: &[u8],
         owner: Option<Owner>,
+        mode: u32,
     ) -> Result<(), FsError> {
         let temp_path = self.checked(temp)?;
         let target = self.checked(name)?;
@@ -344,7 +373,7 @@ impl DirHandle {
             fchown(&file, Some(owner.uid), Some(owner.gid))
                 .map_err(fs_error("chown", &temp_path))?;
         }
-        file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
+        file.set_permissions(Permissions::from_mode(mode))
             .map_err(fs_error("chmod", &temp_path))?;
         file.sync_all().map_err(fs_error("fsync", &temp_path))?;
         drop(file);

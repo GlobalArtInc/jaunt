@@ -5,7 +5,8 @@ use std::path::Path;
 
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::CertType;
-use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey};
+use russh::keys::ssh_key::public::KeyData;
+use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::error::{HostCertProblem, SshError};
@@ -75,10 +76,17 @@ pub struct HostIdentity {
 impl HostIdentity {
     pub fn load(key_path: &Path, cert_path: &Path, now_unix: u64) -> Result<Self, SshError> {
         let key_bytes = read_limited(key_path, Access::OwnerOnly)?;
-        let key =
-            PrivateKey::from_openssh(key_bytes.as_slice()).map_err(|_| SshError::InvalidHostKey)?;
         let cert_bytes = read_limited(cert_path, Access::Any)?;
-        let certificate = std::str::from_utf8(&cert_bytes)
+        Self::from_openssh(&key_bytes, &cert_bytes, now_unix)
+    }
+
+    pub fn from_openssh(
+        private_key: &[u8],
+        certificate: &[u8],
+        now_unix: u64,
+    ) -> Result<Self, SshError> {
+        let key = PrivateKey::from_openssh(private_key).map_err(|_| SshError::InvalidHostKey)?;
+        let certificate = std::str::from_utf8(certificate)
             .map_err(|_| SshError::HostCertificate(HostCertProblem::Malformed))?;
         HostKey::from_private(key)?.with_certificate(certificate, now_unix)
     }
@@ -105,6 +113,16 @@ impl fmt::Debug for HostIdentity {
             .field("private_key", &"<redacted>")
             .finish()
     }
+}
+
+pub fn read_pinned_host_key(path: &Path) -> Result<KeyData, SshError> {
+    let bytes = read_limited(path, Access::Any)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| SshError::PinnedHostKey)?;
+    let key = PublicKey::from_openssh(text.trim()).map_err(|_| SshError::PinnedHostKey)?;
+    if key.algorithm() != Algorithm::Ed25519 {
+        return Err(SshError::PinnedHostKey);
+    }
+    Ok(key.key_data().clone())
 }
 
 #[derive(Clone, Copy)]
@@ -187,12 +205,60 @@ mod tests {
     use russh::keys::ssh_key::certificate::CertType;
     use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 
-    use super::{HostIdentity, HostKey};
+    use super::{HostIdentity, HostKey, read_pinned_host_key};
     use crate::error::{HostCertProblem, SshError};
     use crate::test_support::{NOW, host_certificate, key};
 
     const AFTER: u64 = NOW - 120;
     const BEFORE: u64 = NOW + 7 * 24 * 3600;
+
+    #[test]
+    fn a_pinned_sshd_host_key_must_be_a_bare_ed25519_public_key_of_bounded_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = key(Algorithm::Ed25519);
+        let ed = key(Algorithm::Ed25519);
+        let good = dir.path().join("good.pub");
+        std::fs::write(
+            &good,
+            format!("{} root@node\n", ed.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_pinned_host_key(&good).unwrap(),
+            *ed.public_key().key_data()
+        );
+
+        let ecdsa = key(Algorithm::Ecdsa {
+            curve: russh::keys::EcdsaCurve::NistP256,
+        });
+        let certificate = host_certificate(&ca, ed.public_key(), CertType::Host, AFTER, BEFORE);
+        let mut padded = ed.public_key().to_openssh().unwrap().into_bytes();
+        padded.resize(64 * 1024 + 1, b' ');
+        for (name, content, refused) in [
+            (
+                "ecdsa.pub",
+                ecdsa.public_key().to_openssh().unwrap().into_bytes(),
+                (|error| matches!(error, SshError::PinnedHostKey)) as fn(&SshError) -> bool,
+            ),
+            (
+                "cert.pub",
+                certificate.to_openssh().unwrap().into_bytes(),
+                |error| matches!(error, SshError::PinnedHostKey),
+            ),
+            ("large.pub", padded, |error| {
+                matches!(error, SshError::FileTooLarge { .. })
+            }),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            let error = read_pinned_host_key(&path).unwrap_err();
+            assert!(refused(&error), "{name}: {error}");
+        }
+        assert!(matches!(
+            read_pinned_host_key(&dir.path().join("missing.pub")),
+            Err(SshError::ReadFile { .. })
+        ));
+    }
 
     fn write_pair(
         dir: &std::path::Path,
@@ -291,6 +357,17 @@ mod tests {
         let (key_path, cert_path) = write_pair(dir.path(), &subject, &cert.to_openssh().unwrap());
         let identity = HostIdentity::load(&key_path, &cert_path, NOW).unwrap();
         assert_eq!(identity.certificate, cert);
+        let from_text = HostIdentity::from_openssh(
+            &std::fs::read(&key_path).unwrap(),
+            cert.to_openssh().unwrap().as_bytes(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(from_text.certificate, cert);
+        assert!(matches!(
+            HostIdentity::from_openssh(b"not a key", b"", NOW),
+            Err(SshError::InvalidHostKey)
+        ));
 
         let ecdsa = key(Algorithm::Ecdsa {
             curve: russh::keys::EcdsaCurve::NistP256,

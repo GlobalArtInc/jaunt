@@ -61,6 +61,7 @@ pub struct Renewer {
     pub clock: Arc<dyn Clock>,
     pub jitter: Box<dyn FnMut() -> f64 + Send + Sync>,
     pub backoff: BackoffPolicy,
+    pub after_renewal: Box<dyn Fn(&StateDir) + Send + Sync>,
 }
 
 impl Renewer {
@@ -176,6 +177,7 @@ impl Renewer {
         self.api.reset().await;
         self.record = record;
         self.validity = checked.x509;
+        (self.after_renewal)(&self.state);
         Ok(())
     }
 }

@@ -19,7 +19,7 @@ mod terminate;
 pub use cert::{CertRejection, UserCaKeys, UserCaSource, UserIdentity, verify_user_certificate};
 pub use config::{ServerConfigCell, ServerProfile};
 pub use error::{HostCertProblem, SshError};
-pub use host::{HostIdentity, HostKey};
+pub use host::{HostIdentity, HostKey, read_pinned_host_key};
 pub use inner_ca::InnerCa;
 pub use limits::OuterLimits;
 pub use outer::{

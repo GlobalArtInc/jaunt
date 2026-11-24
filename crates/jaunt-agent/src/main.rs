@@ -7,9 +7,11 @@ mod keys;
 mod paths;
 mod pin;
 mod run;
+mod ssh;
 mod state;
 #[cfg(test)]
 mod testkit;
+mod trust;
 mod verify;
 
 use std::fmt::Display;

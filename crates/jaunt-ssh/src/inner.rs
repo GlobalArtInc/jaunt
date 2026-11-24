@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use russh::client::{self, Handle};
 use russh::keys::ssh_key::public::KeyData;
-use russh::keys::{Algorithm, PublicKey, PublicKeyOrCertificate};
+use russh::keys::{Algorithm, PublicKeyOrCertificate};
 use russh::{Preferred, SshId};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::SshError;
-use crate::host::{Access, read_limited};
+use crate::host::read_pinned_host_key;
 use crate::inner_ca::{InnerCa, InnerCertRequest};
 
 const CLIENT_ID: &str = "SSH-2.0-Jaunt-agent";
@@ -145,13 +145,10 @@ pub(crate) async fn login(
 }
 
 fn read_pin(path: &Path) -> Result<KeyData, InnerLoginError> {
-    let bytes = read_limited(path, Access::Any).map_err(InnerLoginError::HostKeyFile)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| InnerLoginError::HostKeyFormat)?;
-    let key = PublicKey::from_openssh(text.trim()).map_err(|_| InnerLoginError::HostKeyFormat)?;
-    if key.algorithm() != Algorithm::Ed25519 {
-        return Err(InnerLoginError::HostKeyFormat);
-    }
-    Ok(key.key_data().clone())
+    read_pinned_host_key(path).map_err(|error| match error {
+        SshError::PinnedHostKey => InnerLoginError::HostKeyFormat,
+        other => InnerLoginError::HostKeyFile(other),
+    })
 }
 
 #[cfg(test)]

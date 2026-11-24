@@ -1,13 +1,16 @@
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
 use h2::{Ping, PingPong};
-use http::header::{ACCEPT, CONTENT_TYPE};
-use http::{Method, Request, StatusCode};
-use jaunt_proto::{ErrorBody, RenewRequest, RenewResponse};
+use http::header::{ACCEPT, CONTENT_TYPE, DATE};
+use http::{HeaderMap, Method, Request, StatusCode};
+use jaunt_proto::{
+    AgentTrust, AuthorizeRequest, AuthorizeResponse, ErrorBody, RenewRequest, RenewResponse,
+    SessionEnd, SessionEndOutcome,
+};
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
@@ -22,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 use crate::endpoint::AgentEndpoint;
 
 const RENEW_PATH: &str = "/v1/agent/renew";
+const AUTHORIZE_PATH: &str = "/v1/agent/authorize";
+const SESSION_END_PATH: &str = "/v1/agent/session/end";
+const TRUST_PATH: &str = "/v1/agent/trust";
 const JSON: &str = "application/json";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,6 +77,24 @@ enum Exchange {
     Failed(ApiError),
 }
 
+struct Answer {
+    status: StatusCode,
+    server_time: Option<SystemTime>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dated<T> {
+    pub value: T,
+    pub server_time: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    Idempotent,
+    OnlyUnsent,
+}
+
 struct Cached {
     generation: u64,
     sender: SendRequest<Bytes>,
@@ -79,6 +103,7 @@ struct Cached {
 struct Connection {
     cached: Option<Cached>,
     next_generation: u64,
+    resets: u64,
 }
 
 type SharedConnection = Arc<Mutex<Connection>>;
@@ -90,6 +115,7 @@ pub struct AgentApi {
     authority: String,
     keepalive: Keepalive,
     connection: SharedConnection,
+    connecting: Mutex<()>,
     shutdown: CancellationToken,
 }
 
@@ -113,43 +139,83 @@ impl AgentApi {
             connection: Arc::new(Mutex::new(Connection {
                 cached: None,
                 next_generation: 0,
+                resets: 0,
             })),
+            connecting: Mutex::new(()),
             shutdown,
         })
     }
 
     pub async fn renew(&self, request: &RenewRequest) -> Result<RenewResponse, ApiError> {
-        self.post_json(RENEW_PATH, request, true).await
+        self.post_json(RENEW_PATH, request, Retry::Idempotent).await
+    }
+
+    pub async fn authorize(
+        &self,
+        request: &AuthorizeRequest,
+    ) -> Result<AuthorizeResponse, ApiError> {
+        self.post_json(AUTHORIZE_PATH, request, Retry::OnlyUnsent)
+            .await
+    }
+
+    pub async fn session_end(&self, end: &SessionEnd) -> Result<SessionEndOutcome, ApiError> {
+        self.post_json(SESSION_END_PATH, end, Retry::Idempotent)
+            .await
+    }
+
+    pub async fn trust(&self) -> Result<Dated<AgentTrust>, ApiError> {
+        self.call(Method::GET, TRUST_PATH, None, Retry::Idempotent)
+            .await
     }
 
     pub async fn reset(&self) {
-        self.connection.lock().await.cached = None;
+        let mut connection = self.connection.lock().await;
+        connection.cached = None;
+        connection.resets = connection.resets.wrapping_add(1);
     }
 
     async fn post_json<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
-        idempotent: bool,
+        retry: Retry,
     ) -> Result<T, ApiError> {
         let payload = Bytes::from(serde_json::to_vec(body).map_err(|_| ApiError::Request)?);
+        self.call(Method::POST, path, Some(payload), retry)
+            .await
+            .map(|dated| dated.value)
+    }
+
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Bytes>,
+        retry: Retry,
+    ) -> Result<Dated<T>, ApiError> {
         let uri = format!("https://{}{path}", self.authority);
         let mut retried = false;
         loop {
             let (generation, reused, sender) = self.sender().await?;
-            let request = Request::builder()
-                .method(Method::POST)
+            let mut builder = Request::builder()
+                .method(method.clone())
                 .uri(uri.as_str())
-                .header(CONTENT_TYPE, JSON)
-                .header(ACCEPT, JSON)
-                .body(())
-                .map_err(|_| ApiError::Request)?;
+                .header(ACCEPT, JSON);
+            if payload.is_some() {
+                builder = builder.header(CONTENT_TYPE, JSON);
+            }
+            let request = builder.body(()).map_err(|_| ApiError::Request)?;
             let outcome = tokio::select! {
                 () = self.shutdown.cancelled() => return Err(ApiError::Shutdown),
                 outcome = timeout(CALL_TIMEOUT, exchange(sender, request, payload.clone())) => outcome,
             };
             let error = match outcome {
-                Ok(Ok((status, reply))) => return interpret(status, &reply),
+                Ok(Ok(answer)) => {
+                    return interpret(answer.status, &answer.body).map(|value| Dated {
+                        value,
+                        server_time: answer.server_time,
+                    });
+                }
                 Ok(Err(exchange)) => exchange,
                 Err(_) => Exchange::Failed(ApiError::CallTimeout),
             };
@@ -157,7 +223,7 @@ impl AgentApi {
             let may_retry = reused && !retried;
             match error {
                 Exchange::NotSent(_) if may_retry => retried = true,
-                Exchange::NoResponse(_) if may_retry && idempotent => {
+                Exchange::NoResponse(_) if may_retry && retry == Retry::Idempotent => {
                     retried = true;
                 }
                 Exchange::NotSent(error) | Exchange::NoResponse(error) => {
@@ -168,21 +234,42 @@ impl AgentApi {
         }
     }
 
+    async fn cached(&self) -> Option<(u64, bool, SendRequest<Bytes>)> {
+        let connection = self.connection.lock().await;
+        connection
+            .cached
+            .as_ref()
+            .map(|cached| (cached.generation, true, cached.sender.clone()))
+    }
+
     async fn sender(&self) -> Result<(u64, bool, SendRequest<Bytes>), ApiError> {
-        let mut connection = self.connection.lock().await;
-        if let Some(cached) = &connection.cached {
-            return Ok((cached.generation, true, cached.sender.clone()));
+        if let Some(found) = self.cached().await {
+            return Ok(found);
         }
-        let generation = connection.next_generation;
-        connection.next_generation = generation.wrapping_add(1);
+        let _connecting = tokio::select! {
+            () = self.shutdown.cancelled() => return Err(ApiError::Shutdown),
+            guard = self.connecting.lock() => guard,
+        };
+        let (generation, resets) = {
+            let mut connection = self.connection.lock().await;
+            if let Some(cached) = &connection.cached {
+                return Ok((cached.generation, true, cached.sender.clone()));
+            }
+            let generation = connection.next_generation;
+            connection.next_generation = generation.wrapping_add(1);
+            (generation, connection.resets)
+        };
         let sender = tokio::select! {
             () = self.shutdown.cancelled() => return Err(ApiError::Shutdown),
             connected = self.connect(generation) => connected?,
         };
-        connection.cached = Some(Cached {
-            generation,
-            sender: sender.clone(),
-        });
+        let mut connection = self.connection.lock().await;
+        if connection.resets == resets {
+            connection.cached = Some(Cached {
+                generation,
+                sender: sender.clone(),
+            });
+        }
         Ok((generation, false, sender))
     }
 
@@ -268,17 +355,20 @@ async fn keep_alive(pings: Option<PingPong>, settings: Keepalive) {
 async fn exchange(
     sender: SendRequest<Bytes>,
     request: Request<()>,
-    payload: Bytes,
-) -> Result<(StatusCode, Vec<u8>), Exchange> {
+    payload: Option<Bytes>,
+) -> Result<Answer, Exchange> {
     let mut sender = sender.ready().await.map_err(Exchange::NotSent)?;
     let (response, mut stream) = sender
-        .send_request(request, false)
+        .send_request(request, payload.is_none())
         .map_err(Exchange::NotSent)?;
-    stream
-        .send_data(payload, true)
-        .map_err(Exchange::NoResponse)?;
+    if let Some(payload) = payload {
+        stream
+            .send_data(payload, true)
+            .map_err(Exchange::NoResponse)?;
+    }
     let response = response.await.map_err(Exchange::NoResponse)?;
     let status = response.status();
+    let server_time = server_time(response.headers());
     let failed = |error| Exchange::Failed(ApiError::Http2(error));
     let mut body = response.into_body();
     let mut reply = Vec::new();
@@ -292,7 +382,16 @@ async fn exchange(
         }
         reply.extend_from_slice(&chunk);
     }
-    Ok((status, reply))
+    Ok(Answer {
+        status,
+        server_time,
+        body: reply,
+    })
+}
+
+fn server_time(headers: &HeaderMap) -> Option<SystemTime> {
+    let value = headers.get(DATE)?.to_str().ok()?;
+    httpdate::parse_http_date(value).ok()
 }
 
 fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, ApiError> {
@@ -322,24 +421,23 @@ fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
     use http::StatusCode;
-    use jaunt_proto::{RenewRequest, RenewResponse};
-    use jaunt_tunnel::{
-        ALPN_AGENT_API, Keepalive, SwappableClientCert, agent_client_config_swappable,
+    use jaunt_proto::{
+        AgentTrust, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse, SessionEnd,
+        SessionEndOutcome, SessionPermissions,
     };
-    use rustls::pki_types::CertificateDer;
-    use tokio_util::sync::CancellationToken;
+    use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
+    use serde_json::json;
+    use tokio::net::TcpListener;
 
-    use super::{API_KEEPALIVE, AgentApi, ApiError, RENEW_PATH, forget, interpret};
-    use crate::endpoint::AgentEndpoint;
-    use crate::keys::{HostKey, TlsKey};
+    use super::{API_KEEPALIVE, AgentApi, ApiError, forget, interpret};
+    use crate::keys::HostKey;
     use crate::testkit::{
-        FakeGate, NODE_ID, NODE_NAME, NodeIdentity, RawTlsServer, RenewStep, TestPki, eventually,
-        unix_now,
+        AGENT_HOST, AUTHORIZE_PATH, ApiStep, FakeGate, NodeIdentity, RawTlsServer, RenewStep,
+        SESSION_END_PATH, TRUST_PATH, TestPki, agent_api, eventually, soon, trust_reply, unix_now,
+        user_ca_line,
     };
 
     const EMPTY: RenewRequest = RenewRequest {
@@ -347,28 +445,36 @@ mod tests {
         ssh_host_public_key: None,
     };
 
+    fn authorize_request() -> AuthorizeRequest {
+        AuthorizeRequest {
+            session_id: "session-1".to_owned(),
+            user_id: "4f0e7a52-6c1b-4b39-9d55-2a8f1f0c7e11".to_owned(),
+            serial: 7,
+            key_id: "jaunt:alice@example.com:7".to_owned(),
+            login: "deploy".to_owned(),
+            client_addr: "203.0.113.5:40000".to_owned(),
+        }
+    }
+
+    fn session_end() -> SessionEnd {
+        SessionEnd {
+            session_id: "session-1".to_owned(),
+            exit_status: Some(7),
+            bytes_in: 10,
+            bytes_out: 20,
+            recording_incomplete: false,
+        }
+    }
+
+    const PERMISSIONS: SessionPermissions = SessionPermissions {
+        pty: true,
+        port_forwarding: false,
+        record_input: false,
+        max_duration_secs: 3600,
+    };
+
     fn client(pki: &TestPki, endpoint: &str, keepalive: Keepalive) -> (AgentApi, NodeIdentity) {
-        let tls = TlsKey::generate().unwrap();
-        let host = HostKey::generate().unwrap();
-        let certificates =
-            pki.node_certificates(tls.spki_der(), host.key_data(), NODE_ID, NODE_NAME);
-        let x509 = STANDARD.decode(&certificates.x509_certificate_der).unwrap();
-        let identity = Arc::new(
-            SwappableClientCert::new(vec![CertificateDer::from(x509)], tls.rustls_key()).unwrap(),
-        );
-        let config = agent_client_config_swappable(pki.roots(), identity).unwrap();
-        let api = AgentApi::new(
-            &config,
-            &AgentEndpoint::parse(endpoint).unwrap(),
-            keepalive,
-            CancellationToken::new(),
-        )
-        .unwrap();
-        let node = NodeIdentity {
-            spki: tls.spki_der().to_vec(),
-            host_key: host.key_data().clone(),
-        };
-        (api, node)
+        agent_api(pki, endpoint, keepalive)
     }
 
     async fn gate_with(renewals: &[RenewStep]) -> (Arc<TestPki>, FakeGate, AgentApi) {
@@ -435,15 +541,198 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_idempotent_call_is_not_repeated_after_an_unanswered_request() {
-        let (_pki, gate, api) = gate_with(&[issue(), RenewStep::RefuseStream]).await;
+    async fn authorize_is_not_repeated_after_an_unanswered_request() {
+        let (_pki, gate, api) = gate_with(&[issue()]).await;
         api.renew(&EMPTY).await.unwrap();
-        let outcome = api
-            .post_json::<_, RenewResponse>(RENEW_PATH, &EMPTY, false)
-            .await;
+        gate.script(AUTHORIZE_PATH, vec![ApiStep::RefuseStream]);
+        let outcome = api.authorize(&authorize_request()).await;
         assert!(matches!(outcome, Err(ApiError::Http2(_))), "{outcome:?}");
         assert_eq!(gate.api_connections(), 1);
-        assert_eq!(gate.renewals().len(), 2);
+        assert_eq!(gate.requests(AUTHORIZE_PATH).len(), 1);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn authorize_session_end_and_trust_speak_the_agent_api() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        let lines = vec![user_ca_line(), user_ca_line()];
+        gate.set_standing(TRUST_PATH, trust_reply(&lines));
+        gate.script(
+            AUTHORIZE_PATH,
+            vec![
+                ApiStep::Json(
+                    200,
+                    json!({"decision": "allow", "permissions": PERMISSIONS}),
+                ),
+                ApiStep::Json(200, json!({"decision": "deny"})),
+            ],
+        );
+        gate.script(
+            SESSION_END_PATH,
+            vec![ApiStep::Json(200, json!({"outcome": "rejected"}))],
+        );
+        let server_time = UNIX_EPOCH + Duration::from_secs(1_795_000_000);
+        gate.set_server_time(Some(server_time));
+
+        assert_eq!(
+            api.authorize(&authorize_request()).await.unwrap(),
+            AuthorizeResponse::Allow {
+                permissions: PERMISSIONS
+            }
+        );
+        assert_eq!(
+            api.authorize(&authorize_request()).await.unwrap(),
+            AuthorizeResponse::Deny
+        );
+        assert_eq!(
+            api.session_end(&session_end()).await.unwrap(),
+            SessionEndOutcome::Rejected
+        );
+        let trust = api.trust().await.unwrap();
+        assert_eq!(
+            trust.value,
+            AgentTrust {
+                user_ca_keys: lines
+            }
+        );
+        assert_eq!(trust.server_time, Some(server_time));
+        gate.set_server_time(None);
+        assert_eq!(api.trust().await.unwrap().server_time, None);
+
+        let authorize = gate.requests(AUTHORIZE_PATH);
+        assert_eq!(authorize[0].method, "POST");
+        assert_eq!(
+            authorize[0].content_type.as_deref(),
+            Some("application/json")
+        );
+        let sent: AuthorizeRequest = serde_json::from_slice(&authorize[0].body).unwrap();
+        assert_eq!(sent, authorize_request());
+        let ended: SessionEnd =
+            serde_json::from_slice(&gate.requests(SESSION_END_PATH)[0].body).unwrap();
+        assert_eq!(ended, session_end());
+        let trust = gate.requests(TRUST_PATH);
+        assert_eq!(trust[0].method, "GET");
+        assert_eq!(trust[0].content_type, None);
+        assert!(trust[0].body.is_empty());
+        assert_eq!(gate.api_connections(), 1);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn session_end_and_trust_are_retried_once_on_a_refused_reused_stream() {
+        for path in [SESSION_END_PATH, TRUST_PATH] {
+            let (_pki, gate, api) = gate_with(&[issue()]).await;
+            api.renew(&EMPTY).await.unwrap();
+            let answer = if path == TRUST_PATH {
+                trust_reply(&[user_ca_line()])
+            } else {
+                ApiStep::Json(200, json!({"outcome": "recorded"}))
+            };
+            gate.script(path, vec![ApiStep::RefuseStream, answer]);
+            if path == TRUST_PATH {
+                api.trust().await.unwrap();
+            } else {
+                assert_eq!(
+                    api.session_end(&session_end()).await.unwrap(),
+                    SessionEndOutcome::Recorded
+                );
+            }
+            assert_eq!(gate.requests(path).len(), 2, "{path}");
+            assert_eq!(gate.api_connections(), 2, "{path}");
+            gate.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_and_malformed_agent_replies_are_refused() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        gate.script(TRUST_PATH, vec![ApiStep::Oversized]);
+        assert!(matches!(api.trust().await, Err(ApiError::BodyTooLarge)));
+        gate.script(
+            TRUST_PATH,
+            vec![ApiStep::Json(200, json!({"user_ca_keys": [], "extra": 1}))],
+        );
+        assert!(matches!(api.trust().await, Err(ApiError::BadResponse)));
+        gate.script(
+            AUTHORIZE_PATH,
+            vec![ApiStep::Json(200, json!({"decision": "maybe"}))],
+        );
+        assert!(matches!(
+            api.authorize(&authorize_request()).await,
+            Err(ApiError::BadResponse)
+        ));
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_first_calls_share_one_new_connection() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        let api = Arc::new(api);
+        let calls: Vec<_> = (0..5)
+            .map(|_| {
+                let api = api.clone();
+                tokio::spawn(async move { api.trust().await })
+            })
+            .collect();
+        for call in calls {
+            soon("a parallel call", call).await.unwrap().unwrap();
+        }
+        assert_eq!(gate.requests(TRUST_PATH).len(), 5);
+        assert_eq!(gate.api_connections(), 1);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn connecting_does_not_hold_the_connection_lock() {
+        let pki = TestPki::new();
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("{AGENT_HOST}:{}", silent.local_addr().unwrap().port());
+        let (api, _) = client(&pki, &endpoint, API_KEEPALIVE);
+        let api = Arc::new(api);
+        let pending = tokio::spawn({
+            let api = api.clone();
+            async move { api.trust().await }
+        });
+        let (_held, _) = soon("the client to connect", silent.accept())
+            .await
+            .unwrap();
+        assert!(api.connection.try_lock().is_ok());
+        soon("a reset during a slow connect", api.reset()).await;
+        soon(
+            "forgetting during a slow connect",
+            forget(&api.connection, 0),
+        )
+        .await;
+        assert!(!pending.is_finished());
+        pending.abort();
+        assert!(api.connection.lock().await.cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reset_while_connecting_keeps_that_connection_out_of_the_cache() {
+        let pki = Arc::new(TestPki::new());
+        let placeholder = NodeIdentity {
+            spki: Vec::new(),
+            host_key: HostKey::generate().unwrap().key_data().clone(),
+        };
+        let gate = FakeGate::start(pki.clone(), placeholder, &[]).await;
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("{AGENT_HOST}:{}", relay.local_addr().unwrap().port());
+        let (api, node) = client(&pki, &endpoint, API_KEEPALIVE);
+        gate.set_identity(node);
+        let api = Arc::new(api);
+        let pending = tokio::spawn({
+            let api = api.clone();
+            async move { api.trust().await }
+        });
+        let (mut inbound, _) = soon("the client to connect", relay.accept()).await.unwrap();
+        api.reset().await;
+        let mut outbound = tokio::net::TcpStream::connect(gate.addr).await.unwrap();
+        tokio::spawn(async move {
+            drop(tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await);
+        });
+        soon("the call to finish", pending).await.unwrap().unwrap();
+        assert!(api.connection.lock().await.cached.is_none());
         gate.stop().await;
     }
 

@@ -74,6 +74,41 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 #[test]
+fn the_inner_ca_file_is_replaced_atomically_and_readable_by_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::open(dir.path(), false).unwrap();
+    let path = dir.path().join("inner-ca.pub");
+    state.store_inner_ca("ssh-ed25519 AAAAfirst").unwrap();
+    let mut held = fs::File::open(&path).unwrap();
+    state.store_inner_ca("ssh-ed25519 AAAAsecond\n").unwrap();
+    let mut old = String::new();
+    std::io::Read::read_to_string(&mut held, &mut old).unwrap();
+    assert_eq!(old, "ssh-ed25519 AAAAfirst\n");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "ssh-ed25519 AAAAsecond\n"
+    );
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o644);
+    assert_eq!(names(dir.path()), ["inner-ca.pub"]);
+}
+
+#[test]
+fn ssh_host_files_larger_than_64_kib_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::open(dir.path(), false).unwrap();
+    let certificate = dir.path().join("ssh_host_ed25519-cert.pub");
+    fs::write(dir.path().join("ssh_host_ed25519"), vec![b'k'; 64 * 1024]).unwrap();
+    fs::write(&certificate, b"cert").unwrap();
+    let files = state.read_ssh_host_files().unwrap();
+    assert_eq!(files.private_key.len(), 64 * 1024);
+    fs::write(&certificate, vec![b'c'; 64 * 1024 + 1]).unwrap();
+    assert!(matches!(
+        state.read_ssh_host_files(),
+        Err(StateError::Fs(_))
+    ));
+}
+
+#[test]
 fn a_stored_enrollment_loads_back_and_unknown_record_fields_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("state");
@@ -320,6 +355,7 @@ fn the_state_directory_entries_that_count_as_ours_are_exact() {
         (pid_temp.as_str(), true),
         (".write-check.42.tmp", true),
         (".ca-root.der.7.tmp", true),
+        (".inner-ca.pub.7.tmp", true),
         ("previous-20261118T110640Z", true),
         ("previous-20261118T110640Z-12", true),
         ("notes.txt", false),

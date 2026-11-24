@@ -57,7 +57,7 @@ impl ServerProfile {
     pub fn max_auth_attempts(self) -> usize {
         match self {
             Self::Gate => 3,
-            Self::Agent => 2,
+            Self::Agent => 3,
         }
     }
 
@@ -134,7 +134,7 @@ mod tests {
         let ca = key(Algorithm::Ed25519);
         for (profile, attempts, deadline) in [
             (ServerProfile::Gate, 3, Duration::from_secs(30)),
-            (ServerProfile::Agent, 2, Duration::from_secs(45)),
+            (ServerProfile::Agent, 3, Duration::from_secs(45)),
         ] {
             let cell = ServerConfigCell::new(host_identity(&ca).0, profile);
             let config = cell.current();
@@ -225,7 +225,7 @@ mod tests {
         );
         assert_eq!(after.certificates[0].public_key(), second_public.key_data());
         assert!(after.manual_window);
-        assert_eq!(after.max_auth_attempts, 2);
+        assert_eq!(after.max_auth_attempts, 3);
     }
 
     struct Idle;

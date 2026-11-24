@@ -37,6 +37,7 @@ type BoxTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct IncomingStream {
     pub meta: StreamMeta,
     pub io: H2Io,
+    pub cancel: CancellationToken,
 }
 
 pub trait StreamHandler: Send + Sync {
@@ -368,9 +369,10 @@ impl Context {
             return;
         };
         let io = H2Io::new(body, send).with_cancel(guard.token());
+        let cancel = guard.token().clone();
         let handler = self.handler.clone();
         tasks.spawn(async move {
-            handler.handle(IncomingStream { meta, io }).await;
+            handler.handle(IncomingStream { meta, io, cancel }).await;
             drop(guard);
             TaskEnd::Stream
         });

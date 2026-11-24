@@ -1,7 +1,6 @@
-mod api;
+pub(crate) mod api;
 pub(crate) mod config;
 pub mod logging;
-mod refuse;
 mod renew;
 #[cfg(test)]
 mod tests;
@@ -13,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Args;
+use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, SshError};
 use jaunt_tunnel::{
     BackoffPolicy, ClientError, ClientEvent, Keepalive, SwappableClientCert, TlsConfigError,
     TunnelClient, TunnelClientConfig, agent_client_config_swappable,
@@ -23,19 +23,22 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::AGENT_VERSION;
-use crate::clock::{Clock, SystemClock, format_utc};
+use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
+use crate::ssh::{self, ControlAuthority, InnerTargetError, SshService};
 use crate::state::{DEFAULT_STATE_DIR, StateDir, StateError};
+use crate::trust::{TRUST_TIMING, TrustLoader, TrustTiming, random_sampler};
 use crate::verify::{self, VerifyError};
 use api::{API_KEEPALIVE, AgentApi, ApiError};
-use config::ConfigError;
+use config::{ConfigError, InnerConfig};
 use logging::LoggingError;
-use refuse::RefusingHandler;
 use renew::{RENEWAL_BACKOFF, Renewer};
 
 const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 const FILTER_VAR: &str = "RUST_LOG";
+pub const SSH_STREAM_WINDOW: u32 = 1024 * 1024;
+pub const SSH_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -73,6 +76,12 @@ pub enum RunError {
     Tls(#[source] TlsConfigError),
     #[error("cannot set up the agent API client: {0}")]
     Api(#[source] ApiError),
+    #[error("the local sshd cannot be used for SSH sessions: {0}")]
+    InnerTarget(#[source] InnerTargetError),
+    #[error("cannot create the inner CA: {0}")]
+    InnerCa(#[source] SshError),
+    #[error("cannot publish the inner CA for sshd: {0}")]
+    InnerCaFile(#[source] StateError),
     #[error("the tunnel client stopped: {0}")]
     Tunnel(#[source] ClientError),
     #[error("the tunnel client task failed")]
@@ -81,8 +90,11 @@ pub enum RunError {
 
 pub struct RunSettings {
     pub state_dir: PathBuf,
+    pub inner: InnerConfig,
+    pub ssh_limits: AgentLimits,
     pub tunnel_backoff: BackoffPolicy,
     pub renewal_backoff: BackoffPolicy,
+    pub trust: TrustTiming,
     pub api_keepalive: Keepalive,
     pub privileged: bool,
 }
@@ -91,8 +103,11 @@ impl RunSettings {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
             state_dir,
+            inner: InnerConfig::default(),
+            ssh_limits: AgentLimits::default(),
             tunnel_backoff: BackoffPolicy::default(),
             renewal_backoff: RENEWAL_BACKOFF,
+            trust: TRUST_TIMING,
             api_keepalive: API_KEEPALIVE,
             privileged: running_as_root(),
         }
@@ -148,7 +163,11 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
             clock: Arc::new(SystemClock),
             jitter: Box::new(|| rand::random_range(0.0..=1.0)),
         };
-        run(RunSettings::new(state_dir), env, shutdown).await
+        let settings = RunSettings {
+            inner: config.inner,
+            ..RunSettings::new(state_dir)
+        };
+        run(settings, env, shutdown).await
     })
 }
 
@@ -179,21 +198,42 @@ pub async fn run(
     drop(loaded.tls_key);
     let ssh_key = loaded.host_key.key_data().clone();
     drop(loaded.host_key);
+    let target = InnerTarget {
+        sshd_addr: settings.inner.sshd_addr,
+        sshd_host_key: settings.inner.sshd_host_key.clone(),
+    };
+    ssh::check_inner_target(&target).map_err(RunError::InnerTarget)?;
+    let inner_ca = InnerCa::generate().map_err(RunError::InnerCa)?;
+    let inner_ca_line = inner_ca.public_openssh().map_err(RunError::InnerCa)?;
+    state
+        .store_inner_ca(&inner_ca_line)
+        .map_err(RunError::InnerCaFile)?;
     let tls =
         Arc::new(agent_client_config_swappable(roots, identity.clone()).map_err(RunError::Tls)?);
     let stop = shutdown.child_token();
+    let api_stop = CancellationToken::new();
+    let _api_stop_on_drop = api_stop.clone().drop_guard();
     let api = Arc::new(
-        AgentApi::new(&tls, &endpoint, settings.api_keepalive, stop.child_token())
+        AgentApi::new(&tls, &endpoint, settings.api_keepalive, api_stop.clone())
             .map_err(RunError::Api)?,
     );
-    let mut tunnel_config = TunnelClientConfig::new(
-        tls,
-        endpoint.as_str(),
-        endpoint.server_name(),
-        AGENT_VERSION,
-    );
-    tunnel_config.backoff = settings.tunnel_backoff;
+    let service = Arc::new(SshService::new(
+        Arc::new(inner_ca),
+        target,
+        Arc::new(ControlAuthority::new(api.clone())),
+        settings.ssh_limits,
+    ));
+    match ssh::load_host_identity(&state, now_unix(env.clock.as_ref())) {
+        Ok(host) => service.install_host_identity(host),
+        Err(error) => tracing::error!(
+            target: "jaunt::agent",
+            error = %error,
+            "cannot load the SSH host certificate; SSH sessions are refused until a renewal succeeds"
+        ),
+    }
+    let tunnel_config = tunnel_config(tls, &endpoint, settings.tunnel_backoff);
     let events = tunnel_config.subscribe();
+    let trust_events = tunnel_config.subscribe();
     tracing::info!(
         target: "jaunt::agent",
         node_id = %record.node_id,
@@ -202,6 +242,21 @@ pub async fn run(
         x509_not_after = %format_utc(validity.not_after),
         "starting the agent"
     );
+    let reload = {
+        let service = service.clone();
+        let clock = env.clock.clone();
+        Box::new(move |state: &StateDir| {
+            service.reload_host_identity(state, now_unix(clock.as_ref()));
+        })
+    };
+    let loader = TrustLoader {
+        api: api.clone(),
+        ssh: service.clone(),
+        clock: env.clock.clone(),
+        timing: settings.trust,
+        events: Some(trust_events),
+        sample: random_sampler(),
+    };
     let renewer = Renewer {
         api,
         state,
@@ -214,11 +269,12 @@ pub async fn run(
         clock: env.clock,
         jitter: env.jitter,
         backoff: settings.renewal_backoff,
+        after_renewal: reload,
     };
-    let handler = Arc::new(RefusingHandler::default());
+    let trust = tokio::spawn(loader.run(stop.child_token()));
     let mut tunnel = tokio::spawn(TunnelClient::run(
         tunnel_config,
-        handler,
+        service,
         stop.child_token(),
     ));
     let event_log = tokio::spawn(log_tunnel_events(events, stop.child_token()));
@@ -233,12 +289,21 @@ pub async fn run(
         Some(joined) => joined,
         None => tunnel.await,
     };
+    api_stop.cancel();
     match renewal.await {
         Ok(end) => {
             tracing::info!(target: "jaunt::agent", end = ?end, "certificate renewal stopped")
         }
         Err(error) => {
             tracing::error!(target: "jaunt::agent", error = %error, "the renewal task failed");
+        }
+    }
+    match trust.await {
+        Ok(end) => {
+            tracing::info!(target: "jaunt::agent", end = ?end, "user CA trust loading stopped")
+        }
+        Err(error) => {
+            tracing::error!(target: "jaunt::agent", error = %error, "the trust loading task failed");
         }
     }
     if let Err(error) = event_log.await {
@@ -250,6 +315,27 @@ pub async fn run(
         Ok(Err(error)) => Err(RunError::Tunnel(error)),
         Err(_) => Err(RunError::TunnelTask),
     }
+}
+
+fn tunnel_config(
+    tls: Arc<rustls::ClientConfig>,
+    endpoint: &AgentEndpoint,
+    backoff: BackoffPolicy,
+) -> TunnelClientConfig {
+    let mut config = TunnelClientConfig::new(
+        tls,
+        endpoint.as_str(),
+        endpoint.server_name(),
+        AGENT_VERSION,
+    );
+    config.backoff = backoff;
+    config.options.stream_window = SSH_STREAM_WINDOW;
+    config.options.connection_window = SSH_CONNECTION_WINDOW;
+    config
+}
+
+fn now_unix(clock: &dyn Clock) -> u64 {
+    u64::try_from(unix_secs(clock.now())).unwrap_or(0)
 }
 
 async fn log_tunnel_events(mut events: broadcast::Receiver<ClientEvent>, stop: CancellationToken) {

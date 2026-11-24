@@ -1,33 +1,73 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_proto::RenewRequest;
+use jaunt_ssh::SshError;
 use jaunt_tunnel::{BackoffPolicy, NodeId, RegistryEvent, SessionId, StreamKind, StreamMeta};
+use russh::keys::key::safe_rng;
+use russh::keys::ssh_key::certificate::{Builder, CertType};
+use russh::keys::{Algorithm, Certificate, PrivateKey, PublicKeyOrCertificate};
+use russh::{Preferred, client};
+use serde_json::json;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{RunEnv, RunError, RunSettings, run};
+use super::config::InnerConfig;
+use super::{
+    RunEnv, RunError, RunSettings, SSH_CONNECTION_WINDOW, SSH_STREAM_WINDOW, run, tunnel_config,
+};
 use crate::clock::{SystemClock, at_unix_secs};
+use crate::endpoint::AgentEndpoint;
 use crate::enroll::{EnrollEnv, EnrollOptions, enroll};
 use crate::keys::{HostKey, TlsKey};
+use crate::ssh::InnerTargetError;
 use crate::state::{EnrollmentFiles, EnrollmentRecord, StateDir, StateError};
 use crate::testkit::{
-    Approval, ControlScript, FakeControl, FakeGate, LogCapture, ManualClock, NODE_ID, NODE_NAME,
-    NodeIdentity, PollStep, RenewStep, TestPki, eventually, soon, unix_now,
+    AUTHORIZE_PATH, ApiStep, Approval, ControlScript, FakeControl, FakeGate, LogCapture,
+    ManualClock, NODE_ID, NODE_NAME, NodeIdentity, PollStep, RenewStep, SESSION_END_PATH,
+    TRUST_PATH, TestPki, eventually, soon, sshd_host_key_file, trust_reply, unix_now, user_ca_line,
 };
+use crate::trust::TrustTiming;
 
 const HOUR: i64 = 3600;
 
 struct Agent {
     shutdown: CancellationToken,
     join: JoinHandle<Result<(), RunError>>,
+    _sshd: tempfile::TempDir,
+}
+
+const FAST: BackoffPolicy = BackoffPolicy {
+    initial: Duration::from_millis(20),
+    max: Duration::from_millis(200),
+    reset_after: Duration::from_secs(30),
+};
+
+fn settings(dir: &Path, sshd_host_key: PathBuf) -> RunSettings {
+    RunSettings {
+        inner: InnerConfig {
+            sshd_host_key,
+            ..InnerConfig::default()
+        },
+        tunnel_backoff: FAST,
+        trust: TrustTiming {
+            backoff: FAST,
+            refresh_min: Duration::from_secs(3600),
+            refresh_max: Duration::from_secs(3600),
+            wake_jitter: Duration::from_millis(1),
+        },
+        ..RunSettings::new(dir.to_path_buf())
+    }
 }
 
 impl Agent {
@@ -36,21 +76,29 @@ impl Agent {
     }
 
     fn start_with_jitter(dir: &Path, clock: Arc<ManualClock>, sample: f64) -> Self {
-        let settings = RunSettings {
-            tunnel_backoff: BackoffPolicy {
-                initial: Duration::from_millis(20),
-                max: Duration::from_millis(200),
-                reset_after: Duration::from_secs(30),
-            },
-            ..RunSettings::new(dir.to_path_buf())
-        };
+        Self::start_with(dir, clock, sample, |_| {})
+    }
+
+    fn start_with(
+        dir: &Path,
+        clock: Arc<ManualClock>,
+        sample: f64,
+        adjust: impl FnOnce(&mut RunSettings),
+    ) -> Self {
+        let sshd = tempfile::tempdir().unwrap();
+        let mut settings = settings(dir, sshd_host_key_file(sshd.path()));
+        adjust(&mut settings);
         let env = RunEnv {
             clock,
             jitter: Box::new(move || sample),
         };
         let shutdown = CancellationToken::new();
         let join = tokio::spawn(run(settings, env, shutdown.clone()));
-        Self { shutdown, join }
+        Self {
+            shutdown,
+            join,
+            _sshd: sshd,
+        }
     }
 
     async fn stop(self) {
@@ -145,6 +193,88 @@ fn node_id() -> NodeId {
     NodeId::new(NODE_ID).unwrap()
 }
 
+fn stream_meta(session: &str) -> StreamMeta {
+    StreamMeta::new(
+        SessionId::new(session).unwrap(),
+        StreamKind::Ssh,
+        "203.0.113.5:40000",
+    )
+    .unwrap()
+}
+
+async fn first_line(gate: &FakeGate, session: &str) -> Vec<u8> {
+    let mut stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta(session))
+        .await
+        .unwrap();
+    soon("the first line of the stream", async {
+        let mut seen = Vec::new();
+        let mut byte = [0_u8; 1];
+        while stream.read(&mut byte).await.unwrap() == 1 {
+            seen.push(byte[0]);
+            if seen.ends_with(b"\r\n") {
+                break;
+            }
+        }
+        seen
+    })
+    .await
+}
+
+struct HostCertificates(Arc<Mutex<Vec<Option<Certificate>>>>);
+
+impl client::Handler for HostCertificates {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        let presented = match key {
+            PublicKeyOrCertificate::Certificate(certificate) => Some(certificate.clone()),
+            PublicKeyOrCertificate::PublicKey { .. } => None,
+        };
+        self.0.lock().unwrap().push(presented);
+        Ok(true)
+    }
+}
+
+async fn presented_host_certificate(gate: &FakeGate, session: &str) -> String {
+    let stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta(session))
+        .await
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let config = client::Config {
+        preferred: Preferred {
+            host_key_certificates: Cow::Borrowed(&[Algorithm::Ed25519]),
+            ..Preferred::DEFAULT
+        },
+        ..client::Config::default()
+    };
+    let handle = soon(
+        "the SSH handshake",
+        client::connect_stream(Arc::new(config), stream, HostCertificates(seen.clone())),
+    )
+    .await
+    .unwrap();
+    drop(handle);
+    let presented = seen.lock().unwrap().clone();
+    match presented.as_slice() {
+        [Some(certificate)] => certificate.to_openssh().unwrap(),
+        other => panic!("expected one host certificate, saw {other:?}"),
+    }
+}
+
+fn certificate_file(node: &Enrolled) -> String {
+    String::from_utf8(node.file("ssh_host_ed25519-cert.pub"))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
 fn assert_no_key_material(logs: &str, dir: &Path) {
     for name in ["tls.key", "x509.der", "ca-root.der"] {
         let secret = STANDARD.encode(fs::read(dir.join(name)).unwrap());
@@ -182,7 +312,7 @@ async fn run_refuses_to_start_without_an_enrollment() {
 }
 
 #[tokio::test]
-async fn an_enrolled_agent_holds_its_tunnel_refuses_streams_and_survives_drops_and_restarts() {
+async fn an_enrolled_agent_serves_ssh_on_its_tunnel_and_survives_drops_and_restarts() {
     let logs = LogCapture::default();
     let _guard = logs.install();
     let pki = Arc::new(TestPki::new());
@@ -223,26 +353,11 @@ async fn an_enrolled_agent_holds_its_tunnel_refuses_streams_and_survives_drops_a
 
     let agent = Agent::start(dir.path(), ManualClock::new(SystemTime::now()));
     gate.wait_connected().await;
-
-    let meta = StreamMeta::new(
-        SessionId::new("session-1").unwrap(),
-        StreamKind::Ssh,
-        "203.0.113.5:40000",
-    )
-    .unwrap();
-    let mut stream = gate.registry.open_stream(&node_id(), &meta).await.unwrap();
-    let mut received = Vec::new();
-    soon(
-        "the refused stream to end",
-        stream.read_to_end(&mut received),
-    )
-    .await
-    .unwrap();
-    assert!(received.is_empty());
-    eventually("the refusal to be logged", || {
-        logs.text().contains("\"refused_streams\":1")
+    eventually("the agent to accept SSH sessions", || {
+        logs.text().contains("the agent now accepts SSH sessions")
     })
     .await;
+    assert_eq!(first_line(&gate, "session-1").await, b"SSH-2.0-Jaunt\r\n");
 
     assert!(gate.registry.disconnect(&node_id()));
     gate.wait_connected().await;
@@ -448,10 +563,12 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
     clock.advance(Duration::from_secs(10 * 24 * 3600));
     assert_eq!(gate.renewals().len(), 1);
     assert!(gate.registry.is_connected(&node_id()));
-    eventually("the idle API connection to close", || {
-        gate.open_api_connections() == 0
+    eventually("the renewal connection to close", || {
+        gate.open_api_connections() < gate.api_connections()
     })
     .await;
+    assert_eq!(gate.renewals().len(), 1);
+    assert_eq!(gate.paths(), ["/v1/agent/renew", TRUST_PATH]);
 
     agent.stop().await;
     gate.stop().await;
@@ -459,7 +576,7 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
 }
 
 #[tokio::test]
-async fn an_expired_certificate_asks_for_reenrollment_without_calling_the_server() {
+async fn an_expired_certificate_asks_for_reenrollment_without_renewal() {
     let logs = LogCapture::default();
     let _guard = logs.install();
     let t0 = unix_now();
@@ -472,10 +589,402 @@ async fn an_expired_certificate_asks_for_reenrollment_without_calling_the_server
             logs.text().matches("jaunt-agent enroll --replace").count() == reports
         })
         .await;
+        eventually("the trust set to be fetched", || {
+            !gate.requests(TRUST_PATH).is_empty()
+        })
+        .await;
         assert!(gate.renewals().is_empty());
-        assert_eq!(gate.api_connections(), 0);
+        assert_eq!(gate.paths(), [TRUST_PATH]);
 
         agent.stop().await;
         gate.stop().await;
     }
+}
+
+#[tokio::test]
+async fn aborting_the_agent_closes_its_api_connection() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let agent = Agent::start(&node.path(), ManualClock::new(at_unix_secs(t0 - 600)));
+    gate.wait_connected().await;
+    eventually("the trust fetch to hold an API connection", || {
+        !gate.requests(TRUST_PATH).is_empty() && gate.open_api_connections() == 1
+    })
+    .await;
+    agent.join.abort();
+    eventually("the API connection to close", || {
+        gate.open_api_connections() == 0
+    })
+    .await;
+    agent.shutdown.cancel();
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn run_refuses_to_start_without_a_usable_sshd_host_key() {
+    let t0 = unix_now();
+    let (_pki, gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let sshd = tempfile::tempdir().unwrap();
+    let env = || RunEnv {
+        clock: Arc::new(SystemClock),
+        jitter: Box::new(|| 0.5),
+    };
+    let missing = settings(&node.path(), sshd.path().join("missing.pub"));
+    let error = soon("the refusal", run(missing, env(), CancellationToken::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RunError::InnerTarget(InnerTargetError::HostKey {
+            source: SshError::ReadFile { .. },
+            ..
+        })
+    ));
+    assert!(error.to_string().contains("missing.pub"));
+    let wrong = sshd.path().join("rsa.pub");
+    fs::write(&wrong, "ssh-rsa AAAAB3NzaC1yc2E= root@host\n").unwrap();
+    let error = soon(
+        "the refusal",
+        run(
+            settings(&node.path(), wrong),
+            env(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        RunError::InnerTarget(InnerTargetError::HostKey {
+            source: SshError::PinnedHostKey,
+            ..
+        })
+    ));
+    assert!(!node.dir.path().join("inner-ca.pub").exists());
+    assert!(gate.registry.connected_nodes().is_empty());
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn the_inner_ca_is_published_for_sshd_and_replaced_at_every_start() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let mut published = Vec::new();
+    for _ in 0..2 {
+        let agent = Agent::start(&node.path(), ManualClock::new(SystemTime::now()));
+        gate.wait_connected().await;
+        let path = node.dir.path().join("inner-ca.pub");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o644);
+        let line = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(
+            line.starts_with("ssh-ed25519 ") && line.ends_with('\n'),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1);
+        published.push(line);
+        agent.stop().await;
+    }
+    assert_ne!(published[0], published[1]);
+    let leftovers: Vec<String> = fs::read_dir(node.dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn streams_are_refused_until_the_trust_set_loads_and_a_trust_update_refetches_it() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    gate.set_standing(
+        TRUST_PATH,
+        ApiStep::Json(503, json!({"error": "unavailable"})),
+    );
+    let agent = Agent::start(&node.path(), ManualClock::new(SystemTime::now()));
+    gate.wait_connected().await;
+    eventually("a failed trust fetch", || {
+        !gate.requests(TRUST_PATH).is_empty()
+    })
+    .await;
+    assert!(first_line(&gate, "early").await.is_empty());
+    eventually("the refusal to be logged", || {
+        logs.text().contains("\"reason\":\"trust_not_loaded\"")
+    })
+    .await;
+
+    gate.set_standing(TRUST_PATH, trust_reply(&[user_ca_line()]));
+    eventually("the trust set to load", || {
+        logs.text().contains("the agent now accepts SSH sessions")
+    })
+    .await;
+    assert_eq!(first_line(&gate, "later").await, b"SSH-2.0-Jaunt\r\n");
+
+    let fetched = gate.requests(TRUST_PATH).len();
+    gate.registry.send_trust_update(&node_id()).unwrap();
+    eventually("the announced set to be fetched", || {
+        logs.text().contains("\"wake\":\"announced\"") && gate.requests(TRUST_PATH).len() > fetched
+    })
+    .await;
+    assert!(
+        gate.requests(TRUST_PATH)
+            .iter()
+            .all(|seen| seen.node == node_id() && seen.method == "GET")
+    );
+
+    agent.stop().await;
+    gate.stop().await;
+    assert_no_key_material(&logs.text(), node.dir.path());
+}
+
+#[tokio::test]
+async fn a_renewal_presents_the_new_host_certificate_to_new_ssh_connections() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(
+        &[RenewStep::Issue {
+            not_before: t0 - 60,
+            not_after: t0 + 2 * HOUR,
+        }],
+        t0 - HOUR,
+        t0 + HOUR,
+    )
+    .await;
+    let before = certificate_file(&node);
+    let clock = ManualClock::new(at_unix_secs(t0 - 600));
+    let agent = Agent::start(&node.path(), clock.clone());
+    gate.wait_connected().await;
+    eventually("the agent to accept SSH sessions", || {
+        logs.text().contains("the agent now accepts SSH sessions")
+    })
+    .await;
+    assert_eq!(presented_host_certificate(&gate, "before").await, before);
+
+    clock.wait_for_sleeper(at_unix_secs(t0)).await;
+    clock.set(at_unix_secs(t0));
+    eventually("the renewed host certificate to be used", || {
+        logs.text()
+            .contains("new SSH connections use the renewed host certificate")
+    })
+    .await;
+    let after = certificate_file(&node);
+    assert_ne!(after, before);
+    assert_eq!(presented_host_certificate(&gate, "after").await, after);
+
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[test]
+fn the_tunnel_is_configured_with_the_ssh_windows_and_the_given_backoff() {
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let endpoint = AgentEndpoint::parse("agents.example.com:8443").unwrap();
+    let config = tunnel_config(Arc::new(tls), &endpoint, FAST);
+    assert_eq!(config.options.stream_window, 1024 * 1024);
+    assert_eq!(config.options.connection_window, 16 * 1024 * 1024);
+    assert_eq!(
+        (SSH_STREAM_WINDOW, SSH_CONNECTION_WINDOW),
+        (1024 * 1024, 16 * 1024 * 1024)
+    );
+    assert_eq!(config.options.validate(), Ok(()));
+    assert_eq!(config.backoff, FAST);
+    assert_eq!(config.server_addr, "agents.example.com:8443");
+    assert_eq!(config.sni, "agents.example.com");
+}
+
+#[tokio::test]
+async fn without_a_host_certificate_streams_are_refused_until_a_renewal_supplies_one() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(
+        &[RenewStep::Issue {
+            not_before: t0 - 60,
+            not_after: t0 + 2 * HOUR,
+        }],
+        t0 - HOUR,
+        t0 + HOUR,
+    )
+    .await;
+    fs::write(
+        node.dir.path().join("ssh_host_ed25519-cert.pub"),
+        "not a certificate\n",
+    )
+    .unwrap();
+    let clock = ManualClock::new(at_unix_secs(t0 - 600));
+    let agent = Agent::start(&node.path(), clock.clone());
+    gate.wait_connected().await;
+    eventually("the trust set to load", || {
+        logs.text().contains("loaded the user CA trust set")
+    })
+    .await;
+    assert!(first_line(&gate, "early").await.is_empty());
+    eventually("the refusal to be logged", || {
+        logs.text()
+            .contains("\"reason\":\"host_certificate_not_loaded\"")
+    })
+    .await;
+
+    clock.wait_for_sleeper(at_unix_secs(t0)).await;
+    clock.set(at_unix_secs(t0));
+    eventually("the renewal to make the agent ready", || {
+        logs.text().contains("the agent now accepts SSH sessions")
+    })
+    .await;
+    assert_eq!(first_line(&gate, "later").await, b"SSH-2.0-Jaunt\r\n");
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn terminating_a_session_in_the_tunnel_cancels_the_ssh_session() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let agent = Agent::start(&node.path(), ManualClock::new(SystemTime::now()));
+    gate.wait_connected().await;
+    eventually("the agent to accept SSH sessions", || {
+        logs.text().contains("the agent now accepts SSH sessions")
+    })
+    .await;
+    let mut stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta("doomed"))
+        .await
+        .unwrap();
+    let mut banner = [0_u8; 15];
+    soon("the banner", stream.read_exact(&mut banner))
+        .await
+        .unwrap();
+    assert_eq!(&banner, b"SSH-2.0-Jaunt\r\n");
+
+    gate.registry
+        .terminate_session(&node_id(), &SessionId::new("doomed").unwrap())
+        .unwrap();
+    let mut rest = Vec::new();
+    assert!(
+        soon("the stream to close", stream.read_to_end(&mut rest))
+            .await
+            .is_err()
+    );
+    eventually("the SSH session to end", || {
+        let text = logs.text();
+        text.contains("\"event\":\"agent.ssh.end\"") && text.contains("\"session_id\":\"doomed\"")
+    })
+    .await;
+    agent.stop().await;
+    gate.stop().await;
+}
+
+struct User {
+    ca_line: String,
+    key: Arc<PrivateKey>,
+    certificate: Certificate,
+}
+
+fn user() -> User {
+    let ca = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let now = u64::try_from(unix_now()).unwrap();
+    let mut builder = Builder::new_with_random_nonce(
+        &mut safe_rng(),
+        key.public_key().key_data().clone(),
+        now - 120,
+        now + 3600,
+    )
+    .unwrap();
+    builder.serial(7).unwrap();
+    builder.cert_type(CertType::User).unwrap();
+    builder.key_id("jaunt:alice@example.com:7").unwrap();
+    builder
+        .valid_principal("4f0e7a52-6c1b-4b39-9d55-2a8f1f0c7e11")
+        .unwrap();
+    User {
+        ca_line: ca.public_key().to_openssh().unwrap(),
+        key: Arc::new(key),
+        certificate: builder.sign(&ca).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn stopping_the_agent_still_reports_the_end_of_a_live_session() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let user = user();
+    gate.set_standing(TRUST_PATH, trust_reply(std::slice::from_ref(&user.ca_line)));
+    gate.script(
+        AUTHORIZE_PATH,
+        vec![ApiStep::Json(
+            200,
+            json!({"decision": "allow", "permissions": {
+                "pty": true, "port_forwarding": false, "record_input": false,
+                "max_duration_secs": 3600,
+            }}),
+        )],
+    );
+    gate.set_standing(
+        SESSION_END_PATH,
+        ApiStep::Json(200, json!({"outcome": "recorded"})),
+    );
+    let silent_sshd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sshd_addr = silent_sshd.local_addr().unwrap();
+    let agent = Agent::start_with(
+        &node.path(),
+        ManualClock::new(SystemTime::now()),
+        1.0,
+        |settings| settings.inner.sshd_addr = sshd_addr,
+    );
+    gate.wait_connected().await;
+    eventually("the trust set to load", || {
+        !gate.requests(TRUST_PATH).is_empty()
+    })
+    .await;
+
+    let stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta("live"))
+        .await
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut handle = soon(
+        "the SSH handshake",
+        client::connect_stream(
+            Arc::new(client::Config::default()),
+            stream,
+            HostCertificates(seen),
+        ),
+    )
+    .await
+    .unwrap();
+    let login = tokio::spawn(async move {
+        let outcome = handle
+            .authenticate_openssh_cert("deploy", user.key, user.certificate)
+            .await;
+        (handle, outcome)
+    });
+    let (_inner, _) = soon("the inner login to reach sshd", silent_sshd.accept())
+        .await
+        .unwrap();
+    assert_eq!(gate.requests(AUTHORIZE_PATH).len(), 1);
+    assert!(gate.requests(SESSION_END_PATH).is_empty());
+
+    agent.stop().await;
+    let ends = gate.requests(SESSION_END_PATH);
+    assert_eq!(ends.len(), 1);
+    let end: jaunt_proto::SessionEnd = serde_json::from_slice(&ends[0].body).unwrap();
+    assert_eq!(end.session_id, "live");
+    login.abort();
+    gate.stop().await;
 }

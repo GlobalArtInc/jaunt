@@ -30,6 +30,8 @@ pub enum SshError {
     InvalidHostKey,
     #[error("the host key is not an Ed25519 key")]
     HostKeyAlgorithm,
+    #[error("the pinned sshd host key is not an Ed25519 OpenSSH public key")]
+    PinnedHostKey,
     #[error("the host certificate is not usable: {0}")]
     HostCertificate(HostCertProblem),
     #[error("cannot generate an Ed25519 key")]
