@@ -1952,6 +1952,7 @@ dependencies = [
  "jaunt-record",
  "jaunt-ssh",
  "jaunt-tunnel",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

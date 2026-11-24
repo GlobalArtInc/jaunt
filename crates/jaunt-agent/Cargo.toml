@@ -16,3 +16,4 @@ jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
 jaunt-record = { workspace = true }
+thiserror = "2.0.21"

@@ -34,3 +34,13 @@ jobs:
       - run: just pg-migrations
         env:
           DATABASE_URL: postgres://postgres:jaunt@localhost:5432/postgres
+  installer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just installer-containers
+        env:
+          CONTAINER_ENGINE: docker

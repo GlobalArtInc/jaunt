@@ -1,6 +1,10 @@
+mod installer;
+
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use installer::{InstallArgs, UninstallArgs};
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt node agent")]
@@ -24,22 +28,24 @@ enum Command {
         #[arg(long, value_name = "sha256:HEX")]
         ca_pin: Option<String>,
     },
-    #[command(about = "Install the agent service")]
-    Install,
-    #[command(about = "Uninstall the agent service")]
-    Uninstall,
+    #[command(about = "Install the agent service and the sshd drop-in")]
+    Install(InstallArgs),
+    #[command(about = "Remove the agent service and the sshd drop-in")]
+    Uninstall(UninstallArgs),
     #[command(about = "Run the agent")]
     Run,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let command = match cli.command {
-        Command::Enroll { .. } => "enroll",
-        Command::Install => "install",
-        Command::Uninstall => "uninstall",
-        Command::Run => "run",
-    };
+    match Cli::parse().command {
+        Command::Install(args) => installer::run_install(&args),
+        Command::Uninstall(args) => installer::run_uninstall(&args),
+        Command::Enroll { .. } => not_implemented("enroll"),
+        Command::Run => not_implemented("run"),
+    }
+}
+
+fn not_implemented(command: &str) -> ExitCode {
     eprintln!("not implemented: {command}");
     ExitCode::from(2)
 }
