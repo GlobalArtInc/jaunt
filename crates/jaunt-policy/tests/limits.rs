@@ -110,10 +110,11 @@ fn symlinked_files_are_followed_and_broken_links_are_rejected() {
     assert_eq!(linked.hash(), direct.hash());
     assert_eq!(linked.tests().len(), 1);
 
-    symlink("missing.yaml", dir.path().join("broken.yaml")).expect("link broken");
-    symlink("loop-b.yaml", dir.path().join("loop-a.yaml")).expect("link loop a");
-    symlink("loop-a.yaml", dir.path().join("loop-b.yaml")).expect("link loop b");
-    let errors = jaunt_policy::load_dir(dir.path()).expect_err("broken links must be rejected");
+    let plain = tempfile::tempdir().expect("create temp dir");
+    symlink("missing.yaml", plain.path().join("broken.yaml")).expect("link broken");
+    symlink("loop-b.yaml", plain.path().join("loop-a.yaml")).expect("link loop a");
+    symlink("loop-a.yaml", plain.path().join("loop-b.yaml")).expect("link loop b");
+    let errors = jaunt_policy::load_dir(plain.path()).expect_err("broken links must be rejected");
     let mut rejected: Vec<&str> = errors.errors().iter().map(|e| e.file.as_str()).collect();
     rejected.sort_unstable();
     assert_eq!(rejected, ["broken.yaml", "loop-a.yaml", "loop-b.yaml"]);

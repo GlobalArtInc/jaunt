@@ -96,3 +96,64 @@ fn valid_reload_replaces_the_set_and_changes_the_hash() {
     assert!(held.authorize_ssh(&alice(), &prod(), "deploy").allowed);
     assert!(!before.authorize_ssh(&alice(), &prod(), "deploy").allowed);
 }
+
+#[test]
+fn empty_directory_is_allowed_at_startup_but_never_replaces_a_non_empty_set() {
+    let empty = write_dir(&[]);
+    let handle = PolicyHandle::empty();
+    let startup = handle.reload(empty.path());
+    assert!(startup.applied, "{:?}", startup.errors);
+    assert!(handle.snapshot().is_empty());
+
+    let populated = write_dir(&[("roles.yaml", &role("ops", "deploy"))]);
+    let applied = handle.reload(populated.path());
+    assert!(applied.applied);
+    let active_hash = applied.hash.expect("applied reload reports the hash");
+
+    let refused = handle.reload(empty.path());
+    assert!(!refused.applied);
+    assert_eq!(refused.hash, None);
+    assert_eq!(refused.input_hash.as_deref(), Some(load_ok(&[]).hash()));
+    assert_eq!(refused.errors.len(), 1);
+    assert!(refused.errors[0].contains("empty"), "{:?}", refused.errors);
+    assert_eq!(handle.snapshot().hash(), active_hash);
+}
+
+#[test]
+fn reloading_identical_content_is_reported_as_unchanged() {
+    let dir = write_dir(&[("roles.yaml", &role("ops", "deploy"))]);
+    let handle = PolicyHandle::empty();
+    assert!(!handle.reload(dir.path()).unchanged);
+    let again = handle.reload(dir.path());
+    assert!(again.applied && again.unchanged);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_vanished_generation_keeps_the_last_valid_set() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let generation = dir.path().join("..gen1");
+    fs::create_dir(&generation).expect("create generation dir");
+    fs::write(generation.join("roles.yaml"), role("ops", "deploy")).expect("write role");
+    symlink("..gen1", dir.path().join("..data")).expect("link data dir");
+    symlink("..data/roles.yaml", dir.path().join("roles.yaml")).expect("link role");
+
+    let handle = PolicyHandle::empty();
+    let applied = handle.reload(dir.path());
+    assert!(applied.applied, "{:?}", applied.errors);
+    let active_hash = handle.snapshot().hash().to_owned();
+
+    fs::remove_dir_all(&generation).expect("remove generation");
+    let rejected = handle.reload(dir.path());
+    assert!(!rejected.applied);
+    assert!(!rejected.errors.is_empty());
+    assert_eq!(handle.snapshot().hash(), active_hash);
+    assert!(
+        handle
+            .snapshot()
+            .authorize_ssh(&alice(), &prod(), "deploy")
+            .allowed
+    );
+}

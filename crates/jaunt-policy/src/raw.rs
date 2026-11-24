@@ -11,6 +11,8 @@ const USERNAME_PLACEHOLDER: &str = "{username}";
 const NODE_NAME_KEY: &str = "name";
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "PolicyDocument"))]
 #[serde(
     tag = "kind",
     expecting = "a mapping with `kind` set to Role or AccessTest"
@@ -21,20 +23,27 @@ pub(crate) enum RawDocument {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "Role"))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct RawRole {
+    #[cfg_attr(feature = "schema", schemars(extend("const" = "jaunt/v1")))]
     api_version: String,
     metadata: RawMetadata,
     spec: RawRoleSpec,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleMetadata"))]
 #[serde(deny_unknown_fields)]
 struct RawMetadata {
     name: String,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleSpec"))]
 #[serde(deny_unknown_fields)]
 struct RawRoleSpec {
     members: Option<RawMembers>,
@@ -43,6 +52,8 @@ struct RawRoleSpec {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleMembers"))]
 #[serde(deny_unknown_fields)]
 struct RawMembers {
     groups: Option<Vec<String>>,
@@ -50,6 +61,8 @@ struct RawMembers {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleSsh"))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RawSsh {
     nodes: Option<BTreeMap<String, Vec<String>>>,
@@ -61,13 +74,18 @@ struct RawSsh {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "AccessTest"))]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct RawAccessTests {
+    #[cfg_attr(feature = "schema", schemars(extend("const" = "jaunt/v1")))]
     api_version: String,
     spec: Vec<RawAccessTest>,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "AccessTestCase"))]
 #[serde(deny_unknown_fields)]
 struct RawAccessTest {
     user: String,

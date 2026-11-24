@@ -134,6 +134,10 @@ impl PolicySet {
             .any(|role| role.applies_to(identity) && role.admin.contains(&permission))
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.roles.is_empty() && self.tests.is_empty()
+    }
+
     pub fn hash(&self) -> &str {
         &self.hash
     }

@@ -7,9 +7,14 @@ use crate::policy::PolicySet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReloadOutcome {
     pub applied: bool,
+    pub unchanged: bool,
     pub hash: Option<String>,
+    pub input_hash: Option<String>,
     pub errors: Vec<String>,
 }
+
+const EMPTY_RELOAD_REFUSED: &str =
+    "refusing to replace a non-empty policy set with an empty one; the last valid set stays active";
 
 #[derive(Debug)]
 struct Shared {
@@ -55,16 +60,30 @@ impl PolicyHandle {
                     .current
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
+                if set.is_empty() && !guard.is_empty() {
+                    return ReloadOutcome {
+                        applied: false,
+                        unchanged: false,
+                        hash: None,
+                        input_hash: Some(hash),
+                        errors: vec![EMPTY_RELOAD_REFUSED.to_owned()],
+                    };
+                }
+                let unchanged = guard.hash() == hash;
                 *guard = Arc::new(set);
                 ReloadOutcome {
                     applied: true,
-                    hash: Some(hash),
+                    unchanged,
+                    hash: Some(hash.clone()),
+                    input_hash: Some(hash),
                     errors: Vec::new(),
                 }
             }
             Err(errors) => ReloadOutcome {
                 applied: false,
+                unchanged: false,
                 hash: None,
+                input_hash: errors.input_hash().map(str::to_owned),
                 errors: errors.messages(),
             },
         }

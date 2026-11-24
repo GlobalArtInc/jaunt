@@ -258,3 +258,102 @@ fn hash_covers_names_and_contents_in_alphabetical_order() {
     assert_ne!(set.hash(), renamed.hash());
     assert_eq!(load_ok(&[]).hash(), EMPTY_SET_HASH);
 }
+
+#[cfg(unix)]
+#[test]
+fn directory_is_resolved_once_and_a_vanished_generation_fails_the_whole_load() {
+    use std::os::unix::fs::symlink;
+
+    let role = valid_role("ops");
+    let tests = "apiVersion: jaunt/v1\nkind: AccessTest\nspec: []\n";
+    let real = tempfile::tempdir().expect("create temp dir");
+    let generation = real.path().join("..gen1");
+    fs::create_dir(&generation).expect("create generation dir");
+    fs::write(generation.join("a.yaml"), &role).expect("write a.yaml");
+    fs::write(generation.join("b.yaml"), tests).expect("write b.yaml");
+    symlink("..gen1", real.path().join("..data")).expect("link data dir");
+    symlink("..data/a.yaml", real.path().join("a.yaml")).expect("link a.yaml");
+    symlink("..data/b.yaml", real.path().join("b.yaml")).expect("link b.yaml");
+
+    let outer = tempfile::tempdir().expect("create temp dir");
+    let through_link = outer.path().join("policy");
+    symlink(real.path(), &through_link).expect("link policy dir");
+    let set = load_dir(&through_link).expect("a symlinked directory must load");
+    assert_eq!(
+        set.hash(),
+        load_ok(&[("a.yaml", &role), ("b.yaml", tests)]).hash()
+    );
+
+    fs::remove_dir_all(&generation).expect("remove generation");
+    let errors = load_dir(&through_link).expect_err("a vanished generation must fail the load");
+    assert!(errors.to_string().contains("..data"), "{errors}");
+}
+
+#[cfg(unix)]
+#[test]
+fn files_come_from_the_resolved_generation_only() {
+    use std::os::unix::fs::symlink;
+
+    let role = valid_role("ops");
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let generation = dir.path().join("..gen1");
+    fs::create_dir(&generation).expect("create generation dir");
+    fs::write(generation.join("a.yaml"), &role).expect("write a.yaml");
+    symlink("..gen1", dir.path().join("..data")).expect("link data dir");
+    symlink("..data/a.yaml", dir.path().join("a.yaml")).expect("link a.yaml");
+    symlink("..data/new.yaml", dir.path().join("new.yaml")).expect("link not yet published key");
+
+    let set = load_dir(dir.path()).expect("keys of a generation not yet published are ignored");
+    assert_eq!(set.hash(), load_ok(&[("a.yaml", &role)]).hash());
+}
+
+#[cfg(unix)]
+#[test]
+fn files_resolving_outside_the_policy_directory_are_rejected_unread() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("create temp dir");
+    let secret = outside.path().join("secret.yaml");
+    fs::write(
+        &secret,
+        "apiVersion: jaunt/v1
+kind: SECRET-MARKER [
+",
+    )
+    .expect("write outside file");
+
+    let plain = tempfile::tempdir().expect("create temp dir");
+    symlink(&secret, plain.path().join("leak.yaml")).expect("link outside file");
+    let generation_root = tempfile::tempdir().expect("create temp dir");
+    let generation = generation_root.path().join("..gen1");
+    fs::create_dir(&generation).expect("create generation dir");
+    symlink(&secret, generation.join("leak.yaml")).expect("link outside file");
+    symlink("..gen1", generation_root.path().join("..data")).expect("link data dir");
+
+    for dir in [plain.path(), generation_root.path()] {
+        let errors = load_dir(dir).expect_err("outside files must be rejected");
+        assert_eq!(errors.errors().len(), 1, "{errors}");
+        assert_eq!(errors.errors()[0].file, "leak.yaml");
+        assert!(
+            errors.to_string().contains("outside the policy directory"),
+            "{errors}"
+        );
+        assert!(!errors.to_string().contains("SECRET-MARKER"), "{errors}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_link_must_stay_inside_the_policy_directory() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("create temp dir");
+    fs::write(outside.path().join("a.yaml"), valid_role("ops")).expect("write outside file");
+    let dir = tempfile::tempdir().expect("create temp dir");
+    symlink(outside.path(), dir.path().join("..data")).expect("link data dir");
+    let errors = load_dir(dir.path()).expect_err("an escaping ..data must be rejected");
+    assert!(
+        errors.to_string().contains("inside the policy directory"),
+        "{errors}"
+    );
+}

@@ -6,6 +6,7 @@ use crate::model::{Identity, NodeInfo};
 use crate::policy::PolicySet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Expect {
     Allow,

@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+mod policy;
+
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use crate::policy::PolicyCommand;
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt command-line client")]
@@ -34,22 +37,14 @@ enum Command {
     Ensure,
 }
 
-#[derive(Subcommand)]
-enum PolicyCommand {
-    #[command(about = "Check policy files in a directory")]
-    Check { dir: PathBuf },
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = match cli.command {
+        Command::Policy { command } => return policy::run(&command),
         Command::Login { .. } => "login",
         Command::Logout => "logout",
         Command::Status => "status",
         Command::Ls => "ls",
-        Command::Policy {
-            command: PolicyCommand::Check { .. },
-        } => "policy check",
         Command::Ensure => "ensure",
     };
     eprintln!("not implemented: {command}");

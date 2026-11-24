@@ -17,6 +17,7 @@ const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILES: usize = 512;
 const MAX_ERRORS: usize = 100;
 const MAX_ERRORS_PER_FILE: usize = 100;
+const GENERATION_LINK: &str = "..data";
 
 pub(crate) struct SourceFile {
     pub(crate) name: String,
@@ -45,10 +46,15 @@ impl fmt::Display for LoadError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadErrors {
     errors: Vec<LoadError>,
+    input_hash: Option<String>,
 }
 
 impl LoadErrors {
-    fn new(mut errors: Vec<LoadError>) -> Self {
+    fn new(errors: Vec<LoadError>) -> Self {
+        LoadErrors::with_input_hash(errors, None)
+    }
+
+    fn with_input_hash(mut errors: Vec<LoadError>, input_hash: Option<String>) -> Self {
         if errors.len() > MAX_ERRORS {
             let omitted = errors.len() - MAX_ERRORS;
             errors.truncate(MAX_ERRORS);
@@ -58,7 +64,11 @@ impl LoadErrors {
                 message: format!("{omitted} more errors omitted"),
             });
         }
-        LoadErrors { errors }
+        LoadErrors { errors, input_hash }
+    }
+
+    pub fn input_hash(&self) -> Option<&str> {
+        self.input_hash.as_deref()
     }
 
     pub fn errors(&self) -> &[LoadError] {
@@ -138,13 +148,43 @@ struct Candidate {
     len: u64,
 }
 
+fn resolve_generation(root: &Path) -> Result<Option<PathBuf>, String> {
+    let link = root.join(GENERATION_LINK);
+    match fs::symlink_metadata(&link) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("cannot resolve {GENERATION_LINK}: {err}")),
+    }
+    let generation = fs::canonicalize(&link)
+        .map_err(|err| format!("cannot resolve {GENERATION_LINK}: {err}"))?;
+    if !generation.starts_with(root) || !generation.is_dir() {
+        return Err(format!(
+            "{GENERATION_LINK} must resolve to a directory inside the policy directory"
+        ));
+    }
+    Ok(Some(generation))
+}
+
 pub fn load_dir(dir: &Path) -> Result<PolicySet, LoadErrors> {
     let dir_label = dir.display().to_string();
+    let root = fs::canonicalize(dir).map_err(|err| {
+        LoadErrors::new(vec![file_error(
+            &dir_label,
+            format!("cannot read policy directory: {err}"),
+        )])
+    })?;
+    let generation = resolve_generation(&root)
+        .map_err(|message| LoadErrors::new(vec![file_error(&dir_label, message)]))?;
+    let source = generation.unwrap_or(root);
+    load_resolved(&source, &dir_label)
+}
+
+fn load_resolved(dir: &Path, dir_label: &str) -> Result<PolicySet, LoadErrors> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
             return Err(LoadErrors::new(vec![file_error(
-                &dir_label,
+                dir_label,
                 format!("cannot read policy directory: {err}"),
             )]));
         }
@@ -157,7 +197,7 @@ pub fn load_dir(dir: &Path) -> Result<PolicySet, LoadErrors> {
             Ok(entry) => entry,
             Err(err) => {
                 errors.push(file_error(
-                    &dir_label,
+                    dir_label,
                     format!("cannot read directory entry: {err}"),
                 ));
                 continue;
@@ -172,8 +212,7 @@ pub fn load_dir(dir: &Path) -> Result<PolicySet, LoadErrors> {
             errors.push(file_error(&lossy_name, "file name is not valid UTF-8"));
             continue;
         };
-        let path = entry.path();
-        let len = match fs::metadata(&path) {
+        let len = match fs::metadata(entry.path()) {
             Ok(metadata) if metadata.is_file() => metadata.len(),
             Ok(_) => continue,
             Err(err) => {
@@ -181,9 +220,23 @@ pub fn load_dir(dir: &Path) -> Result<PolicySet, LoadErrors> {
                 continue;
             }
         };
+        let path = match fs::canonicalize(entry.path()) {
+            Ok(path) if path.starts_with(dir) => path,
+            Ok(_) => {
+                errors.push(file_error(
+                    name,
+                    "file resolves outside the policy directory",
+                ));
+                continue;
+            }
+            Err(err) => {
+                errors.push(file_error(name, format!("cannot resolve file: {err}")));
+                continue;
+            }
+        };
         if candidates.len() >= MAX_FILES {
             errors.push(file_error(
-                &dir_label,
+                dir_label,
                 format!("more than {MAX_FILES} policy files"),
             ));
             return Err(LoadErrors::new(errors));
@@ -239,6 +292,7 @@ pub(crate) fn build(
 ) -> Result<PolicySet, LoadErrors> {
     files.sort_by(|a, b| a.name.cmp(&b.name));
     let hash = hash_files(&files);
+    let input_complete = errors.is_empty();
     let mut roles: Vec<Role> = Vec::new();
     let mut tests: Vec<AccessTest> = Vec::new();
     let mut role_origins: HashMap<String, (String, usize)> = HashMap::new();
@@ -269,7 +323,10 @@ pub(crate) fn build(
     if errors.is_empty() {
         Ok(PolicySet { roles, tests, hash })
     } else {
-        Err(LoadErrors::new(errors))
+        Err(LoadErrors::with_input_hash(
+            errors,
+            input_complete.then_some(hash),
+        ))
     }
 }
 
