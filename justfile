@@ -6,6 +6,7 @@ lint:
 
 test:
     cargo test --workspace --locked
+    cargo test --release -p jaunt-ca --locked
 
 deny:
     cargo deny check

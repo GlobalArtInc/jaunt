@@ -1,3 +1,4 @@
+mod ca;
 mod config;
 
 use std::path::{Path, PathBuf};
@@ -44,7 +45,13 @@ enum Command {
 #[derive(Subcommand)]
 enum CaCommand {
     #[command(about = "Initialize the certificate authority")]
-    Init,
+    Init {
+        #[arg(
+            long,
+            help = "Create a new age identity in <data_dir>/ca instead of reading one from the environment"
+        )]
+        generate_identity: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -66,8 +73,8 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Run => run(&cli.config),
         Command::Ca {
-            command: CaCommand::Init,
-        } => not_implemented("ca init"),
+            command: CaCommand::Init { generate_identity },
+        } => ca::init(&cli.config, generate_identity),
         Command::Node {
             command: NodeCommand::Approve { .. },
         } => not_implemented("node approve"),

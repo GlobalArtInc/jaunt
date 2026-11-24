@@ -14,5 +14,9 @@ workspace = true
 clap = { workspace = true }
 serde = { workspace = true }
 serde-saphyr = { workspace = true }
+jaunt-ca = { workspace = true }
 jaunt-control = { workspace = true }
 jaunt-gate = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"

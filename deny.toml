@@ -2,6 +2,8 @@
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side channel affects private-key operations only; jaunt-oidc verifies signatures with provider public keys and never signs or decrypts with RSA; no fixed version is reachable through openidconnect 4.1; revisit if another crate starts using rsa 0.9 for signing or decryption" },
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained notice without a vulnerability; required by openidconnect and oauth2; revisit when they drop it" },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained notice; used only by proc-macro crates of age at build time and not linked into the binary" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained notice; used only by proc-macro crates of age at build time and not linked into the binary" },
 ]
 
 [licenses]

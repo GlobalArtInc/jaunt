@@ -11,4 +11,13 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+age = "0.11.5"
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 jaunt-proto = { workspace = true }
+signature = "2"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "getrandom"] }
+uuid = "1.29.3"
+zeroize = "1.9.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
