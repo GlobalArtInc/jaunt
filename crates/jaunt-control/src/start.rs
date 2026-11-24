@@ -9,13 +9,13 @@ use jaunt_store::NewLoginRequest;
 use crate::audit;
 use crate::control::Control;
 use crate::http::{error_response, json_body, json_response, server_error};
-use crate::pending::{InsertError, PendingLogin};
+use crate::pending::{InsertError, PendingKind, PendingLogin};
 use crate::pkce;
 
 pub(crate) const LOGIN_KIND: &str = "loopback";
 pub(crate) const LOGIN_TTL_SECS: i64 = 300;
 
-const CHALLENGE_METHOD: &str = "S256";
+pub(crate) const CHALLENGE_METHOD: &str = "S256";
 const MIN_PORT: u32 = 1024;
 const MAX_PORT: u32 = 65535;
 const MAX_LABEL_LEN: usize = 64;
@@ -45,12 +45,12 @@ fn validate(request: StartRequest) -> Option<ValidStart> {
     })
 }
 
-fn is_valid_label(label: &str) -> bool {
+pub(crate) fn is_valid_label(label: &str) -> bool {
     (1..=MAX_LABEL_LEN).contains(&label.len())
         && label.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
-fn busy() -> Response {
+pub(crate) fn busy() -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, "busy")
 }
 
@@ -101,7 +101,7 @@ pub(crate) async fn handle(
     let entry = PendingLogin {
         auth,
         login_id: request.id.clone(),
-        redirect_port: valid.port,
+        kind: PendingKind::Loopback { port: valid.port },
         expires_at: request.expires_at,
     };
     match control.pending.insert(state, entry, now.secs) {

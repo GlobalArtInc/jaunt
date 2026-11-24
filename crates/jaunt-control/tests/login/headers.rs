@@ -30,13 +30,18 @@ async fn every_response_carries_the_hardening_headers() {
     let bare = harness.get("/v1/whoami").await;
     assert_eq!(bare.status, StatusCode::UNAUTHORIZED);
     for (name, _, reply) in &replies {
-        assert_hardened(name, reply);
+        let policy = if *name == "html page" {
+            "strict-origin"
+        } else {
+            "no-referrer"
+        };
+        assert_hardened(name, reply, policy);
     }
-    assert_hardened("empty 401", &bare);
+    assert_hardened("empty 401", &bare, "no-referrer");
 }
 
-fn assert_hardened(name: &str, reply: &crate::support::Reply) {
+fn assert_hardened(name: &str, reply: &crate::support::Reply, referrer_policy: &str) {
     assert_eq!(reply.header("x-content-type-options"), "nosniff", "{name}");
     assert_eq!(reply.header("cache-control"), "no-store", "{name}");
-    assert_eq!(reply.header("referrer-policy"), "no-referrer", "{name}");
+    assert_eq!(reply.header("referrer-policy"), referrer_policy, "{name}");
 }

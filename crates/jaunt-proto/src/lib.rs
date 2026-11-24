@@ -1,7 +1,9 @@
+mod device;
 mod error;
 mod login;
 mod whoami;
 
+pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
 pub use error::ErrorBody;
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
 pub use whoami::WhoamiResponse;

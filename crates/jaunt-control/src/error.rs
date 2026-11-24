@@ -9,6 +9,10 @@ pub enum ControlError {
     CertificateTtlTooShort,
     #[error("the pending login capacity must be at least one")]
     NoPendingCapacity,
+    #[error("the public origin must be an https origin without a path, query or credentials")]
+    InvalidPublicOrigin,
+    #[error("the client address header is not a valid http header name")]
+    InvalidClientIpHeader,
     #[error("the host authority keys cannot be listed: {0}")]
     HostKeys(#[source] CaError),
     #[error("the http server failed: {0}")]

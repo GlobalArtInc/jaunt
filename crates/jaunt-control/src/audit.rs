@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenyReason {
     MalformedQuery,
@@ -11,6 +13,9 @@ pub(crate) enum DenyReason {
     EmailNotVerified,
     IdentityRejected,
     ProviderUnavailable,
+    UserDenied,
+    ApprovalRejected,
+    BrowserMismatch,
     Internal,
 }
 
@@ -28,6 +33,9 @@ impl DenyReason {
             DenyReason::EmailNotVerified => "email_not_verified",
             DenyReason::IdentityRejected => "identity_rejected",
             DenyReason::ProviderUnavailable => "provider_unavailable",
+            DenyReason::UserDenied => "user_denied",
+            DenyReason::ApprovalRejected => "approval_rejected",
+            DenyReason::BrowserMismatch => "browser_mismatch",
             DenyReason::Internal => "internal",
         }
     }
@@ -78,8 +86,34 @@ pub(crate) fn login_started(login_id: &str) {
     tracing::info!(target: "jaunt::audit", event = "login.started", login_id);
 }
 
-pub(crate) fn login_approved(login_id: &str, user_id: &str, email: &str) {
-    tracing::info!(target: "jaunt::audit", event = "login.approved", login_id, user_id, email);
+pub(crate) fn login_approved(login_id: &str, user_id: &str, email: &str, kind: &str) {
+    tracing::info!(target: "jaunt::audit", event = "login.approved", login_id, user_id, email, kind);
+}
+
+pub(crate) fn device_started(login_id: &str, ip: IpAddr) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "login.device.started",
+        login_id,
+        ip = %ip
+    );
+}
+
+pub(crate) fn device_code_failed(ip: IpAddr) {
+    tracing::info!(target: "jaunt::audit", event = "login.device.code_failed", ip = %ip);
+}
+
+pub(crate) fn device_locked_out(ip: IpAddr) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "login.device.locked_out",
+        ip = %ip,
+        reason = "ip_limit"
+    );
+}
+
+pub(crate) fn device_continued(login_id: &str) {
+    tracing::info!(target: "jaunt::audit", event = "login.device.continued", login_id);
 }
 
 pub(crate) fn login_denied(login_id: Option<&str>, reason: DenyReason) {

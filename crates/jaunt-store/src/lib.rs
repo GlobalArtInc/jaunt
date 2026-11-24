@@ -14,7 +14,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
 pub use certificates::{Certificate, Certificates, NewCertificate};
 pub use error::StoreError;
-pub use login_requests::{LoginRequest, LoginRequestState, LoginRequests, NewLoginRequest};
+pub use login_requests::{
+    LoginRequest, LoginRequestState, LoginRequests, NewDeviceLoginRequest, NewLoginRequest,
+};
 pub use users::{NewUser, User, Users};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");

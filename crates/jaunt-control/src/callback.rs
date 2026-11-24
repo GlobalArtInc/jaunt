@@ -1,24 +1,21 @@
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use jaunt_oidc::{ExchangeFailure, OidcError, UserInfoFailure};
-use jaunt_store::{LoginRequestState, NewUser};
+use jaunt_store::{LoginRequest, LoginRequestState, NewUser, User};
 
 use crate::audit::{self, DenyReason};
+use crate::clock::Moment;
 use crate::completion;
 use crate::control::Control;
+use crate::device;
 use crate::http::server_error;
-use crate::pending::PendingLogin;
+use crate::pending::{PendingKind, PendingLogin};
 use crate::start::LOGIN_KIND;
 
 const MAX_QUERY_LEN: usize = 8 * 1024;
 const LOOPBACK_HOST: &str = "127.0.0.1";
-
-const FAILURE_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<title>Sign-in failed</title><style>body{font-family:sans-serif;margin:3rem}</style></head>\
-<body><h1>Sign-in failed</h1><p>The sign-in could not be completed. \
-You can close this tab and start again from the terminal.</p></body></html>";
 
 #[derive(Default)]
 struct CallbackParams {
@@ -77,25 +74,6 @@ fn internal() -> Denial {
     denial(LoopbackError::ServerError, DenyReason::Internal)
 }
 
-fn failure_page() -> Response {
-    let mut response = Response::new(Body::from(FAILURE_PAGE));
-    *response.status_mut() = StatusCode::BAD_REQUEST;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
-    );
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    response
-}
-
 fn loopback_redirect(port: u16, pairs: &[(&str, &str)]) -> Response {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (name, value) in pairs {
@@ -138,31 +116,76 @@ fn oidc_denial(err: &OidcError) -> Denial {
     }
 }
 
-pub(crate) async fn handle(State(control): State<Control>, RawQuery(query): RawQuery) -> Response {
+pub(crate) async fn handle(
+    State(control): State<Control>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
     let Some(params) = query.as_deref().and_then(parse_query) else {
         audit::login_denied(None, DenyReason::MalformedQuery);
-        return failure_page();
+        return device::page::sign_in_failed();
     };
     let Some(state) = params.state.as_deref().filter(|state| !state.is_empty()) else {
         audit::login_denied(None, DenyReason::MalformedQuery);
-        return failure_page();
+        return device::page::sign_in_failed();
     };
     let Some(entry) = control.pending.take(state) else {
         audit::login_denied(None, DenyReason::UnknownState);
-        return failure_page();
+        return device::page::sign_in_failed();
     };
-    let port = entry.redirect_port;
+    let kind = entry.kind.clone();
     let login_id = entry.login_id.clone();
+    let error_reported = params.error.is_some();
 
-    match approve(&control, entry, params.code, params.error.is_some(), state).await {
-        Ok(completion_code) => {
-            loopback_redirect(port, &[("login_id", &login_id), ("code", &completion_code)])
+    match kind {
+        PendingKind::Loopback { port } => {
+            match approve(&control, entry, params.code, error_reported, state).await {
+                Ok(completion_code) => {
+                    loopback_redirect(port, &[("login_id", &login_id), ("code", &completion_code)])
+                }
+                Err(denied) => {
+                    audit::login_denied(Some(&login_id), denied.reason);
+                    loopback_redirect(
+                        port,
+                        &[("error", denied.error.code()), ("login_id", &login_id)],
+                    )
+                }
+            }
         }
-        Err(denied) => {
-            audit::login_denied(Some(&login_id), denied.reason);
-            loopback_redirect(port, &[("error", denied.error.code())])
+        PendingKind::Device { browser_hash } => {
+            if !device::browser::matches(&headers, &browser_hash) {
+                audit::login_denied(Some(&login_id), DenyReason::BrowserMismatch);
+                return device::page::sign_in_failed();
+            }
+            let signed_in = sign_in(
+                &control,
+                entry,
+                params.code,
+                error_reported,
+                state,
+                device::DEVICE_KIND,
+            )
+            .await;
+            match signed_in {
+                Ok(signed_in) => device::approval::offer(
+                    &control,
+                    &signed_in.request,
+                    &signed_in.user,
+                    signed_in.now.secs,
+                ),
+                Err(denied) => {
+                    audit::login_denied(Some(&login_id), denied.reason);
+                    device::page::sign_in_failed()
+                }
+            }
         }
     }
+}
+
+struct SignedIn {
+    request: LoginRequest,
+    user: User,
+    now: Moment,
 }
 
 async fn approve(
@@ -172,6 +195,39 @@ async fn approve(
     provider_error: bool,
     state: &str,
 ) -> Result<String, Denial> {
+    let signed_in = sign_in(control, entry, code, provider_error, state, LOGIN_KIND).await?;
+    let SignedIn { request, user, now } = signed_in;
+    let completion = completion::issue().map_err(|_| {
+        tracing::error!(target: "jaunt::control", "the system entropy source failed");
+        internal()
+    })?;
+    let approved = control
+        .store
+        .login_requests()
+        .approve(&request.id, &user.id, Some(&completion.hash), now.secs)
+        .await
+        .map_err(|err| {
+            tracing::error!(target: "jaunt::control", error = %err, "approving the login request failed");
+            internal()
+        })?;
+    if !approved {
+        return Err(denial(
+            LoopbackError::InvalidRequest,
+            DenyReason::ApproveLost,
+        ));
+    }
+    audit::login_approved(&request.id, &user.id, &user.email, LOGIN_KIND);
+    Ok(completion.secret)
+}
+
+async fn sign_in(
+    control: &Control,
+    entry: PendingLogin,
+    code: Option<String>,
+    provider_error: bool,
+    state: &str,
+    expected_kind: &str,
+) -> Result<SignedIn, Denial> {
     let PendingLogin { auth, login_id, .. } = entry;
     if provider_error {
         return Err(denial(
@@ -202,7 +258,7 @@ async fn approve(
             return Err(internal());
         }
     };
-    if request.kind != LOGIN_KIND || request.state != LoginRequestState::Pending {
+    if request.kind != expected_kind || request.state != LoginRequestState::Pending {
         return Err(denial(
             LoopbackError::InvalidRequest,
             DenyReason::RequestNotPending,
@@ -242,23 +298,5 @@ async fn approve(
             tracing::error!(target: "jaunt::control", error = %err, "storing the user failed");
             internal()
         })?;
-    let completion = completion::issue().map_err(|_| {
-        tracing::error!(target: "jaunt::control", "the system entropy source failed");
-        internal()
-    })?;
-    let approved = requests
-        .approve(&login_id, &user.id, Some(&completion.hash), now.secs)
-        .await
-        .map_err(|err| {
-            tracing::error!(target: "jaunt::control", error = %err, "approving the login request failed");
-            internal()
-        })?;
-    if !approved {
-        return Err(denial(
-            LoopbackError::InvalidRequest,
-            DenyReason::ApproveLost,
-        ));
-    }
-    audit::login_approved(&login_id, &user.id, &user.email);
-    Ok(completion.secret)
+    Ok(SignedIn { request, user, now })
 }

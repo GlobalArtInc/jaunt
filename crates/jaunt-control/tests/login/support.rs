@@ -2,15 +2,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, Signer};
-use jaunt_control::{Clock, Control, ControlError, ControlParts};
+use jaunt_control::{Clock, Control, ControlError, ControlParts, DeviceSettings};
 use jaunt_store::Store;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -21,6 +24,8 @@ use crate::provider::{FakeProvider, Identity, form_pairs};
 
 pub const DEFAULT_CERT_TTL_SECS: u64 = 8 * 60 * 60;
 pub const LOGIN_TTL_SECS: u64 = 300;
+pub const PUBLIC_ORIGIN: &str = "https://jaunt.example";
+pub const DEFAULT_PEER: &str = "198.51.100.7:50000";
 pub const UNISSUED_CODE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[derive(Clone)]
@@ -60,6 +65,9 @@ pub struct Options {
     pub cert_ttl_secs: u64,
     pub pending_capacity: usize,
     pub authority: CaKind,
+    pub device_login: bool,
+    pub client_ip_header: Option<&'static str>,
+    pub public_origin: &'static str,
 }
 
 impl Default for Options {
@@ -68,6 +76,9 @@ impl Default for Options {
             cert_ttl_secs: DEFAULT_CERT_TTL_SECS,
             pending_capacity: 100,
             authority: CaKind::User,
+            device_login: true,
+            client_ip_header: None,
+            public_origin: PUBLIC_ORIGIN,
         }
     }
 }
@@ -94,6 +105,23 @@ impl Reply {
     pub fn location(&self) -> &str {
         assert_eq!(self.status, StatusCode::FOUND);
         self.header("location")
+    }
+
+    pub fn refresh_target(&self) -> String {
+        assert_eq!(self.status, StatusCode::OK, "{}", self.text());
+        assert!(self.headers.get("location").is_none());
+        self.header("refresh")
+            .strip_prefix("0; url=")
+            .unwrap()
+            .to_owned()
+    }
+
+    pub fn set_cookies(&self) -> Vec<String> {
+        self.headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect()
     }
 
     pub fn error_code(&self) -> String {
@@ -215,6 +243,11 @@ impl Harness {
             host_trust,
             cert_ttl: Duration::from_secs(options.cert_ttl_secs),
             pending_capacity: options.pending_capacity,
+            device: DeviceSettings {
+                enabled: options.device_login,
+                public_origin: options.public_origin.to_owned(),
+                client_ip_header: options.client_ip_header.map(str::to_owned),
+            },
             clock: clock.clock(),
         })?;
         Ok(Harness {
@@ -229,7 +262,15 @@ impl Harness {
         })
     }
 
-    pub async fn send(&self, request: Request<Body>) -> Reply {
+    pub async fn send(&self, mut request: Request<Body>) -> Reply {
+        if request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_none()
+        {
+            let peer: SocketAddr = DEFAULT_PEER.parse().unwrap();
+            request.extensions_mut().insert(ConnectInfo(peer));
+        }
         let response = self.router.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();

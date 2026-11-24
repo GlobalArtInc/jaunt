@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jaunt_control::DeviceSettings;
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use serde::Deserialize;
 use url::Url;
@@ -14,6 +15,7 @@ const DEFAULT_CERT_TTL_SECS: u64 = 28_800;
 const MIN_CERT_TTL_SECS: u64 = 60;
 const MAX_CERT_TTL_SECS: u64 = 86_400;
 const CALLBACK_PATH: &str = "/v1/login/callback";
+const MAX_HEADER_NAME_LEN: usize = 64;
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
@@ -26,6 +28,9 @@ pub struct Config {
     pub public_url: Option<String>,
     #[serde(default = "default_cert_ttl_secs")]
     pub cert_ttl_secs: u64,
+    #[serde(default = "default_device_login")]
+    pub device_login: bool,
+    pub client_ip_header: Option<String>,
     pub oidc: Option<OidcSection>,
 }
 
@@ -46,6 +51,7 @@ pub struct RunSettings {
     pub data_dir: PathBuf,
     pub listen: SocketAddr,
     pub cert_ttl: Duration,
+    pub device: DeviceSettings,
     pub oidc: OidcConfig,
 }
 
@@ -57,6 +63,8 @@ pub enum ConfigError {
     InvalidPublicUrl(&'static str),
     #[error("cert_ttl_secs must be between {MIN_CERT_TTL_SECS} and {MAX_CERT_TTL_SECS}")]
     CertTtlOutOfRange,
+    #[error("client_ip_header must be a header name of letters, digits and hyphens")]
+    InvalidClientIpHeader,
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -88,6 +96,10 @@ fn default_cert_ttl_secs() -> u64 {
     DEFAULT_CERT_TTL_SECS
 }
 
+fn default_device_login() -> bool {
+    true
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let options = serde_saphyr::options! { with_snippet: false };
@@ -102,6 +114,10 @@ impl Config {
         if !(MIN_CERT_TTL_SECS..=MAX_CERT_TTL_SECS).contains(&self.cert_ttl_secs) {
             return Err(ConfigError::CertTtlOutOfRange);
         }
+        let client_ip_header = self
+            .client_ip_header
+            .map(|name| validate_header_name(&name))
+            .transpose()?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -136,6 +152,11 @@ impl Config {
             data_dir: self.data_dir,
             listen: self.listen,
             cert_ttl: Duration::from_secs(self.cert_ttl_secs),
+            device: DeviceSettings {
+                enabled: self.device_login,
+                public_origin: origin,
+                client_ip_header,
+            },
             oidc,
         })
     }
@@ -166,6 +187,19 @@ fn validate_public_url(text: &str) -> Result<String, ConfigError> {
         return Err(invalid("must not contain a path"));
     }
     Ok(url.origin().ascii_serialization())
+}
+
+fn validate_header_name(text: &str) -> Result<String, ConfigError> {
+    let valid = !text.is_empty()
+        && text.len() <= MAX_HEADER_NAME_LEN
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if valid {
+        Ok(text.to_ascii_lowercase())
+    } else {
+        Err(ConfigError::InvalidClientIpHeader)
+    }
 }
 
 fn read_client_secret(
@@ -351,6 +385,61 @@ cert_ttl_secs: {SECRET}
                 matches!(
                     config.into_run_settings(&secret_env),
                     Err(ConfigError::InvalidPublicUrl(_))
+                ),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_login_is_on_by_default_and_can_be_switched_off() {
+        let defaults = parse("").into_run_settings(&secret_env).unwrap();
+        assert!(defaults.device.enabled);
+        assert_eq!(defaults.device.client_ip_header, None);
+        assert_eq!(defaults.device.public_origin, "https://jaunt.example.com");
+
+        let off = parse("device_login: false\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert!(!off.device.enabled);
+        let explicit_on = parse("device_login: true\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert!(explicit_on.device.enabled);
+    }
+
+    #[test]
+    fn the_client_ip_header_is_a_plain_header_name_and_is_lowercased() {
+        let accepted = [
+            ("x-forwarded-for", "x-forwarded-for"),
+            ("X-Real-IP", "x-real-ip"),
+            ("CF-Connecting-IP", "cf-connecting-ip"),
+        ];
+        for (given, normalised) in accepted {
+            let settings = parse(&format!("client_ip_header: {given}\n"))
+                .into_run_settings(&secret_env)
+                .unwrap();
+            assert_eq!(
+                settings.device.client_ip_header.as_deref(),
+                Some(normalised)
+            );
+        }
+        let too_long = "a".repeat(65);
+        let rejected = [
+            "",
+            "x forwarded",
+            "x_forwarded",
+            "x:forwarded",
+            "x-for\u{e9}",
+            too_long.as_str(),
+        ];
+        for given in rejected {
+            let mut config = parse("");
+            config.client_ip_header = Some(given.to_owned());
+            assert!(
+                matches!(
+                    config.into_run_settings(&secret_env),
+                    Err(ConfigError::InvalidClientIpHeader)
                 ),
                 "{given:?}"
             );

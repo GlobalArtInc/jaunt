@@ -12,11 +12,12 @@ fn assert_static_failure_page(reply: &Reply) {
     assert_eq!(reply.header("content-type"), "text/html; charset=utf-8");
     assert_eq!(
         reply.header("content-security-policy"),
-        "default-src 'none'; style-src 'unsafe-inline'"
+        "default-src 'none'; form-action 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'"
     );
+    assert_eq!(reply.header("x-frame-options"), "DENY");
     assert_eq!(reply.header("x-content-type-options"), "nosniff");
     assert_eq!(reply.header("cache-control"), "no-store");
-    assert_eq!(reply.header("referrer-policy"), "no-referrer");
+    assert_eq!(reply.header("referrer-policy"), "strict-origin");
     assert!(reply.text().contains("Sign-in failed"));
 }
 
@@ -95,7 +96,10 @@ async fn redirect_host_and_port_never_come_from_the_request() {
         .await;
     assert_eq!(
         denied.location(),
-        "http://127.0.0.1:41235/callback?error=access_denied"
+        format!(
+            "http://127.0.0.1:41235/callback?error=access_denied&login_id={}",
+            denied_session.login_id
+        )
     );
 }
 
@@ -135,7 +139,10 @@ async fn failures_with_a_known_login_redirect_with_a_generic_error_code() {
         let reply = harness.callback(&query).await;
         assert_eq!(
             reply.location(),
-            format!("http://127.0.0.1:41236/callback?error={expected}"),
+            format!(
+                "http://127.0.0.1:41236/callback?error={expected}&login_id={}",
+                session.login_id
+            ),
             "{name}"
         );
 
@@ -223,7 +230,10 @@ async fn a_code_replayed_under_another_login_is_refused() {
 
     assert_eq!(
         replay.location(),
-        "http://127.0.0.1:45123/callback?error=access_denied"
+        format!(
+            "http://127.0.0.1:45123/callback?error=access_denied&login_id={}",
+            second.login_id
+        )
     );
     let stored = harness
         .store
@@ -248,7 +258,10 @@ async fn callback_for_an_expired_login_request_is_refused() {
 
     assert_eq!(
         reply.location(),
-        "http://127.0.0.1:41237/callback?error=invalid_request"
+        format!(
+            "http://127.0.0.1:41237/callback?error=invalid_request&login_id={}",
+            session.login_id
+        )
     );
     let stored = harness
         .store
@@ -294,7 +307,10 @@ async fn a_login_that_expires_during_the_provider_exchange_is_not_approved() {
 
     assert_eq!(
         reply.location(),
-        "http://127.0.0.1:41238/callback?error=invalid_request"
+        format!(
+            "http://127.0.0.1:41238/callback?error=invalid_request&login_id={}",
+            session.login_id
+        )
     );
     let audit: Vec<(&str, Option<&str>)> = events
         .iter()

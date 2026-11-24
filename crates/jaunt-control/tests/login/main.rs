@@ -1,6 +1,14 @@
 mod audit;
 mod callback;
 mod control;
+mod device_audit;
+mod device_binding;
+mod device_codes;
+mod device_flow;
+mod device_origin;
+mod device_pages;
+mod device_serve;
+mod device_support;
 mod finish;
 mod headers;
 mod provider;

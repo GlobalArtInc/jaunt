@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
 
 use crate::clock::{Clock, Moment};
+use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
 use crate::http;
 use crate::pending::PendingLogins;
@@ -27,6 +29,7 @@ pub struct ControlParts {
     pub host_trust: TrustSet,
     pub cert_ttl: Duration,
     pub pending_capacity: usize,
+    pub device: DeviceSettings,
     pub clock: Clock,
 }
 
@@ -37,6 +40,7 @@ pub struct Inner {
     pub(crate) host_ca_keys: Vec<String>,
     pub(crate) cert_ttl: Duration,
     pub(crate) pending: PendingLogins,
+    pub(crate) device: DeviceState,
     clock: Clock,
 }
 
@@ -68,6 +72,7 @@ impl Control {
             .host_trust
             .to_authorized_lines()
             .map_err(ControlError::HostKeys)?;
+        let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
             Duration::from_secs(parts.cert_ttl.as_secs().min(MAX_USER_VALIDITY.as_secs()));
         Ok(Control {
@@ -78,6 +83,7 @@ impl Control {
                 host_ca_keys,
                 cert_ttl,
                 pending: PendingLogins::new(parts.pending_capacity),
+                device,
                 clock: parts.clock,
             }),
         })
@@ -89,7 +95,10 @@ impl Control {
 
     pub fn sweep_expired(&self) -> usize {
         match self.now() {
-            Some(now) => self.pending.sweep(now.secs),
+            Some(now) => {
+                self.device.sweep(now.secs);
+                self.pending.sweep(now.secs)
+            }
             None => 0,
         }
     }
@@ -113,9 +122,13 @@ impl Control {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ControlError> {
         let sweeper = tokio::spawn(sweep_forever(self.clone()));
-        let served = axum::serve(listener, self.router())
-            .with_graceful_shutdown(shutdown)
-            .await;
+        let served = axum::serve(
+            listener,
+            self.router()
+                .into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await;
         sweeper.abort();
         served.map_err(ControlError::Serve)
     }

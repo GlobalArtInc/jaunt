@@ -3,10 +3,16 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use jaunt_oidc::PendingAuth;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingKind {
+    Loopback { port: u16 },
+    Device { browser_hash: String },
+}
+
 pub(crate) struct PendingLogin {
     pub(crate) auth: PendingAuth,
     pub(crate) login_id: String,
-    pub(crate) redirect_port: u16,
+    pub(crate) kind: PendingKind,
     pub(crate) expires_at: i64,
 }
 
@@ -83,7 +89,7 @@ mod tests {
 
     use jaunt_oidc::{PendingAuth, Secret};
 
-    use super::{InsertError, PendingLogin, PendingLogins};
+    use super::{InsertError, PendingKind, PendingLogin, PendingLogins};
 
     fn entry(expires_at: i64) -> PendingLogin {
         PendingLogin {
@@ -95,7 +101,7 @@ mod tests {
                 created_at: SystemTime::UNIX_EPOCH,
             },
             login_id: "login".to_owned(),
-            redirect_port: 40000,
+            kind: PendingKind::Loopback { port: 40000 },
             expires_at,
         }
     }

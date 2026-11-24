@@ -89,6 +89,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         host_trust: authorities.host_trust,
         cert_ttl: settings.cert_ttl,
         pending_capacity: PENDING_CAPACITY,
+        device: settings.device,
         clock: system_clock(),
     })?;
 

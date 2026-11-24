@@ -9,6 +9,7 @@ use jaunt_proto::{FinishRequest, FinishResponse};
 use jaunt_store::{LoginRequestState, NewApiToken, NewCertificate};
 
 use crate::audit::{self, FinishReason};
+use crate::clock::Moment;
 use crate::completion;
 use crate::control::Control;
 use crate::http::{BodyFailure, error_response, json_body, json_response, server_error};
@@ -26,7 +27,7 @@ enum Outcome {
     ServerError,
 }
 
-struct Failure {
+pub(crate) struct Failure {
     outcome: Outcome,
     reason: FinishReason,
     login_id: Option<String>,
@@ -43,20 +44,20 @@ impl Failure {
         }
     }
 
-    fn grant(reason: FinishReason) -> Failure {
+    pub(crate) fn grant(reason: FinishReason) -> Failure {
         Failure::new(Outcome::InvalidGrant, reason)
     }
 
-    fn internal(reason: FinishReason) -> Failure {
+    pub(crate) fn internal(reason: FinishReason) -> Failure {
         Failure::new(Outcome::ServerError, reason)
     }
 
-    fn for_login(mut self, login_id: &str) -> Failure {
+    pub(crate) fn for_login(mut self, login_id: &str) -> Failure {
         self.login_id = Some(login_id.to_owned());
         self
     }
 
-    fn for_user(mut self, user_id: &str) -> Failure {
+    pub(crate) fn for_user(mut self, user_id: &str) -> Failure {
         self.user_id = Some(user_id.to_owned());
         self
     }
@@ -86,7 +87,7 @@ impl From<BodyFailure> for Failure {
     }
 }
 
-struct Issued {
+pub(crate) struct Issued {
     login_id: String,
     user_id: String,
     email: String,
@@ -108,41 +109,45 @@ pub(crate) async fn handle(
         Err(failure) => Err(Failure::from(failure)),
     };
     match outcome {
-        Ok(issued) => {
-            audit::cert_issued(
-                &issued.login_id,
-                &issued.user_id,
-                &issued.email,
-                issued.serial,
-            );
-            json_response(
-                StatusCode::OK,
-                &FinishResponse {
-                    certificate: issued.certificate,
-                    serial: issued.serial,
-                    key_id: issued.key_id,
-                    valid_after: issued.valid_after,
-                    valid_before: issued.valid_before,
-                    api_token: issued.api_token,
-                    token_expires_at: issued.valid_before,
-                    user_id: issued.user_id,
-                    email: issued.email,
-                    host_ca_keys: control.host_ca_keys.clone(),
-                },
-            )
-        }
-        Err(failure) => {
-            audit::finish_failed(
-                failure.login_id.as_deref(),
-                failure.user_id.as_deref(),
-                failure.reason,
-            );
-            failure.into_response()
-        }
+        Ok(issued) => success_response(&control, issued),
+        Err(failure) => failure_response(failure),
     }
 }
 
-fn parse_public_key(text: &str) -> Option<PublicKey> {
+pub(crate) fn success_response(control: &Control, issued: Issued) -> Response {
+    audit::cert_issued(
+        &issued.login_id,
+        &issued.user_id,
+        &issued.email,
+        issued.serial,
+    );
+    json_response(
+        StatusCode::OK,
+        &FinishResponse {
+            certificate: issued.certificate,
+            serial: issued.serial,
+            key_id: issued.key_id,
+            valid_after: issued.valid_after,
+            valid_before: issued.valid_before,
+            api_token: issued.api_token,
+            token_expires_at: issued.valid_before,
+            user_id: issued.user_id,
+            email: issued.email,
+            host_ca_keys: control.host_ca_keys.clone(),
+        },
+    )
+}
+
+pub(crate) fn failure_response(failure: Failure) -> Response {
+    audit::finish_failed(
+        failure.login_id.as_deref(),
+        failure.user_id.as_deref(),
+        failure.reason,
+    );
+    failure.into_response()
+}
+
+pub(crate) fn parse_public_key(text: &str) -> Option<PublicKey> {
     let text = text.trim_end_matches(['\r', '\n']);
     if text.len() > MAX_PUBLIC_KEY_LEN || text.chars().any(char::is_control) {
         return None;
@@ -154,7 +159,7 @@ fn parse_public_key(text: &str) -> Option<PublicKey> {
     Some(PublicKey::from(key.key_data().clone()))
 }
 
-fn canonical_login_id(text: &str) -> Option<String> {
+pub(crate) fn canonical_login_id(text: &str) -> Option<String> {
     let parsed = Uuid::parse_str(text).ok()?;
     let canonical = parsed.hyphenated().to_string();
     (canonical == text).then_some(canonical)
@@ -210,6 +215,17 @@ async fn issue(control: &Control, request: FinishRequest) -> Result<Issued, Fail
         Failure::internal(FinishReason::CorruptRecord).for_login(&login_id)
     })?;
 
+    redeem_and_issue(control, login_id, user_id, subject_key, now).await
+}
+
+pub(crate) async fn redeem_and_issue(
+    control: &Control,
+    login_id: String,
+    user_id: String,
+    subject_key: PublicKey,
+    now: Moment,
+) -> Result<Issued, Failure> {
+    let requests = control.store.login_requests();
     let failed = |failure: Failure| failure.for_login(&login_id).for_user(&user_id);
     let redeemed = requests
         .redeem(&login_id, now.secs)

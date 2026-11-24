@@ -11,17 +11,18 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
-use crate::{callback, finish, start, whoami};
+use crate::{callback, device, finish, start, whoami};
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
 
 pub(crate) fn router(control: Control) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/login/start", post(start::handle))
         .route("/v1/login/callback", get(callback::handle))
         .route("/v1/login/finish", post(finish::handle))
-        .route("/v1/whoami", get(whoami::handle))
+        .route("/v1/whoami", get(whoami::handle));
+    device::mount(routes, &control)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)
@@ -36,13 +37,12 @@ async fn response_headers(request: Request, next: Next) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("no-referrer"));
     response
 }
 
