@@ -1,7 +1,10 @@
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use super::error::InstallError;
 
@@ -11,6 +14,52 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, InstallError> {
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(InstallError::io("read", path)(source)),
     }
+}
+
+pub const MAX_MANAGED_FILE: u64 = 64 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegularFile {
+    pub content: Vec<u8>,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Existing {
+    Absent,
+    NotRegular,
+    Oversized,
+    Regular(RegularFile),
+}
+
+pub fn read_regular_no_follow(path: &Path) -> Result<Existing, InstallError> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Existing::Absent),
+        Err(Errno::LOOP) => return Ok(Existing::NotRegular),
+        Err(errno) => return Err(InstallError::io("open", path)(io::Error::from(errno))),
+    };
+    let file = File::from(fd);
+    let metadata = file.metadata().map_err(InstallError::io("stat", path))?;
+    if !metadata.is_file() {
+        return Ok(Existing::NotRegular);
+    }
+    let mut content = Vec::new();
+    file.take(MAX_MANAGED_FILE + 1)
+        .read_to_end(&mut content)
+        .map_err(InstallError::io("read", path))?;
+    if content.len() as u64 > MAX_MANAGED_FILE {
+        return Ok(Existing::Oversized);
+    }
+    Ok(Existing::Regular(RegularFile {
+        content,
+        mode: metadata.permissions().mode() & 0o7777,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }))
 }
 
 pub fn exists(path: &Path) -> Result<bool, InstallError> {
@@ -193,10 +242,13 @@ pub fn remove_dir_all(path: &Path) -> Result<(), InstallError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::super::testing::TempRoot;
-    use super::{create_empty_if_absent, ensure_dir, read_optional, remove_file, write_atomic};
+    use super::{
+        Existing, MAX_MANAGED_FILE, RegularFile, create_empty_if_absent, ensure_dir, read_optional,
+        read_regular_no_follow, remove_file, write_atomic,
+    };
 
     fn mode_of(path: &std::path::Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -263,6 +315,57 @@ mod tests {
         let mut created = Vec::new();
         assert!(ensure_dir(&path, 0o700, true, &mut created).is_err());
         assert_eq!(created, vec![root.path().join("a")]);
+    }
+
+    #[test]
+    fn reading_without_following_sees_only_small_regular_files() {
+        let root = TempRoot::new();
+        let file = root.path().join("file");
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let limit = usize::try_from(MAX_MANAGED_FILE).unwrap();
+        let largest = root.path().join("largest");
+        fs::write(&largest, vec![b'#'; limit]).unwrap();
+        let oversized = root.path().join("oversized");
+        fs::write(&oversized, vec![b'#'; limit + 1]).unwrap();
+        let fifo = root.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        let meta = fs::metadata(&file).unwrap();
+        let expected_file = Existing::Regular(RegularFile {
+            content: b"content".to_vec(),
+            mode: 0o640,
+            uid: meta.uid(),
+            gid: meta.gid(),
+        });
+        for (path, expected) in [
+            (root.path().join("missing"), "absent"),
+            (file.clone(), "regular"),
+            (link, "not regular"),
+            (root.path().to_path_buf(), "not regular"),
+            (fifo, "not regular"),
+            (largest.clone(), "regular"),
+            (oversized, "oversized"),
+        ] {
+            let found = read_regular_no_follow(&path).unwrap();
+            assert_eq!(expected_file_kind(&found), expected, "{path:?}");
+        }
+        assert_eq!(read_regular_no_follow(&file).unwrap(), expected_file);
+    }
+
+    fn expected_file_kind(existing: &Existing) -> &'static str {
+        match existing {
+            Existing::Absent => "absent",
+            Existing::NotRegular => "not regular",
+            Existing::Oversized => "oversized",
+            Existing::Regular(_) => "regular",
+        }
     }
 
     #[test]

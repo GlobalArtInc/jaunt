@@ -3,16 +3,16 @@ use std::path::PathBuf;
 
 use super::account::{self, Inspection};
 use super::args::InstallOptions;
-use super::env::{DirSpec, Env, Ledger, Written, require_root};
+use super::env::{DirSpec, Env, Ledger, Replaced, Written, require_root};
 use super::error::{
     ConfigTestOutcome, DROPIN_AND_UNIT_REMAIN, DROPIN_REMAINS, InstallError, RollbackOutcome,
 };
-use super::files;
+use super::files::{self, Existing, RegularFile};
 use super::layout::{
     CONFIG_DIR, DROPIN_DIR, DROPIN_PATH, INNER_CA_FILE, SERVICE_NAME, SSHD_CONFIG, UNIT_DIR,
     UNIT_PATH, inner_ca_path,
 };
-use super::render::{self, is_foreign_dropin};
+use super::render::{self, is_foreign};
 use super::runner::{Output, RunnerError, excerpt};
 use super::scan::find_user_ca_directives;
 use super::service;
@@ -47,6 +47,7 @@ fn stage_changes(
     ledger.preexisting_group_gid = inspection.group_gid.clone();
     account::ensure(env, &opts.user, &opts.state_dir, inspection, ledger)?;
     prepare_directories(env, opts, ledger)?;
+    write_agent_config(env, opts, ledger)?;
     install_dropin(env, sshd, opts, ledger)
 }
 
@@ -71,7 +72,7 @@ fn handle_stage_failure(
         undo(env, opts, ledger);
     } else if !matches!(error, InstallError::AfterCommit { .. }) {
         env.report.warn(
-            "not cleaning up: the drop-in could not be rolled back, so the account, the state directory and inner-ca.pub stay in place for it",
+            "not cleaning up: the drop-in could not be rolled back, so the account, the state directory, inner-ca.pub and the agent configuration stay in place for it",
         );
     }
     error
@@ -127,12 +128,13 @@ fn preflight(
     }
 
     if let Some(existing) = files::read_optional(&env.layout.path(DROPIN_PATH))?
-        && is_foreign_dropin(&existing)
+        && is_foreign(&existing)
     {
         return Err(InstallError::ForeignDropin {
             path: DROPIN_PATH.to_string(),
         });
     }
+    check_config_replaceable(env, &opts.config)?;
     if let Some(finding) = find_user_ca_directives(env.layout)?.into_iter().next() {
         return Err(InstallError::UserCaDirective {
             file: finding.file,
@@ -232,6 +234,103 @@ fn warn_about_selinux(env: &mut Env<'_>) {
         Err(error) => env
             .report
             .warn(format!("could not determine the SELinux mode: {error}")),
+    }
+}
+
+const CONFIG_MODE: u32 = 0o644;
+
+fn check_config_replaceable(env: &Env<'_>, config: &str) -> Result<(), InstallError> {
+    existing_config(env, config).map(|_| ())
+}
+
+fn existing_config(env: &Env<'_>, config: &str) -> Result<Option<RegularFile>, InstallError> {
+    let refuse = |reason: &'static str| InstallError::ForeignConfig {
+        path: config.to_string(),
+        reason,
+    };
+    match files::read_regular_no_follow(&env.layout.path(config))? {
+        Existing::Absent => Ok(None),
+        Existing::NotRegular => Err(refuse("it is a symbolic link or not a regular file")),
+        Existing::Oversized => Err(refuse(
+            "it is larger than 64 KiB, so it is not a configuration written by jaunt-agent",
+        )),
+        Existing::Regular(file) if is_foreign(&file.content) => Err(refuse(
+            "it already exists and was not written by jaunt-agent (it does not start with the line `# Managed by jaunt-agent. Do not edit.`)",
+        )),
+        Existing::Regular(file) => Ok(Some(file)),
+    }
+}
+
+fn config_parent(config: &str) -> &str {
+    match config.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent,
+        _ => "/",
+    }
+}
+
+fn write_agent_config(
+    env: &mut Env<'_>,
+    opts: &InstallOptions,
+    ledger: &mut Ledger,
+) -> Result<(), InstallError> {
+    let config = opts.config.as_str();
+    let parent = config_parent(config);
+    if parent != CONFIG_DIR {
+        env.ensure_dir(
+            parent,
+            &DirSpec {
+                mode: 0o755,
+                owner: None,
+                enforce: false,
+            },
+            ledger,
+        )?;
+    }
+    let content = render::agent_config(&opts.state_dir);
+    let previous = existing_config(env, config)?;
+    let same_content = previous
+        .as_ref()
+        .is_some_and(|file| file.content == content.as_bytes());
+    let settled = previous.as_ref().is_some_and(|file| {
+        file.mode == CONFIG_MODE && (!env.live || (file.uid == 0 && file.gid == 0))
+    });
+    if same_content && settled {
+        env.report.info(format!("unchanged: {config}"));
+        return Ok(());
+    }
+    if env.dry_run {
+        if same_content {
+            env.report.plan(format!(
+                "fix permissions of {config} (mode {CONFIG_MODE:04o}, owner root:root)"
+            ));
+        } else {
+            env.report
+                .plan(format!("write {config} (mode {CONFIG_MODE:04o})"));
+            env.report.plan_block(&content);
+        }
+        return Ok(());
+    }
+    let path = env.layout.path(config);
+    let sync_error = files::write_atomic(&path, content.as_bytes(), CONFIG_MODE)?;
+    match previous {
+        None => ledger.files.push(path),
+        Some(file) => ledger.replaced.push(Replaced {
+            path,
+            content: file.content,
+            mode: file.mode,
+        }),
+    }
+    if same_content {
+        env.report.info(format!(
+            "fixed permissions: {config} (mode {CONFIG_MODE:04o}, owner root:root)"
+        ));
+    } else {
+        env.report
+            .info(format!("wrote: {config} (mode {CONFIG_MODE:04o})"));
+    }
+    match sync_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -394,6 +493,19 @@ fn undo(env: &mut Env<'_>, opts: &InstallOptions, ledger: &Ledger) {
             account::run_or_warn(env, "chown", &[&owner, &path]);
         }
     }
+    for replaced in ledger.replaced.iter().rev() {
+        match files::write_atomic(&replaced.path, &replaced.content, replaced.mode) {
+            Ok(None) => {}
+            Ok(Some(error)) => env.report.warn(format!(
+                "restored {} but could not sync its directory: {error}",
+                replaced.path.display()
+            )),
+            Err(error) => env.report.warn(format!(
+                "could not restore the previous {}: {error}",
+                replaced.path.display()
+            )),
+        }
+    }
     for file in ledger.files.iter().rev() {
         match files::remove_file(file) {
             Ok(_) => {}
@@ -472,10 +584,12 @@ mod tests {
     use super::super::render;
     use super::super::report::Level;
     use super::super::sshd::{LOOPBACK_DEPLOY_SPEC, PROBES, Sshd};
-    use super::super::testing::{FakeConfig, Harness, options};
+    use super::super::testing::{FakeConfig, Harness, Setup, options, symlink_to_managed_config};
     use super::{finish_dropin, handle_stage_failure, install, should_undo};
+    use crate::run::config;
 
     const CA: &str = "/var/lib/jaunt/inner-ca.pub";
+    const CONFIG: &str = "/etc/jaunt/agent.yaml";
 
     fn run(harness: &mut Harness, opts: &InstallOptions) -> Result<(), InstallError> {
         let mut env = harness.env();
@@ -520,8 +634,14 @@ mod tests {
                 "ExecStart=/usr/local/bin/jaunt-agent run --config /etc/jaunt/agent.yaml\n"
             )
         );
+        assert!(unit.contains("\nLimitCORE=0\nMemorySwapMax=0\n"));
+        assert_eq!(
+            harness.root.read(CONFIG).unwrap(),
+            "# Managed by jaunt-agent. Do not edit.\nstate_dir: /var/lib/jaunt\nlog_level: info\n"
+        );
         assert_eq!(mode(&harness, DROPIN_PATH), 0o644);
         assert_eq!(mode(&harness, UNIT_PATH), 0o644);
+        assert_eq!(mode(&harness, CONFIG), 0o644);
         assert_eq!(mode(&harness, "/etc/jaunt"), 0o755);
         assert_eq!(mode(&harness, "/var/lib/jaunt"), 0o700);
         assert_eq!(mode(&harness, "/var/lib/jaunt/inner-ca.pub"), 0o644);
@@ -592,6 +712,11 @@ mod tests {
             Level::Info,
             "unchanged: /etc/systemd/system/jaunt-agent.service"
         ));
+        assert!(
+            harness
+                .report
+                .contains(Level::Info, "unchanged: /etc/jaunt/agent.yaml")
+        );
     }
 
     #[test]
@@ -600,10 +725,12 @@ mod tests {
         run(&mut harness, &options()).unwrap();
         chmod(&harness, DROPIN_PATH, 0o600);
         chmod(&harness, UNIT_PATH, 0o666);
+        chmod(&harness, CONFIG, 0o600);
         harness.report = Default::default();
         run(&mut harness, &options()).unwrap();
         assert_eq!(mode(&harness, DROPIN_PATH), 0o644);
         assert_eq!(mode(&harness, UNIT_PATH), 0o644);
+        assert_eq!(mode(&harness, CONFIG), 0o644);
         assert!(harness.report.contains(
             Level::Info,
             "fixed permissions: /etc/ssh/sshd_config.d/50-jaunt.conf"
@@ -630,12 +757,52 @@ mod tests {
             .calls()
             .contains(&format!("chown root:root {DROPIN_PATH}"));
         assert_eq!(chowned, not_root);
+        assert!(!has_call(&harness, &format!("chown root:root {CONFIG}")));
+        assert_eq!(
+            harness
+                .report
+                .contains(Level::Info, "fixed permissions: /etc/jaunt/agent.yaml"),
+            not_root
+        );
+    }
+
+    #[test]
+    fn a_config_with_the_right_content_but_a_wrong_mode_is_rewritten_and_restored_on_failure() {
+        let mut harness = Harness::new(FakeConfig {
+            sshd_t_rejects_trust_line: true,
+            ..FakeConfig::default()
+        });
+        harness
+            .root
+            .write(CONFIG, &render::agent_config("/var/lib/jaunt"));
+        chmod(&harness, CONFIG, 0o600);
+        run(&mut harness, &options()).unwrap_err();
+        assert_eq!(mode(&harness, CONFIG), 0o600);
+        assert!(
+            harness
+                .report
+                .contains(Level::Info, "fixed permissions: /etc/jaunt/agent.yaml")
+        );
+    }
+
+    #[test]
+    fn a_custom_config_in_an_existing_directory_leaves_its_mode_alone() {
+        let mut harness = Harness::new(FakeConfig::default());
+        fs::create_dir_all(harness.root.path_of("/opt/jaunt")).unwrap();
+        chmod(&harness, "/opt/jaunt", 0o750);
+        let opts = InstallOptions {
+            config: "/opt/jaunt/agent.yaml".to_string(),
+            ..options()
+        };
+        run(&mut harness, &opts).unwrap();
+        assert_eq!(mode(&harness, "/opt/jaunt"), 0o750);
+        assert_eq!(mode(&harness, "/opt/jaunt/agent.yaml"), 0o644);
     }
 
     #[test]
     fn existing_etc_jaunt_keeps_its_mode_and_an_existing_state_dir_is_tightened() {
         let mut harness = Harness::new(FakeConfig::default());
-        harness.root.write("/etc/jaunt/agent.yaml", "x: 1\n");
+        harness.root.write("/etc/jaunt/other.yaml", "x: 1\n");
         chmod(&harness, "/etc/jaunt", 0o750);
         harness
             .root
@@ -791,7 +958,7 @@ mod tests {
             sshd_t_rejects_trust_line: true,
             ..FakeConfig::default()
         });
-        let previous = format!("{}\n# previous\n", render::DROPIN_HEADER);
+        let previous = format!("{}\n# previous\n", render::MANAGED_HEADER);
         harness.root.write(DROPIN_PATH, &previous);
         chmod(&harness, DROPIN_PATH, 0o600);
         let error = run(&mut harness, &options()).unwrap_err();
@@ -830,6 +997,122 @@ mod tests {
                 render::dropin("/var/lib/jaunt")
             );
         }
+    }
+
+    #[test]
+    fn a_custom_state_dir_reaches_the_agent_through_the_config_file() {
+        let mut harness = Harness::new(FakeConfig::default());
+        let opts = InstallOptions {
+            state_dir: "/srv/jaunt/state".to_string(),
+            ..options()
+        };
+        run(&mut harness, &opts).unwrap();
+        let loaded = config::load(&harness.root.path_of(CONFIG)).unwrap();
+        assert_eq!(loaded.state_dir, Some(PathBuf::from("/srv/jaunt/state")));
+        assert_eq!(loaded.log_level.as_deref(), Some("info"));
+    }
+
+    #[test]
+    fn foreign_config_is_refused_before_any_change_and_left_intact() {
+        let setups: [(Setup, &str); 4] = [
+            (
+                |harness| harness.root.write(CONFIG, "state_dir: /srv/mine/state\n"),
+                "was not written by jaunt-agent",
+            ),
+            (
+                |harness| {
+                    let big = render::agent_config("/var/lib/jaunt") + &"#".repeat(64 * 1024);
+                    harness.root.write(CONFIG, &big);
+                },
+                "larger than 64 KiB",
+            ),
+            (
+                |harness| symlink_to_managed_config(&harness.root, CONFIG),
+                "symbolic link or not a regular file",
+            ),
+            (
+                |harness| fs::create_dir_all(harness.root.path_of(CONFIG)).unwrap(),
+                "symbolic link or not a regular file",
+            ),
+        ];
+        for (setup, reason) in setups {
+            let mut harness = Harness::new(FakeConfig::default());
+            harness.live = true;
+            setup(&harness);
+            let before = harness.root.snapshot();
+            let error = run(&mut harness, &options()).unwrap_err();
+            assert!(
+                matches!(error, InstallError::ForeignConfig { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains(reason), "{error}");
+            assert!(error.to_string().contains(CONFIG), "{error}");
+            assert_eq!(harness.root.snapshot(), before);
+            for mutating in ["groupadd", "useradd", "chown", "systemctl"] {
+                assert!(!has_call(&harness, mutating), "{mutating}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_config_and_an_own_one_for_another_state_dir_are_rewritten() {
+        for existing in ["", render::agent_config("/srv/old/state").as_str()] {
+            let mut harness = Harness::new(FakeConfig::default());
+            harness.root.write(CONFIG, existing);
+            run(&mut harness, &options()).unwrap();
+            assert_eq!(
+                harness.root.read(CONFIG).unwrap(),
+                render::agent_config("/var/lib/jaunt")
+            );
+            assert!(
+                harness
+                    .report
+                    .contains(Level::Info, "wrote: /etc/jaunt/agent.yaml (mode 0644)")
+            );
+        }
+    }
+
+    #[test]
+    fn failed_validation_restores_the_previous_config_with_its_mode() {
+        let mut harness = Harness::new(FakeConfig {
+            sshd_t_rejects_trust_line: true,
+            ..FakeConfig::default()
+        });
+        let previous = render::agent_config("/srv/old/state");
+        harness.root.write(CONFIG, &previous);
+        chmod(&harness, CONFIG, 0o600);
+        run(&mut harness, &options()).unwrap_err();
+        assert_eq!(harness.root.read(CONFIG).unwrap(), previous);
+        assert_eq!(mode(&harness, CONFIG), 0o600);
+    }
+
+    #[test]
+    fn a_config_in_a_custom_directory_is_written_there_and_removed_with_it_on_failure() {
+        let opts = InstallOptions {
+            config: "/opt/jaunt/conf/agent.yaml".to_string(),
+            ..options()
+        };
+        let mut harness = Harness::new(FakeConfig::default());
+        run(&mut harness, &opts).unwrap();
+        assert_eq!(
+            harness.root.read("/opt/jaunt/conf/agent.yaml").unwrap(),
+            render::agent_config("/var/lib/jaunt")
+        );
+        assert!(
+            harness
+                .root
+                .read(UNIT_PATH)
+                .unwrap()
+                .contains("run --config /opt/jaunt/conf/agent.yaml\n")
+        );
+
+        let mut harness = Harness::new(FakeConfig {
+            sshd_t_rejects_trust_line: true,
+            ..FakeConfig::default()
+        });
+        let before = harness.root.snapshot();
+        run(&mut harness, &opts).unwrap_err();
+        assert_eq!(harness.root.snapshot(), before);
     }
 
     #[test]
@@ -1108,6 +1391,11 @@ mod tests {
             Level::Info,
             "plan: write /etc/ssh/sshd_config.d/50-jaunt.conf"
         ));
+        assert!(
+            harness
+                .report
+                .contains(Level::Info, "plan: write /etc/jaunt/agent.yaml (mode 0644)")
+        );
         assert!(harness.report.contains(Level::Info, "plan: run useradd"));
         assert!(
             harness

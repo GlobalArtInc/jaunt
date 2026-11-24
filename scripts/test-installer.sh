@@ -7,6 +7,9 @@ STATE_DIR=/var/lib/jaunt
 CA_FILE=$STATE_DIR/inner-ca.pub
 DROPIN=/etc/ssh/sshd_config.d/50-jaunt.conf
 UNIT=/etc/systemd/system/jaunt-agent.service
+CONFIG=/etc/jaunt/agent.yaml
+HEADER='# Managed by jaunt-agent. Do not edit.'
+CUSTOM_STATE_DIR=/opt/jaunt-custom/state
 FOREIGN_CA=/etc/ssh/foreign-ca.pub
 FOREIGN_DROPIN=/etc/ssh/sshd_config.d/10-foreign-ca.conf
 SPECS=(
@@ -37,7 +40,14 @@ run_agent() {
   last_output=$("$AGENT" "$@" 2>&1) || last_status=$?
 }
 
+run_agent_as_jaunt() {
+  last_status=0
+  last_output=$(runuser -u jaunt -- "$AGENT" "$@" 2>&1) || last_status=$?
+}
+
 output_has() { grep -qF -- "$1" <<<"$last_output"; }
+first_line_is() { [ "$(head -n 1 "$2")" = "$1" ]; }
+managed_checksums() { sha256sum "$DROPIN" "$UNIT" "$CONFIG"; }
 status_is_zero() { [ "$last_status" -eq 0 ]; }
 status_is_nonzero() { [ "$last_status" -ne 0 ]; }
 absent() { [ ! -e "$1" ]; }
@@ -275,6 +285,26 @@ test_foreign_dropin_is_refused_and_kept() {
   rm -f "$DROPIN"
 }
 
+test_foreign_config_is_refused_and_kept() {
+  mkdir -p /etc/jaunt
+  printf 'state_dir: /srv/mine/state\n' >"$CONFIG"
+  local before
+  before=$(manifest)
+  run_agent install --no-service
+  check "foreign agent.yaml: install fails" status_is_nonzero
+  check "foreign agent.yaml: message says it was not written by jaunt-agent" output_has "was not written by jaunt-agent"
+  check "foreign agent.yaml: message names the file" output_has "$CONFIG"
+  check "foreign agent.yaml: file left intact and nothing else changed" same_text "$(manifest)" "$before"
+  check "foreign agent.yaml: no user was created" user_absent
+  check "foreign agent.yaml: no state directory" absent "$STATE_DIR"
+  check "foreign agent.yaml: no drop-in" absent "$DROPIN"
+  run_agent uninstall --no-service
+  check "foreign agent.yaml: uninstall exits zero" status_is_zero
+  check "foreign agent.yaml: uninstall warns that it keeps the file" output_has "not removing $CONFIG"
+  check "foreign agent.yaml: uninstall leaves the file intact" same_text "$(manifest)" "$before"
+  rm -rf /etc/jaunt
+}
+
 break_sshd_t() {
   mv "$SSHD" "$SSHD.real"
   cat >"$SSHD" <<'WRAPPER'
@@ -346,6 +376,18 @@ test_install() {
   check "install: unit has NoNewPrivileges=yes" has_line "NoNewPrivileges=yes" "$UNIT"
   check "install: unit has ProtectSystem=strict" has_line "ProtectSystem=strict" "$UNIT"
   check "install: unit is 0644 root:root" mode_is 644 "$UNIT"
+  check "install: unit has LimitCORE=0" has_line "LimitCORE=0" "$UNIT"
+  check "install: unit has MemorySwapMax=0" has_line "MemorySwapMax=0" "$UNIT"
+  check "install: unit runs the agent with the config file" has_line "ExecStart=$AGENT run --config $CONFIG" "$UNIT"
+  check "install: agent config exists" present "$CONFIG"
+  check "install: agent config is 0644" mode_is 644 "$CONFIG"
+  check "install: agent config owner is root" owner_is root:root "$CONFIG"
+  check "install: agent config starts with the header" first_line_is "$HEADER" "$CONFIG"
+  check "install: agent config has the state directory" has_line "state_dir: $STATE_DIR" "$CONFIG"
+  check "install: agent config has the log level" has_line "log_level: info" "$CONFIG"
+  run_agent_as_jaunt run --config "$CONFIG"
+  check "install: run --config as user jaunt exits non-zero" status_is_nonzero
+  check "install: run --config as user jaunt reports the state directory as not enrolled" output_has "$STATE_DIR holds no enrollment"
   check "install: /etc/jaunt is 0755 root:root" mode_is 755 /etc/jaunt
   check "install: state directory is 0700 jaunt:jaunt" mode_is 700 "$STATE_DIR"
   check "install: state directory owner is jaunt" owner_is jaunt:jaunt "$STATE_DIR"
@@ -368,12 +410,14 @@ test_install() {
 
 test_second_install_changes_nothing() {
   cp /tmp/test-ca.pub "$CA_FILE"
-  local before after
+  local before after managed_before
   before=$(manifest)
+  managed_before=$(managed_checksums)
   run_agent install --no-service
   after=$(manifest)
   check "second install: exits zero" status_is_zero
   check "second install: checksums, modes and owners are unchanged" same_text "$after" "$before"
+  check "second install: drop-in, unit and agent config checksums are unchanged" same_text "$(managed_checksums)" "$managed_before"
   check "second install: inner-ca.pub keeps its content" same_file /tmp/test-ca.pub "$CA_FILE"
   check "second install: sshd -T -C loopback still trusts the inner CA" is_trusted "${SPECS[0]}"
 }
@@ -431,6 +475,8 @@ test_uninstall() {
   check "uninstall: exits zero" status_is_zero
   check "uninstall: drop-in removed" absent "$DROPIN"
   check "uninstall: unit removed" absent "$UNIT"
+  check "uninstall: agent config removed" absent "$CONFIG"
+  check "uninstall: /etc/jaunt kept" present /etc/jaunt
   check "uninstall: sshd -t passes" sshd_config_valid
   check "uninstall: state directory kept" present "$STATE_DIR"
   check "uninstall: user kept" user_present
@@ -454,6 +500,44 @@ test_purge_keeps_a_human_account() {
   userdel -r jaunt >/dev/null 2>&1 || true
 }
 
+test_custom_state_dir_reaches_run() {
+  run_agent install --no-service --state-dir "$CUSTOM_STATE_DIR"
+  if ! status_is_zero; then printf '%s\n' "$last_output"; fi
+  check "custom state dir: install exits zero" status_is_zero
+  check "custom state dir: agent config has the custom state directory" has_line "state_dir: $CUSTOM_STATE_DIR" "$CONFIG"
+  check "custom state dir: state directory owner is jaunt" owner_is jaunt:jaunt "$CUSTOM_STATE_DIR"
+  run_agent_as_jaunt run --config "$CONFIG"
+  check "custom state dir: run --config as user jaunt exits non-zero" status_is_nonzero
+  check "custom state dir: run --config as user jaunt uses the state directory from the config" output_has "$CUSTOM_STATE_DIR holds no enrollment"
+  run_agent uninstall --purge --no-service
+  check "custom state dir: uninstall --purge exits zero" status_is_zero
+  check "custom state dir: agent config removed" absent "$CONFIG"
+  check "custom state dir: state directory removed" absent "$CUSTOM_STATE_DIR"
+  check "custom state dir: user removed" user_absent
+  check "custom state dir: effective sshd configuration equals the original" same_text "$(effective_dump)" "$baseline"
+  rmdir /opt/jaunt-custom
+}
+
+test_custom_config_is_removed_only_with_the_same_flag() {
+  local custom=/opt/jaunt-conf/agent.yaml
+  run_agent install --no-service --config "$custom"
+  if ! status_is_zero; then printf '%s\n' "$last_output"; fi
+  check "custom config: install exits zero" status_is_zero
+  check "custom config: written at the custom path" first_line_is "$HEADER" "$custom"
+  check "custom config: nothing at the default path" absent "$CONFIG"
+  check "custom config: unit runs the agent with the custom config" has_line "ExecStart=$AGENT run --config $custom" "$UNIT"
+  run_agent uninstall --no-service
+  check "custom config: uninstall without --config exits zero" status_is_zero
+  check "custom config: uninstall without --config warns nothing is at the default path" output_has "no agent configuration was found at $CONFIG"
+  check "custom config: uninstall without --config leaves the custom file" present "$custom"
+  run_agent uninstall --purge --no-service --config "$custom"
+  check "custom config: uninstall --config exits zero" status_is_zero
+  check "custom config: uninstall --config removes the custom file" absent "$custom"
+  check "custom config: user removed by the purge" user_absent
+  check "custom config: effective sshd configuration equals the original" same_text "$(effective_dump)" "$baseline"
+  rmdir /opt/jaunt-conf
+}
+
 inside() {
   prepare_image
   baseline=$(effective_dump)
@@ -463,6 +547,7 @@ inside() {
   test_human_account_named_jaunt_blocks_install
   test_symlinked_state_dir_is_refused
   test_foreign_dropin_is_refused_and_kept
+  test_foreign_config_is_refused_and_kept
   test_dry_run
   test_preexisting_user_ca_is_refused_before_any_change
   test_failed_install_keeps_a_preexisting_group
@@ -472,6 +557,8 @@ inside() {
   test_real_login_is_trusted_only_from_loopback
   test_uninstall
   test_purge_keeps_a_human_account
+  test_custom_state_dir_reaches_run
+  test_custom_config_is_removed_only_with_the_same_flag
   if [ "$failures" -ne 0 ]; then
     printf 'RESULT [%s]: %d assertion(s) failed\n' "$label" "$failures"
     exit 1

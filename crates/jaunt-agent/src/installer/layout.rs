@@ -8,6 +8,7 @@ pub const DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/50-jaunt.conf";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const UNIT_PATH: &str = "/etc/systemd/system/jaunt-agent.service";
 pub const CONFIG_DIR: &str = "/etc/jaunt";
+pub const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/jaunt";
 pub const INNER_CA_FILE: &str = "inner-ca.pub";
 pub const DEFAULT_SSHD: &str = "/usr/sbin/sshd";

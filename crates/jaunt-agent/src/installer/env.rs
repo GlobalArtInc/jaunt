@@ -36,10 +36,18 @@ pub struct Adopted {
     pub gid: u32,
 }
 
+#[derive(Debug)]
+pub struct Replaced {
+    pub path: PathBuf,
+    pub content: Vec<u8>,
+    pub mode: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Ledger {
     pub dirs: Vec<PathBuf>,
     pub files: Vec<PathBuf>,
+    pub replaced: Vec<Replaced>,
     pub adopted: Vec<Adopted>,
     pub group: bool,
     pub user: bool,
@@ -50,6 +58,7 @@ impl Ledger {
     pub fn is_empty(&self) -> bool {
         self.dirs.is_empty()
             && self.files.is_empty()
+            && self.replaced.is_empty()
             && self.adopted.is_empty()
             && !self.group
             && !self.user

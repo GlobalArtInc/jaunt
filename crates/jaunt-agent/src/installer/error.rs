@@ -44,6 +44,10 @@ pub enum InstallError {
     )]
     ForeignDropin { path: String },
     #[error(
+        "refusing to write the agent configuration {path}: {reason}; move it away or remove it and run install again (nothing was changed)"
+    )]
+    ForeignConfig { path: String, reason: &'static str },
+    #[error(
         "{file}:{line}: `TrustedUserCAKeys {value}` makes sshd trust a user CA; Jaunt requires that sshd trusts no user CA for outside connections. Remove or comment out that directive and run install again (nothing was changed)"
     )]
     UserCaDirective {

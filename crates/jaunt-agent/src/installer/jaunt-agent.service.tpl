@@ -33,6 +33,8 @@ AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077
+LimitCORE=0
+MemorySwapMax=0
 
 [Install]
 WantedBy=multi-user.target

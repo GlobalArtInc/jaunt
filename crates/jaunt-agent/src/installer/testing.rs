@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::args::InstallOptions;
 use super::env::Env;
 use super::layout::{Layout, SSHD_CONFIG};
+use super::render::agent_config;
 use super::report::Report;
 use super::runner::{Output, Runner, RunnerError, command_line};
 
@@ -407,6 +408,15 @@ impl Harness {
             .map(|call| call.replace(&prefix, ""))
             .collect()
     }
+}
+
+pub type Setup = fn(&Harness);
+
+pub fn symlink_to_managed_config(root: &TempRoot, config: &str) {
+    root.write("/srv/elsewhere.yaml", &agent_config("/srv/jaunt/state"));
+    let link = root.path_of(config);
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(root.path_of("/srv/elsewhere.yaml"), link).unwrap();
 }
 
 pub fn options() -> InstallOptions {

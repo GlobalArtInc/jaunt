@@ -4,9 +4,9 @@ use super::account;
 use super::args::UninstallOptions;
 use super::env::{Env, require_root};
 use super::error::InstallError;
-use super::files;
+use super::files::{self, Existing};
 use super::layout::{DROPIN_PATH, INNER_CA_FILE, SYSTEM_USER, UNIT_PATH};
-use super::render::{DROPIN_HEADER, is_foreign_dropin};
+use super::render::{MANAGED_HEADER, carries_header, is_foreign};
 use super::runner::excerpt;
 use super::service;
 use super::sshd::{Sshd, split_keyword};
@@ -16,18 +16,25 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
     require_root(env)?;
     let unit_present = files::exists(&env.layout.path(UNIT_PATH))?;
     let dropin = files::read_optional(&env.layout.path(DROPIN_PATH))?;
-    let foreign = dropin.as_deref().is_some_and(is_foreign_dropin);
-    let ours = dropin.as_deref().filter(|bytes| !is_foreign_dropin(bytes));
+    let foreign = dropin.as_deref().is_some_and(is_foreign);
+    let ours = dropin.as_deref().filter(|bytes| !is_foreign(bytes));
     if foreign {
         env.report.warn(format!(
-            "not removing {DROPIN_PATH}: it was not written by jaunt-agent (it does not start with the line `{DROPIN_HEADER}`)"
+            "not removing {DROPIN_PATH}: it was not written by jaunt-agent (it does not start with the line `{MANAGED_HEADER}`)"
         ));
     }
-    if !unit_present && ours.is_none() && !opts.purge {
-        if !foreign {
+    let config = config_state(env, &opts.config)?;
+    if !unit_present && ours.is_none() && config != ConfigState::Managed && !opts.purge {
+        if !foreign && config == ConfigState::Absent {
             env.report.info("nothing to uninstall");
         }
         return Ok(());
+    }
+    if config == ConfigState::Absent && (unit_present || ours.is_some()) {
+        env.report.warn(format!(
+            "no agent configuration was found at {}; if install was given another --config, run uninstall again with the same --config to remove it",
+            opts.config
+        ));
     }
 
     let sshd = locate_sshd(env, ours.is_some())?;
@@ -47,6 +54,9 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
         }
         env.remove_file(UNIT_PATH)?;
     }
+    if config == ConfigState::Managed && config_state(env, &opts.config)? == ConfigState::Managed {
+        env.remove_file(&opts.config)?;
+    }
     if ours.is_some() {
         env.remove_file(DROPIN_PATH)?;
         if let Some(sshd) = &sshd {
@@ -65,6 +75,38 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
         account::remove(env, SYSTEM_USER, &state_dir)?;
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigState {
+    Absent,
+    Managed,
+    Kept,
+}
+
+fn config_state(env: &mut Env<'_>, config: &str) -> Result<ConfigState, InstallError> {
+    match files::read_regular_no_follow(&env.layout.path(config))? {
+        Existing::Absent => Ok(ConfigState::Absent),
+        Existing::Regular(file) if carries_header(&file.content) => Ok(ConfigState::Managed),
+        Existing::Regular(_) => {
+            env.report.warn(format!(
+                "not removing {config}: it was not written by jaunt-agent (it does not start with the line `{MANAGED_HEADER}`)"
+            ));
+            Ok(ConfigState::Kept)
+        }
+        Existing::Oversized => {
+            env.report.warn(format!(
+                "not removing {config}: it is larger than 64 KiB, so it was not written by jaunt-agent"
+            ));
+            Ok(ConfigState::Kept)
+        }
+        Existing::NotRegular => {
+            env.report.warn(format!(
+                "not removing {config}: it is a symbolic link or not a regular file"
+            ));
+            Ok(ConfigState::Kept)
+        }
+    }
 }
 
 fn locate_sshd(env: &mut Env<'_>, needed: bool) -> Result<Option<Sshd>, InstallError> {
@@ -168,8 +210,10 @@ mod tests {
     use super::super::layout::{DROPIN_PATH, UNIT_PATH};
     use super::super::render;
     use super::super::report::Level;
-    use super::super::testing::{FakeConfig, Harness, options};
+    use super::super::testing::{FakeConfig, Harness, Setup, options, symlink_to_managed_config};
     use super::{state_dir_from_dropin, uninstall};
+
+    const CONFIG: &str = "/etc/jaunt/agent.yaml";
 
     fn installed(config: FakeConfig) -> Harness {
         let mut harness = Harness::new(config);
@@ -188,6 +232,7 @@ mod tests {
         UninstallOptions {
             purge: false,
             no_service: false,
+            config: CONFIG.to_string(),
             state_dir: "/var/lib/jaunt".to_string(),
         }
     }
@@ -218,6 +263,8 @@ mod tests {
         run(&mut harness, &plain()).unwrap();
         assert_eq!(harness.root.read(UNIT_PATH), None);
         assert_eq!(harness.root.read(DROPIN_PATH), None);
+        assert_eq!(harness.root.read(CONFIG), None);
+        assert!(harness.root.path_of("/etc/jaunt").is_dir());
         assert!(harness.root.path_of("/var/lib/jaunt/inner-ca.pub").exists());
         let sshd = "/usr/sbin/sshd -f /etc/ssh/sshd_config";
         assert_eq!(
@@ -373,6 +420,115 @@ mod tests {
             "keep"
         );
         assert!(!harness.root.path_of("/var/lib/jaunt").exists());
+    }
+
+    #[test]
+    fn a_managed_config_alone_is_removed_and_a_foreign_one_is_kept_with_a_warning() {
+        let mut harness = Harness::new(FakeConfig::default());
+        harness
+            .root
+            .write(CONFIG, &render::agent_config("/srv/jaunt/state"));
+        harness.live = true;
+        run(&mut harness, &plain()).unwrap();
+        assert_eq!(harness.root.read(CONFIG), None);
+        assert!(harness.root.path_of("/etc/jaunt").is_dir());
+        assert_eq!(harness.calls(), vec!["id -u".to_string()]);
+
+        let setups: [(Setup, &str); 5] = [
+            (
+                |harness| fs::create_dir_all(harness.root.path_of(CONFIG)).unwrap(),
+                "symbolic link or not a regular file",
+            ),
+            (
+                |harness| harness.root.write(CONFIG, ""),
+                "was not written by jaunt-agent",
+            ),
+            (
+                |harness| {
+                    let big = render::agent_config("/var/lib/jaunt") + &"#".repeat(64 * 1024);
+                    harness.root.write(CONFIG, &big);
+                },
+                "larger than 64 KiB",
+            ),
+            (
+                |harness| harness.root.write(CONFIG, "log_level: debug\n"),
+                "was not written by jaunt-agent",
+            ),
+            (
+                |harness| symlink_to_managed_config(&harness.root, CONFIG),
+                "symbolic link or not a regular file",
+            ),
+        ];
+        for (setup, reason) in setups {
+            let mut harness = installed(FakeConfig::default());
+            fs::remove_file(harness.root.path_of(CONFIG)).unwrap();
+            setup(&harness);
+            let probe = |harness: &Harness| {
+                let path = harness.root.path_of(CONFIG);
+                let kind = fs::symlink_metadata(&path).unwrap().file_type();
+                let content = if path.is_file() {
+                    fs::read(&path).unwrap()
+                } else {
+                    Vec::new()
+                };
+                (kind.is_symlink(), kind.is_dir(), content)
+            };
+            let config_before = probe(&harness);
+            run(&mut harness, &plain()).unwrap();
+            assert_eq!(probe(&harness), config_before);
+            assert_eq!(harness.root.read(UNIT_PATH), None);
+            assert_eq!(harness.root.read(DROPIN_PATH), None);
+            assert!(
+                harness
+                    .report
+                    .contains(Level::Warn, "not removing /etc/jaunt/agent.yaml"),
+                "{reason}"
+            );
+            assert!(harness.report.contains(Level::Warn, reason), "{reason}");
+            assert!(!harness.report.contains(Level::Info, "nothing to uninstall"));
+        }
+    }
+
+    #[test]
+    fn a_custom_config_is_removed_only_by_an_uninstall_given_the_same_config() {
+        let custom = "/opt/jaunt/agent.yaml";
+        let mut harness = Harness::new(FakeConfig::default());
+        let mut env = harness.env();
+        let install_opts = InstallOptions {
+            config: custom.to_string(),
+            ..options()
+        };
+        install(&mut env, &install_opts).unwrap();
+
+        run(&mut harness, &plain()).unwrap();
+        assert_eq!(harness.root.read(UNIT_PATH), None);
+        assert_eq!(
+            harness.root.read(custom).unwrap(),
+            render::agent_config("/var/lib/jaunt")
+        );
+        assert!(harness.report.contains(
+            Level::Warn,
+            "no agent configuration was found at /etc/jaunt/agent.yaml"
+        ));
+
+        harness.report = Default::default();
+        let opts = UninstallOptions {
+            config: custom.to_string(),
+            ..plain()
+        };
+        run(&mut harness, &opts).unwrap();
+        assert_eq!(harness.root.read(custom), None);
+        assert!(harness.root.path_of("/opt/jaunt").is_dir());
+        assert!(
+            harness
+                .report
+                .contains(Level::Info, "removed: /opt/jaunt/agent.yaml")
+        );
+        assert!(
+            !harness
+                .report
+                .contains(Level::Warn, "no agent configuration")
+        );
     }
 
     #[test]

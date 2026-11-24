@@ -1,5 +1,5 @@
 mod api;
-mod config;
+pub(crate) mod config;
 pub mod logging;
 mod refuse;
 mod renew;
