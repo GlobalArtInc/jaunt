@@ -1,9 +1,13 @@
 use std::collections::BTreeSet;
 
-use jaunt_store::{LoginRequestState, NewCertificate, NewLoginRequest, NewUser, Store, StoreError};
+use jaunt_store::{
+    LoginRequestState, NewApiToken, NewCertificate, NewLoginRequest, NewUser, Store, StoreError,
+    User,
+};
 use tempfile::TempDir;
 
 const NOW: i64 = 1_000;
+const COMPLETION_HASH: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
 
 async fn open_store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -46,7 +50,7 @@ async fn approved_request(store: &Store, ttl_secs: i64) -> String {
         .expect("create");
     assert!(
         requests
-            .approve(&request.id, &user.id, NOW)
+            .approve(&request.id, &user.id, Some(COMPLETION_HASH), NOW)
             .await
             .expect("approve")
     );
@@ -145,7 +149,7 @@ async fn approve_rejects_expired_request() {
     let request = requests.create(&new_request(60), NOW).await.unwrap();
     assert!(
         !requests
-            .approve(&request.id, &user.id, NOW + 60)
+            .approve(&request.id, &user.id, Some(COMPLETION_HASH), NOW + 60)
             .await
             .unwrap()
     );
@@ -225,7 +229,12 @@ async fn approve_only_works_from_pending() {
     let requests = store.login_requests();
     let before = requests.get(&first_id).await.unwrap().unwrap();
     assert_eq!(before.state, LoginRequestState::Approved);
-    assert!(!requests.approve(&first_id, &other.id, NOW).await.unwrap());
+    assert!(
+        !requests
+            .approve(&first_id, &other.id, None, NOW)
+            .await
+            .unwrap()
+    );
     let after = requests.get(&first_id).await.unwrap().unwrap();
     assert_eq!(after.user_id, before.user_id);
     assert_eq!(after.state, LoginRequestState::Approved);
@@ -233,7 +242,7 @@ async fn approve_only_works_from_pending() {
     assert!(requests.redeem(&first_id, NOW + 1).await.unwrap().is_some());
     assert!(
         !requests
-            .approve(&first_id, &other.id, NOW + 1)
+            .approve(&first_id, &other.id, None, NOW + 1)
             .await
             .unwrap()
     );
@@ -259,8 +268,208 @@ async fn approve_unknown_request_returns_false() {
         .unwrap();
     let approved = store
         .login_requests()
-        .approve("no-such-request", &user.id, NOW)
+        .approve("no-such-request", &user.id, Some(COMPLETION_HASH), NOW)
         .await
         .unwrap();
     assert!(!approved);
+}
+
+async fn token_fixture(store: &Store, token_hash: &str, expires_at: i64) -> (User, NewApiToken) {
+    let user = store
+        .users()
+        .upsert(&new_user("ada@example.com"), NOW)
+        .await
+        .unwrap();
+    let certificates = store.certificates();
+    let serial = certificates.allocate_serial().await.unwrap();
+    certificates
+        .record(&NewCertificate {
+            serial,
+            user_id: user.id.clone(),
+            kind: "user".to_string(),
+            key_id: "key".to_string(),
+            valid_after: NOW,
+            valid_before: expires_at,
+            issued_at: NOW,
+        })
+        .await
+        .unwrap();
+    let token = NewApiToken {
+        token_hash: token_hash.to_string(),
+        user_id: user.id.clone(),
+        cert_serial: serial,
+        created_at: NOW,
+        expires_at,
+    };
+    (user, token)
+}
+
+#[tokio::test]
+async fn api_token_is_found_together_with_its_user() {
+    let (_dir, store) = open_store().await;
+    let (user, token) = token_fixture(&store, "hash-1", NOW + 60).await;
+    let tokens = store.api_tokens();
+    tokens.create(&token).await.unwrap();
+    let found = tokens
+        .find_valid("hash-1", NOW + 1)
+        .await
+        .unwrap()
+        .expect("token is valid");
+    assert_eq!(found.user, user);
+    assert_eq!(found.token.token_hash, "hash-1");
+    assert_eq!(found.token.user_id, user.id);
+    assert_eq!(found.token.cert_serial, token.cert_serial);
+    assert_eq!(found.token.created_at, NOW);
+    assert_eq!(found.token.expires_at, NOW + 60);
+    assert!(
+        tokens
+            .find_valid("hash-2", NOW + 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn api_token_is_not_found_at_or_after_expiry() {
+    let (_dir, store) = open_store().await;
+    let (_user, token) = token_fixture(&store, "hash-1", NOW + 60).await;
+    let tokens = store.api_tokens();
+    tokens.create(&token).await.unwrap();
+    assert!(
+        tokens
+            .find_valid("hash-1", NOW + 59)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        tokens
+            .find_valid("hash-1", NOW + 60)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tokens
+            .find_valid("hash-1", NOW + 61)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn api_token_hash_cannot_be_inserted_twice() {
+    let (_dir, store) = open_store().await;
+    let (_user, token) = token_fixture(&store, "hash-1", NOW + 60).await;
+    let tokens = store.api_tokens();
+    tokens.create(&token).await.unwrap();
+    let again = tokens.create(&token).await;
+    assert!(matches!(again, Err(StoreError::Database(_))));
+}
+
+#[tokio::test]
+async fn api_token_rejects_unknown_certificate_and_empty_lifetime() {
+    let (_dir, store) = open_store().await;
+    let (_user, token) = token_fixture(&store, "hash-1", NOW + 60).await;
+    let tokens = store.api_tokens();
+    let orphan = NewApiToken {
+        cert_serial: token.cert_serial + 1,
+        ..token.clone()
+    };
+    assert!(matches!(
+        tokens.create(&orphan).await,
+        Err(StoreError::Database(_))
+    ));
+    let instant = NewApiToken {
+        expires_at: token.created_at,
+        ..token
+    };
+    assert!(matches!(
+        tokens.create(&instant).await,
+        Err(StoreError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn approve_stores_the_completion_hash_in_the_same_update() {
+    let (_dir, store) = open_store().await;
+    let requests = store.login_requests();
+    let user = store
+        .users()
+        .upsert(&new_user("ada@example.com"), NOW)
+        .await
+        .unwrap();
+    let pending = requests.create(&new_request(60), NOW).await.unwrap();
+    assert_eq!(pending.completion_hash, None);
+
+    assert!(
+        requests
+            .approve(&pending.id, &user.id, Some(COMPLETION_HASH), NOW)
+            .await
+            .unwrap()
+    );
+    let approved = requests.get(&pending.id).await.unwrap().unwrap();
+    assert_eq!(approved.state, LoginRequestState::Approved);
+    assert_eq!(approved.completion_hash.as_deref(), Some(COMPLETION_HASH));
+
+    let redeemed = requests
+        .redeem(&pending.id, NOW + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(redeemed.completion_hash.as_deref(), Some(COMPLETION_HASH));
+
+    let unbound = requests.create(&new_request(60), NOW).await.unwrap();
+    assert!(
+        requests
+            .approve(&unbound.id, &user.id, None, NOW)
+            .await
+            .unwrap()
+    );
+    let stored = requests.get(&unbound.id).await.unwrap().unwrap();
+    assert_eq!(stored.completion_hash, None);
+}
+
+#[tokio::test]
+async fn approve_keeps_the_first_completion_hash() {
+    let (_dir, store) = open_store().await;
+    let id = approved_request(&store, 60).await;
+    let requests = store.login_requests();
+    let user_id = requests
+        .get(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .user_id
+        .expect("approved user");
+    assert!(
+        !requests
+            .approve(&id, &user_id, Some("other"), NOW)
+            .await
+            .unwrap()
+    );
+    let stored = requests.get(&id).await.unwrap().unwrap();
+    assert_eq!(stored.completion_hash.as_deref(), Some(COMPLETION_HASH));
+}
+
+#[tokio::test]
+async fn purge_expired_deletes_only_rows_that_expired_before_the_cutoff() {
+    let (_dir, store) = open_store().await;
+    let requests = store.login_requests();
+    let short = requests.create(&new_request(10), NOW).await.unwrap();
+    let boundary = requests.create(&new_request(20), NOW).await.unwrap();
+    let long = requests.create(&new_request(600), NOW).await.unwrap();
+
+    assert_eq!(requests.purge_expired(NOW + 10).await.unwrap(), 0);
+    assert_eq!(requests.purge_expired(NOW + 11).await.unwrap(), 1);
+    assert!(requests.get(&short.id).await.unwrap().is_none());
+    assert!(requests.get(&boundary.id).await.unwrap().is_some());
+
+    assert_eq!(requests.purge_expired(NOW + 20).await.unwrap(), 0);
+    assert_eq!(requests.purge_expired(NOW + 21).await.unwrap(), 1);
+    assert!(requests.get(&boundary.id).await.unwrap().is_none());
+    assert!(requests.get(&long.id).await.unwrap().is_some());
+    assert_eq!(requests.purge_expired(NOW + 21).await.unwrap(), 0);
 }

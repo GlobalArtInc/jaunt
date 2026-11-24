@@ -1,3 +1,4 @@
+mod api_tokens;
 mod certificates;
 mod error;
 mod login_requests;
@@ -10,6 +11,7 @@ use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
 pub use certificates::{Certificate, Certificates, NewCertificate};
 pub use error::StoreError;
 pub use login_requests::{LoginRequest, LoginRequestState, LoginRequests, NewLoginRequest};
@@ -44,6 +46,10 @@ impl Store {
     pub async fn migrate(&self) -> Result<(), StoreError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
+    }
+
+    pub fn api_tokens(&self) -> ApiTokens {
+        ApiTokens::new(self.pool.clone())
     }
 
     pub fn users(&self) -> Users {

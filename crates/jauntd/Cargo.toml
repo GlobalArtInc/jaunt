@@ -17,6 +17,13 @@ serde-saphyr = { workspace = true }
 jaunt-ca = { workspace = true }
 jaunt-control = { workspace = true }
 jaunt-gate = { workspace = true }
+jaunt-oidc = { workspace = true }
+jaunt-store = { workspace = true }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
+url = "2.5.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"

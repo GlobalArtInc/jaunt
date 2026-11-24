@@ -1,5 +1,8 @@
 mod ca;
 mod config;
+mod logging;
+mod serve;
+mod storage;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -88,8 +91,8 @@ fn main() -> ExitCode {
 }
 
 fn run(path: &Path) -> ExitCode {
-    match config::load(path) {
-        Ok(config) => not_implemented(&format!("run (data_dir: {})", config.data_dir.display())),
+    match serve::run(path, &|name| std::env::var_os(name)) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(1)

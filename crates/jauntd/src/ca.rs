@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -7,16 +6,14 @@ use std::time::SystemTime;
 
 use jaunt_ca::{
     AgeIdentity, CaKind, Committed, FileBackend, IDENTITY_FILE_VAR, IDENTITY_VAR, InternalCa,
-    StagingDir,
+    StagingDir, TrustSet,
 };
 
-use crate::config;
+use crate::config::{self, EnvLookup};
 
 const CA_DIR: &str = "ca";
 const STAGING_PREFIX: &str = "ca.staging";
 const IDENTITY_FILE: &str = "age-identity.txt";
-
-type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
 #[derive(Clone, Copy)]
 enum IdentitySource {
@@ -36,6 +33,39 @@ struct Output {
     code: u8,
     stdout: String,
     stderr: String,
+}
+
+pub struct Authorities {
+    pub user: FileBackend,
+    pub host_trust: TrustSet,
+}
+
+pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authorities, String> {
+    let ca_dir = data_dir.join(CA_DIR);
+    let identity = resolve_identity(&ca_dir, env)?;
+    let (_user_trust, user) =
+        FileBackend::load(&ca_dir, CaKind::User, &identity).map_err(|err| err.to_string())?;
+    let (host_trust, _host) =
+        FileBackend::load(&ca_dir, CaKind::Host, &identity).map_err(|err| err.to_string())?;
+    Ok(Authorities { user, host_trust })
+}
+
+fn resolve_identity(ca_dir: &Path, env: EnvLookup<'_>) -> Result<AgeIdentity, String> {
+    let key = env(IDENTITY_VAR);
+    let key_file = env(IDENTITY_FILE_VAR);
+    if key.is_some() || key_file.is_some() {
+        return AgeIdentity::from_sources(key, key_file).map_err(|err| err.to_string());
+    }
+    let generated = ca_dir.join(IDENTITY_FILE);
+    match fs::metadata(&generated) {
+        Ok(_) => AgeIdentity::read_file(&generated).map_err(|err| err.to_string()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(format!(
+            "no age identity for the certificate authorities: set {IDENTITY_VAR} or \
+             {IDENTITY_FILE_VAR}, or keep the generated identity at {}",
+            generated.display()
+        )),
+        Err(err) => Err(format!("{}: {err}", generated.display())),
+    }
 }
 
 pub fn init(config_path: &Path, generate_identity: bool) -> ExitCode {
@@ -263,12 +293,12 @@ mod tests {
     use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
     use jaunt_ca::{
         AgeIdentity, CaError, CaKind, Committed, FileBackend, IDENTITY_FILE_VAR, IDENTITY_VAR,
-        InternalCa, StagingDir,
+        InternalCa, Signer, StagingDir,
     };
 
     use super::{
         CA_DIR, IDENTITY_FILE, IdentitySource, Initialized, Output, STAGING_PREFIX,
-        commit_warnings, init_authorities, install, render, run,
+        commit_warnings, init_authorities, install, load_authorities, render, run,
     };
 
     fn entries(path: &Path) -> Vec<String> {
@@ -567,5 +597,64 @@ mod tests {
         assert_eq!(stderr.len(), 2);
         assert!(stderr[0].starts_with("warning: sync directory /data"));
         assert!(stderr[1].contains("/data/ca/age-identity.txt"));
+    }
+
+    #[test]
+    fn authorities_load_with_the_generated_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let initialized =
+            init_authorities(&data_dir, IdentitySource::Generate, &no_env, now()).unwrap();
+
+        let authorities = load_authorities(&data_dir, &no_env).unwrap();
+
+        assert_eq!(authorities.user.kind(), CaKind::User);
+        assert_eq!(
+            authorities.user.public_key().to_openssh().unwrap(),
+            initialized.user_ca
+        );
+        assert_eq!(
+            authorities.host_trust.to_authorized_lines().unwrap(),
+            [initialized.host_ca]
+        );
+    }
+
+    #[test]
+    fn authorities_load_with_an_identity_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let (_identity, identity_path) = operator_identity(dir.path());
+        assert_eq!(run_with_identity_file(&data_dir, &identity_path).code, 0);
+        let env =
+            |name: &str| (name == IDENTITY_FILE_VAR).then(|| identity_path.as_os_str().to_owned());
+
+        assert!(load_authorities(&data_dir, &env).is_ok());
+
+        let err = load_authorities(&data_dir, &no_env).err().unwrap();
+        assert!(err.contains(IDENTITY_VAR) && err.contains(IDENTITY_FILE_VAR));
+    }
+
+    #[test]
+    fn authorities_refuse_conflicting_wrong_and_missing_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        init_authorities(&data_dir, IdentitySource::Generate, &no_env, now()).unwrap();
+        let (_stranger, stranger_path) = operator_identity(dir.path());
+
+        let conflict = load_authorities(&data_dir, &|_| Some(stranger_path.as_os_str().to_owned()))
+            .err()
+            .unwrap();
+        assert!(conflict.contains("not both"));
+
+        let wrong = load_authorities(&data_dir, &|name| {
+            (name == IDENTITY_FILE_VAR).then(|| stranger_path.as_os_str().to_owned())
+        })
+        .err()
+        .unwrap();
+        assert!(wrong.contains("could not decrypt"));
+
+        let empty = tempfile::tempdir().unwrap();
+        let uninitialized = load_authorities(empty.path(), &no_env).err().unwrap();
+        assert!(uninitialized.contains("no age identity"));
     }
 }

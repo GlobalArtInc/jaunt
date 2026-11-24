@@ -71,7 +71,7 @@ impl Users {
     }
 }
 
-fn user_from_row(row: &SqliteRow) -> Result<User, StoreError> {
+pub(crate) fn user_from_row(row: &SqliteRow) -> Result<User, StoreError> {
     let groups: String = row.try_get("groups")?;
     let groups = serde_json::from_str(&groups)
         .map_err(|err| StoreError::Corrupt(format!("users.groups: {err}")))?;

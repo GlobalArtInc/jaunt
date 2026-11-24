@@ -40,6 +40,7 @@ pub struct LoginRequest {
     pub pkce_challenge: String,
     pub user_id: Option<String>,
     pub client_label: Option<String>,
+    pub completion_hash: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
     pub redeemed_at: Option<i64>,
@@ -49,18 +50,21 @@ const CREATE: &str = "INSERT INTO login_requests \
     (id, kind, state, pkce_challenge, client_label, created_at, expires_at) \
     VALUES (?, ?, 'pending', ?, ?, ?, ?) \
     RETURNING id, kind, state, pkce_challenge, user_id, client_label, \
-    created_at, expires_at, redeemed_at";
+    completion_hash, created_at, expires_at, redeemed_at";
 
 const GET: &str = "SELECT id, kind, state, pkce_challenge, user_id, client_label, \
-    created_at, expires_at, redeemed_at FROM login_requests WHERE id = ?";
+    completion_hash, created_at, expires_at, redeemed_at FROM login_requests WHERE id = ?";
 
-const APPROVE: &str = "UPDATE login_requests SET state = 'approved', user_id = ? \
+const APPROVE: &str = "UPDATE login_requests \
+    SET state = 'approved', user_id = ?, completion_hash = ? \
     WHERE id = ? AND state = 'pending' AND expires_at > ? RETURNING id";
 
 const REDEEM: &str = "UPDATE login_requests SET state = 'redeemed', redeemed_at = ? \
     WHERE id = ? AND state = 'approved' AND expires_at > ? \
     RETURNING id, kind, state, pkce_challenge, user_id, client_label, \
-    created_at, expires_at, redeemed_at";
+    completion_hash, created_at, expires_at, redeemed_at";
+
+const PURGE_EXPIRED: &str = "DELETE FROM login_requests WHERE expires_at < ?";
 
 #[derive(Clone)]
 pub struct LoginRequests {
@@ -100,9 +104,16 @@ impl LoginRequests {
         row.as_ref().map(request_from_row).transpose()
     }
 
-    pub async fn approve(&self, id: &str, user_id: &str, now: i64) -> Result<bool, StoreError> {
+    pub async fn approve(
+        &self,
+        id: &str,
+        user_id: &str,
+        completion_hash: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StoreError> {
         let row = sqlx::query(APPROVE)
             .bind(user_id)
+            .bind(completion_hash)
             .bind(id)
             .bind(now)
             .fetch_optional(&self.pool)
@@ -119,6 +130,14 @@ impl LoginRequests {
             .await?;
         row.as_ref().map(request_from_row).transpose()
     }
+
+    pub async fn purge_expired(&self, older_than: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query(PURGE_EXPIRED)
+            .bind(older_than)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn request_from_row(row: &SqliteRow) -> Result<LoginRequest, StoreError> {
@@ -130,6 +149,7 @@ fn request_from_row(row: &SqliteRow) -> Result<LoginRequest, StoreError> {
         pkce_challenge: row.try_get("pkce_challenge")?,
         user_id: row.try_get("user_id")?,
         client_label: row.try_get("client_label")?,
+        completion_hash: row.try_get("completion_hash")?,
         created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,
         redeemed_at: row.try_get("redeemed_at")?,
