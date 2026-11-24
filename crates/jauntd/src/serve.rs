@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, system_clock};
 use jaunt_oidc::{OidcClient, OidcError};
+use jaunt_policy::Watcher;
 use jaunt_store::{Store, StoreError};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -66,10 +67,43 @@ pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
     runtime.block_on(serve(settings, authorities))
 }
 
+struct Started {
+    control: Control,
+    watcher: Watcher,
+    listen: SocketAddr,
+}
+
 async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), ServeError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(ServeError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(ServeError::Signals)?;
 
+    let Started {
+        control,
+        watcher,
+        listen,
+    } = start(settings, authorities).await?;
+    let listener = match bind(listen).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            policy::stop_watcher(watcher).await;
+            return Err(err);
+        }
+    };
+
+    control
+        .serve(listener, async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            tracing::info!(target: "jaunt::daemon", "shutting down");
+            policy::stop_watcher(watcher).await;
+        })
+        .await?;
+    Ok(())
+}
+
+async fn start(settings: RunSettings, authorities: Authorities) -> Result<Started, ServeError> {
     let policy = policy::load_at_startup(&settings.policy_dir)?;
 
     let prepared = storage::prepare(&settings.data_dir)?;
@@ -102,8 +136,15 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         policy: policy.clone(),
         clock: system_clock(),
     })?;
+    let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
+    Ok(Started {
+        control,
+        watcher,
+        listen: settings.listen,
+    })
+}
 
-    let listen = settings.listen;
+async fn bind(listen: SocketAddr) -> Result<TcpListener, ServeError> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|source| ServeError::Listen {
@@ -115,19 +156,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         source,
     })?;
     tracing::info!(target: "jaunt::daemon", listen = %bound, "serving plain http");
-
-    let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
-    control
-        .serve(listener, async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-            tracing::info!(target: "jaunt::daemon", "shutting down");
-            policy::stop_watcher(watcher).await;
-        })
-        .await?;
-    Ok(())
+    Ok(listener)
 }
 
 fn log_exposure(database: &Path, data_dir: &Path, exposure: Exposure) {
@@ -150,12 +179,15 @@ fn log_exposure(database: &Path, data_dir: &Path, exposure: Exposure) {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::Arc;
-    use std::time::SystemTime;
+    use std::time::{Duration, Instant, SystemTime};
 
     use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa};
+    use jaunt_policy::PolicySet;
 
-    use super::{ServeError, run, serve};
+    use super::{ServeError, run, serve, start};
     use crate::ca::Authorities;
     use crate::config;
     use crate::policy::PolicyError;
@@ -245,5 +277,86 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("roles.yaml"), "{shown}");
         assert!(!dir.path().join("jaunt.db").exists());
+    }
+
+    fn role(login: &str) -> String {
+        format!(
+            "apiVersion: jaunt/v1\nkind: Role\nmetadata: {{ name: ops }}\nspec:\n  members: {{ users: [alice@example.com] }}\n  ssh: {{ nodes: {{ env: [prod] }}, logins: [{login}] }}\n"
+        )
+    }
+
+    fn fake_discovery() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = format!(
+            "{{\"issuer\":\"{base}\",\"authorization_endpoint\":\"{base}/authorize\",\
+             \"token_endpoint\":\"{base}/token\",\"jwks_uri\":\"{base}/jwks\",\
+             \"response_types_supported\":[\"code\"],\"subject_types_supported\":[\"public\"],\
+             \"id_token_signing_alg_values_supported\":[\"EdDSA\"]}}"
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = if request.starts_with(b"GET /jwks") {
+                    "{\"keys\":[]}".to_owned()
+                } else {
+                    discovery.clone()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn control_follows_the_edits_the_watcher_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("roles.yaml"), role("deploy")).unwrap();
+        let path = write_config(dir.path(), "");
+        let mut settings = config::load(&path)
+            .unwrap()
+            .into_run_settings(&secret_only)
+            .unwrap();
+        settings.oidc.issuer_url = fake_discovery();
+        settings.policy_poll = Duration::from_millis(20);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let started = runtime
+            .block_on(start(settings, authorities(dir.path())))
+            .unwrap();
+
+        let loaded = started.control.policy().snapshot().hash().to_owned();
+        assert_ne!(loaded, PolicySet::empty().hash());
+        let temporary = policy_dir.join(".roles.yaml.tmp");
+        std::fs::write(&temporary, role("ops")).unwrap();
+        std::fs::rename(&temporary, policy_dir.join("roles.yaml")).unwrap();
+        let begun = Instant::now();
+        while started.control.policy().snapshot().hash() == loaded {
+            assert!(
+                begun.elapsed() < Duration::from_secs(5),
+                "the control never saw the edit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        started.watcher.stop();
     }
 }

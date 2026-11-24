@@ -8,6 +8,8 @@ use jaunt_policy::{PolicyHandle, ReloadOutcome, Watcher, watch};
 use tracing::Dispatch;
 
 const POLICY_DIR_MODE: u32 = 0o750;
+const PERMISSION_BITS: u32 = 0o777;
+const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
 const REPORTED_ERRORS: usize = 3;
 const MAX_ERROR_CHARS: usize = 200;
 
@@ -59,8 +61,11 @@ pub fn load_at_startup(dir: &Path) -> Result<PolicyHandle, PolicyError> {
             messages: outcome.errors,
         });
     }
+    if !created {
+        warn_if_writable_by_others(dir);
+    }
     let policy = handle.snapshot();
-    if policy.is_empty() {
+    if policy.role_count() == 0 {
         tracing::warn!(
             target: "jaunt::daemon",
             path = %dir.display(),
@@ -76,6 +81,28 @@ pub fn load_at_startup(dir: &Path) -> Result<PolicyHandle, PolicyError> {
         "policy loaded"
     );
     Ok(handle)
+}
+
+fn warn_if_writable_by_others(dir: &Path) {
+    match fs::metadata(dir) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & PERMISSION_BITS;
+            if mode & GROUP_OR_OTHERS_WRITE != 0 {
+                tracing::warn!(
+                    target: "jaunt::daemon",
+                    path = %dir.display(),
+                    mode = format_args!("{mode:03o}"),
+                    "the policy directory is writable by group or others"
+                );
+            }
+        }
+        Err(err) => tracing::warn!(
+            target: "jaunt::daemon",
+            path = %dir.display(),
+            error = %err,
+            "cannot inspect the permissions of the policy directory"
+        ),
+    }
 }
 
 pub fn start_watcher(handle: PolicyHandle, dir: PathBuf, interval: Duration) -> Watcher {
@@ -130,6 +157,7 @@ mod tests {
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -141,6 +169,11 @@ mod tests {
 
     const TICK: Duration = Duration::from_millis(20);
     const DEADLINE: Duration = Duration::from_secs(5);
+    const CHILD_DIR_VAR: &str = "JAUNTD_POLICY_TEST_DIR";
+    const CHILD_TEST: &str =
+        "policy::tests::a_missing_directory_is_created_with_mode_0750_under_a_restrictive_umask";
+    const DENIES_EVERYTHING: &str = "denies everything";
+    const WRITABLE_WARNING: &str = "writable by group or others";
 
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -201,6 +234,10 @@ mod tests {
         }
     }
 
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     fn reload_events(text: &str) -> Vec<&str> {
         text.lines()
             .filter(|line| line.contains("\"event\":\"policy.reload\""))
@@ -211,12 +248,88 @@ mod tests {
     fn a_valid_directory_is_loaded_at_startup() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("roles.yaml"), role("deploy")).unwrap();
+        let (captured, _guard) = capture();
+
+        let handle = load_at_startup(dir.path()).unwrap();
+
+        let policy = handle.snapshot();
+        assert_eq!(policy.role_count(), 1);
+        assert_ne!(policy.hash(), PolicySet::empty().hash());
+        let text = captured.text();
+        assert!(text.contains("\"roles\":1"), "{text}");
+        assert!(text.contains(policy.hash()), "{text}");
+        assert!(!text.contains(DENIES_EVERYTHING), "{text}");
+    }
+
+    #[test]
+    fn a_policy_with_access_tests_but_no_roles_is_reported_as_denying_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tests.yaml"),
+            "apiVersion: jaunt/v1\nkind: AccessTest\nspec:\n  - { user: alice@example.com, node: { env: prod }, login: root, expect: deny }\n",
+        )
+        .unwrap();
+        let (captured, _guard) = capture();
 
         let handle = load_at_startup(dir.path()).unwrap();
 
         let policy = handle.snapshot();
         assert!(!policy.is_empty());
-        assert_ne!(policy.hash(), PolicySet::empty().hash());
+        assert_eq!(policy.role_count(), 0);
+        let text = captured.text();
+        assert!(text.contains(DENIES_EVERYTHING), "{text}");
+        assert!(text.contains("\"roles\":0"), "{text}");
+    }
+
+    #[test]
+    fn an_existing_directory_writable_by_group_or_others_is_reported_but_accepted() {
+        for (mode, reported) in [
+            (0o750, false),
+            (0o700, false),
+            (0o755, false),
+            (0o770, true),
+            (0o752, true),
+            (0o777, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let policy_dir = dir.path().join("policy");
+            fs::create_dir(&policy_dir).unwrap();
+            fs::write(policy_dir.join("roles.yaml"), role("deploy")).unwrap();
+            fs::set_permissions(&policy_dir, fs::Permissions::from_mode(mode)).unwrap();
+            let (captured, _guard) = capture();
+
+            let handle = load_at_startup(&policy_dir).unwrap();
+
+            assert_eq!(handle.snapshot().role_count(), 1, "{mode:o}");
+            let text = captured.text();
+            assert_eq!(text.contains(WRITABLE_WARNING), reported, "{mode:o} {text}");
+            if reported {
+                assert!(text.contains(&format!("\"mode\":\"{mode:03o}\"")), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_directory_is_created_with_mode_0750_under_a_restrictive_umask() {
+        if let Some(dir) = std::env::var_os(CHILD_DIR_VAR) {
+            let policy_dir = Path::new(&dir).join("policy");
+            load_at_startup(&policy_dir).unwrap();
+            assert_eq!(mode_of(&policy_dir), 0o750);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                "umask 077 && exec \"$0\" --exact \"$1\" --test-threads=1",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .arg(CHILD_TEST)
+            .env(CHILD_DIR_VAR, dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(mode_of(&dir.path().join("policy")), 0o750);
     }
 
     #[test]
@@ -228,7 +341,7 @@ mod tests {
 
         assert!(handle.snapshot().is_empty());
         let text = captured.text();
-        assert!(text.contains("denies everything"), "{text}");
+        assert!(text.contains(DENIES_EVERYTHING), "{text}");
         assert!(text.contains("\"created\":false"), "{text}");
         assert!(text.contains(PolicySet::empty().hash()), "{text}");
     }
@@ -241,11 +354,10 @@ mod tests {
 
         let handle = load_at_startup(&policy_dir).unwrap();
 
-        let mode = fs::metadata(&policy_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o750);
+        assert_eq!(mode_of(&policy_dir), 0o750);
         assert!(handle.snapshot().is_empty());
         let text = captured.text();
-        assert!(text.contains("denies everything"), "{text}");
+        assert!(text.contains(DENIES_EVERYTHING), "{text}");
         assert!(text.contains("\"created\":true"), "{text}");
     }
 

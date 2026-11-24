@@ -248,3 +248,117 @@ async fn sweep_forever(control: Control) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdListener;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa};
+    use jaunt_oidc::{ClientSecret, OidcClient, OidcConfig};
+    use jaunt_policy::{PolicyHandle, PolicySet};
+    use jaunt_store::Store;
+
+    use super::{Control, ControlParts};
+    use crate::clock::system_clock;
+    use crate::device::DeviceSettings;
+    use crate::naming::{AgentEndpoint, SshSuffix};
+
+    const ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\nspec:\n  members: { groups: [ops] }\n  ssh: { nodes: { env: [prod] }, logins: [deploy] }\n";
+
+    fn fake_discovery() -> String {
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = format!(
+            "{{\"issuer\":\"{base}\",\"authorization_endpoint\":\"{base}/authorize\",\
+             \"token_endpoint\":\"{base}/token\",\"jwks_uri\":\"{base}/jwks\",\
+             \"response_types_supported\":[\"code\"],\"subject_types_supported\":[\"public\"],\
+             \"id_token_signing_alg_values_supported\":[\"EdDSA\"]}}"
+        );
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = if request.starts_with(b"GET /jwks") {
+                    "{\"keys\":[]}".to_owned()
+                } else {
+                    discovery.clone()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_policy_snapshot_is_the_loaded_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("roles.yaml"), ROLE).unwrap();
+        let policy = PolicyHandle::empty();
+        assert!(policy.reload(&policy_dir).applied);
+
+        let ca_root = dir.path().join("ca");
+        let identity = AgeIdentity::generate();
+        for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
+            FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
+        }
+        let (_, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
+        let (host_trust, host) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
+        let (_, internal) = FileBackend::load(&ca_root, CaKind::Internal, &identity).unwrap();
+        let root = InternalCa::create_root(&internal, SystemTime::now()).unwrap();
+        let internal_ca = InternalCa::new(Arc::new(internal), root.certificate_der).unwrap();
+        let store = Store::open(&dir.path().join("jaunt.db")).await.unwrap();
+        store.migrate().await.unwrap();
+        let oidc = OidcClient::discover(OidcConfig::new(
+            fake_discovery(),
+            "jaunt",
+            ClientSecret::new("secret".to_owned()),
+            "https://jaunt.example/v1/login/callback",
+        ))
+        .await
+        .unwrap();
+
+        let control = Control::new(ControlParts {
+            store,
+            oidc,
+            user_authority: Arc::new(user),
+            host_trust,
+            host_authority: Arc::new(host),
+            internal_ca,
+            ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
+            agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
+            cert_ttl: Duration::from_secs(3600),
+            pending_capacity: 10,
+            device: DeviceSettings {
+                enabled: false,
+                public_origin: "https://jaunt.example".to_owned(),
+                client_ip_header: None,
+            },
+            policy: policy.clone(),
+            clock: system_clock(),
+        })
+        .unwrap();
+
+        let snapshot = control.policy_snapshot();
+        assert_eq!(snapshot.hash(), policy.snapshot().hash());
+        assert_ne!(snapshot.hash(), PolicySet::empty().hash());
+        assert_eq!(snapshot.role_count(), 1);
+    }
+}
