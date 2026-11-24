@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
 
 use crate::admin::NodeAdmin;
+use crate::audit::{self, SessionEnd};
 use crate::clock::{Clock, Moment};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
@@ -21,6 +22,7 @@ use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
 use crate::rate_limit::RateLimiter;
+use crate::web::WebState;
 
 pub const PENDING_CAPACITY: usize = 10_000;
 
@@ -44,6 +46,7 @@ pub struct ControlParts {
     pub pending_capacity: usize,
     pub device: DeviceSettings,
     pub policy: PolicyHandle,
+    pub web_enabled: bool,
     pub clock: Clock,
 }
 
@@ -63,6 +66,7 @@ pub struct Inner {
     pub(crate) poll_limiter: RateLimiter,
     pub(crate) enroll_limiter: RateLimiter,
     policy: PolicyHandle,
+    pub(crate) web: WebState,
     clock: Clock,
 }
 
@@ -100,6 +104,7 @@ impl Control {
             .host_trust
             .to_authorized_lines()
             .map_err(ControlError::HostKeys)?;
+        let web = WebState::new(parts.web_enabled, &parts.device.public_origin);
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
             Duration::from_secs(parts.cert_ttl.as_secs().min(MAX_USER_VALIDITY.as_secs()));
@@ -120,13 +125,19 @@ impl Control {
                 poll_limiter: RateLimiter::polls(),
                 enroll_limiter: RateLimiter::enrollments(),
                 policy: parts.policy,
+                web,
                 clock: parts.clock,
             }),
         })
     }
 
     pub fn router(&self) -> Router {
-        http::router(self.clone())
+        http::router(self.clone(), Router::new())
+    }
+
+    #[doc(hidden)]
+    pub fn router_with_extra_web_routes(&self, extra: Router<Control>) -> Router {
+        http::router(self.clone(), extra)
     }
 
     pub fn agent_router(&self) -> Router {
@@ -217,6 +228,20 @@ impl Control {
         Ok(u64::try_from(recovered.len()).unwrap_or(u64::MAX))
     }
 
+    pub async fn purge_web_sessions(&self) -> Result<usize, ControlError> {
+        let now = self.now().ok_or(ControlError::Clock)?;
+        let ended = self
+            .store
+            .web_sessions()
+            .purge_expired(now.secs)
+            .await
+            .map_err(ControlError::PurgeWebSessions)?;
+        for user_id in &ended {
+            audit::web_session_ended(user_id, SessionEnd::Expired);
+        }
+        Ok(ended.len())
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -241,6 +266,10 @@ impl Control {
     pub(crate) fn now(&self) -> Option<Moment> {
         Moment::read(&self.clock)
     }
+
+    pub(crate) fn public_origin(&self) -> &str {
+        &self.device.origin
+    }
 }
 
 async fn sweep_forever(control: Control) {
@@ -260,6 +289,9 @@ async fn sweep_forever(control: Control) {
         }
         if let Err(err) = control.purge_stale_sessions().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging stale sessions failed");
+        }
+        if let Err(err) = control.purge_web_sessions().await {
+            tracing::warn!(target: "jaunt::control", error = %err, "purging expired web sessions failed");
         }
     }
 }
@@ -368,6 +400,7 @@ mod tests {
                 client_ip_header: None,
             },
             policy: policy.clone(),
+            web_enabled: false,
             clock: system_clock(),
         })
         .unwrap();

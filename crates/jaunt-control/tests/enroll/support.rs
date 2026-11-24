@@ -360,6 +360,7 @@ impl Harness {
                 client_ip_header: None,
             },
             policy: policy.clone(),
+            web_enabled: false,
             clock: clock.clock(),
         })?;
         Ok(Harness {

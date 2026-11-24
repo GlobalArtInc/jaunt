@@ -34,6 +34,7 @@ mod session_http;
 mod source_ip;
 mod start;
 mod token;
+mod web;
 mod whoami;
 
 pub use admin::{

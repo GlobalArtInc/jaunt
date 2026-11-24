@@ -135,6 +135,7 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         pending_capacity: PENDING_CAPACITY,
         device: settings.device,
         policy: policy.clone(),
+        web_enabled: settings.web,
         clock: system_clock(),
     })?;
     let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);

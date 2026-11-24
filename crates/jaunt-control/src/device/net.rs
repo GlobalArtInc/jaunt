@@ -38,13 +38,33 @@ pub(crate) fn is_valid_origin(text: &str) -> bool {
         && !host.contains('@')
 }
 
+pub(crate) fn is_canonical_origin(text: &str) -> bool {
+    let Some(authority) = text.strip_prefix("https://") else {
+        return false;
+    };
+    if authority.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+    let port = if authority.starts_with('[') {
+        authority.rsplit_once("]:").map(|(_, port)| port)
+    } else if authority.matches(':').count() > 1 {
+        return false;
+    } else {
+        authority.rsplit_once(':').map(|(_, port)| port)
+    };
+    port.is_none_or(|port| {
+        port.parse::<u16>()
+            .is_ok_and(|number| number != 443 && number.to_string() == port)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, SocketAddr};
 
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
-    use super::{client_ip, is_valid_origin, origin_allowed};
+    use super::{client_ip, is_canonical_origin, is_valid_origin, origin_allowed};
 
     const PEER: &str = "198.51.100.7:40000";
 
@@ -180,6 +200,37 @@ mod tests {
             "https://jaunt example",
         ] {
             assert!(!is_valid_origin(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_canonical_origin_has_a_lowercase_host_and_no_default_or_padded_port() {
+        for good in [
+            "https://jaunt.example",
+            "https://jaunt.example:8443",
+            "https://127.0.0.1:8443",
+            "https://[::1]",
+            "https://[::1]:8443",
+        ] {
+            assert!(is_canonical_origin(good), "{good}");
+        }
+        for bad in [
+            "https://JAUNT.example",
+            "https://Jaunt.example:8443",
+            "https://jaunt.example:443",
+            "https://jaunt.example:",
+            "https://jaunt.example:0443",
+            "https://jaunt.example:08443",
+            "https://jaunt.example:65536",
+            "https://jaunt.example:80a",
+            "https://[::1]:443",
+            "https://[::1]:",
+            "https://[FE80::1]:8443",
+            "https://a:b:c",
+            "http://jaunt.example",
+            "",
+        ] {
+            assert!(!is_canonical_origin(bad), "{bad}");
         }
     }
 }

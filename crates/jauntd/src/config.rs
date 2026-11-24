@@ -34,6 +34,8 @@ pub struct Config {
     pub cert_ttl_secs: u64,
     #[serde(default = "default_device_login")]
     pub device_login: bool,
+    #[serde(default = "default_web")]
+    pub web: bool,
     pub client_ip_header: Option<String>,
     pub ssh_suffix: Option<String>,
     pub agent_endpoint: Option<String>,
@@ -67,6 +69,7 @@ pub struct RunSettings {
     pub agent_endpoint: AgentEndpoint,
     pub policy_dir: PathBuf,
     pub policy_poll: Duration,
+    pub web: bool,
     pub oidc: OidcConfig,
 }
 
@@ -129,6 +132,10 @@ fn default_device_login() -> bool {
 
 fn default_policy_poll_secs() -> u64 {
     DEFAULT_POLICY_POLL_SECS
+}
+
+fn default_web() -> bool {
+    true
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -210,6 +217,7 @@ impl Config {
             agent_endpoint,
             policy_dir,
             policy_poll: Duration::from_secs(self.policy_poll_secs),
+            web: self.web,
             oidc,
         })
     }
@@ -559,6 +567,21 @@ cert_ttl_secs: {SECRET}
             .into_run_settings(&secret_env)
             .unwrap();
         assert!(explicit_on.device.enabled);
+    }
+
+    #[test]
+    fn the_web_console_is_on_by_default_and_can_be_switched_off() {
+        let defaults = parse("").into_run_settings(&secret_env).unwrap();
+        assert!(defaults.web);
+
+        let off = parse("web: false\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert!(!off.web);
+        assert!(off.device.enabled);
+        let explicit_on = parse("web: true\n").into_run_settings(&secret_env).unwrap();
+        assert!(explicit_on.web);
+        assert!(serde_saphyr::from_str::<Config>("data_dir: /d\nweb: maybe\n").is_err());
     }
 
     #[test]

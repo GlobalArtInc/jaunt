@@ -1,8 +1,10 @@
+use std::net::SocketAddr;
+
 use axum::body::Body;
-use axum::extract::{RawQuery, State};
+use axum::extract::{ConnectInfo, Extension, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use jaunt_oidc::{ExchangeFailure, OidcError, UserInfoFailure};
+use jaunt_oidc::{ExchangeFailure, OidcError, PendingAuth, UserInfoFailure};
 use jaunt_store::{LoginRequest, LoginRequestState, NewUser, User};
 
 use crate::audit::{self, DenyReason};
@@ -13,6 +15,7 @@ use crate::device;
 use crate::http::server_error;
 use crate::pending::{PendingKind, PendingLogin};
 use crate::start::LOGIN_KIND;
+use crate::web;
 
 const MAX_QUERY_LEN: usize = 8 * 1024;
 const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -118,6 +121,7 @@ fn oidc_denial(err: &OidcError) -> Denial {
 
 pub(crate) async fn handle(
     State(control): State<Control>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -179,7 +183,112 @@ pub(crate) async fn handle(
                 }
             }
         }
+        PendingKind::Web {
+            return_to,
+            browser_hash,
+        } => {
+            let mut response = match peer {
+                Some(Extension(ConnectInfo(peer))) => {
+                    let request = WebCallback {
+                        return_to: &return_to,
+                        browser_hash: &browser_hash,
+                        code: params.code,
+                        provider_error: error_reported,
+                        state,
+                        headers: &headers,
+                        peer,
+                    };
+                    complete_web(&control, entry, request).await
+                }
+                None => {
+                    tracing::error!(target: "jaunt::control", "the connection address is unavailable for a web sign-in");
+                    web::pages::server_error()
+                }
+            };
+            control.web.headers.apply(response.headers_mut());
+            response
+        }
     }
+}
+
+struct WebCallback<'a> {
+    return_to: &'a str,
+    browser_hash: &'a str,
+    code: Option<String>,
+    provider_error: bool,
+    state: &'a str,
+    headers: &'a HeaderMap,
+    peer: SocketAddr,
+}
+
+async fn complete_web(
+    control: &Control,
+    entry: PendingLogin,
+    request: WebCallback<'_>,
+) -> Response {
+    let login_id = entry.login_id.clone();
+    if !web::login_binding_matches(request.headers, request.browser_hash) {
+        audit::login_denied(Some(&login_id), DenyReason::BrowserMismatch);
+        return web::pages::sign_in_failed();
+    }
+    let signed_in = sign_in_web(
+        control,
+        entry,
+        request.code,
+        request.provider_error,
+        request.state,
+    )
+    .await;
+    match signed_in {
+        Ok((user, now)) => {
+            web::establish(
+                control,
+                &login_id,
+                request.return_to,
+                &user,
+                now,
+                request.headers,
+                request.peer,
+            )
+            .await
+        }
+        Err(denied) => {
+            audit::login_denied(Some(&login_id), denied.reason);
+            web::pages::sign_in_failed()
+        }
+    }
+}
+
+async fn sign_in_web(
+    control: &Control,
+    entry: PendingLogin,
+    code: Option<String>,
+    provider_error: bool,
+    state: &str,
+) -> Result<(User, Moment), Denial> {
+    let PendingLogin {
+        auth, expires_at, ..
+    } = entry;
+    if provider_error {
+        return Err(denial(
+            LoopbackError::AccessDenied,
+            DenyReason::ProviderError,
+        ));
+    }
+    let Some(code) = code.filter(|code| !code.is_empty()) else {
+        return Err(denial(
+            LoopbackError::InvalidRequest,
+            DenyReason::MissingCode,
+        ));
+    };
+    let now = control.now().ok_or_else(internal)?;
+    if expires_at <= now.secs {
+        return Err(denial(
+            LoopbackError::InvalidRequest,
+            DenyReason::RequestExpired,
+        ));
+    }
+    exchange_and_store_user(control, auth, &code, state).await
 }
 
 struct SignedIn {
@@ -271,7 +380,17 @@ async fn sign_in(
         ));
     }
 
-    let identity = match control.oidc.complete(auth, &code, state).await {
+    let (user, now) = exchange_and_store_user(control, auth, &code, state).await?;
+    Ok(SignedIn { request, user, now })
+}
+
+async fn exchange_and_store_user(
+    control: &Control,
+    auth: PendingAuth,
+    code: &str,
+    state: &str,
+) -> Result<(User, Moment), Denial> {
+    let identity = match control.oidc.complete(auth, code, state).await {
         Ok(identity) => identity,
         Err(err) => {
             tracing::warn!(target: "jaunt::control", error = %err, "the provider sign-in was not accepted");
@@ -299,5 +418,5 @@ async fn sign_in(
             tracing::error!(target: "jaunt::control", error = %err, "storing the user failed");
             internal()
         })?;
-    Ok(SignedIn { request, user, now })
+    Ok((user, now))
 }

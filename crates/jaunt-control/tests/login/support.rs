@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::Router;
 use axum::body::Body;
@@ -83,6 +83,8 @@ pub struct Options {
     pub device_login: bool,
     pub client_ip_header: Option<&'static str>,
     pub public_origin: &'static str,
+    pub web: bool,
+    pub extra_web_routes: Option<Router<Control>>,
 }
 
 impl Default for Options {
@@ -94,6 +96,8 @@ impl Default for Options {
             device_login: true,
             client_ip_header: None,
             public_origin: PUBLIC_ORIGIN,
+            web: false,
+            extra_web_routes: None,
         }
     }
 }
@@ -174,6 +178,9 @@ pub struct Harness {
     pub provider: FakeProvider,
     pub clock: TestClock,
     pub host_keys: Vec<String>,
+    pub policy: PolicyHandle,
+    policy_dir: PathBuf,
+    database: PathBuf,
     counter: AtomicU64,
     _dir: TempDir,
 }
@@ -251,11 +258,14 @@ impl Harness {
         let root = InternalCa::create_root(&internal_signer, SystemTime::now()).unwrap();
         let internal_ca = InternalCa::new(Arc::new(internal_signer), root.certificate_der).unwrap();
 
-        let store = Store::open(&dir.path().join("jaunt.db")).await.unwrap();
+        let database = dir.path().join("jaunt.db");
+        let store = Store::open(&database).await.unwrap();
         store.migrate().await.unwrap();
 
         let provider = FakeProvider::start().await;
         let clock = TestClock::new();
+        let policy = loaded_policy(dir.path());
+        let policy_dir = dir.path().join("policy");
         let control = Control::new(ControlParts {
             store: store.clone(),
             oidc: provider.oidc_client().await,
@@ -273,19 +283,33 @@ impl Harness {
                 public_origin: options.public_origin.to_owned(),
                 client_ip_header: options.client_ip_header.map(str::to_owned),
             },
-            policy: loaded_policy(dir.path()),
+            policy: policy.clone(),
+            web_enabled: options.web,
             clock: clock.clock(),
         })?;
+        let router = match options.extra_web_routes {
+            Some(extra) => control.router_with_extra_web_routes(extra),
+            None => control.router(),
+        };
         Ok(Harness {
-            router: control.router(),
+            router,
             control,
             store,
             provider,
             clock,
             host_keys,
+            policy,
+            policy_dir,
+            database,
             counter: AtomicU64::new(0),
             _dir: dir,
         })
+    }
+
+    pub fn load_policy(&self, roles_yaml: &str) {
+        std::fs::write(self.policy_dir.join("roles.yaml"), roles_yaml).unwrap();
+        let outcome = self.policy.reload(&self.policy_dir);
+        assert!(outcome.applied, "{:?}", outcome.errors);
     }
 
     pub async fn send(&self, mut request: Request<Body>) -> Reply {
@@ -297,6 +321,14 @@ impl Harness {
             let peer: SocketAddr = DEFAULT_PEER.parse().unwrap();
             request.extensions_mut().insert(ConnectInfo(peer));
         }
+        self.send_without_peer(request).await
+    }
+
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.database
+    }
+
+    pub async fn send_without_peer(&self, request: Request<Body>) -> Reply {
         let response = self.router.clone().oneshot(request).await.unwrap();
         let (parts, body) = response.into_parts();
         let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();

@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::support::{Harness, LOGIN_TTL_SECS};
+use crate::support::{Harness, LOGIN_TTL_SECS, sha256_hex};
+use crate::web_support::SESSION_TTL_SECS;
 
 const RETENTION_SECS: u64 = 3600;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -38,11 +39,32 @@ async fn wait_until_swept(harness: &Harness, login_id: &str, what: &str) {
     }
 }
 
+async fn wait_until_session_is_gone(harness: &Harness, secret: &str) {
+    let hash = sha256_hex(secret);
+    let started = Instant::now();
+    while harness
+        .store
+        .web_sessions()
+        .get(&hash)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "timed out waiting for the web session purge"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn the_background_sweeper_runs_on_its_interval_and_shutdown_ends_serve() {
-    let harness = Harness::new().await;
+    let harness = Harness::with_web().await;
+    let signed = harness.web_sign_in().await;
     let stale = harness.begin().await;
     harness.clock.advance(LOGIN_TTL_SECS + RETENTION_SECS + 1);
+    harness.clock.advance(SESSION_TTL_SECS);
     assert_eq!(harness.control.pending_len(), 1);
 
     tokio::time::pause();
@@ -61,6 +83,7 @@ async fn the_background_sweeper_runs_on_its_interval_and_shutdown_ends_serve() {
     }
     tokio::time::advance(Duration::from_millis(1)).await;
     wait_until_swept(&harness, &stale.login_id, "the first sweep").await;
+    wait_until_session_is_gone(&harness, &signed.secret).await;
 
     let fresh = harness.begin().await;
     harness.clock.advance(LOGIN_TTL_SECS + RETENTION_SECS + 1);

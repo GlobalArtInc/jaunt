@@ -23,7 +23,7 @@ pub(crate) fn issue() -> Result<IssuedCode, EntropyUnavailable> {
     Ok(IssuedCode { secret, hash })
 }
 
-fn is_well_formed(value: &str) -> bool {
+pub(crate) fn is_well_formed(value: &str) -> bool {
     value.len() == ENCODED_LEN
         && value
             .bytes()

@@ -11,6 +11,10 @@ pub enum ControlError {
     NoPendingCapacity,
     #[error("the public origin must be an https origin without a path, query or credentials")]
     InvalidPublicOrigin,
+    #[error(
+        "the public origin must be written as a browser sends it: lowercase host and no default port"
+    )]
+    NonCanonicalPublicOrigin,
     #[error("the client address header is not a valid http header name")]
     InvalidClientIpHeader,
     #[error("the host signing authority is not a host certificate authority")]
@@ -31,4 +35,6 @@ pub enum ControlError {
     PurgeEnrollments(#[source] StoreError),
     #[error("purging stale sessions failed: {0}")]
     PurgeSessions(#[source] StoreError),
+    #[error("purging expired web sessions failed: {0}")]
+    PurgeWebSessions(#[source] StoreError),
 }

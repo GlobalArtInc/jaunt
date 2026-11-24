@@ -71,3 +71,32 @@ async fn control_exposes_the_policy_it_was_given() {
     assert!(policy.authorize_ssh(&alice, &node, "alice").allowed);
     assert!(!policy.authorize_ssh(&alice, &node, "root").allowed);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_public_origin_must_be_written_the_way_a_browser_sends_it() {
+    for origin in [
+        "https://JAUNT.example",
+        "https://Jaunt.example:8443",
+        "https://jaunt.example:443",
+        "https://jaunt.example:0443",
+        "https://jaunt.example:",
+    ] {
+        let refused = Harness::try_with(Options {
+            public_origin: origin,
+            ..Options::default()
+        })
+        .await;
+        assert!(
+            matches!(refused, Err(ControlError::NonCanonicalPublicOrigin)),
+            "{origin}"
+        );
+    }
+    for origin in ["https://jaunt.example:8443", "https://127.0.0.1:8443"] {
+        let accepted = Harness::try_with(Options {
+            public_origin: origin,
+            ..Options::default()
+        })
+        .await;
+        assert!(accepted.is_ok(), "{origin}");
+    }
+}

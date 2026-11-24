@@ -2023,6 +2023,7 @@ dependencies = [
  "jaunt-ssh",
  "jaunt-store",
  "jaunt-tunnel",
+ "jaunt-web",
  "jsonwebtoken",
  "rustls",
  "serde",
@@ -2142,6 +2143,10 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
 ]
+
+[[package]]
+name = "jaunt-web"
+version = "0.0.0"
 
 [[package]]
 name = "jauntd"

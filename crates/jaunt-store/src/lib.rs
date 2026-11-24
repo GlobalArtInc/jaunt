@@ -6,6 +6,7 @@ mod login_requests;
 mod nodes;
 mod sessions;
 mod users;
+mod web_sessions;
 
 use std::path::Path;
 use std::time::Duration;
@@ -33,6 +34,7 @@ pub use sessions::{
     Sessions,
 };
 pub use users::{NewUser, User, Users};
+pub use web_sessions::{NewWebSession, ValidWebSession, WebSession, WebSessions};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -91,5 +93,9 @@ impl Store {
 
     pub fn sessions(&self) -> Sessions {
         Sessions::new(self.pool.clone())
+    }
+
+    pub fn web_sessions(&self) -> WebSessions {
+        WebSessions::new(self.pool.clone())
     }
 }

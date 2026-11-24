@@ -12,13 +12,13 @@ use serde::de::DeserializeOwned;
 
 use crate::control::Control;
 use crate::{
-    callback, client_config, device, enroll, finish, nodes, poll, renew, session_http, start,
+    callback, client_config, device, enroll, finish, nodes, poll, renew, session_http, start, web,
     whoami,
 };
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
 
-pub(crate) fn router(control: Control) -> Router {
+pub(crate) fn router(control: Control, extra_web_routes: Router<Control>) -> Router {
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/login/start", post(start::handle))
@@ -29,7 +29,8 @@ pub(crate) fn router(control: Control) -> Router {
         .route("/v1/nodes", get(nodes::handle))
         .route("/v1/agent/enroll", post(enroll::handle))
         .route("/v1/agent/enroll/poll", post(poll::handle));
-    device::mount(routes, &control)
+    let routes = device::mount(routes, &control);
+    web::mount(routes, &control, extra_web_routes)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)
@@ -52,7 +53,9 @@ async fn healthz() -> &'static str {
 async fn response_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),

@@ -3,7 +3,7 @@ pub(crate) mod browser;
 mod code;
 mod forms;
 mod limiter;
-mod net;
+pub(crate) mod net;
 pub(crate) mod page;
 mod poll;
 mod polls;
@@ -55,6 +55,9 @@ impl DeviceState {
     ) -> Result<DeviceState, ControlError> {
         if !net::is_valid_origin(&settings.public_origin) {
             return Err(ControlError::InvalidPublicOrigin);
+        }
+        if !net::is_canonical_origin(&settings.public_origin) {
+            return Err(ControlError::NonCanonicalPublicOrigin);
         }
         let client_ip_header = settings
             .client_ip_header

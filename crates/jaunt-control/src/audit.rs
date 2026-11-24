@@ -145,3 +145,63 @@ pub(crate) fn finish_failed(login_id: Option<&str>, user_id: Option<&str>, reaso
         reason = reason.code()
     );
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    Logout,
+    Expired,
+}
+
+impl SessionEnd {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            SessionEnd::Logout => "logout",
+            SessionEnd::Expired => "expired",
+        }
+    }
+}
+
+pub(crate) fn web_login_started(login_id: &str) {
+    tracing::info!(target: "jaunt::audit", event = "web.login.started", login_id);
+}
+
+pub(crate) fn web_session_created(login_id: &str, user_id: &str, ip: IpAddr, expires_at: i64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "web.session.created",
+        login_id,
+        user_id,
+        ip = %ip,
+        expires_at
+    );
+}
+
+pub(crate) fn web_session_ended(user_id: &str, reason: SessionEnd) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "web.session.ended",
+        user_id,
+        reason = reason.code()
+    );
+}
+
+pub(crate) fn web_csrf_denied(user_id: &str, reason: &'static str) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "web.csrf.denied",
+        user_id,
+        reason
+    );
+}
+
+pub(crate) fn admin_denied(user_id: &str, permission: &'static str, policy_hash: &str) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "authz.deny",
+        phase = "admin",
+        permission,
+        reason = "policy_denied",
+        user_id,
+        policy_hash
+    );
+}

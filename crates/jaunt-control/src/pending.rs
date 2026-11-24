@@ -5,8 +5,16 @@ use jaunt_oidc::PendingAuth;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingKind {
-    Loopback { port: u16 },
-    Device { browser_hash: String },
+    Loopback {
+        port: u16,
+    },
+    Device {
+        browser_hash: String,
+    },
+    Web {
+        return_to: String,
+        browser_hash: String,
+    },
 }
 
 pub(crate) struct PendingLogin {
