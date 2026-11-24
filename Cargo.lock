@@ -1473,6 +1473,10 @@ name = "jaunt-policy"
 version = "0.0.0"
 dependencies = [
  "jaunt-proto",
+ "serde",
+ "serde-saphyr",
+ "sha2 0.11.1",
+ "tempfile",
 ]
 
 [[package]]
