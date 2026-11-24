@@ -18,11 +18,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jaunt::agent::SshAgent;
 use jaunt::browser::{BrowserError, BrowserOpener};
+use jaunt::consent::ConsentPrompt;
 use jaunt::login::{LoginError, LoginOptions, LoginPorts, LoginReport, login};
 use jaunt::profile::ProfileName;
 use jaunt::server_url::ServerUrl;
+use jaunt::ssh_include::IncludeTarget;
 use jaunt_proto::{
-    ErrorBody, FinishRequest, FinishResponse, StartRequest, StartResponse, WhoamiResponse,
+    ClientConfig, ErrorBody, FinishRequest, FinishResponse, GateEndpoint, NodeList, NodeSummary,
+    StartRequest, StartResponse, WhoamiResponse,
 };
 use sha2::{Digest, Sha256};
 use ssh_key::certificate::{Builder, CertType};
@@ -38,6 +41,9 @@ pub const USER_ID: &str = "3f2b1c9e-7a44-4d0e-9c58-0a6b8f1d2e77";
 pub const EMAIL: &str = "alice@example.com";
 pub const SERIAL: u64 = 7;
 pub const DEFAULT_VALIDITY_SECS: u64 = 8 * 3600;
+pub const SUFFIX: &str = "example.test";
+pub const GATE_HOST: &str = "gate.other.test";
+pub const GATE_PORT: u16 = 2222;
 
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -127,7 +133,18 @@ pub fn response_for(certificate: &Certificate, spec: &CertSpec) -> FinishRespons
 }
 
 #[derive(Clone, Default)]
+pub enum ClientConfigReply {
+    #[default]
+    NotConfigured,
+    Valid,
+    Failing,
+    Custom(serde_json::Value),
+}
+
+#[derive(Clone, Default)]
 pub struct Behavior {
+    pub client_config: ClientConfigReply,
+    pub nodes: Vec<NodeSummary>,
     pub finish_error: Option<&'static str>,
     pub principals: Option<Vec<String>>,
     pub host_certificate: bool,
@@ -145,12 +162,14 @@ pub struct Seen {
     pub completion: Option<String>,
     pub public_key: Option<String>,
     pub finish_calls: usize,
+    pub client_config_calls: usize,
     pub revoked: bool,
 }
 
 struct Shared {
     behavior: Behavior,
     ca: PrivateKey,
+    host_ca: PrivateKey,
     port: Mutex<u16>,
     seen: Mutex<Seen>,
     challenge: Mutex<Option<String>>,
@@ -260,11 +279,53 @@ async fn whoami_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -
     .into_response()
 }
 
+fn host_ca_line(shared: &Shared) -> String {
+    PublicKey::from(shared.host_ca.public_key().key_data().clone())
+        .to_openssh()
+        .unwrap()
+}
+
+async fn client_config_handler(State(shared): State<Arc<Shared>>) -> Response {
+    shared.seen.lock().unwrap().client_config_calls += 1;
+    match &shared.behavior.client_config {
+        ClientConfigReply::NotConfigured => error_response(StatusCode::NOT_FOUND, "not_configured"),
+        ClientConfigReply::Failing => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        }
+        ClientConfigReply::Custom(value) => Json(value.clone()).into_response(),
+        ClientConfigReply::Valid => Json(ClientConfig {
+            ssh_suffix: SUFFIX.to_owned(),
+            gate: GateEndpoint {
+                host: GATE_HOST.to_owned(),
+                port: GATE_PORT,
+            },
+            host_ca_keys: vec![host_ca_line(&shared)],
+        })
+        .into_response(),
+    }
+}
+
+async fn nodes_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let revoked = shared.seen.lock().unwrap().revoked;
+    if revoked || presented != Some(format!("Bearer {API_TOKEN}").as_str()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(NodeList {
+        nodes: shared.behavior.nodes.clone(),
+        truncated: false,
+    })
+    .into_response()
+}
+
 impl FakeServer {
     pub fn start(behavior: Behavior) -> FakeServer {
         let shared = Arc::new(Shared {
             behavior,
             ca: ca_key(),
+            host_ca: ca_key(),
             port: Mutex::new(0),
             seen: Mutex::new(Seen::default()),
             challenge: Mutex::new(None),
@@ -273,6 +334,8 @@ impl FakeServer {
             .route("/v1/login/start", post(start_handler))
             .route("/v1/login/finish", post(finish_handler))
             .route("/v1/whoami", get(whoami_handler))
+            .route("/v1/client-config", get(client_config_handler))
+            .route("/v1/nodes", get(nodes_handler))
             .with_state(Arc::clone(&shared));
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -310,6 +373,10 @@ impl FakeServer {
 
     pub fn server_url(&self) -> ServerUrl {
         ServerUrl::parse(&self.url()).unwrap()
+    }
+
+    pub fn host_ca_line(&self) -> String {
+        host_ca_line(&self.shared)
     }
 
     pub fn redirect_port(&self) -> u16 {
@@ -438,6 +505,44 @@ pub struct Outcome {
     pub notices: String,
 }
 
+pub struct ScriptedPrompt {
+    interactive: bool,
+    answer: bool,
+    asked: Mutex<Vec<String>>,
+}
+
+impl ScriptedPrompt {
+    pub fn new(interactive: bool, answer: bool) -> ScriptedPrompt {
+        ScriptedPrompt {
+            interactive,
+            answer,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl ConsentPrompt for ScriptedPrompt {
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+
+    fn confirm(&self, question: &str) -> std::io::Result<bool> {
+        self.asked.lock().unwrap().push(question.to_owned());
+        Ok(self.answer)
+    }
+}
+
+pub struct LoginSetup<'a> {
+    pub profile: &'a str,
+    pub ssh: Option<IncludeTarget>,
+    pub accept: bool,
+    pub prompt: &'a ScriptedPrompt,
+}
+
 pub fn run_login(
     server: &FakeServer,
     home: &Path,
@@ -446,12 +551,40 @@ pub fn run_login(
     no_browser: bool,
     timeout: Duration,
 ) -> Outcome {
+    let prompt = ScriptedPrompt::new(false, false);
+    run_login_setup(
+        server,
+        home,
+        opener,
+        agent,
+        no_browser,
+        timeout,
+        LoginSetup {
+            profile: "default",
+            ssh: None,
+            accept: false,
+            prompt: &prompt,
+        },
+    )
+}
+
+pub fn run_login_setup(
+    server: &FakeServer,
+    home: &Path,
+    opener: &dyn BrowserOpener,
+    agent: &SshAgent,
+    no_browser: bool,
+    timeout: Duration,
+    setup: LoginSetup<'_>,
+) -> Outcome {
     let options = LoginOptions {
         server: server.server_url(),
-        profile: ProfileName::default_name(),
+        profile: ProfileName::parse(setup.profile).unwrap(),
         home: home.to_owned(),
         no_browser,
         timeout,
+        ssh: setup.ssh,
+        accept_ssh_config: setup.accept,
     };
     let mut notices = Vec::new();
     let result = {
@@ -460,6 +593,7 @@ pub fn run_login(
             agent,
             clock: &SystemTime::now,
             notices: &mut notices,
+            consent: setup.prompt,
         };
         login(&options, &mut ports)
     };

@@ -8,6 +8,7 @@ use url::Url;
 use crate::agent::{AgentError, SshAgent};
 use crate::browser::BrowserOpener;
 use crate::client::{ApiClient, ApiError};
+use crate::consent::ConsentPrompt;
 use crate::display::format_local;
 use crate::issued::{VerifyError, verify};
 use crate::key::{KeyError, SessionKey};
@@ -15,7 +16,11 @@ use crate::loopback::{Callback, FailureCode, LoopbackError, LoopbackListener};
 use crate::pkce::{EntropyError, Pkce};
 use crate::profile::ProfileName;
 use crate::server_url::{ServerUrl, check_web_url};
-use crate::store::{LoginFiles, ProfileStore, StoreError, Transaction};
+use crate::ssh_config::{
+    SshConfigError, check_profile_dir, render_known_hosts, render_ssh_config, validate,
+};
+use crate::ssh_include::{IncludeOutcome, IncludeTarget, ensure_include};
+use crate::store::{LoginFiles, ProfileStore, SshFiles, StoreError, Transaction};
 
 const CHALLENGE_METHOD: &str = "S256";
 const MAX_LABEL_LEN: usize = 64;
@@ -39,12 +44,22 @@ pub enum LoginError {
     Failed,
     #[error(transparent)]
     Verify(#[from] VerifyError),
+    #[error(
+        "cannot fetch the SSH settings from the server: {source}; sign in with --no-ssh-config to skip them"
+    )]
+    ClientConfig { source: ApiError },
+    #[error(
+        "the SSH settings from the server were refused: {0}; sign in with --no-ssh-config to skip them"
+    )]
+    SshSettings(#[from] SshConfigError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("the system clock is set before 1970")]
     Clock,
     #[error("cannot write to the terminal: {0}")]
     Terminal(io::Error),
+    #[error("cannot ask for confirmation: {0}")]
+    Consent(io::Error),
 }
 
 pub struct LoginOptions {
@@ -53,6 +68,8 @@ pub struct LoginOptions {
     pub home: PathBuf,
     pub no_browser: bool,
     pub timeout: Duration,
+    pub ssh: Option<IncludeTarget>,
+    pub accept_ssh_config: bool,
 }
 
 pub struct LoginPorts<'a> {
@@ -60,6 +77,7 @@ pub struct LoginPorts<'a> {
     pub agent: &'a SshAgent,
     pub clock: &'a dyn Fn() -> SystemTime,
     pub notices: &'a mut dyn Write,
+    pub consent: &'a dyn ConsentPrompt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +174,10 @@ pub fn login(
     options: &LoginOptions,
     ports: &mut LoginPorts<'_>,
 ) -> Result<LoginReport, LoginError> {
+    let store = ProfileStore::new(&options.home, &options.profile);
+    if options.ssh.is_some() {
+        check_profile_dir(store.dir())?;
+    }
     let key = SessionKey::generate(&options.profile)?;
     let pkce = Pkce::generate()?;
     let listener = LoopbackListener::bind()?;
@@ -192,7 +214,18 @@ pub fn login(
         .filter(|secs| *secs > 0)
         .ok_or(VerifyError::Expired)?;
 
-    let store = ProfileStore::new(&options.home, &options.profile);
+    let mut notes = Vec::new();
+    let ssh = match &options.ssh {
+        Some(_) => prepare_ssh(
+            &client,
+            &store,
+            ports.consent,
+            options.accept_ssh_config,
+            &mut notes,
+        )?,
+        None => None,
+    };
+    let had_ssh_files = store.has_any_ssh_file()?;
     let mut transaction = store.begin(
         &LoginFiles {
             server: &options.server,
@@ -200,10 +233,10 @@ pub fn login(
             certificate_line: &verified.certificate_line,
             token: &verified.token,
             meta: &verified.meta,
+            ssh: ssh.as_ref(),
         },
         clock_now,
     )?;
-    let mut notes = Vec::new();
     if let Some(err) = transaction.sweep_warning() {
         notes.push(format!(
             "warning: stale files of an earlier sign-in were not removed: {err}"
@@ -244,6 +277,16 @@ pub fn login(
             ));
         }
     }
+    if ssh.is_none() && had_ssh_files {
+        notes.push("the previous SSH setup of this profile was removed".to_owned());
+    }
+    if let (Some(files), Some(target)) = (&ssh, &options.ssh) {
+        let scope = format!(
+            "*.{} through {}:{}",
+            files.client.ssh_suffix, files.client.gate.host, files.client.gate.port
+        );
+        notes.push(include_note(&scope, target, ensure_include(target)));
+    }
     let placement = match staged {
         StagedKey::Agent => KeyPlacement::Agent,
         StagedKey::Disk { reason, .. } => KeyPlacement::Disk {
@@ -259,6 +302,91 @@ pub fn login(
         placement,
         notes,
     })
+}
+
+fn prepare_ssh(
+    client: &ApiClient,
+    store: &ProfileStore,
+    consent: &dyn ConsentPrompt,
+    accept: bool,
+    notes: &mut Vec<String>,
+) -> Result<Option<SshFiles>, LoginError> {
+    let fetched = match client.client_config() {
+        Ok(fetched) => fetched,
+        Err(ApiError::NotConfigured) => {
+            notes.push(
+                "the server has no SSH gateway configured yet; the SSH setup was skipped"
+                    .to_owned(),
+            );
+            return Ok(None);
+        }
+        Err(source) => return Err(LoginError::ClientConfig { source }),
+    };
+    let client_config = validate(fetched)?;
+    let scope = format!(
+        "*.{} through {}:{}",
+        client_config.ssh_suffix, client_config.gate.host, client_config.gate.port
+    );
+    let known = store
+        .read_client_config()
+        .ok()
+        .flatten()
+        .is_some_and(|previous| {
+            previous.ssh_suffix == client_config.ssh_suffix && previous.gate == client_config.gate
+        });
+    if !known && !accept {
+        if !consent.interactive() {
+            notes.push(format!(
+                "the server wants to manage ssh for {scope}; the SSH setup was skipped: run `jaunt login --accept-ssh-config` to enable it"
+            ));
+            return Ok(None);
+        }
+        let question = format!(
+            "This server will manage ssh for *.{} through {}:{}. Configure ssh? [y/N]",
+            client_config.ssh_suffix, client_config.gate.host, client_config.gate.port
+        );
+        if !consent.confirm(&question).map_err(LoginError::Consent)? {
+            notes.push(format!(
+                "the SSH setup for {scope} was declined: run `jaunt login --accept-ssh-config` to enable it"
+            ));
+            return Ok(None);
+        }
+    }
+    let ssh_config = render_ssh_config(&client_config, store.dir())?;
+    let known_hosts = render_known_hosts(&client_config);
+    Ok(Some(SshFiles {
+        client: client_config,
+        ssh_config,
+        known_hosts,
+    }))
+}
+
+fn include_note(
+    scope: &str,
+    target: &IncludeTarget,
+    outcome: Result<IncludeOutcome, crate::ssh_include::IncludeError>,
+) -> String {
+    match outcome {
+        Ok(IncludeOutcome::Unchanged) => format!(
+            "SSH setup is ready for {scope}: {} already includes the profile",
+            target.config_path.display()
+        ),
+        Ok(IncludeOutcome::Created) => format!(
+            "SSH setup is ready for {scope}: created {} with `{}`",
+            target.config_path.display(),
+            target.line
+        ),
+        Ok(IncludeOutcome::Added { backup }) => format!(
+            "SSH setup is ready for {scope}: added `{}` to the top of {} (the previous file is saved as {})",
+            target.line,
+            target.config_path.display(),
+            backup.display()
+        ),
+        Err(err) => format!(
+            "warning: the SSH files are in place but {} was not updated: {err}",
+            target.config_path.display()
+        ),
+    }
 }
 
 enum StagedKey {

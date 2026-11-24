@@ -4,6 +4,7 @@ use crate::agent::{AgentError, SshAgent};
 use crate::client::{ApiClient, ApiError};
 use crate::display::{format_local, format_span, printable};
 use crate::server_url::ServerUrl;
+use crate::ssh_include::{IncludeTarget, include_present};
 use crate::store::{ProfileMeta, ProfileStore, StoreError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,11 +56,59 @@ pub fn agent_view(store: &ProfileStore, agent: &SshAgent) -> AgentView {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshView {
+    NotSetUp,
+    Ready {
+        suffix: String,
+        gate: String,
+        shadowed_by: Option<String>,
+    },
+    IncludeMissing {
+        config: String,
+    },
+    Unknown(String),
+}
+
+pub fn ssh_view(store: &ProfileStore, include: Option<&IncludeTarget>) -> SshView {
+    let config = match store.read_client_config() {
+        Ok(Some(config)) => config,
+        Ok(None) => return SshView::NotSetUp,
+        Err(err) => return SshView::Unknown(err.to_string()),
+    };
+    match store.ssh_files_present() {
+        Ok(true) => {}
+        Ok(false) => return SshView::Unknown("the generated files are missing".to_owned()),
+        Err(err) => return SshView::Unknown(err.to_string()),
+    }
+    if let Some(target) = include {
+        match include_present(target) {
+            Ok(true) => {}
+            Ok(false) => {
+                return SshView::IncludeMissing {
+                    config: target.config_path.display().to_string(),
+                };
+            }
+            Err(err) => return SshView::Unknown(err.to_string()),
+        }
+    }
+    let shadowed_by = store
+        .shadowing_profiles(&config.ssh_suffix)
+        .into_iter()
+        .next();
+    SshView::Ready {
+        suffix: config.ssh_suffix,
+        gate: format!("{}:{}", config.gate.host, config.gate.port),
+        shadowed_by,
+    }
+}
+
 pub fn render(
     out: &mut dyn Write,
     session: &Session,
     now_secs: i64,
     agent: &AgentView,
+    ssh: &SshView,
 ) -> io::Result<()> {
     let meta = &session.meta;
     writeln!(
@@ -85,11 +134,43 @@ pub fn render(
         format_local(meta.valid_before)
     )?;
     match agent {
-        AgentView::NotConfigured => Ok(()),
-        AgentView::Loaded => writeln!(out, "Key in ssh-agent: yes"),
-        AgentView::NotLoaded => writeln!(out, "Key in ssh-agent: no"),
+        AgentView::NotConfigured => {}
+        AgentView::Loaded => writeln!(out, "Key in ssh-agent: yes")?,
+        AgentView::NotLoaded => writeln!(out, "Key in ssh-agent: no")?,
         AgentView::Unknown(reason) => {
-            writeln!(out, "Key in ssh-agent: unknown ({})", printable(reason))
+            writeln!(out, "Key in ssh-agent: unknown ({})", printable(reason))?;
+        }
+    }
+    match ssh {
+        SshView::NotSetUp => writeln!(out, "SSH setup: not installed"),
+        SshView::Ready {
+            suffix,
+            gate,
+            shadowed_by,
+        } => {
+            writeln!(
+                out,
+                "SSH setup: ready (hosts *.{} through {})",
+                printable(suffix),
+                printable(gate)
+            )?;
+            match shadowed_by {
+                Some(other) => writeln!(
+                    out,
+                    "SSH setup: shadowed by profile {}: ssh reads that profile's settings for *.{} first",
+                    printable(other),
+                    printable(suffix)
+                ),
+                None => Ok(()),
+            }
+        }
+        SshView::IncludeMissing { config } => writeln!(
+            out,
+            "SSH setup: files are in place but {} does not include them; run `jaunt login` again",
+            printable(config)
+        ),
+        SshView::Unknown(reason) => {
+            writeln!(out, "SSH setup: unknown ({})", printable(reason))
         }
     }
 }
@@ -140,7 +221,7 @@ pub fn check_online(
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentView, Session, render};
+    use super::{AgentView, Session, SshView, render};
     use crate::server_url::ServerUrl;
     use crate::store::ProfileMeta;
 
@@ -161,8 +242,12 @@ mod tests {
     }
 
     fn rendered(session: &Session, now: i64, agent: &AgentView) -> String {
+        rendered_with(session, now, agent, &SshView::NotSetUp)
+    }
+
+    fn rendered_with(session: &Session, now: i64, agent: &AgentView, ssh: &SshView) -> String {
         let mut out = Vec::new();
-        render(&mut out, session, now, agent).unwrap();
+        render(&mut out, session, now, agent, ssh).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -199,5 +284,43 @@ mod tests {
             &AgentView::Unknown("boom\n".to_owned()),
         );
         assert!(unknown.contains("Key in ssh-agent: unknown (boom?)"));
+    }
+
+    #[test]
+    fn the_report_says_whether_the_ssh_setup_is_in_place() {
+        let session = session(10_000);
+        let cases = [
+            (SshView::NotSetUp, "SSH setup: not installed"),
+            (
+                SshView::Ready {
+                    suffix: "example.test".to_owned(),
+                    gate: "gate.example.org:22".to_owned(),
+                    shadowed_by: None,
+                },
+                "SSH setup: ready (hosts *.example.test through gate.example.org:22)",
+            ),
+            (
+                SshView::Ready {
+                    suffix: "example.test".to_owned(),
+                    gate: "gate.example.org:22".to_owned(),
+                    shadowed_by: Some("alpha".to_owned()),
+                },
+                "SSH setup: shadowed by profile alpha:",
+            ),
+            (
+                SshView::IncludeMissing {
+                    config: "/home/u/.ssh/config".to_owned(),
+                },
+                "SSH setup: files are in place but /home/u/.ssh/config does not include them",
+            ),
+            (
+                SshView::Unknown("boom\n".to_owned()),
+                "SSH setup: unknown (boom?)",
+            ),
+        ];
+        for (view, line) in cases {
+            let text = rendered_with(&session, 0, &AgentView::NotConfigured, &view);
+            assert!(text.contains(line), "{text}");
+        }
     }
 }

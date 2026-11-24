@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+use jaunt_proto::ClientConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::profile::{ProfileName, profile_dir};
 use crate::secret::Secret;
 use crate::server_url::ServerUrl;
+use crate::ssh_config::validate;
 
 const SERVER_FILE: &str = "server";
 const PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
@@ -18,13 +20,19 @@ const CERTIFICATE_FILE: &str = "id_ed25519-cert.pub";
 const TOKEN_FILE: &str = "token";
 const META_FILE: &str = "meta.json";
 const PRIVATE_KEY_FILE: &str = "id_ed25519";
-const OWNED_FILES: [&str; 6] = [
+const CLIENT_FILE: &str = "client.json";
+const SSH_CONFIG_FILE: &str = "ssh_config";
+const KNOWN_HOSTS_FILE: &str = "known_hosts";
+const OWNED_FILES: [&str; 9] = [
     PRIVATE_KEY_FILE,
     CERTIFICATE_FILE,
     PUBLIC_KEY_FILE,
     TOKEN_FILE,
     META_FILE,
     SERVER_FILE,
+    CLIENT_FILE,
+    SSH_CONFIG_FILE,
+    KNOWN_HOSTS_FILE,
 ];
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -51,6 +59,14 @@ pub struct LoginFiles<'a> {
     pub certificate_line: &'a str,
     pub token: &'a Secret,
     pub meta: &'a ProfileMeta,
+    pub ssh: Option<&'a SshFiles>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshFiles {
+    pub client: ClientConfig,
+    pub ssh_config: String,
+    pub known_hosts: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -143,6 +159,78 @@ impl ProfileStore {
             .map_err(|_| StoreError::Corrupt { path })
     }
 
+    pub fn ssh_config_path(&self) -> PathBuf {
+        self.dir.join(SSH_CONFIG_FILE)
+    }
+
+    pub fn known_hosts_path(&self) -> PathBuf {
+        self.dir.join(KNOWN_HOSTS_FILE)
+    }
+
+    pub fn read_client_config(&self) -> Result<Option<ClientConfig>, StoreError> {
+        let path = self.dir.join(CLIENT_FILE);
+        let Some(bytes) = self.read_bytes(&path)? else {
+            return Ok(None);
+        };
+        let parsed: ClientConfig = serde_json::from_slice(&bytes)
+            .map_err(|_| StoreError::Corrupt { path: path.clone() })?;
+        validate(parsed)
+            .map(Some)
+            .map_err(|_| StoreError::Corrupt { path })
+    }
+
+    pub fn ssh_files_present(&self) -> Result<bool, StoreError> {
+        for path in [self.ssh_config_path(), self.known_hosts_path()] {
+            if self.read_bytes(&path)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn shadowing_profiles(&self, suffix: &str) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.home) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name >= self.name {
+                continue;
+            }
+            let Ok(profile) = ProfileName::parse(&name) else {
+                continue;
+            };
+            let other = ProfileStore::new(&self.home, &profile);
+            let same_suffix = matches!(
+                other.read_client_config(),
+                Ok(Some(config)) if config.ssh_suffix == suffix
+            );
+            if same_suffix && matches!(other.ssh_files_present(), Ok(true)) {
+                found.push(name);
+            }
+        }
+        found.sort();
+        found
+    }
+
+    pub fn has_any_ssh_file(&self) -> Result<bool, StoreError> {
+        if !self.dir_exists()? {
+            return Ok(false);
+        }
+        for name in [CLIENT_FILE, SSH_CONFIG_FILE, KNOWN_HOSTS_FILE] {
+            let path = self.dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => return Ok(true),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_error("inspect", &path, err)),
+            }
+        }
+        Ok(false)
+    }
+
     pub fn read_token(&self) -> Result<Option<Secret>, StoreError> {
         let path = self.dir.join(TOKEN_FILE);
         let Some(mut text) = self.read_text(&path)? else {
@@ -198,6 +286,15 @@ impl ProfileStore {
         transaction.write(CERTIFICATE_FILE, &line_bytes(files.certificate_line))?;
         transaction.write(TOKEN_FILE, files.token.expose().as_bytes())?;
         transaction.write(META_FILE, &meta)?;
+        if let Some(ssh) = files.ssh {
+            let client =
+                serde_json::to_vec_pretty(&ssh.client).map_err(|_| StoreError::Corrupt {
+                    path: self.dir.join(CLIENT_FILE),
+                })?;
+            transaction.write(CLIENT_FILE, &client)?;
+            transaction.write(SSH_CONFIG_FILE, ssh.ssh_config.as_bytes())?;
+            transaction.write(KNOWN_HOSTS_FILE, ssh.known_hosts.as_bytes())?;
+        }
         Ok(transaction)
     }
 
@@ -649,8 +746,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Cleared, LoginFiles, ProfileMeta, ProfileStore, Retired, SIBLING_COUNTER, StoreError,
-        Transaction,
+        Cleared, LoginFiles, ProfileMeta, ProfileStore, Retired, SIBLING_COUNTER, SshFiles,
+        StoreError, Transaction,
     };
     use crate::profile::ProfileName;
     use crate::secret::Secret;
@@ -685,6 +782,7 @@ mod tests {
                 certificate_line: "ssh-ed25519-cert-v01@openssh.com CERT",
                 token: &token,
                 meta: &meta(),
+                ssh: None,
             },
             SystemTime::now(),
         )
@@ -796,9 +894,12 @@ mod tests {
         let (root, store) = store();
         save(&store, "jt_first");
         fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(store.dir().join("ssh_config"), "Host x\n").unwrap();
+        fs::write(store.dir().join("notes.txt"), "Host x\n").unwrap();
         fs::write(store.dir().join(".token.keep"), "keep-me\n").unwrap();
         fs::write(store.dir().join("id_ed25519"), "OLD-KEY\n").unwrap();
+        for owned in ["ssh_config", "known_hosts", "client.json"] {
+            fs::write(store.dir().join(owned), "old ssh setup\n").unwrap();
+        }
 
         let retired = save(&store, "jt_second").unwrap();
         assert_eq!(
@@ -811,13 +912,17 @@ mod tests {
         assert_eq!(store.read_token().unwrap().unwrap().expose(), "jt_second");
         assert!(!store.private_key_path().exists());
         assert_eq!(
-            fs::read_to_string(store.dir().join("ssh_config")).unwrap(),
+            fs::read_to_string(store.dir().join("notes.txt")).unwrap(),
             "Host x\n"
         );
         assert_eq!(
             fs::read_to_string(store.dir().join(".token.keep")).unwrap(),
             "keep-me\n"
         );
+        for owned in ["ssh_config", "known_hosts", "client.json"] {
+            assert!(!store.dir().join(owned).exists(), "{owned}");
+        }
+        assert!(!store.has_any_ssh_file().unwrap());
 
         retired.discard().unwrap();
         assert_eq!(names(&root.path().join("state")), ["default"]);
@@ -922,7 +1027,10 @@ mod tests {
         save(&store, "jt_token");
         fs::write(store.dir().join("id_ed25519"), "KEY-MATERIAL\n").unwrap();
         fs::write(store.dir().join(".id_ed25519.1.2.tmp"), "LEFTOVER-KEY\n").unwrap();
-        fs::write(store.dir().join("ssh_config"), "Host x\n").unwrap();
+        fs::write(store.dir().join("notes.txt"), "Host x\n").unwrap();
+        for owned in ["ssh_config", "known_hosts", "client.json"] {
+            fs::write(store.dir().join(owned), "ssh setup\n").unwrap();
+        }
         fs::write(store.dir().join(".token.keep"), "keep-me\n").unwrap();
         let alias = root.path().join("alias");
         fs::hard_link(store.private_key_path(), &alias).unwrap();
@@ -940,7 +1048,7 @@ mod tests {
                 directory_kept: true
             }
         );
-        assert_eq!(names(store.dir()), [".token.keep", "ssh_config"]);
+        assert_eq!(names(store.dir()), [".token.keep", "notes.txt"]);
         assert!(!stale_new.exists() && !stale_old.exists());
         assert_zeroed(&alias, "KEY-MATERIAL\n".len());
         for untouched in [&other_profile, &lookalike] {
@@ -951,7 +1059,7 @@ mod tests {
             );
         }
 
-        fs::remove_file(store.dir().join("ssh_config")).unwrap();
+        fs::remove_file(store.dir().join("notes.txt")).unwrap();
         fs::remove_file(store.dir().join(".token.keep")).unwrap();
         assert_eq!(
             store.clear().unwrap(),
@@ -1144,5 +1252,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn ssh_files() -> SshFiles {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, PrivateKey, PublicKey};
+
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let line = PublicKey::from(key.public_key().key_data().clone())
+            .to_openssh()
+            .unwrap();
+        SshFiles {
+            client: jaunt_proto::ClientConfig {
+                ssh_suffix: "example.test".to_owned(),
+                gate: jaunt_proto::GateEndpoint {
+                    host: "gate.example.org".to_owned(),
+                    port: 22,
+                },
+                host_ca_keys: vec![line],
+            },
+            ssh_config: "Host x\n".to_owned(),
+            known_hosts: "@cert-authority x y\n".to_owned(),
+        }
+    }
+
+    fn begin_with_ssh(store: &ProfileStore, ssh: &SshFiles) -> Transaction {
+        let server = ServerUrl::parse("https://jaunt.example.com").unwrap();
+        let token = Secret::new("jt_token".to_owned());
+        store
+            .begin(
+                &LoginFiles {
+                    server: &server,
+                    public_key_line: "ssh-ed25519 PUB",
+                    certificate_line: "ssh-ed25519-cert-v01@openssh.com CERT",
+                    token: &token,
+                    meta: &meta(),
+                    ssh: Some(ssh),
+                },
+                SystemTime::now(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn the_ssh_files_are_staged_with_the_profile_read_back_and_validated() {
+        let (_root, store) = store();
+        save(&store, "jt_first");
+        assert!(!store.has_any_ssh_file().unwrap());
+        assert!(!store.ssh_files_present().unwrap());
+        assert_eq!(store.read_client_config().unwrap(), None);
+
+        let ssh = ssh_files();
+        let mut transaction = begin_with_ssh(&store, &ssh);
+        assert_eq!(
+            names(transaction.staging_dir()),
+            [
+                "client.json",
+                "id_ed25519-cert.pub",
+                "id_ed25519.pub",
+                "known_hosts",
+                "meta.json",
+                "ssh_config",
+                "token"
+            ]
+        );
+        transaction.commit().unwrap().unwrap().discard().unwrap();
+
+        for name in ["client.json", "ssh_config", "known_hosts"] {
+            assert_eq!(mode(&store.dir().join(name)), 0o600, "{name}");
+        }
+        assert_eq!(store.read_client_config().unwrap().unwrap(), ssh.client);
+        assert_eq!(
+            fs::read_to_string(store.ssh_config_path()).unwrap(),
+            ssh.ssh_config
+        );
+        assert_eq!(
+            fs::read_to_string(store.known_hosts_path()).unwrap(),
+            ssh.known_hosts
+        );
+        assert!(store.ssh_files_present().unwrap() && store.has_any_ssh_file().unwrap());
+
+        fs::remove_file(store.known_hosts_path()).unwrap();
+        assert!(!store.ssh_files_present().unwrap());
+        fs::write(store.dir().join("client.json"), r#"{"ssh_suffix":"A b"}"#).unwrap();
+        assert!(matches!(
+            store.read_client_config(),
+            Err(StoreError::Corrupt { .. })
+        ));
+        for suffix in ["Bad Suffix", "com", "exa\nmple.test"] {
+            let mut tampered = ssh.client.clone();
+            tampered.ssh_suffix = suffix.to_owned();
+            fs::write(
+                store.dir().join("client.json"),
+                serde_json::to_vec(&tampered).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                matches!(store.read_client_config(), Err(StoreError::Corrupt { .. })),
+                "{suffix:?}"
+            );
+        }
     }
 }

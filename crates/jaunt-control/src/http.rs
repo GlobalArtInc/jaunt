@@ -11,7 +11,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
-use crate::{callback, device, enroll, finish, poll, renew, session_http, start, whoami};
+use crate::{
+    callback, client_config, device, enroll, finish, nodes, poll, renew, session_http, start,
+    whoami,
+};
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
 
@@ -22,6 +25,8 @@ pub(crate) fn router(control: Control) -> Router {
         .route("/v1/login/callback", get(callback::handle))
         .route("/v1/login/finish", post(finish::handle))
         .route("/v1/whoami", get(whoami::handle))
+        .route("/v1/client-config", get(client_config::handle))
+        .route("/v1/nodes", get(nodes::handle))
         .route("/v1/agent/enroll", post(enroll::handle))
         .route("/v1/agent/enroll/poll", post(poll::handle));
     device::mount(routes, &control)

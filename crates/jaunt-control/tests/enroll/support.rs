@@ -15,7 +15,7 @@ use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
-    DeviceSettings, NodeAdmin, SshSuffix,
+    DeviceSettings, GateEndpoint, NodeAdmin, SshSuffix,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -83,6 +83,7 @@ pub enum HostAuthority {
 pub struct Options {
     pub host_authority: HostAuthority,
     pub empty_policy: bool,
+    pub gate_endpoint: Option<&'static str>,
 }
 
 impl Default for Options {
@@ -90,6 +91,7 @@ impl Default for Options {
         Options {
             host_authority: HostAuthority::Matching,
             empty_policy: false,
+            gate_endpoint: None,
         }
     }
 }
@@ -173,6 +175,7 @@ pub struct Harness {
     pub agent_router: Router,
     pub control: Control,
     pub admin: NodeAdmin,
+    pub policy: PolicyHandle,
     pub store: Store,
     pub clock: TestClock,
     pub root_der: Vec<u8>,
@@ -332,6 +335,11 @@ impl Harness {
 
         let provider = FakeProvider::start().await;
         let clock = TestClock::new();
+        let policy = if options.empty_policy {
+            PolicyHandle::empty()
+        } else {
+            loaded_policy(&dir.path().join("policy"))
+        };
         let control = Control::new(ControlParts {
             store: store.clone(),
             oidc: provider.oidc_client().await,
@@ -340,6 +348,9 @@ impl Harness {
             host_authority,
             internal_ca,
             ssh_suffix: SshSuffix::parse(SUFFIX).unwrap(),
+            gate_endpoint: options
+                .gate_endpoint
+                .map(|text| GateEndpoint::parse(text).unwrap()),
             agent_endpoint: AgentEndpoint::parse(AGENT_ENDPOINT).unwrap(),
             cert_ttl: Duration::from_secs(8 * 60 * 60),
             pending_capacity: 100,
@@ -348,17 +359,14 @@ impl Harness {
                 public_origin: "https://jaunt.example.test".to_owned(),
                 client_ip_header: None,
             },
-            policy: if options.empty_policy {
-                PolicyHandle::empty()
-            } else {
-                loaded_policy(&dir.path().join("policy"))
-            },
+            policy: policy.clone(),
             clock: clock.clock(),
         })?;
         Ok(Harness {
             router: control.router(),
             agent_router: control.agent_router(),
             admin: control.node_admin(),
+            policy,
             control,
             store,
             clock,

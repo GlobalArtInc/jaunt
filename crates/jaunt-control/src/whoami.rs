@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use jaunt_proto::WhoamiResponse;
+use jaunt_store::ValidApiToken;
 
 use crate::control::Control;
 use crate::http::{empty_response, json_response, server_error};
@@ -25,13 +26,30 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("Bearer").then_some(presented)
 }
 
-pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -> Response {
-    let Some(token_hash) = bearer_token(&headers).and_then(token::hash_presented) else {
-        return unauthorized();
+pub(crate) enum AuthFailure {
+    Rejected,
+    Unavailable,
+}
+
+impl AuthFailure {
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            AuthFailure::Rejected => unauthorized(),
+            AuthFailure::Unavailable => server_error(),
+        }
+    }
+}
+
+pub(crate) async fn authenticate(
+    control: &Control,
+    headers: &HeaderMap,
+) -> Result<ValidApiToken, AuthFailure> {
+    let Some(token_hash) = bearer_token(headers).and_then(token::hash_presented) else {
+        return Err(AuthFailure::Rejected);
     };
     let Some(now) = control.now() else {
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
-        return server_error();
+        return Err(AuthFailure::Unavailable);
     };
     match control
         .store
@@ -39,7 +57,18 @@ pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -
         .find_valid(&token_hash, now.secs)
         .await
     {
-        Ok(Some(valid)) => json_response(
+        Ok(Some(valid)) => Ok(valid),
+        Ok(None) => Err(AuthFailure::Rejected),
+        Err(err) => {
+            tracing::error!(target: "jaunt::control", error = %err, "looking up the api token failed");
+            Err(AuthFailure::Unavailable)
+        }
+    }
+}
+
+pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -> Response {
+    match authenticate(&control, &headers).await {
+        Ok(valid) => json_response(
             StatusCode::OK,
             &WhoamiResponse {
                 user_id: valid.user.id,
@@ -49,10 +78,6 @@ pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -
                 token_expires_at: valid.token.expires_at,
             },
         ),
-        Ok(None) => unauthorized(),
-        Err(err) => {
-            tracing::error!(target: "jaunt::control", error = %err, "looking up the api token failed");
-            server_error()
-        }
+        Err(failure) => failure.into_response(),
     }
 }

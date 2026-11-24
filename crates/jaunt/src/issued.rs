@@ -138,7 +138,7 @@ fn canonical_host_keys(lines: &[String]) -> Result<Vec<String>, VerifyError> {
         .collect()
 }
 
-fn canonical_host_key(line: &str) -> Option<String> {
+pub(crate) fn canonical_host_key(line: &str) -> Option<String> {
     if line.is_empty() || line.len() > MAX_KEY_LINE_LEN || line.chars().any(char::is_control) {
         return None;
     }

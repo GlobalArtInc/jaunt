@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
 use crate::support::{
@@ -8,35 +8,42 @@ use crate::support::{
     serial_section, visit, write_script,
 };
 
-fn base_command(home: &Path) -> Command {
+pub(crate) fn user_home(home: &Path) -> PathBuf {
+    home.parent().unwrap().join("userhome")
+}
+
+pub(crate) fn base_command(home: &Path) -> Command {
+    fs::create_dir_all(user_home(home)).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_jaunt"));
     command
         .env("JAUNT_HOME", home)
+        .env("HOME", user_home(home))
+        .stdin(Stdio::null())
         .env_remove("SSH_AUTH_SOCK")
         .env_remove("JAUNT_PROFILE")
         .env_remove("JAUNT_SERVER");
     command
 }
 
-fn jaunt(home: &Path, args: &[&str]) -> Output {
+pub(crate) fn jaunt(home: &Path, args: &[&str]) -> Output {
     base_command(home).args(args).output().unwrap()
 }
 
-fn stdout(output: &Output) -> String {
+pub(crate) fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn stderr(output: &Output) -> String {
+pub(crate) fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-struct Finished {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Finished {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
-fn login_through_the_binary(
+pub(crate) fn login_through_the_binary(
     server: &FakeServer,
     home: &Path,
     tweak: impl FnOnce(&mut Command),
@@ -90,7 +97,7 @@ fn login_through_the_binary(
     }
 }
 
-fn write_profile(home: &Path, server_url: &str, valid_before: i64) {
+pub(crate) fn write_profile(home: &Path, server_url: &str, valid_before: i64) {
     let dir = home.join("default");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("server"), format!("{server_url}\n")).unwrap();

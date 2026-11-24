@@ -17,7 +17,7 @@ use crate::clock::{Clock, Moment};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
 use crate::http;
-use crate::naming::{AgentEndpoint, SshSuffix};
+use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
 use crate::rate_limit::RateLimiter;
@@ -38,6 +38,7 @@ pub struct ControlParts {
     pub host_authority: Arc<dyn Signer>,
     pub internal_ca: InternalCa,
     pub ssh_suffix: SshSuffix,
+    pub gate_endpoint: Option<GateEndpoint>,
     pub agent_endpoint: AgentEndpoint,
     pub cert_ttl: Duration,
     pub pending_capacity: usize,
@@ -54,6 +55,7 @@ pub struct Inner {
     pub(crate) host_authority: Arc<dyn Signer>,
     pub(crate) internal_ca: InternalCa,
     pub(crate) ssh_suffix: SshSuffix,
+    pub(crate) gate_endpoint: Option<GateEndpoint>,
     pub(crate) agent_endpoint: AgentEndpoint,
     pub(crate) cert_ttl: Duration,
     pub(crate) pending: PendingLogins,
@@ -110,6 +112,7 @@ impl Control {
                 host_authority: parts.host_authority,
                 internal_ca: parts.internal_ca,
                 ssh_suffix: parts.ssh_suffix,
+                gate_endpoint: parts.gate_endpoint,
                 agent_endpoint: parts.agent_endpoint,
                 cert_ttl,
                 pending: PendingLogins::new(parts.pending_capacity),
@@ -355,6 +358,7 @@ mod tests {
             host_authority: Arc::new(host),
             internal_ca,
             ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
+            gate_endpoint: None,
             agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
             cert_ttl: Duration::from_secs(3600),
             pending_capacity: 10,

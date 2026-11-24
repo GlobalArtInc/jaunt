@@ -264,6 +264,7 @@ impl Harness {
             host_authority: Arc::new(host_signer),
             internal_ca,
             ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
+            gate_endpoint: None,
             agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
             cert_ttl: Duration::from_secs(options.cert_ttl_secs),
             pending_capacity: options.pending_capacity,

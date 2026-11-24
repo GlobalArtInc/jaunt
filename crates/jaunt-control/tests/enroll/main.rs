@@ -2,6 +2,7 @@ mod admin;
 mod audit;
 mod authorize;
 mod authorize_checks;
+mod client_api;
 mod enroll;
 mod flow;
 mod renew;

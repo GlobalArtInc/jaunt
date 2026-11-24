@@ -4,7 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jaunt_proto::{
-    ErrorBody, FinishRequest, FinishResponse, StartRequest, StartResponse, WhoamiResponse,
+    ClientConfig, ErrorBody, FinishRequest, FinishResponse, NodeList, StartRequest, StartResponse,
+    WhoamiResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
@@ -23,12 +24,15 @@ const JSON: &str = "application/json";
 const START_PATH: &str = "/v1/login/start";
 const FINISH_PATH: &str = "/v1/login/finish";
 const WHOAMI_PATH: &str = "/v1/whoami";
+const CLIENT_CONFIG_PATH: &str = "/v1/client-config";
+const NODES_PATH: &str = "/v1/nodes";
 const READ_CHUNK_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerCode {
     InvalidGrant,
     Busy,
+    NotConfigured,
     Other,
 }
 
@@ -46,6 +50,8 @@ pub enum ApiError {
     InvalidGrant,
     #[error("the server is busy, try again")]
     Busy,
+    #[error("the server has no SSH gateway configured")]
+    NotConfigured,
     #[error(
         "the server does not accept this sign-in (expired or revoked), run `jaunt login` again"
     )]
@@ -95,12 +101,32 @@ impl ApiClient {
     }
 
     pub fn whoami(&self, token: &Secret) -> Result<WhoamiResponse, ApiError> {
+        self.get_with_token(WHOAMI_PATH, token)
+    }
+
+    pub fn nodes(&self, token: &Secret) -> Result<NodeList, ApiError> {
+        self.get_with_token(NODES_PATH, token)
+    }
+
+    pub fn client_config(&self) -> Result<ClientConfig, ApiError> {
+        let request = self
+            .http
+            .get(self.server.endpoint(CLIENT_CONFIG_PATH))
+            .header(ACCEPT, JSON);
+        self.call(request)
+    }
+
+    fn get_with_token<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &Secret,
+    ) -> Result<T, ApiError> {
         let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| ApiError::Unauthorized)?;
         bearer.set_sensitive(true);
         let request = self
             .http
-            .get(self.server.endpoint(WHOAMI_PATH))
+            .get(self.server.endpoint(path))
             .header(ACCEPT, JSON)
             .header(AUTHORIZATION, bearer);
         self.call(request)
@@ -184,6 +210,7 @@ fn error_for(status: u16, body: &[u8]) -> ApiError {
         Ok(parsed) => match parsed.error.as_str() {
             "invalid_grant" => ServerCode::InvalidGrant,
             "busy" => ServerCode::Busy,
+            "not_configured" => ServerCode::NotConfigured,
             _ => ServerCode::Other,
         },
         Err(_) => ServerCode::Other,
@@ -191,6 +218,8 @@ fn error_for(status: u16, body: &[u8]) -> ApiError {
     match (code, status) {
         (ServerCode::InvalidGrant, _) => ApiError::InvalidGrant,
         (ServerCode::Busy, _) => ApiError::Busy,
+        (ServerCode::NotConfigured, 404) => ApiError::NotConfigured,
+        (ServerCode::NotConfigured, _) => ApiError::Rejected { status },
         (ServerCode::Other, 401) => ApiError::Unauthorized,
         (ServerCode::Other, _) => ApiError::Rejected { status },
     }
@@ -226,5 +255,14 @@ mod tests {
                 .contains("run `jaunt login` again")
         );
         assert_eq!(ApiError::Busy.to_string(), "the server is busy, try again");
+        assert_eq!(
+            error_for(404, br#"{"error":"not_configured"}"#),
+            ApiError::NotConfigured
+        );
+        assert_eq!(
+            error_for(500, br#"{"error":"not_configured"}"#),
+            ApiError::Rejected { status: 500 }
+        );
+        assert_eq!(error_for(404, b""), ApiError::Rejected { status: 404 });
     }
 }

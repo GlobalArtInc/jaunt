@@ -5,15 +5,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 
 use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
+use crate::client::{ApiClient, ApiError};
+use crate::consent::TerminalPrompt;
 use crate::login::{LoginOptions, LoginPorts, login};
 use crate::logout::logout;
+use crate::ls::{render_json, render_text};
 use crate::profile::{ProfileName, resolve_home};
 use crate::server_url::ServerUrl;
-use crate::status::{Session, agent_view, check_online, render};
+use crate::ssh_config::validate;
+use crate::ssh_include::{IncludeTarget, include_line};
+use crate::status::{Session, agent_view, check_online, render, ssh_view};
 use crate::store::ProfileStore;
 
 const EXIT_FAILED: u8 = 1;
@@ -64,6 +69,36 @@ pub struct LoginArgs {
         help = "Sign in without a browser on this machine (not implemented yet)"
     )]
     pub device: bool,
+    #[arg(
+        long,
+        help = "Do not write the ssh_config and known_hosts files or touch ~/.ssh/config"
+    )]
+    pub no_ssh_config: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_ssh_config",
+        help = "Set up ssh for the domain and gateway the server names without asking"
+    )]
+    pub accept_ssh_config: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Args)]
+pub struct LsArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -111,6 +146,26 @@ fn home_for(environment: &Environment) -> Result<PathBuf, ExitCode> {
     .map_err(usage_error)
 }
 
+fn include_target(
+    environment: &Environment,
+    home: &std::path::Path,
+) -> Result<IncludeTarget, ExitCode> {
+    let user_home = environment
+        .user_home
+        .as_deref()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            usage_error(
+                "cannot determine the home directory that holds ~/.ssh/config; use --no-ssh-config",
+            )
+        })?;
+    let line = include_line(home, user_home).map_err(usage_error)?;
+    Ok(IncludeTarget {
+        config_path: user_home.join(".ssh").join("config"),
+        line,
+    })
+}
+
 fn now_secs() -> Result<i64, ExitCode> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -146,12 +201,22 @@ pub fn run_login(args: &LoginArgs, environment: &Environment) -> ExitCode {
             return usage_error("no server given: pass --server URL or set JAUNT_SERVER");
         }
     };
+    let ssh = if args.no_ssh_config {
+        None
+    } else {
+        match include_target(environment, &home) {
+            Ok(target) => Some(target),
+            Err(code) => return code,
+        }
+    };
     let options = LoginOptions {
         server,
         profile: args.profile.clone(),
         home,
         no_browser: args.no_browser,
         timeout: Duration::from_secs(args.timeout.min(MAX_TIMEOUT_SECS)),
+        ssh,
+        accept_ssh_config: args.accept_ssh_config,
     };
     let agent = SshAgent::new(environment.ssh_auth_sock.clone());
     let mut stderr = io::stderr();
@@ -160,6 +225,7 @@ pub fn run_login(args: &LoginArgs, environment: &Environment) -> ExitCode {
         agent: &agent,
         clock: &SystemTime::now,
         notices: &mut stderr,
+        consent: &TerminalPrompt,
     };
     match login(&options, &mut ports) {
         Ok(report) => {
@@ -210,8 +276,10 @@ pub fn run_status(args: &StatusArgs, environment: &Environment) -> ExitCode {
     };
     let agent = SshAgent::new(environment.ssh_auth_sock.clone());
     let view = agent_view(&store, &agent);
+    let include = include_target(environment, &home).ok();
+    let ssh = ssh_view(&store, include.as_ref());
     let mut stdout = io::stdout().lock();
-    if let Err(err) = render(&mut stdout, &session, now, &view) {
+    if let Err(err) = render(&mut stdout, &session, now, &view, &ssh) {
         return failure(format!("cannot write to the terminal: {err}"));
     }
     let mut valid = session.is_valid_at(now);
@@ -229,6 +297,73 @@ pub fn run_status(args: &StatusArgs, environment: &Environment) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(EXIT_FAILED)
+    }
+}
+
+pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
+    let home = match home_for(environment) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let store = ProfileStore::new(&home, &args.profile);
+    let session = match Session::load(&store) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return failure(format!(
+                "not signed in (profile `{}`): run `jaunt login`",
+                args.profile
+            ));
+        }
+        Err(err) => return failure(err),
+    };
+    let token = match store.read_token() {
+        Ok(Some(token)) => token,
+        Ok(None) => return failure("the API token file is missing: run `jaunt login`"),
+        Err(err) => return failure(err),
+    };
+    let client = match ApiClient::new(&session.server) {
+        Ok(client) => client,
+        Err(err) => return failure(err),
+    };
+    let list = match client.nodes(&token) {
+        Ok(list) => list,
+        Err(ApiError::Unauthorized) => {
+            return failure("your session expired: run `jaunt login`");
+        }
+        Err(err) => return failure(err),
+    };
+    let rendered = match args.format {
+        OutputFormat::Json => match render_json(&list) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => {
+            let suffix = match display_suffix(&store, &client) {
+                Ok(suffix) => suffix,
+                Err(code) => return code,
+            };
+            render_text(&list, suffix.as_deref())
+        }
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
+}
+
+fn display_suffix(store: &ProfileStore, client: &ApiClient) -> Result<Option<String>, ExitCode> {
+    match store.read_client_config() {
+        Ok(Some(config)) => return Ok(Some(config.ssh_suffix)),
+        Ok(None) => {}
+        Err(err) => return Err(failure(err)),
+    }
+    match client.client_config().map(validate) {
+        Ok(Ok(config)) => Ok(Some(config.ssh_suffix)),
+        Ok(Err(err)) => {
+            eprintln!("jaunt: note: host names are shown without the SSH domain: {err}");
+            Ok(None)
+        }
+        Err(err) => {
+            eprintln!("jaunt: note: host names are shown without the SSH domain: {err}");
+            Ok(None)
+        }
     }
 }
 

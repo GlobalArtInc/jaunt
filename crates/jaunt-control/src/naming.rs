@@ -13,6 +13,11 @@ pub enum NamingError {
          port from 1 to 65535"
     )]
     AgentEndpoint,
+    #[error(
+        "the gate endpoint must be a dns name or an ip address, optionally followed by a port \
+         from 1 to 65535 (an ipv6 address goes in square brackets)"
+    )]
+    GateEndpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,76 @@ impl AgentEndpoint {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateEndpoint {
+    host: String,
+    port: u16,
+}
+
+impl GateEndpoint {
+    pub const DEFAULT_PORT: u16 = 22;
+
+    pub fn parse(text: &str) -> Result<GateEndpoint, NamingError> {
+        let text = text.to_ascii_lowercase();
+        let (host, port) = split_gate(&text)?;
+        let host = match host {
+            GateHost::Bracketed(inner) => inner
+                .parse::<Ipv6Addr>()
+                .map_err(|_| NamingError::GateEndpoint)?
+                .to_string(),
+            GateHost::Plain(plain) if plain.parse::<Ipv4Addr>().is_ok() || is_dns_name(plain) => {
+                plain.to_owned()
+            }
+            GateHost::Plain(_) => return Err(NamingError::GateEndpoint),
+        };
+        let port = match port {
+            None => GateEndpoint::DEFAULT_PORT,
+            Some(digits) => parse_port(digits)?,
+        };
+        Ok(GateEndpoint { host, port })
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+enum GateHost<'a> {
+    Plain(&'a str),
+    Bracketed(&'a str),
+}
+
+fn split_gate(text: &str) -> Result<(GateHost<'_>, Option<&str>), NamingError> {
+    if let Some(rest) = text.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']').ok_or(NamingError::GateEndpoint)?;
+        return match after {
+            "" => Ok((GateHost::Bracketed(inner), None)),
+            _ => {
+                let digits = after.strip_prefix(':').ok_or(NamingError::GateEndpoint)?;
+                Ok((GateHost::Bracketed(inner), Some(digits)))
+            }
+        };
+    }
+    match text.split_once(':') {
+        None => Ok((GateHost::Plain(text), None)),
+        Some((host, digits)) => Ok((GateHost::Plain(host), Some(digits))),
+    }
+}
+
+fn parse_port(digits: &str) -> Result<u16, NamingError> {
+    let well_formed =
+        !digits.is_empty() && digits.len() <= 5 && digits.bytes().all(|byte| byte.is_ascii_digit());
+    digits
+        .parse::<u16>()
+        .ok()
+        .filter(|number| well_formed && *number != 0)
+        .ok_or(NamingError::GateEndpoint)
+}
+
 pub(crate) fn is_dns_label(label: &str) -> bool {
     let bytes = label.as_bytes();
     let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
@@ -79,7 +154,7 @@ fn is_dns_name(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEndpoint, SshSuffix, is_dns_label};
+    use super::{AgentEndpoint, GateEndpoint, SshSuffix, is_dns_label};
 
     #[test]
     fn dns_labels_follow_the_lowercase_rule() {
@@ -152,6 +227,53 @@ mod tests {
             ("[::1:443", false),
         ] {
             assert_eq!(AgentEndpoint::parse(text).is_ok(), ok, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_gate_endpoint_is_a_host_with_an_optional_port() {
+        for (text, host, port) in [
+            ("gate.example.com", "gate.example.com", 22),
+            ("gate.example.com:2222", "gate.example.com", 2222),
+            ("GATE.Example.COM:22", "gate.example.com", 22),
+            ("10.0.0.1", "10.0.0.1", 22),
+            ("10.0.0.1:65535", "10.0.0.1", 65535),
+            ("[::1]", "::1", 22),
+            ("[2001:DB8::1]:2222", "2001:db8::1", 2222),
+            ("[2001:0db8::1]:2222", "2001:db8::1", 2222),
+            ("[2001:db8:0:0::1]", "2001:db8::1", 22),
+            ("localhost:1", "localhost", 1),
+        ] {
+            let parsed = GateEndpoint::parse(text).unwrap();
+            assert_eq!((parsed.host(), parsed.port()), (host, port), "{text:?}");
+        }
+        for text in [
+            "",
+            ":22",
+            "gate.example.com:",
+            "gate.example.com:0",
+            "gate.example.com:65536",
+            "gate.example.com:+22",
+            "gate.example.com:2 2",
+            "gate.example.com:99999999999",
+            "gate..example.com",
+            "gate_example.com",
+            "gaté.example.com",
+            "gate example.com",
+            "gate.example.com\n",
+            "ssh://gate.example.com",
+            "jaunt@gate.example.com",
+            "::1",
+            "::1:22",
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[gate.example.com]:22",
+            "[fe80::1%eth0]:22",
+            "gate.example.com:22:22",
+            "-gate.example.com",
+        ] {
+            assert!(GateEndpoint::parse(text).is_err(), "{text:?}");
         }
     }
 }

@@ -4,7 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use jaunt::commands::{
-    Environment, LoginArgs, LogoutArgs, StatusArgs, run_login, run_logout, run_status,
+    Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_login, run_logout, run_ls,
+    run_status,
 };
 
 use crate::policy::PolicyCommand;
@@ -25,7 +26,7 @@ enum Command {
     #[command(about = "Show session status")]
     Status(StatusArgs),
     #[command(about = "List available hosts")]
-    Ls,
+    Ls(LsArgs),
     #[command(about = "Policy commands")]
     Policy {
         #[command(subcommand)]
@@ -42,7 +43,7 @@ fn main() -> ExitCode {
         Command::Login(args) => return run_login(&args, &Environment::from_process()),
         Command::Logout(args) => return run_logout(&args, &Environment::from_process()),
         Command::Status(args) => return run_status(&args, &Environment::from_process()),
-        Command::Ls => "ls",
+        Command::Ls(args) => return run_ls(&args, &Environment::from_process()),
         Command::Ensure => "ensure",
     };
     eprintln!("not implemented: {command}");

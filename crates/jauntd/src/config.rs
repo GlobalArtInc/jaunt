@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jaunt_control::{AgentEndpoint, DeviceSettings, NamingError, SshSuffix};
+use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use serde::Deserialize;
 use url::Url;
@@ -40,6 +40,7 @@ pub struct Config {
     pub policy_dir: Option<PathBuf>,
     #[serde(default = "default_policy_poll_secs")]
     pub policy_poll_secs: u64,
+    pub gate_endpoint: Option<String>,
     pub oidc: Option<OidcSection>,
 }
 
@@ -62,6 +63,7 @@ pub struct RunSettings {
     pub cert_ttl: Duration,
     pub device: DeviceSettings,
     pub ssh_suffix: SshSuffix,
+    pub gate_endpoint: Option<GateEndpoint>,
     pub agent_endpoint: AgentEndpoint,
     pub policy_dir: PathBuf,
     pub policy_poll: Duration,
@@ -88,6 +90,8 @@ pub enum ConfigError {
     MissingAgentEndpoint,
     #[error("agent_endpoint: {0}")]
     InvalidAgentEndpoint(#[source] NamingError),
+    #[error("gate_endpoint: {0}")]
+    InvalidGateEndpoint(#[source] NamingError),
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -155,6 +159,10 @@ impl Config {
             .ok_or(ConfigError::MissingAgentEndpoint)?;
         let agent_endpoint =
             AgentEndpoint::parse(&agent_endpoint).map_err(ConfigError::InvalidAgentEndpoint)?;
+        let gate_endpoint = self
+            .gate_endpoint
+            .map(|text| GateEndpoint::parse(&text).map_err(ConfigError::InvalidGateEndpoint))
+            .transpose()?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -198,6 +206,7 @@ impl Config {
                 client_ip_header,
             },
             ssh_suffix,
+            gate_endpoint,
             agent_endpoint,
             policy_dir,
             policy_poll: Duration::from_secs(self.policy_poll_secs),
@@ -446,6 +455,48 @@ cert_ttl_secs: {SECRET}
                     Err(ConfigError::InvalidAgentEndpoint(_))
                 ),
                 "{endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_endpoint_is_optional_defaults_to_port_22_and_is_lowercased() {
+        let absent = parse("").into_run_settings(&secret_env).unwrap();
+        assert!(absent.gate_endpoint.is_none());
+
+        for (given, host, port) in [
+            ("gate.example.com", "gate.example.com", 22),
+            ("gate.example.com:2222", "gate.example.com", 2222),
+            ("Gate.Example.COM:65535", "gate.example.com", 65535),
+            ("192.0.2.10:1", "192.0.2.10", 1),
+            ("[2001:db8::1]:2200", "2001:db8::1", 2200),
+        ] {
+            let settings = parse(&format!("gate_endpoint: \"{given}\"\n"))
+                .into_run_settings(&secret_env)
+                .unwrap();
+            let gate = settings.gate_endpoint.unwrap();
+            assert_eq!((gate.host(), gate.port()), (host, port), "{given:?}");
+        }
+
+        for given in [
+            "",
+            "gate.example.com:0",
+            "gate.example.com:65536",
+            "gate.example.com:ssh",
+            "gate example.com",
+            "ssh://gate.example.com",
+            "jaunt@gate.example.com",
+            "::1",
+            "gate.example.com\nProxyCommand x",
+        ] {
+            let mut config = parse("");
+            config.gate_endpoint = Some(given.to_owned());
+            assert!(
+                matches!(
+                    config.into_run_settings(&secret_env),
+                    Err(ConfigError::InvalidGateEndpoint(_))
+                ),
+                "{given:?}"
             );
         }
     }

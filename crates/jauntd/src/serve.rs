@@ -129,6 +129,7 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         host_authority: Arc::new(authorities.host),
         internal_ca: authorities.internal,
         ssh_suffix: settings.ssh_suffix,
+        gate_endpoint: settings.gate_endpoint,
         agent_endpoint: settings.agent_endpoint,
         cert_ttl: settings.cert_ttl,
         pending_capacity: PENDING_CAPACITY,
@@ -358,5 +359,76 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         started.watcher.stop();
+    }
+
+    fn client_config_answer(extra: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("policy")).unwrap();
+        let path = write_config(dir.path(), extra);
+        let mut settings = config::load(&path)
+            .unwrap()
+            .into_run_settings(&secret_only)
+            .unwrap();
+        settings.oidc.issuer_url = fake_discovery();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = runtime
+            .block_on(start(settings, authorities(dir.path())))
+            .unwrap();
+        let answer = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(
+                started
+                    .control
+                    .clone()
+                    .serve(listener, std::future::pending()),
+            );
+            let fetched = tokio::task::spawn_blocking(move || {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                write!(
+                    stream,
+                    "GET /v1/client-config HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).unwrap();
+                answer
+            })
+            .await
+            .unwrap();
+            server.abort();
+            fetched
+        });
+        started.watcher.stop();
+        answer
+    }
+
+    #[test]
+    fn the_configured_gate_endpoint_reaches_the_client_config_route() {
+        let configured = client_config_answer("gate_endpoint: Gate.Example.org:2222\n");
+
+        assert!(configured.starts_with("HTTP/1.1 200"), "{configured}");
+        assert!(
+            configured.contains(
+                r#""ssh_suffix":"jaunt.example.com","gate":{"host":"gate.example.org","port":2222}"#
+            ),
+            "{configured}"
+        );
+
+        let defaulted = client_config_answer("gate_endpoint: gate.example.org\n");
+        assert!(
+            defaulted.contains(r#""gate":{"host":"gate.example.org","port":22}"#),
+            "{defaulted}"
+        );
+
+        let absent = client_config_answer("");
+        assert!(absent.starts_with("HTTP/1.1 404"), "{absent}");
+        assert!(absent.contains(r#"{"error":"not_configured"}"#), "{absent}");
     }
 }

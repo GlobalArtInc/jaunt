@@ -1,0 +1,410 @@
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
+
+use jaunt_proto::{ClientConfig, GateEndpoint};
+
+use crate::issued::canonical_host_key;
+
+pub const GATE_USER: &str = "jaunt";
+pub const DEFAULT_GATE_PORT: u16 = 22;
+pub const HEADER: &str = "# Managed by jaunt. Do not edit.";
+
+const MAX_LABEL_LEN: usize = 63;
+const MAX_DNS_NAME_LEN: usize = 253;
+const MAX_SUFFIX_LEN: usize = MAX_DNS_NAME_LEN - MAX_LABEL_LEN - 1;
+const MAX_HOST_CA_KEYS: usize = 16;
+const MIN_SUFFIX_LABELS: usize = 2;
+const PRIVATE_KEY_FILE: &str = "id_ed25519";
+const CERTIFICATE_FILE: &str = "id_ed25519-cert.pub";
+const KNOWN_HOSTS_FILE: &str = "known_hosts";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SshConfigError {
+    #[error("the server sent an SSH domain suffix that is not a lowercase DNS name")]
+    BadSuffix,
+    #[error("the server sent a gate host that is neither a lowercase DNS name nor an IP address")]
+    BadGateHost,
+    #[error("the server sent a gate port that is not between 1 and 65535")]
+    BadGatePort,
+    #[error("the server sent no usable host CA keys")]
+    BadHostKeys,
+    #[error(
+        "the path {path:?} contains characters that cannot be written to an ssh_config safely; \
+         choose another JAUNT_HOME"
+    )]
+    UnsafePath { path: PathBuf },
+}
+
+pub fn validate(config: ClientConfig) -> Result<ClientConfig, SshConfigError> {
+    let ClientConfig {
+        ssh_suffix,
+        gate,
+        host_ca_keys,
+    } = config;
+    if ssh_suffix.len() > MAX_SUFFIX_LEN
+        || !is_dns_name(&ssh_suffix)
+        || ssh_suffix.split('.').count() < MIN_SUFFIX_LABELS
+    {
+        return Err(SshConfigError::BadSuffix);
+    }
+    let host = canonical_host(&gate.host)?;
+    if gate.port == 0 {
+        return Err(SshConfigError::BadGatePort);
+    }
+    if host_ca_keys.is_empty() || host_ca_keys.len() > MAX_HOST_CA_KEYS {
+        return Err(SshConfigError::BadHostKeys);
+    }
+    let host_ca_keys = host_ca_keys
+        .iter()
+        .map(|line| canonical_host_key(line).ok_or(SshConfigError::BadHostKeys))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ClientConfig {
+        ssh_suffix,
+        gate: GateEndpoint {
+            host,
+            port: gate.port,
+        },
+        host_ca_keys,
+    })
+}
+
+fn canonical_host(host: &str) -> Result<String, SshConfigError> {
+    if host.contains(':') {
+        return host
+            .parse::<Ipv6Addr>()
+            .ok()
+            .filter(|addr| addr.to_string() == host)
+            .map(|addr| addr.to_string())
+            .ok_or(SshConfigError::BadGateHost);
+    }
+    if host.len() <= MAX_DNS_NAME_LEN && (host.parse::<Ipv4Addr>().is_ok() || is_dns_name(host)) {
+        Ok(host.to_owned())
+    } else {
+        Err(SshConfigError::BadGateHost)
+    }
+}
+
+pub fn is_dns_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= MAX_LABEL_LEN
+        && edge(*first)
+        && edge(*last)
+        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
+}
+
+fn is_dns_name(text: &str) -> bool {
+    text.len() <= MAX_DNS_NAME_LEN && text.split('.').all(is_dns_label)
+}
+
+pub fn path_argument(text: &str) -> Option<String> {
+    let safe = text.starts_with('/')
+        && text.chars().all(|ch| {
+            ch.is_alphanumeric()
+                || matches!(
+                    ch,
+                    '/' | '.' | '_' | '+' | '@' | ',' | ':' | '=' | '-' | ' '
+                )
+        });
+    if !safe {
+        return None;
+    }
+    if text.contains(' ') {
+        Some(format!("\"{text}\""))
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn profile_path(profile_dir: &Path, file: &str) -> Result<String, SshConfigError> {
+    let unsafe_path = || SshConfigError::UnsafePath {
+        path: profile_dir.join(file),
+    };
+    let text = profile_dir.join(file);
+    let text = text.to_str().ok_or_else(unsafe_path)?;
+    path_argument(text).ok_or_else(unsafe_path)
+}
+
+fn jump_target(gate: &GateEndpoint) -> String {
+    if gate.host.contains(':') {
+        format!("[{}]:{}", gate.host, gate.port)
+    } else {
+        format!("{}:{}", gate.host, gate.port)
+    }
+}
+
+pub fn check_profile_dir(profile_dir: &Path) -> Result<(), SshConfigError> {
+    for file in [PRIVATE_KEY_FILE, CERTIFICATE_FILE, KNOWN_HOSTS_FILE] {
+        profile_path(profile_dir, file)?;
+    }
+    Ok(())
+}
+
+pub fn render_ssh_config(
+    config: &ClientConfig,
+    profile_dir: &Path,
+) -> Result<String, SshConfigError> {
+    let identity = profile_path(profile_dir, PRIVATE_KEY_FILE)?;
+    let certificate = profile_path(profile_dir, CERTIFICATE_FILE)?;
+    let known_hosts = profile_path(profile_dir, KNOWN_HOSTS_FILE)?;
+    let common = format!(
+        "    IdentityFile {identity}\n    CertificateFile {certificate}\n    IdentitiesOnly yes\n    UserKnownHostsFile {known_hosts}\n    StrictHostKeyChecking yes\n"
+    );
+    let gate = &config.gate;
+    let mut text = format!("{HEADER}\nHost {}\n    User {GATE_USER}\n", gate.host);
+    if gate.port != DEFAULT_GATE_PORT {
+        text.push_str(&format!("    Port {}\n", gate.port));
+    }
+    text.push_str("    ProxyJump none\n");
+    text.push_str(&common);
+    text.push_str(&format!(
+        "\nHost *.{}\n    ProxyJump {GATE_USER}@{}\n",
+        config.ssh_suffix,
+        jump_target(gate)
+    ));
+    text.push_str(&common);
+    Ok(text)
+}
+
+pub fn render_known_hosts(config: &ClientConfig) -> String {
+    let gate = &config.gate;
+    let mut patterns = vec![format!("*.{}", config.ssh_suffix), gate.host.clone()];
+    if gate.port != DEFAULT_GATE_PORT {
+        patterns.push(format!("[{}]:{}", gate.host, gate.port));
+    }
+    let mut text = String::new();
+    for pattern in &patterns {
+        for key in &config.host_ca_keys {
+            text.push_str(&format!("@cert-authority {pattern} {key}\n"));
+        }
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use jaunt_proto::{ClientConfig, GateEndpoint};
+    use ssh_key::rand_core::OsRng;
+    use ssh_key::{Algorithm, PrivateKey, PublicKey};
+
+    use super::{SshConfigError, render_known_hosts, render_ssh_config, validate};
+
+    fn key_line() -> String {
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        PublicKey::from(key.public_key().key_data().clone())
+            .to_openssh()
+            .unwrap()
+    }
+
+    fn config(suffix: &str, host: &str, port: u16, keys: &[String]) -> ClientConfig {
+        ClientConfig {
+            ssh_suffix: suffix.to_owned(),
+            gate: GateEndpoint {
+                host: host.to_owned(),
+                port,
+            },
+            host_ca_keys: keys.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_ssh_config_for_the_default_port_matches_the_golden_text() {
+        let key = key_line();
+        let valid = validate(config("example.test", "gate.example.org", 22, &[key])).unwrap();
+
+        let text = render_ssh_config(&valid, Path::new("/home/u/.jaunt/default")).unwrap();
+
+        let expected = "# Managed by jaunt. Do not edit.
+Host gate.example.org
+    User jaunt
+    ProxyJump none
+    IdentityFile /home/u/.jaunt/default/id_ed25519
+    CertificateFile /home/u/.jaunt/default/id_ed25519-cert.pub
+    IdentitiesOnly yes
+    UserKnownHostsFile /home/u/.jaunt/default/known_hosts
+    StrictHostKeyChecking yes
+
+Host *.example.test
+    ProxyJump jaunt@gate.example.org:22
+    IdentityFile /home/u/.jaunt/default/id_ed25519
+    CertificateFile /home/u/.jaunt/default/id_ed25519-cert.pub
+    IdentitiesOnly yes
+    UserKnownHostsFile /home/u/.jaunt/default/known_hosts
+    StrictHostKeyChecking yes
+";
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn a_non_default_port_and_an_ipv6_gate_are_written_with_brackets_and_a_port_line() {
+        let valid = validate(config("example.test", "2001:db8::1", 2222, &[key_line()])).unwrap();
+
+        let text = render_ssh_config(&valid, Path::new("/p")).unwrap();
+
+        assert!(text.contains("Host 2001:db8::1\n    User jaunt\n    Port 2222\n"));
+        assert!(text.contains("    ProxyJump jaunt@[2001:db8::1]:2222\n"));
+        let hosts = render_known_hosts(&valid);
+        assert!(hosts.contains("@cert-authority [2001:db8::1]:2222 ssh-ed25519 "));
+    }
+
+    #[test]
+    fn known_hosts_has_one_line_per_key_per_pattern_and_no_comments() {
+        let (first, second) = (key_line(), key_line());
+        let keys = [first.clone(), second.clone()];
+        let default_port = validate(config("example.test", "gate.example.org", 22, &keys)).unwrap();
+        let custom_port =
+            validate(config("example.test", "gate.example.org", 2222, &keys)).unwrap();
+
+        assert_eq!(
+            render_known_hosts(&default_port),
+            format!(
+                "@cert-authority *.example.test {first}\n@cert-authority *.example.test {second}\n@cert-authority gate.example.org {first}\n@cert-authority gate.example.org {second}\n"
+            )
+        );
+        assert_eq!(
+            render_known_hosts(&custom_port),
+            format!(
+                "@cert-authority *.example.test {first}\n@cert-authority *.example.test {second}\n@cert-authority gate.example.org {first}\n@cert-authority gate.example.org {second}\n@cert-authority [gate.example.org]:2222 {first}\n@cert-authority [gate.example.org]:2222 {second}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn host_keys_are_rewritten_without_their_comments() {
+        let commented = format!("{} someone@laptop", key_line());
+
+        let valid = validate(config("example.test", "gate.example.org", 22, &[commented])).unwrap();
+
+        assert_eq!(valid.host_ca_keys[0].split(' ').count(), 2);
+    }
+
+    #[test]
+    fn hostile_values_are_refused_before_anything_can_be_rendered() {
+        let key = key_line();
+        let long_label = "a".repeat(64);
+        let long_name = format!("{0}.{0}.{0}.{0}", "a".repeat(62));
+        let suffixes = [
+            "",
+            "com",
+            "corp",
+            "example.test\nProxyCommand touch /tmp/x",
+            "example.test ProxyCommand=x",
+            "exam ple.test",
+            "example.test%h",
+            "example.test;id",
+            "example.test#",
+            "Example.Test",
+            "*.example.test",
+            "exämple.test",
+            "-example.test",
+            ".example.test",
+            "example..test",
+            "example.test.",
+            long_label.as_str(),
+            long_name.as_str(),
+        ];
+        for suffix in suffixes {
+            let outcome = validate(config(
+                suffix,
+                "gate.example.org",
+                22,
+                std::slice::from_ref(&key),
+            ));
+            assert_eq!(outcome.err(), Some(SshConfigError::BadSuffix), "{suffix:?}");
+        }
+        let hosts = [
+            "",
+            "gate.example.org\nProxyCommand x",
+            "gate.example.org extra",
+            "gate%h.example.org",
+            "gate;id",
+            "gäte.example.org",
+            "Gate.example.org",
+            "-oProxyCommand=x",
+            "fe80::1%eth0",
+            "::ffff:1.2.3.4x",
+            "2001:DB8::1",
+            "[::1]",
+        ];
+        for host in hosts {
+            let outcome = validate(config("example.test", host, 22, std::slice::from_ref(&key)));
+            assert_eq!(outcome.err(), Some(SshConfigError::BadGateHost), "{host:?}");
+        }
+        assert_eq!(
+            validate(config(
+                "example.test",
+                "gate.example.org",
+                0,
+                std::slice::from_ref(&key)
+            ))
+            .err(),
+            Some(SshConfigError::BadGatePort)
+        );
+        for keys in [
+            vec![],
+            vec![format!("{key}\nProxyCommand x")],
+            vec!["not a key".to_owned()],
+            vec![key.clone(); 17],
+        ] {
+            assert_eq!(
+                validate(config("example.test", "gate.example.org", 22, &keys)).err(),
+                Some(SshConfigError::BadHostKeys)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_hosts_ip_literals_and_numeric_names_are_accepted() {
+        let key = key_line();
+        for host in [
+            "gate",
+            "10.0.0.1",
+            "gate-1.example.org",
+            "::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                validate(config("corp.test", host, 22, std::slice::from_ref(&key))).is_ok(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_profile_paths_are_refused_and_spaces_are_quoted() {
+        let valid = validate(config(
+            "example.test",
+            "gate.example.org",
+            22,
+            &[key_line()],
+        ))
+        .unwrap();
+        for path in [
+            "/home/u/.jaunt/def\nault",
+            "/home/u/50%/default",
+            "/home/u/$HOME/default",
+            "/home/u/a\"b/default",
+            "/home/u/a'b/default",
+            "/home/u/a;b/default",
+            "/home/u/a#b/default",
+            "/home/u/a*b/default",
+            "/home/u/a\\b/default",
+            "relative/default",
+        ] {
+            let outcome = render_ssh_config(&valid, Path::new(path));
+            assert!(
+                matches!(outcome, Err(SshConfigError::UnsafePath { .. })),
+                "{path:?}"
+            );
+        }
+        let spaced = render_ssh_config(&valid, Path::new("/home/Jane Doe/.jaunt/default")).unwrap();
+        assert!(spaced.contains("    IdentityFile \"/home/Jane Doe/.jaunt/default/id_ed25519\"\n"));
+        let accented = render_ssh_config(&valid, Path::new("/home/jörg/.jaunt/default")).unwrap();
+        assert!(accented.contains("    IdentityFile /home/jörg/.jaunt/default/id_ed25519\n"));
+    }
+}

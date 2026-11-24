@@ -4,4 +4,6 @@ mod certs;
 mod cli;
 mod client;
 mod login_flow;
+mod ssh_cli;
+mod ssh_setup;
 mod support;

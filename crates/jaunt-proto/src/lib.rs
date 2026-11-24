@@ -1,3 +1,4 @@
+mod client;
 mod device;
 mod enroll;
 mod error;
@@ -6,6 +7,7 @@ mod plane;
 mod session;
 mod whoami;
 
+pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};
 pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
 pub use enroll::{
     EnrollRequest, EnrollResponse, EnrollmentApproved, NodeCertificates, PollRequest, PollResponse,
@@ -109,5 +111,45 @@ mod tests {
             assert!(!shown.contains(secret), "{secret} leaked: {shown}");
         }
         assert!(shown.contains("login-1") && shown.contains("user-1"));
+    }
+
+    #[test]
+    fn client_responses_are_strict_and_round_trip() {
+        use super::{ClientConfig, NodeList};
+
+        let config = json!({
+            "ssh_suffix": "jaunt.test",
+            "gate": {"host": "gate.example.com", "port": 22},
+            "host_ca_keys": ["ssh-ed25519 AAAA"],
+        });
+        let parsed: ClientConfig = serde_json::from_value(config.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), config);
+        let mut extra = config.clone();
+        extra["extra"] = json!(1);
+        assert!(serde_json::from_value::<ClientConfig>(extra).is_err());
+        let mut nested = config;
+        nested["gate"]["extra"] = json!(1);
+        assert!(serde_json::from_value::<ClientConfig>(nested).is_err());
+
+        let list = json!({
+            "nodes": [{
+                "name": "web-01",
+                "labels": {"env": "prod"},
+                "hostname": "web-01.internal",
+                "connected": false,
+            }],
+            "truncated": false,
+        });
+        let parsed: NodeList = serde_json::from_value(list.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), list);
+        let mut extra = list.clone();
+        extra["nodes"][0]["extra"] = json!(1);
+        assert!(serde_json::from_value::<NodeList>(extra).is_err());
+        let mut top_level = list.clone();
+        top_level["extra"] = json!(1);
+        assert!(serde_json::from_value::<NodeList>(top_level).is_err());
+        let mut missing = list;
+        missing.as_object_mut().unwrap().remove("truncated");
+        assert!(serde_json::from_value::<NodeList>(missing).is_err());
     }
 }
