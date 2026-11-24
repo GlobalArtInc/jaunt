@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use jaunt_proto::{ClientConfig, GateEndpoint};
 
 use crate::issued::canonical_host_key;
+use crate::profile::ProfileName;
 
 pub const GATE_USER: &str = "jaunt";
 pub const DEFAULT_GATE_PORT: u16 = 22;
@@ -33,6 +34,20 @@ pub enum SshConfigError {
          choose another JAUNT_HOME"
     )]
     UnsafePath { path: PathBuf },
+    #[error(
+        "the jaunt program path {path:?} contains characters that cannot be written to an ssh_config safely; \
+         install jaunt in another directory"
+    )]
+    UnsafeProgram { path: PathBuf },
+    #[error("the profile name {name:?} cannot be written to an ssh_config safely")]
+    UnsafeProfile { name: String },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EnsureCommand<'a> {
+    pub program: &'a Path,
+    pub home: Option<&'a Path>,
+    pub profile: &'a ProfileName,
 }
 
 pub fn validate(config: ClientConfig) -> Result<ClientConfig, SshConfigError> {
@@ -100,16 +115,29 @@ fn is_dns_name(text: &str) -> bool {
     text.len() <= MAX_DNS_NAME_LEN && text.split('.').all(is_dns_label)
 }
 
-pub fn path_argument(text: &str) -> Option<String> {
-    let safe = text.starts_with('/')
+fn is_safe_path(text: &str) -> bool {
+    text.starts_with('/')
         && text.chars().all(|ch| {
             ch.is_alphanumeric()
                 || matches!(
                     ch,
                     '/' | '.' | '_' | '+' | '@' | ',' | ':' | '=' | '-' | ' '
                 )
-        });
-    if !safe {
+        })
+}
+
+fn is_safe_word(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+pub fn path_argument(text: &str) -> Option<String> {
+    if !is_safe_path(text) {
         return None;
     }
     if text.contains(' ') {
@@ -143,18 +171,66 @@ pub fn check_profile_dir(profile_dir: &Path) -> Result<(), SshConfigError> {
     Ok(())
 }
 
+fn ensure_words(command: &EnsureCommand<'_>) -> Result<String, SshConfigError> {
+    let program = command
+        .program
+        .to_str()
+        .filter(|text| is_safe_path(text))
+        .ok_or_else(|| SshConfigError::UnsafeProgram {
+            path: command.program.to_owned(),
+        })?;
+    let profile = command.profile.as_str();
+    if !is_safe_word(profile) {
+        return Err(SshConfigError::UnsafeProfile {
+            name: profile.to_owned(),
+        });
+    }
+    let home = match command.home {
+        Some(home) => {
+            let text = home
+                .to_str()
+                .filter(|text| is_safe_path(text))
+                .ok_or_else(|| SshConfigError::UnsafePath {
+                    path: home.to_owned(),
+                })?;
+            format!(" --home '{text}'")
+        }
+        None => String::new(),
+    };
+    Ok(format!(
+        "'{program}' ensure{home} --profile {profile} --quiet"
+    ))
+}
+
+pub fn check_ensure_command(command: &EnsureCommand<'_>) -> Result<(), SshConfigError> {
+    ensure_words(command).map(drop)
+}
+
+pub fn ensure_match_line(
+    ssh_suffix: &str,
+    command: &EnsureCommand<'_>,
+) -> Result<String, SshConfigError> {
+    let words = ensure_words(command)?;
+    Ok(format!("Match host *.{ssh_suffix} exec \"{words}\""))
+}
+
 pub fn render_ssh_config(
     config: &ClientConfig,
     profile_dir: &Path,
+    command: &EnsureCommand<'_>,
 ) -> Result<String, SshConfigError> {
     let identity = profile_path(profile_dir, PRIVATE_KEY_FILE)?;
     let certificate = profile_path(profile_dir, CERTIFICATE_FILE)?;
     let known_hosts = profile_path(profile_dir, KNOWN_HOSTS_FILE)?;
+    let auto_sign_in = ensure_match_line(&config.ssh_suffix, command)?;
     let common = format!(
         "    IdentityFile {identity}\n    CertificateFile {certificate}\n    IdentitiesOnly yes\n    UserKnownHostsFile {known_hosts}\n    StrictHostKeyChecking yes\n"
     );
     let gate = &config.gate;
-    let mut text = format!("{HEADER}\nHost {}\n    User {GATE_USER}\n", gate.host);
+    let mut text = format!(
+        "{HEADER}\n{auto_sign_in}\n\nHost {}\n    User {GATE_USER}\n",
+        gate.host
+    );
     if gate.port != DEFAULT_GATE_PORT {
         text.push_str(&format!("    Port {}\n", gate.port));
     }
@@ -192,7 +268,25 @@ mod tests {
     use ssh_key::rand_core::OsRng;
     use ssh_key::{Algorithm, PrivateKey, PublicKey};
 
-    use super::{SshConfigError, render_known_hosts, render_ssh_config, validate};
+    use super::{
+        EnsureCommand, SshConfigError, check_ensure_command, render_known_hosts, validate,
+    };
+    use crate::profile::ProfileName;
+
+    const PROGRAM: &str = "/usr/local/bin/jaunt";
+
+    fn render_ssh_config(
+        config: &ClientConfig,
+        profile_dir: &Path,
+    ) -> Result<String, SshConfigError> {
+        let profile = ProfileName::default_name();
+        let command = EnsureCommand {
+            program: Path::new(PROGRAM),
+            home: None,
+            profile: &profile,
+        };
+        super::render_ssh_config(config, profile_dir, &command)
+    }
 
     fn key_line() -> String {
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
@@ -220,6 +314,8 @@ mod tests {
         let text = render_ssh_config(&valid, Path::new("/home/u/.jaunt/default")).unwrap();
 
         let expected = "# Managed by jaunt. Do not edit.
+Match host *.example.test exec \"'/usr/local/bin/jaunt' ensure --profile default --quiet\"
+
 Host gate.example.org
     User jaunt
     ProxyJump none
@@ -406,5 +502,94 @@ Host *.example.test
         assert!(spaced.contains("    IdentityFile \"/home/Jane Doe/.jaunt/default/id_ed25519\"\n"));
         let accented = render_ssh_config(&valid, Path::new("/home/jörg/.jaunt/default")).unwrap();
         assert!(accented.contains("    IdentityFile /home/jörg/.jaunt/default/id_ed25519\n"));
+    }
+
+    #[test]
+    fn the_auto_sign_in_block_for_a_spaced_accented_home_matches_the_golden_text() {
+        let valid = validate(config("corp.test", "gate.corp.test", 22, &[key_line()])).unwrap();
+        let profile = ProfileName::parse("work-2").unwrap();
+        let command = EnsureCommand {
+            program: Path::new("/home/Jörg Müller/bin/jaunt"),
+            home: Some(Path::new("/srv/Jörg Müller/jaunt")),
+            profile: &profile,
+        };
+
+        let text =
+            super::render_ssh_config(&valid, Path::new("/srv/Jörg Müller/jaunt/work-2"), &command)
+                .unwrap();
+
+        let expected = "# Managed by jaunt. Do not edit.
+Match host *.corp.test exec \"'/home/Jörg Müller/bin/jaunt' ensure --home '/srv/Jörg Müller/jaunt' --profile work-2 --quiet\"
+
+Host gate.corp.test
+    User jaunt
+    ProxyJump none
+    IdentityFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519\"
+    CertificateFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519-cert.pub\"
+    IdentitiesOnly yes
+    UserKnownHostsFile \"/srv/Jörg Müller/jaunt/work-2/known_hosts\"
+    StrictHostKeyChecking yes
+
+Host *.corp.test
+    ProxyJump jaunt@gate.corp.test:22
+    IdentityFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519\"
+    CertificateFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519-cert.pub\"
+    IdentitiesOnly yes
+    UserKnownHostsFile \"/srv/Jörg Müller/jaunt/work-2/known_hosts\"
+    StrictHostKeyChecking yes
+";
+        assert_eq!(text, expected);
+        assert!(!text.contains('%'));
+    }
+
+    #[test]
+    fn a_program_path_that_a_shell_could_misread_is_refused_before_any_text_exists() {
+        let valid = validate(config(
+            "example.test",
+            "gate.example.org",
+            22,
+            &[key_line()],
+        ))
+        .unwrap();
+        let profile = ProfileName::default_name();
+        for program in [
+            "/opt/ja'unt/jaunt",
+            "/opt/ja\"unt/jaunt",
+            "/opt/$HOME/jaunt",
+            "/opt/50%h/jaunt",
+            "/opt/a;b/jaunt",
+            "/opt/a`id`/jaunt",
+            "/opt/a\\b/jaunt",
+            "/opt/a\nb/jaunt",
+            "/opt/a*b/jaunt",
+            "/opt/~/jaunt",
+            "relative/jaunt",
+        ] {
+            let command = EnsureCommand {
+                program: Path::new(program),
+                home: None,
+                profile: &profile,
+            };
+            let outcome = super::render_ssh_config(&valid, Path::new("/p"), &command);
+            assert!(
+                matches!(outcome, Err(SshConfigError::UnsafeProgram { .. })),
+                "{program:?}"
+            );
+            assert!(check_ensure_command(&command).is_err(), "{program:?}");
+        }
+        for home in ["/srv/50%", "/srv/a'b", "/srv/$X", "relative"] {
+            let command = EnsureCommand {
+                program: Path::new(PROGRAM),
+                home: Some(Path::new(home)),
+                profile: &profile,
+            };
+            assert!(
+                matches!(
+                    check_ensure_command(&command),
+                    Err(SshConfigError::UnsafePath { .. })
+                ),
+                "{home:?}"
+            );
+        }
     }
 }

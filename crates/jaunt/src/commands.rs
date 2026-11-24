@@ -1,9 +1,9 @@
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, ValueEnum};
 
@@ -11,12 +11,13 @@ use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
 use crate::client::{ApiClient, ApiError};
 use crate::consent::TerminalPrompt;
-use crate::login::{LoginOptions, LoginPorts, login};
+use crate::ensure::{EnsureIo, EnsureRequest, RenewOptions, SIGN_IN_DEADLINE};
+use crate::login::{LoginOptions, LoginPorts, SshSetup, lock_profile, login};
 use crate::logout::logout;
 use crate::ls::{render_json, render_text};
 use crate::profile::{ProfileName, resolve_home};
 use crate::server_url::ServerUrl;
-use crate::ssh_config::validate;
+use crate::ssh_config::{EnsureCommand, validate};
 use crate::ssh_include::{IncludeTarget, include_line};
 use crate::status::{Session, agent_view, check_online, render, ssh_view};
 use crate::store::ProfileStore;
@@ -118,6 +119,21 @@ pub struct StatusArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct EnsureArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub home: Option<PathBuf>,
+    #[arg(long, help = "Print only warnings and errors")]
+    pub quiet: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct LogoutArgs {
     #[arg(
         long,
@@ -166,6 +182,15 @@ fn include_target(
     })
 }
 
+fn custom_home(environment: &Environment, home: &Path) -> Option<PathBuf> {
+    let default_home = resolve_home(None, environment.user_home.clone()).ok();
+    if default_home.as_deref() == Some(home) {
+        None
+    } else {
+        Some(home.to_owned())
+    }
+}
+
 fn now_secs() -> Result<i64, ExitCode> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -204,10 +229,23 @@ pub fn run_login(args: &LoginArgs, environment: &Environment) -> ExitCode {
     let ssh = if args.no_ssh_config {
         None
     } else {
-        match include_target(environment, &home) {
-            Ok(target) => Some(target),
+        let include = match include_target(environment, &home) {
+            Ok(target) => target,
             Err(code) => return code,
-        }
+        };
+        let program = match env::current_exe() {
+            Ok(program) => program,
+            Err(err) => {
+                return usage_error(format!(
+                    "cannot find the path of the running jaunt program: {err}; use --no-ssh-config"
+                ));
+            }
+        };
+        Some(SshSetup {
+            include,
+            program,
+            ensure_home: custom_home(environment, &home),
+        })
     };
     let options = LoginOptions {
         server,
@@ -277,7 +315,14 @@ pub fn run_status(args: &StatusArgs, environment: &Environment) -> ExitCode {
     let agent = SshAgent::new(environment.ssh_auth_sock.clone());
     let view = agent_view(&store, &agent);
     let include = include_target(environment, &home).ok();
-    let ssh = ssh_view(&store, include.as_ref());
+    let program = env::current_exe().ok();
+    let ensure_home = custom_home(environment, &home);
+    let command = program.as_deref().map(|program| EnsureCommand {
+        program,
+        home: ensure_home.as_deref(),
+        profile: &args.profile,
+    });
+    let ssh = ssh_view(&store, include.as_ref(), command.as_ref());
     let mut stdout = io::stdout().lock();
     if let Err(err) = render(&mut stdout, &session, now, &view, &ssh) {
         return failure(format!("cannot write to the terminal: {err}"));
@@ -298,6 +343,72 @@ pub fn run_status(args: &StatusArgs, environment: &Environment) -> ExitCode {
     } else {
         ExitCode::from(EXIT_FAILED)
     }
+}
+
+fn ensure_ssh_setup(environment: &Environment, home: &Path) -> Option<SshSetup> {
+    let user_home = environment
+        .user_home
+        .as_deref()
+        .filter(|path| path.is_absolute())?;
+    let line = include_line(home, user_home).ok()?;
+    let program = env::current_exe().ok()?;
+    Some(SshSetup {
+        include: IncludeTarget {
+            config_path: user_home.join(".ssh").join("config"),
+            line,
+        },
+        program,
+        ensure_home: custom_home(environment, home),
+    })
+}
+
+fn ensure_request(args: &EnsureArgs, environment: &Environment) -> Result<EnsureRequest, String> {
+    let home = match &args.home {
+        Some(home) if home.is_absolute() => home.clone(),
+        Some(_) => return Err("--home must be an absolute path".to_owned()),
+        None => resolve_home(
+            environment.jaunt_home.clone(),
+            environment.user_home.clone(),
+        )
+        .map_err(|err| err.to_string())?,
+    };
+    Ok(EnsureRequest {
+        renew: RenewOptions {
+            ssh: ensure_ssh_setup(environment, &home),
+            custom_home: custom_home(environment, &home).is_some(),
+            home,
+            profile: args.profile.clone(),
+            deadline: SIGN_IN_DEADLINE,
+        },
+        quiet: args.quiet,
+    })
+}
+
+pub fn run_ensure_with(args: &EnsureArgs, environment: &Environment, io: EnsureIo<'_>) -> u8 {
+    match ensure_request(args, environment) {
+        Ok(request) => crate::ensure::run(&request, io),
+        Err(message) => {
+            drop(writeln!(io.stderr, "jaunt: {message}"));
+            EXIT_USAGE
+        }
+    }
+}
+
+pub fn run_ensure(args: &EnsureArgs, environment: &Environment) -> ExitCode {
+    let agent = SshAgent::new(environment.ssh_auth_sock.clone());
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    let terminal = stderr.is_terminal();
+    let io = EnsureIo {
+        stdout: &mut stdout,
+        stderr: &mut stderr,
+        terminal,
+        browser: &SystemBrowser,
+        agent: &agent,
+        consent: &TerminalPrompt,
+        clock: &SystemTime::now,
+    };
+    ExitCode::from(run_ensure_with(args, environment, io))
 }
 
 pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
@@ -380,8 +491,22 @@ pub fn run_logout(args: &LogoutArgs, environment: &Environment) -> ExitCode {
         Err(code) => return code,
     };
     let store = ProfileStore::new(&home, &args.profile);
+    let lock = if home.is_dir() {
+        let deadline = Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+        match lock_profile(&home, &args.profile, deadline, &mut io::stderr()) {
+            Ok(lock) => Some(lock),
+            Err(err) => return failure(err),
+        }
+    } else {
+        None
+    };
     let agent = SshAgent::new(environment.ssh_auth_sock.clone());
-    match logout(&store, &agent) {
+    let outcome = logout(&store, &agent);
+    if let Err(err) = store.clear_failure_marker() {
+        eprintln!("jaunt: warning: the record of an earlier failed sign-in was not removed: {err}");
+    }
+    drop(lock);
+    match outcome {
         Ok(report) => {
             if let Some(warning) = &report.agent_warning {
                 eprintln!("jaunt: warning: the key may still be loaded in ssh-agent: {warning}");
@@ -400,5 +525,63 @@ pub fn run_logout(args: &LogoutArgs, environment: &Environment) -> ExitCode {
             report_lines(text, ExitCode::SUCCESS)
         }
         Err(err) => failure(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{Environment, custom_home, ensure_ssh_setup};
+    use crate::profile::ProfileName;
+    use crate::ssh_config::{EnsureCommand, ensure_match_line};
+
+    fn environment(user_home: Option<&str>) -> Environment {
+        Environment {
+            jaunt_home: None,
+            user_home: user_home.map(PathBuf::from),
+            ssh_auth_sock: None,
+        }
+    }
+
+    #[test]
+    fn only_a_home_other_than_the_default_is_pinned_in_the_generated_command() {
+        let cases = [
+            (Some("/home/u"), "/home/u/.jaunt", None),
+            (Some("/home/u"), "/srv/jaunt", Some("/srv/jaunt")),
+            (None, "/home/u/.jaunt", Some("/home/u/.jaunt")),
+            (Some("relative"), "/home/u/.jaunt", Some("/home/u/.jaunt")),
+        ];
+        for (user_home, home, pinned) in cases {
+            assert_eq!(
+                custom_home(&environment(user_home), Path::new(home)),
+                pinned.map(PathBuf::from),
+                "{user_home:?} {home}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rendered_line_for_the_default_home_has_no_home_option() {
+        let environment = environment(Some("/home/u"));
+        let setup = ensure_ssh_setup(&environment, Path::new("/home/u/.jaunt")).unwrap();
+        let profile = ProfileName::default_name();
+
+        let line = ensure_match_line(
+            "example.test",
+            &EnsureCommand {
+                program: &setup.program,
+                home: setup.ensure_home.as_deref(),
+                profile: &profile,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(setup.ensure_home, None);
+        assert!(!line.contains("--home"), "{line}");
+        assert!(
+            line.ends_with(" ensure --profile default --quiet\""),
+            "{line}"
+        );
     }
 }

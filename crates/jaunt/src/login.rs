@@ -1,23 +1,25 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jaunt_proto::{FinishRequest, StartRequest};
 use url::Url;
 
 use crate::agent::{AgentError, SshAgent};
 use crate::browser::BrowserOpener;
-use crate::client::{ApiClient, ApiError};
+use crate::client::{ApiClient, ApiError, TOTAL_TIMEOUT};
 use crate::consent::ConsentPrompt;
 use crate::display::format_local;
 use crate::issued::{VerifyError, verify};
 use crate::key::{KeyError, SessionKey};
+use crate::lock::{LockError, ProfileLock};
 use crate::loopback::{Callback, FailureCode, LoopbackError, LoopbackListener};
 use crate::pkce::{EntropyError, Pkce};
 use crate::profile::ProfileName;
 use crate::server_url::{ServerUrl, check_web_url};
 use crate::ssh_config::{
-    SshConfigError, check_profile_dir, render_known_hosts, render_ssh_config, validate,
+    EnsureCommand, SshConfigError, check_ensure_command, check_profile_dir, render_known_hosts,
+    render_ssh_config, validate,
 };
 use crate::ssh_include::{IncludeOutcome, IncludeTarget, ensure_include};
 use crate::store::{LoginFiles, ProfileStore, SshFiles, StoreError, Transaction};
@@ -25,6 +27,7 @@ use crate::store::{LoginFiles, ProfileStore, SshFiles, StoreError, Transaction};
 const CHALLENGE_METHOD: &str = "S256";
 const MAX_LABEL_LEN: usize = 64;
 const UNKNOWN_HOST: &str = "unknown";
+const MIN_CALL_AFTER_APPROVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoginError {
@@ -60,6 +63,19 @@ pub enum LoginError {
     Terminal(io::Error),
     #[error("cannot ask for confirmation: {0}")]
     Consent(io::Error),
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    #[error("the held lock belongs to another profile")]
+    ForeignLock,
+    #[error("{0}; sign in with --no-ssh-config to skip the SSH setup")]
+    UnsafeCommand(SshConfigError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshSetup {
+    pub include: IncludeTarget,
+    pub program: PathBuf,
+    pub ensure_home: Option<PathBuf>,
 }
 
 pub struct LoginOptions {
@@ -68,7 +84,7 @@ pub struct LoginOptions {
     pub home: PathBuf,
     pub no_browser: bool,
     pub timeout: Duration,
-    pub ssh: Option<IncludeTarget>,
+    pub ssh: Option<SshSetup>,
     pub accept_ssh_config: bool,
 }
 
@@ -170,18 +186,118 @@ fn open_or_announce(
     .map_err(LoginError::Terminal)
 }
 
+pub fn lock_profile(
+    home: &Path,
+    profile: &ProfileName,
+    deadline: Instant,
+    notices: &mut dyn Write,
+) -> Result<ProfileLock, LoginError> {
+    let store = ProfileStore::new(home, profile);
+    let mut notice_error = None;
+    let acquired = ProfileLock::acquire(home, &store.lock_path(), deadline, &mut || {
+        if let Err(err) = writeln!(
+            notices,
+            "jaunt: another sign-in for profile `{profile}` is in progress; waiting for it to finish"
+        ) {
+            notice_error = Some(err);
+        }
+    });
+    if let Some(err) = notice_error {
+        return Err(LoginError::Terminal(err));
+    }
+    Ok(acquired?)
+}
+
+fn ensure_command<'a>(setup: &'a SshSetup, profile: &'a ProfileName) -> EnsureCommand<'a> {
+    EnsureCommand {
+        program: &setup.program,
+        home: setup.ensure_home.as_deref(),
+        profile,
+    }
+}
+
+fn check_ssh_paths(options: &LoginOptions, store: &ProfileStore) -> Result<(), LoginError> {
+    if let Some(setup) = &options.ssh {
+        check_profile_dir(store.dir())?;
+        check_ensure_command(&ensure_command(setup, &options.profile))
+            .map_err(LoginError::UnsafeCommand)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallBudget {
+    Standard,
+    WithinDeadline,
+}
+
+impl CallBudget {
+    fn before_approval(self, deadline: Instant) -> Result<Duration, LoginError> {
+        match self {
+            CallBudget::Standard => Ok(TOTAL_TIMEOUT),
+            CallBudget::WithinDeadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(LoopbackError::TimedOut.into());
+                }
+                Ok(remaining.min(TOTAL_TIMEOUT))
+            }
+        }
+    }
+
+    fn after_approval(self, deadline: Instant) -> Duration {
+        match self {
+            CallBudget::Standard => TOTAL_TIMEOUT,
+            CallBudget::WithinDeadline => deadline
+                .saturating_duration_since(Instant::now())
+                .max(MIN_CALL_AFTER_APPROVAL)
+                .min(TOTAL_TIMEOUT),
+        }
+    }
+}
+
 pub fn login(
     options: &LoginOptions,
     ports: &mut LoginPorts<'_>,
 ) -> Result<LoginReport, LoginError> {
     let store = ProfileStore::new(&options.home, &options.profile);
-    if options.ssh.is_some() {
-        check_profile_dir(store.dir())?;
+    check_ssh_paths(options, &store)?;
+    let deadline = Instant::now()
+        .checked_add(options.timeout)
+        .ok_or(LoopbackError::InvalidTimeout)?;
+    let lock = lock_profile(&options.home, &options.profile, deadline, ports.notices)?;
+    let outcome = signed_in(options, deadline, CallBudget::Standard, ports, &store);
+    drop(lock);
+    outcome
+}
+
+pub fn login_with_lock(
+    options: &LoginOptions,
+    ports: &mut LoginPorts<'_>,
+    lock: &ProfileLock,
+) -> Result<LoginReport, LoginError> {
+    let store = ProfileStore::new(&options.home, &options.profile);
+    if lock.path() != store.lock_path() {
+        return Err(LoginError::ForeignLock);
     }
+    check_ssh_paths(options, &store)?;
+    let deadline = Instant::now()
+        .checked_add(options.timeout)
+        .ok_or(LoopbackError::InvalidTimeout)?;
+    signed_in(options, deadline, CallBudget::WithinDeadline, ports, &store)
+}
+
+fn signed_in(
+    options: &LoginOptions,
+    deadline: Instant,
+    calls: CallBudget,
+    ports: &mut LoginPorts<'_>,
+    store: &ProfileStore,
+) -> Result<LoginReport, LoginError> {
     let key = SessionKey::generate(&options.profile)?;
     let pkce = Pkce::generate()?;
     let listener = LoopbackListener::bind()?;
-    let client = ApiClient::new(&options.server)?;
+    let client = ApiClient::new(&options.server)?.with_deadline(calls.before_approval(deadline)?);
 
     let started = client.start(&StartRequest {
         code_challenge: pkce.challenge().to_owned(),
@@ -193,11 +309,16 @@ pub fn login(
         check_web_url(&started.authorize_url).map_err(|_| LoginError::BadAuthorizeUrl)?;
     open_or_announce(options.no_browser, &authorize, ports)?;
 
-    let completion = match listener.wait_for_callback(&started.login_id, options.timeout)? {
+    let wait = deadline.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return Err(LoopbackError::TimedOut.into());
+    }
+    let completion = match listener.wait_for_callback(&started.login_id, wait)? {
         Callback::Approved(code) => code,
         Callback::Failed(FailureCode::AccessDenied) => return Err(LoginError::Denied),
         Callback::Failed(FailureCode::Other) => return Err(LoginError::Failed),
     };
+    let client = client.with_deadline(calls.after_approval(deadline));
     let response = client.finish(&FinishRequest {
         login_id: started.login_id,
         code_verifier: pkce.verifier().expose().to_owned(),
@@ -216,9 +337,10 @@ pub fn login(
 
     let mut notes = Vec::new();
     let ssh = match &options.ssh {
-        Some(_) => prepare_ssh(
-            &client,
-            &store,
+        Some(setup) => prepare_ssh(
+            &client.with_deadline(calls.after_approval(deadline)),
+            store,
+            &ensure_command(setup, &options.profile),
             ports.consent,
             options.accept_ssh_config,
             &mut notes,
@@ -278,14 +400,23 @@ pub fn login(
         }
     }
     if ssh.is_none() && had_ssh_files {
-        notes.push("the previous SSH setup of this profile was removed".to_owned());
+        notes.push("warning: the previous SSH setup of this profile was removed".to_owned());
     }
-    if let (Some(files), Some(target)) = (&ssh, &options.ssh) {
+    if let Err(err) = store.clear_failure_marker() {
+        notes.push(format!(
+            "warning: the record of an earlier failed sign-in was not removed: {err}"
+        ));
+    }
+    if let (Some(files), Some(setup)) = (&ssh, &options.ssh) {
         let scope = format!(
             "*.{} through {}:{}",
             files.client.ssh_suffix, files.client.gate.host, files.client.gate.port
         );
-        notes.push(include_note(&scope, target, ensure_include(target)));
+        notes.push(include_note(
+            &scope,
+            &setup.include,
+            ensure_include(&setup.include),
+        ));
     }
     let placement = match staged {
         StagedKey::Agent => KeyPlacement::Agent,
@@ -307,6 +438,7 @@ pub fn login(
 fn prepare_ssh(
     client: &ApiClient,
     store: &ProfileStore,
+    command: &EnsureCommand<'_>,
     consent: &dyn ConsentPrompt,
     accept: bool,
     notes: &mut Vec<String>,
@@ -315,7 +447,7 @@ fn prepare_ssh(
         Ok(fetched) => fetched,
         Err(ApiError::NotConfigured) => {
             notes.push(
-                "the server has no SSH gateway configured yet; the SSH setup was skipped"
+                "warning: the server has no SSH gateway configured yet; the SSH setup was skipped"
                     .to_owned(),
             );
             return Ok(None);
@@ -337,7 +469,7 @@ fn prepare_ssh(
     if !known && !accept {
         if !consent.interactive() {
             notes.push(format!(
-                "the server wants to manage ssh for {scope}; the SSH setup was skipped: run `jaunt login --accept-ssh-config` to enable it"
+                "warning: the server wants to manage ssh for {scope}; the SSH setup was skipped: run `jaunt login --accept-ssh-config` to enable it"
             ));
             return Ok(None);
         }
@@ -347,12 +479,12 @@ fn prepare_ssh(
         );
         if !consent.confirm(&question).map_err(LoginError::Consent)? {
             notes.push(format!(
-                "the SSH setup for {scope} was declined: run `jaunt login --accept-ssh-config` to enable it"
+                "warning: the SSH setup for {scope} was declined: run `jaunt login --accept-ssh-config` to enable it"
             ));
             return Ok(None);
         }
     }
-    let ssh_config = render_ssh_config(&client_config, store.dir())?;
+    let ssh_config = render_ssh_config(&client_config, store.dir(), command)?;
     let known_hosts = render_known_hosts(&client_config);
     Ok(Some(SshFiles {
         client: client_config,

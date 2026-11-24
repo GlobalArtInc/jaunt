@@ -3,6 +3,7 @@ mod agent_faults;
 mod certs;
 mod cli;
 mod client;
+mod ensure;
 mod login_flow;
 mod ssh_cli;
 mod ssh_setup;

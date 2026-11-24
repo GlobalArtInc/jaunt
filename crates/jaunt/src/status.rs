@@ -4,6 +4,7 @@ use crate::agent::{AgentError, SshAgent};
 use crate::client::{ApiClient, ApiError};
 use crate::display::{format_local, format_span, printable};
 use crate::server_url::ServerUrl;
+use crate::ssh_config::{EnsureCommand, ensure_match_line};
 use crate::ssh_include::{IncludeTarget, include_present};
 use crate::store::{ProfileMeta, ProfileStore, StoreError};
 
@@ -63,6 +64,7 @@ pub enum SshView {
         suffix: String,
         gate: String,
         shadowed_by: Option<String>,
+        auto_sign_in: bool,
     },
     IncludeMissing {
         config: String,
@@ -70,7 +72,11 @@ pub enum SshView {
     Unknown(String),
 }
 
-pub fn ssh_view(store: &ProfileStore, include: Option<&IncludeTarget>) -> SshView {
+pub fn ssh_view(
+    store: &ProfileStore,
+    include: Option<&IncludeTarget>,
+    command: Option<&EnsureCommand<'_>>,
+) -> SshView {
     let config = match store.read_client_config() {
         Ok(Some(config)) => config,
         Ok(None) => return SshView::NotSetUp,
@@ -92,6 +98,13 @@ pub fn ssh_view(store: &ProfileStore, include: Option<&IncludeTarget>) -> SshVie
             Err(err) => return SshView::Unknown(err.to_string()),
         }
     }
+    let generated = match store.read_ssh_config() {
+        Ok(text) => text.unwrap_or_default(),
+        Err(err) => return SshView::Unknown(err.to_string()),
+    };
+    let auto_sign_in = command
+        .and_then(|command| ensure_match_line(&config.ssh_suffix, command).ok())
+        .is_some_and(|expected| generated.lines().any(|line| line == expected));
     let shadowed_by = store
         .shadowing_profiles(&config.ssh_suffix)
         .into_iter()
@@ -100,6 +113,7 @@ pub fn ssh_view(store: &ProfileStore, include: Option<&IncludeTarget>) -> SshVie
         suffix: config.ssh_suffix,
         gate: format!("{}:{}", config.gate.host, config.gate.port),
         shadowed_by,
+        auto_sign_in,
     }
 }
 
@@ -147,6 +161,7 @@ pub fn render(
             suffix,
             gate,
             shadowed_by,
+            auto_sign_in,
         } => {
             writeln!(
                 out,
@@ -154,6 +169,17 @@ pub fn render(
                 printable(suffix),
                 printable(gate)
             )?;
+            if *auto_sign_in {
+                writeln!(
+                    out,
+                    "Auto sign-in: on (ssh signs you in again when the certificate expires)"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "Auto sign-in: off (run `jaunt login` again to turn it on)"
+                )?;
+            }
             match shadowed_by {
                 Some(other) => writeln!(
                     out,
@@ -296,16 +322,18 @@ mod tests {
                     suffix: "example.test".to_owned(),
                     gate: "gate.example.org:22".to_owned(),
                     shadowed_by: None,
+                    auto_sign_in: true,
                 },
-                "SSH setup: ready (hosts *.example.test through gate.example.org:22)",
+                "SSH setup: ready (hosts *.example.test through gate.example.org:22)\nAuto sign-in: on",
             ),
             (
                 SshView::Ready {
                     suffix: "example.test".to_owned(),
                     gate: "gate.example.org:22".to_owned(),
                     shadowed_by: Some("alpha".to_owned()),
+                    auto_sign_in: false,
                 },
-                "SSH setup: shadowed by profile alpha:",
+                "Auto sign-in: off (run `jaunt login` again to turn it on)\nSSH setup: shadowed by profile alpha:",
             ),
             (
                 SshView::IncludeMissing {

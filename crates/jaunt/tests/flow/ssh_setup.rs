@@ -321,8 +321,8 @@ fn two_profiles_get_independent_files_and_share_one_include_line() {
     assert_eq!(config, format!("{}\n", world.target().line));
     assert_eq!(names(&world.ssh_dir()), ["config"]);
 
-    let first = ssh_view(&world.store("default"), None);
-    let second = ssh_view(&world.store("work"), None);
+    let first = ssh_view(&world.store("default"), None, None);
+    let second = ssh_view(&world.store("work"), None, None);
     let SshView::Ready { shadowed_by, .. } = first else {
         panic!("expected a ready setup, got {first:?}");
     };
@@ -409,7 +409,7 @@ fn a_failing_client_config_fetch_leaves_the_previous_profile_and_ssh_config_inta
     assert!(message.contains("--no-ssh-config"), "{message}");
     assert_eq!(snapshot(&world.profile_dir("default")), profile_before);
     assert_eq!(snapshot(&world.ssh_dir()), config_before);
-    assert_eq!(names(&world.home), ["default"]);
+    assert_eq!(names(&world.home), [".default.lock", "default"]);
 }
 
 #[test]
@@ -426,7 +426,7 @@ fn a_profile_path_that_cannot_be_written_safely_fails_before_anything_changes() 
         Err(LoginError::SshSettings(SshConfigError::UnsafePath { .. }))
     ));
     assert_eq!(snapshot(&world.profile_dir("default")), before);
-    assert_eq!(names(&world.home), ["default"]);
+    assert_eq!(names(&world.home), [".default.lock", "default"]);
     assert!(!world.ssh_dir().exists());
     assert!(untouched.seen(|seen| seen.redirect_port.is_none() && seen.client_config_calls == 0));
 }
@@ -547,10 +547,10 @@ fn hostile_client_configs_are_refused_and_nothing_is_written() {
         assert!(refused.contains(expected), "{reply}: {refused}");
         assert!(error.to_string().contains("--no-ssh-config"), "{error}");
         assert!(!error.to_string().contains("ProxyCommand"), "{error}");
-        assert!(!world.home.exists(), "{reply}");
+        assert_eq!(names(&world.home), [".default.lock"], "{reply}");
         assert!(!world.ssh_dir().exists(), "{reply}");
         assert!(
-            fs::read_dir(world.root.path()).unwrap().count() == 1,
+            fs::read_dir(world.root.path()).unwrap().count() == 2,
             "{reply}"
         );
     }

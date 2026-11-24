@@ -182,7 +182,7 @@ fn a_failed_key_placement_leaves_no_profile_and_keeps_a_previous_session_byte_fo
         "{first:?}"
     );
     assert!(!store.dir().exists());
-    assert!(names(&home).is_empty(), "{:?}", names(&home));
+    assert_eq!(names(&home), [".default.lock"]);
 
     login_with(&server, &home, &SshAgent::new(None));
     let before = snapshot(store.dir());
@@ -200,7 +200,7 @@ fn a_failed_key_placement_leaves_no_profile_and_keeps_a_previous_session_byte_fo
         "{second:?}"
     );
     assert_eq!(snapshot(store.dir()), before);
-    assert_eq!(names(&home), ["default"]);
+    assert_eq!(names(&home), [".default.lock", "default"]);
 
     let recorded = fs::read_to_string(&calls).unwrap();
     let lines: Vec<&str> = recorded.lines().collect();
@@ -239,7 +239,7 @@ fn a_failing_removal_of_the_previous_key_is_only_a_warning() {
         second.notes[0]
     );
     assert_ne!(store.read_public_key_line().unwrap().unwrap(), first_line);
-    assert_eq!(names(&home), ["default"]);
+    assert_eq!(names(&home), [".default.lock", "default"]);
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn a_commit_failure_after_the_key_was_sent_removes_the_agent_key_and_the_staged_
                 && lines[1].ends_with("/id_ed25519.pub"),
             "hang={hang_on_add}: {lines:?}"
         );
-        assert_eq!(names(&home), ["default"]);
+        assert_eq!(names(&home), [".default.lock", "default"]);
         assert!(home.join("default").is_file());
     }
 }

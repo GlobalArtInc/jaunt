@@ -325,7 +325,7 @@ fn a_second_login_removes_the_previous_key_from_the_agent() {
     assert_ne!(first_line, second_line);
     assert!(agent.client().holds(&second_line).unwrap());
     assert!(!agent.client().holds(&first_line).unwrap());
-    assert_eq!(names(&home), ["default"]);
+    assert_eq!(names(&home), [".default.lock", "default"]);
 }
 
 #[test]

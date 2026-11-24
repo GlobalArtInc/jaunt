@@ -34,6 +34,7 @@ const OWNED_FILES: [&str; 9] = [
     SSH_CONFIG_FILE,
     KNOWN_HOSTS_FILE,
 ];
+const MAX_MARKER_BYTES: u64 = 64;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const MAX_READ_BYTES: u64 = 1024 * 1024;
@@ -127,6 +128,49 @@ impl ProfileStore {
         &self.dir
     }
 
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn lock_path(&self) -> PathBuf {
+        self.home.join(format!(".{}.lock", self.name))
+    }
+
+    pub fn failure_marker_path(&self) -> PathBuf {
+        self.home.join(format!(".{}.ensure-failed", self.name))
+    }
+
+    pub fn read_failure_marker(&self) -> Option<i64> {
+        let path = self.failure_marker_path();
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > MAX_MARKER_BYTES {
+            return None;
+        }
+        fs::read_to_string(&path).ok()?.trim().parse::<i64>().ok()
+    }
+
+    pub fn write_failure_marker(&self, unix_secs: i64) -> Result<(), StoreError> {
+        let path = self.failure_marker_path();
+        let serial = SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.home.join(format!(
+            ".{}.ensure-failed.tmp.{}.{serial}",
+            self.name,
+            std::process::id()
+        ));
+        if let Err(err) = write_new_file(&temporary, format!("{unix_secs}\n").as_bytes()) {
+            drop(fs::remove_file(&temporary));
+            return Err(io_error("write", &temporary, err));
+        }
+        fs::rename(&temporary, &path).map_err(|err| {
+            drop(fs::remove_file(&temporary));
+            io_error("replace", &path, err)
+        })
+    }
+
+    pub fn clear_failure_marker(&self) -> Result<(), StoreError> {
+        remove_if_present(&self.failure_marker_path()).map(drop)
+    }
+
     pub fn public_key_path(&self) -> PathBuf {
         self.dir.join(PUBLIC_KEY_FILE)
     }
@@ -177,6 +221,16 @@ impl ProfileStore {
         validate(parsed)
             .map(Some)
             .map_err(|_| StoreError::Corrupt { path })
+    }
+
+    pub fn read_certificate_line(&self) -> Result<Option<String>, StoreError> {
+        let path = self.certificate_path();
+        Ok(self.read_text(&path)?.map(|text| text.trim().to_owned()))
+    }
+
+    pub fn read_ssh_config(&self) -> Result<Option<String>, StoreError> {
+        let path = self.ssh_config_path();
+        self.read_text(&path)
     }
 
     pub fn ssh_files_present(&self) -> Result<bool, StoreError> {

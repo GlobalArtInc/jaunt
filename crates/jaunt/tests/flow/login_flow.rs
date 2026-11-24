@@ -28,9 +28,14 @@ fn profile_store(home: &Path) -> ProfileStore {
 
 fn assert_nothing_on_disk(home: &Path) {
     let leftovers: Vec<_> = match fs::read_dir(home) {
-        Ok(entries) => entries.map(|entry| entry.unwrap().file_name()).collect(),
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != ".default.lock")
+            .collect(),
         Err(_) => Vec::new(),
     };
+    let lock = home.join(".default.lock");
+    assert!(!lock.exists() || fs::read(&lock).unwrap().is_empty());
     assert!(leftovers.is_empty(), "left on disk: {leftovers:?}");
 }
 

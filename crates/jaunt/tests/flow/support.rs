@@ -19,7 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jaunt::agent::SshAgent;
 use jaunt::browser::{BrowserError, BrowserOpener};
 use jaunt::consent::ConsentPrompt;
-use jaunt::login::{LoginError, LoginOptions, LoginPorts, LoginReport, login};
+use jaunt::login::{LoginError, LoginOptions, LoginPorts, LoginReport, SshSetup, login};
 use jaunt::profile::ProfileName;
 use jaunt::server_url::ServerUrl;
 use jaunt::ssh_include::IncludeTarget;
@@ -44,6 +44,7 @@ pub const DEFAULT_VALIDITY_SECS: u64 = 8 * 3600;
 pub const SUFFIX: &str = "example.test";
 pub const GATE_HOST: &str = "gate.other.test";
 pub const GATE_PORT: u16 = 2222;
+pub const HARMLESS_PROGRAM: &str = "/usr/bin/true";
 
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -164,6 +165,13 @@ pub struct Seen {
     pub finish_calls: usize,
     pub client_config_calls: usize,
     pub revoked: bool,
+    pub requests: usize,
+}
+
+fn record_request(shared: &Shared) -> bool {
+    let mut seen = shared.seen.lock().unwrap();
+    seen.requests += 1;
+    seen.revoked
 }
 
 struct Shared {
@@ -199,6 +207,7 @@ async fn start_handler(
     let port = *shared.port.lock().unwrap();
     {
         let mut seen = shared.seen.lock().unwrap();
+        seen.requests += 1;
         seen.redirect_port = u16::try_from(request.redirect_port).ok();
         seen.challenge_method = Some(request.code_challenge_method.clone());
         seen.label.clone_from(&request.client_label);
@@ -222,6 +231,7 @@ async fn finish_handler(
 ) -> Response {
     {
         let mut seen = shared.seen.lock().unwrap();
+        seen.requests += 1;
         seen.finish_calls += 1;
         seen.verifier = Some(request.code_verifier.clone());
         seen.completion.clone_from(&request.completion_code);
@@ -265,7 +275,7 @@ async fn whoami_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let revoked = shared.seen.lock().unwrap().revoked;
+    let revoked = record_request(&shared);
     if revoked || presented != Some(format!("Bearer {API_TOKEN}").as_str()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -286,6 +296,7 @@ fn host_ca_line(shared: &Shared) -> String {
 }
 
 async fn client_config_handler(State(shared): State<Arc<Shared>>) -> Response {
+    record_request(&shared);
     shared.seen.lock().unwrap().client_config_calls += 1;
     match &shared.behavior.client_config {
         ClientConfigReply::NotConfigured => error_response(StatusCode::NOT_FOUND, "not_configured"),
@@ -309,7 +320,7 @@ async fn nodes_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) ->
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let revoked = shared.seen.lock().unwrap().revoked;
+    let revoked = record_request(&shared);
     if revoked || presented != Some(format!("Bearer {API_TOKEN}").as_str()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -583,7 +594,11 @@ pub fn run_login_setup(
         home: home.to_owned(),
         no_browser,
         timeout,
-        ssh: setup.ssh,
+        ssh: setup.ssh.map(|include| SshSetup {
+            include,
+            program: PathBuf::from(HARMLESS_PROGRAM),
+            ensure_home: None,
+        }),
         accept_ssh_config: setup.accept,
     };
     let mut notices = Vec::new();

@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use jaunt::commands::{
-    Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_login, run_logout, run_ls,
-    run_status,
+    EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_ensure, run_login,
+    run_logout, run_ls, run_status,
 };
 
 use crate::policy::PolicyCommand;
@@ -32,22 +32,20 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    #[command(about = "Ensure a valid session and certificate")]
-    Ensure,
+    #[command(about = "Make sure a valid certificate is in place, signing in again if needed")]
+    Ensure(EnsureArgs),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let command = match cli.command {
-        Command::Policy { command } => return policy::run(&command),
-        Command::Login(args) => return run_login(&args, &Environment::from_process()),
-        Command::Logout(args) => return run_logout(&args, &Environment::from_process()),
-        Command::Status(args) => return run_status(&args, &Environment::from_process()),
-        Command::Ls(args) => return run_ls(&args, &Environment::from_process()),
-        Command::Ensure => "ensure",
-    };
-    eprintln!("not implemented: {command}");
-    ExitCode::from(2)
+    match cli.command {
+        Command::Policy { command } => policy::run(&command),
+        Command::Login(args) => run_login(&args, &Environment::from_process()),
+        Command::Logout(args) => run_logout(&args, &Environment::from_process()),
+        Command::Status(args) => run_status(&args, &Environment::from_process()),
+        Command::Ls(args) => run_ls(&args, &Environment::from_process()),
+        Command::Ensure(args) => run_ensure(&args, &Environment::from_process()),
+    }
 }
 
 #[cfg(test)]
