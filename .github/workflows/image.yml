@@ -1,0 +1,162 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+    inputs:
+      prune:
+        description: "Delete old images from Astrum (otherwise only list what would be deleted)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ASTRUM_REPOSITORY: docker-prod
+  IMAGE_NAME: jaunt
+  KEEP: "15"
+
+jobs:
+  image:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: production-registry
+    timeout-minutes: 60
+    steps:
+      - name: Check that the Astrum credentials are present
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          ASTRUM_USERNAME: ${{ secrets.ASTRUM_USERNAME }}
+          ASTRUM_PASSWORD: ${{ secrets.ASTRUM_PASSWORD }}
+        run: |
+          set -eu
+          missing=0
+          for name in ASTRUM_HOST ASTRUM_USERNAME ASTRUM_PASSWORD; do
+            value=$(printenv "$name" || true)
+            if [ -z "$value" ]; then
+              echo "::error::$name is empty or not set in the production-registry environment"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ]
+
+      - name: actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Decide whether this run may publish
+        id: publish
+        run: |
+          set -eu
+          head=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ -z "$head" ]; then
+            echo "::error::cannot read the head of main"
+            exit 1
+          fi
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::this run is for ${GITHUB_SHA:0:7} but main is at ${head:0:7}: the image is not built or pushed, so old code never gets the newest timestamp"
+          fi
+
+      - name: Work out the tag
+        id: tag
+        run: |
+          set -eu
+          echo "value=$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Test the prune script
+        run: python3 -I -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Build the jauntd image
+        if: steps.publish.outputs.allowed == 'true'
+        env:
+          DOCKER_BUILDKIT: "1"
+          TAG: ${{ steps.tag.outputs.value }}
+          CREATED: ${{ steps.tag.outputs.created }}
+        run: |
+          set -eu
+          docker build --platform linux/amd64 --target jauntd \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            --build-arg "CREATED=$CREATED" \
+            -t "jaunt-local:$TAG" .
+
+      - name: Extract the agent and CLI binaries
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          set -eu
+          docker build --platform linux/amd64 --target binaries --output type=local,dest=binaries .
+          tar -C binaries -czf jaunt-binaries-linux-amd64.tar.gz jauntd jaunt-agent jaunt
+          sha256sum jaunt-binaries-linux-amd64.tar.gz > jaunt-binaries-linux-amd64.tar.gz.sha256
+
+      - name: actions/upload-artifact v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: jaunt-binaries-linux-amd64
+          path: |
+            jaunt-binaries-linux-amd64.tar.gz
+            jaunt-binaries-linux-amd64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Log in to Astrum
+        if: steps.publish.outputs.allowed == 'true'
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          ASTRUM_USERNAME: ${{ secrets.ASTRUM_USERNAME }}
+          ASTRUM_PASSWORD: ${{ secrets.ASTRUM_PASSWORD }}
+        run: printf '%s' "$ASTRUM_PASSWORD" | docker login "$ASTRUM_HOST" -u "$ASTRUM_USERNAME" --password-stdin
+
+      - name: Push the image to Astrum
+        if: steps.publish.outputs.allowed == 'true'
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          set -eu
+          target="$ASTRUM_HOST/$ASTRUM_REPOSITORY/$IMAGE_NAME:$TAG"
+          docker tag "jaunt-local:$TAG" "$target"
+          docker push "$target"
+          echo "pushed: $IMAGE_NAME:$TAG"
+
+      - name: Decide whether pruning may delete
+        id: prune
+        if: steps.publish.outputs.allowed == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_PRUNE: ${{ inputs.prune }}
+          VARIABLE_PRUNE: ${{ vars.ASTRUM_PRUNE }}
+        run: |
+          set -eu
+          dry_run=1
+          if [ "$EVENT" = workflow_dispatch ] && [ "$INPUT_PRUNE" = true ]; then
+            dry_run=0
+          elif [ "$EVENT" = push ] && [ "$VARIABLE_PRUNE" = true ]; then
+            dry_run=0
+          fi
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "pruning dry run: $dry_run"
+
+      - name: Remove old images from Astrum
+        if: steps.publish.outputs.allowed == 'true'
+        env:
+          ASTRUM_HOST: ${{ secrets.ASTRUM_HOST }}
+          ASTRUM_USERNAME: ${{ secrets.ASTRUM_USERNAME }}
+          ASTRUM_PASSWORD: ${{ secrets.ASTRUM_PASSWORD }}
+          DRY_RUN: ${{ steps.prune.outputs.dry_run }}
+        run: python3 scripts/astrum-prune.py

@@ -29,3 +29,9 @@ ssh-containers:
 
 pg-migrations:
     : "${DATABASE_URL:?DATABASE_URL is required}"; for file in crates/jaunt-store/migrations/*.sql; do psql "$DATABASE_URL" -1 -v ON_ERROR_STOP=1 -q -f "$file" || exit 1; done
+
+image:
+    scripts/build-image.sh image
+
+image-binaries:
+    scripts/build-image.sh binaries
