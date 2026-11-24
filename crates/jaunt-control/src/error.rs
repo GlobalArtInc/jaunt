@@ -29,4 +29,6 @@ pub enum ControlError {
     RecoverDeliveries(#[source] StoreError),
     #[error("purging stored enrollments failed: {0}")]
     PurgeEnrollments(#[source] StoreError),
+    #[error("purging stale sessions failed: {0}")]
+    PurgeSessions(#[source] StoreError),
 }

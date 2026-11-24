@@ -312,7 +312,11 @@ async fn only_a_host_authority_that_matches_the_trust_set_is_accepted() {
             Some("HostAuthorityNotTrusted"),
         ),
     ] {
-        let built = Harness::try_with(Options { host_authority }).await;
+        let built = Harness::try_with(Options {
+            host_authority,
+            ..Options::default()
+        })
+        .await;
         let outcome = match built {
             Ok(_) => None,
             Err(ControlError::NotHostAuthority) => Some("NotHostAuthority"),

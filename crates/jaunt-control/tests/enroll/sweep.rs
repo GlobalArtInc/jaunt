@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::session_support::{routed, scenario, stored};
 use crate::support::{Enrolled, Harness};
 
 const RETENTION_SECS: u64 = 3600;
@@ -153,6 +154,25 @@ async fn the_background_sweeper_recovers_interrupted_deliveries() {
         assert!(
             started.elapsed() < DEADLINE,
             "the delivery was not recovered"
+        );
+        tokio::task::yield_now().await;
+    }
+    running.shut_down().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_background_sweeper_purges_stale_routed_sessions() {
+    let s = scenario().await;
+    let session_id = routed(&s.harness, &s.alice).await;
+    s.harness.clock.advance(60 + RETENTION_SECS + 1);
+
+    let running = serve_with_paused_time(&s.harness).await;
+
+    let started = Instant::now();
+    while stored(&s.harness, &session_id).await.is_some() {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "the routed session was not purged"
         );
         tokio::task::yield_now().await;
     }

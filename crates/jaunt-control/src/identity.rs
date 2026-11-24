@@ -1,7 +1,6 @@
 use jaunt_policy::Identity;
 use jaunt_store::User;
 
-#[allow(dead_code)]
 pub(crate) fn policy_identity(user: &User) -> Identity {
     Identity {
         email: user.email.clone(),

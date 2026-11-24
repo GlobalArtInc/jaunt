@@ -4,6 +4,7 @@ mod enrollments;
 mod error;
 mod login_requests;
 mod nodes;
+mod sessions;
 mod users;
 
 use std::path::Path;
@@ -26,6 +27,10 @@ pub use login_requests::{
 pub use nodes::{
     CertificateState, Labels, NewNodeCertificate, Node, NodeCertificate, NodeCertificateKind,
     NodeKeys, NodeState, Nodes,
+};
+pub use sessions::{
+    ActivateSession, EndOutcome, EndRejection, EndSession, NewSession, Session, SessionState,
+    Sessions,
 };
 pub use users::{NewUser, User, Users};
 
@@ -82,5 +87,9 @@ impl Store {
 
     pub fn enrollments(&self) -> Enrollments {
         Enrollments::new(self.pool.clone())
+    }
+
+    pub fn sessions(&self) -> Sessions {
+        Sessions::new(self.pool.clone())
     }
 }

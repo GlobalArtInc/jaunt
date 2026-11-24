@@ -18,7 +18,7 @@ use crate::start::LOGIN_KIND;
 use crate::token;
 
 const MAX_PUBLIC_KEY_LEN: usize = 1024;
-const CERTIFICATE_KIND: &str = "user";
+pub(crate) const CERTIFICATE_KIND: &str = "user";
 
 enum Outcome {
     InvalidRequest,

@@ -1,9 +1,14 @@
 mod admin;
 mod audit;
+mod authorize;
+mod authorize_checks;
 mod enroll;
 mod flow;
 mod renew;
+mod route;
 mod serve;
+mod session_http;
+mod session_support;
 mod support;
 mod sweep;
 

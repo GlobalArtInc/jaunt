@@ -82,12 +82,14 @@ pub enum HostAuthority {
 
 pub struct Options {
     pub host_authority: HostAuthority,
+    pub empty_policy: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             host_authority: HostAuthority::Matching,
+            empty_policy: false,
         }
     }
 }
@@ -346,7 +348,11 @@ impl Harness {
                 public_origin: "https://jaunt.example.test".to_owned(),
                 client_ip_header: None,
             },
-            policy: loaded_policy(&dir.path().join("policy")),
+            policy: if options.empty_policy {
+                PolicyHandle::empty()
+            } else {
+                loaded_policy(&dir.path().join("policy"))
+            },
             clock: clock.clock(),
         })?;
         Ok(Harness {

@@ -2,6 +2,8 @@ mod device;
 mod enroll;
 mod error;
 mod login;
+mod plane;
+mod session;
 mod whoami;
 
 pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
@@ -11,6 +13,11 @@ pub use enroll::{
 };
 pub use error::ErrorBody;
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
+pub use plane::{BoxFuture, ControlError, ControlPlane};
+pub use session::{
+    AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
+    RouteRequest, SessionEnd, SessionEndOutcome, SessionPermissions,
+};
 pub use whoami::WhoamiResponse;
 
 #[cfg(test)]

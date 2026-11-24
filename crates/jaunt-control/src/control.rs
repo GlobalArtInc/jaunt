@@ -28,6 +28,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STORED_REQUEST_RETENTION_SECS: i64 = 3600;
 const STORED_ENROLLMENT_RETENTION_SECS: i64 = 3600;
 const STALE_DELIVERY_SECS: i64 = 120;
+const STALE_SESSION_RETENTION_SECS: i64 = 3600;
 
 pub struct ControlParts {
     pub store: Store,
@@ -133,7 +134,6 @@ impl Control {
         &self.inner.policy
     }
 
-    #[allow(dead_code)]
     pub(crate) fn policy_snapshot(&self) -> Arc<PolicySet> {
         self.inner.policy.snapshot()
     }
@@ -184,6 +184,15 @@ impl Control {
             }
         }
         Ok(u64::try_from(purged.len()).unwrap_or(u64::MAX))
+    }
+
+    pub async fn purge_stale_sessions(&self) -> Result<u64, ControlError> {
+        let now = self.now().ok_or(ControlError::Clock)?;
+        self.store
+            .sessions()
+            .purge_expired_routed(now.secs.saturating_sub(STALE_SESSION_RETENTION_SECS))
+            .await
+            .map_err(ControlError::PurgeSessions)
     }
 
     pub async fn recover_stale_deliveries(&self) -> Result<u64, ControlError> {
@@ -245,6 +254,9 @@ async fn sweep_forever(control: Control) {
         }
         if let Err(err) = control.purge_stored_enrollments().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired enrollments failed");
+        }
+        if let Err(err) = control.purge_stale_sessions().await {
+            tracing::warn!(target: "jaunt::control", error = %err, "purging stale sessions failed");
         }
     }
 }

@@ -66,11 +66,11 @@ pub fn install_recorder() {
     });
 }
 
-fn start_recording() {
+pub fn start_recording() {
     RECORDING.with(|recording| *recording.borrow_mut() = Some(Vec::new()));
 }
 
-fn take_recording() -> Vec<Captured> {
+pub fn take_recording() -> Vec<Captured> {
     RECORDING
         .with(|recording| recording.borrow_mut().take())
         .unwrap()

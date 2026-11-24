@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
-use crate::{callback, device, enroll, finish, poll, renew, start, whoami};
+use crate::{callback, device, enroll, finish, poll, renew, session_http, start, whoami};
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
 
@@ -33,6 +33,8 @@ pub(crate) fn router(control: Control) -> Router {
 pub(crate) fn agent_router(control: Control) -> Router {
     Router::new()
         .route("/v1/agent/renew", post(renew::handle))
+        .route("/v1/agent/authorize", post(session_http::authorize))
+        .route("/v1/agent/session/end", post(session_http::end))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)
