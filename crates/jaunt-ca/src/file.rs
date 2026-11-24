@@ -4,11 +4,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ssh_key::rand_core::OsRng;
-use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
+use ssh_key::{Algorithm, Fingerprint, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
 
 use crate::error::CaError;
 use crate::fsutil::{
-    ensure_private_dir, exists, fingerprint_from_hex, fingerprint_hex, read_limited, write_new_with,
+    ensure_private_dir, exists, fingerprint_from_hex, fingerprint_hex, read_limited, write_new,
+    write_new_with,
 };
 use crate::identity::{AgeIdentity, AgeRecipient, encrypt};
 use crate::kind::CaKind;
@@ -18,8 +19,10 @@ use crate::trust::TrustSet;
 const ACTIVE_FILE: &str = "active";
 const PUBLIC_SUFFIX: &str = ".pub";
 const ENCRYPTED_SUFFIX: &str = ".age";
+const ROOT_SUFFIX: &str = ".root.der";
 
 const MAX_ACTIVE_LEN: u64 = 128;
+const MAX_ROOT_LEN: u64 = 16 * 1024;
 const MAX_PUBLIC_LEN: u64 = 4096;
 const MAX_ENCRYPTED_LEN: u64 = 64 * 1024;
 const MAX_PRIVATE_LEN: usize = 8 * 1024;
@@ -88,17 +91,7 @@ impl FileBackend {
         identity: &AgeIdentity,
     ) -> Result<(TrustSet, FileBackend), CaError> {
         let dir = kind_dir(root, kind);
-        let active_path = dir.join(ACTIVE_FILE);
-        if !exists(&active_path)? {
-            return Err(CaError::NotInitialized(kind));
-        }
-
-        let active_hex = read_active(&active_path)?;
-        let active_fingerprint =
-            fingerprint_from_hex(&active_hex).ok_or_else(|| CaError::CorruptStore {
-                path: active_path.clone(),
-                reason: "active file does not hold a key fingerprint",
-            })?;
+        let (active_hex, active_fingerprint) = read_active_key(&dir, kind)?;
 
         let trust = TrustSet::new(read_public_keys(&dir)?, active_fingerprint)?;
 
@@ -112,6 +105,36 @@ impl FileBackend {
                 public_key,
             },
         ))
+    }
+}
+
+impl FileBackend {
+    pub fn store_root_certificate(root: &Path, der: &[u8]) -> Result<(), CaError> {
+        if der.is_empty() || der.len() as u64 > MAX_ROOT_LEN {
+            return Err(CaError::InvalidRootCertificate {
+                reason: "size is out of range",
+            });
+        }
+        let dir = kind_dir(root, CaKind::Internal);
+        let (active_hex, _) = read_active_key(&dir, CaKind::Internal)?;
+        let path = dir.join(format!("{active_hex}{ROOT_SUFFIX}"));
+        match write_new(&path, der) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                Err(CaError::RootCertificateExists)
+            }
+            Err(err) => Err(CaError::io("write", &path)(err)),
+        }
+    }
+
+    pub fn load_root_certificate(root: &Path) -> Result<Vec<u8>, CaError> {
+        let dir = kind_dir(root, CaKind::Internal);
+        let (active_hex, _) = read_active_key(&dir, CaKind::Internal)?;
+        let path = dir.join(format!("{active_hex}{ROOT_SUFFIX}"));
+        if !exists(&path)? {
+            return Err(CaError::RootCertificateMissing);
+        }
+        Ok(read_limited(&path, MAX_ROOT_LEN)?.to_vec())
     }
 }
 
@@ -177,6 +200,17 @@ fn corrupt(path: &Path, reason: &'static str) -> CaError {
         path: path.to_path_buf(),
         reason,
     }
+}
+
+fn read_active_key(dir: &Path, kind: CaKind) -> Result<(String, Fingerprint), CaError> {
+    let active_path = dir.join(ACTIVE_FILE);
+    if !exists(&active_path)? {
+        return Err(CaError::NotInitialized(kind));
+    }
+    let active_hex = read_active(&active_path)?;
+    let fingerprint = fingerprint_from_hex(&active_hex)
+        .ok_or_else(|| corrupt(&active_path, "active file does not hold a key fingerprint"))?;
+    Ok((active_hex, fingerprint))
 }
 
 fn read_active(path: &Path) -> Result<String, CaError> {
@@ -335,17 +369,94 @@ mod tests {
     }
 
     #[test]
-    fn user_and_host_authorities_are_independent() {
+    fn user_host_and_internal_authorities_are_independent() {
         let dir = tempfile::tempdir().unwrap();
         let identity = AgeIdentity::generate();
         let user = FileBackend::init(dir.path(), CaKind::User, &identity.recipient()).unwrap();
         let host = FileBackend::init(dir.path(), CaKind::Host, &identity.recipient()).unwrap();
+        let internal =
+            FileBackend::init(dir.path(), CaKind::Internal, &identity.recipient()).unwrap();
         assert_ne!(user.key_data(), host.key_data());
+        assert_ne!(user.key_data(), internal.key_data());
+        assert_ne!(host.key_data(), internal.key_data());
         let (user_trust, _) = FileBackend::load(dir.path(), CaKind::User, &identity).unwrap();
         let (host_trust, _) = FileBackend::load(dir.path(), CaKind::Host, &identity).unwrap();
+        let (internal_trust, backend) =
+            FileBackend::load(dir.path(), CaKind::Internal, &identity).unwrap();
         assert_eq!(user_trust.keys().len(), 1);
         assert_eq!(user_trust.active().key_data(), user.key_data());
         assert_eq!(host_trust.active().key_data(), host.key_data());
+        assert_eq!(internal_trust.active().key_data(), internal.key_data());
+        assert_eq!(backend.kind(), CaKind::Internal);
+        assert!(dir.path().join("internal").join("active").exists());
+    }
+
+    #[test]
+    fn root_certificate_is_stored_beside_the_internal_key_and_never_replaced() {
+        let authority = authority(CaKind::Internal);
+        let root = authority.dir.path();
+        let dir = root.join("internal");
+        let hex = fingerprint_hex(authority.trust.active());
+        assert!(matches!(
+            FileBackend::load_root_certificate(root),
+            Err(CaError::RootCertificateMissing)
+        ));
+
+        FileBackend::store_root_certificate(root, b"root der").unwrap();
+        let mut expected = vec![
+            "active".to_owned(),
+            format!("{hex}.age"),
+            format!("{hex}.pub"),
+            format!("{hex}.root.der"),
+        ];
+        expected.sort();
+        assert_eq!(file_names(&dir), expected);
+        assert_eq!(
+            FileBackend::load_root_certificate(root).unwrap(),
+            b"root der"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join(format!("{hex}.root.der"));
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        assert!(matches!(
+            FileBackend::store_root_certificate(root, b"another"),
+            Err(CaError::RootCertificateExists)
+        ));
+        assert_eq!(
+            FileBackend::load_root_certificate(root).unwrap(),
+            b"root der"
+        );
+        FileBackend::load(root, CaKind::Internal, &authority.identity).unwrap();
+    }
+
+    #[test]
+    fn root_certificate_needs_an_initialized_authority_and_a_sane_size() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            FileBackend::store_root_certificate(empty.path(), b"root der"),
+            Err(CaError::NotInitialized(CaKind::Internal))
+        ));
+        assert!(matches!(
+            FileBackend::load_root_certificate(empty.path()),
+            Err(CaError::NotInitialized(CaKind::Internal))
+        ));
+
+        let authority = authority(CaKind::Internal);
+        let root = authority.dir.path();
+        for bad in [Vec::new(), vec![0u8; 16 * 1024 + 1]] {
+            assert!(matches!(
+                FileBackend::store_root_certificate(root, &bad),
+                Err(CaError::InvalidRootCertificate { .. })
+            ));
+        }
+        assert!(FileBackend::store_root_certificate(root, &vec![0u8; 16 * 1024]).is_ok());
     }
 
     #[test]

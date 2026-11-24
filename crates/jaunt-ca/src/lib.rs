@@ -7,6 +7,7 @@ mod kind;
 mod signer;
 mod staging;
 mod trust;
+mod x509;
 
 #[cfg(test)]
 mod test_support;
@@ -25,3 +26,8 @@ pub use kind::CaKind;
 pub use signer::Signer;
 pub use staging::{Committed, StagingDir};
 pub use trust::TrustSet;
+pub use x509::{
+    DEFAULT_NODE_VALIDITY, DEFAULT_SERVER_VALIDITY, InternalCa, IssuedCertificate,
+    MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, NodeCertParams, NodeIdentity, ROOT_VALIDITY,
+    ServerCertParams, SubjectPublicKey, parse_node_identity,
+};

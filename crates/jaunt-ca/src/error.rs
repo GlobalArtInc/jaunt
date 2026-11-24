@@ -14,6 +14,18 @@ pub enum CaError {
     InvalidEmail,
     InvalidUserId,
     InvalidHostnames,
+    InvalidNodeId,
+    InvalidSubjectKey,
+    InvalidNodeIdentity,
+    InvalidRootCertificate {
+        reason: &'static str,
+    },
+    RootCertificateExists,
+    RootCertificateMissing,
+    RootNotValid,
+    ExceedsRootValidity,
+    Random,
+    X509(rcgen::Error),
     WrongAuthorityKind {
         expected: CaKind,
     },
@@ -67,6 +79,30 @@ impl fmt::Display for CaError {
             CaError::InvalidHostnames => {
                 f.write_str("hostnames must be 1 to 64 distinct exact names of at most 253 bytes without whitespace, control or pattern characters")
             }
+            CaError::InvalidNodeId => f.write_str("the node id must not be the nil UUID"),
+            CaError::InvalidSubjectKey => {
+                f.write_str("the subject public key must be a valid Ed25519 key")
+            }
+            CaError::InvalidNodeIdentity => f.write_str(
+                "the certificate does not carry exactly one canonical node identity URI",
+            ),
+            CaError::InvalidRootCertificate { reason } => {
+                write!(f, "invalid root certificate: {reason}")
+            }
+            CaError::RootCertificateExists => {
+                f.write_str("the internal authority already has a root certificate")
+            }
+            CaError::RootCertificateMissing => {
+                f.write_str("the internal authority has no root certificate")
+            }
+            CaError::RootNotValid => {
+                f.write_str("the root certificate is not valid at the issuing time")
+            }
+            CaError::ExceedsRootValidity => {
+                f.write_str("the certificate would outlive the root certificate")
+            }
+            CaError::Random => f.write_str("the system random number generator failed"),
+            CaError::X509(err) => write!(f, "x509 error: {err}"),
             CaError::InvalidTime => f.write_str("certificate time is out of range"),
             CaError::UnsupportedKeyAlgorithm => {
                 f.write_str("certificate authority keys must be Ed25519")
@@ -104,6 +140,7 @@ impl Error for CaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             CaError::SshKey(err) => Some(err),
+            CaError::X509(err) => Some(err),
             CaError::Io { source, .. } => Some(source),
             _ => None,
         }

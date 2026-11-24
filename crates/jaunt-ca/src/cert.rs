@@ -39,9 +39,9 @@ pub struct HostCertParams {
     pub validity: Duration,
 }
 
-struct Window {
-    valid_after: u64,
-    valid_before: u64,
+pub(crate) struct Window {
+    pub(crate) valid_after: u64,
+    pub(crate) valid_before: u64,
 }
 
 pub fn sign_user_certificate(
@@ -141,7 +141,7 @@ fn validate_hostname(name: &str) -> bool {
             .any(|c| c.is_control() || c.is_whitespace() || FORBIDDEN_HOSTNAME_CHARS.contains(&c))
 }
 
-fn validate_hostnames(hostnames: &[String]) -> Result<(), CaError> {
+pub(crate) fn validate_hostnames(hostnames: &[String]) -> Result<(), CaError> {
     let distinct: HashSet<&str> = hostnames.iter().map(String::as_str).collect();
     let acceptable = !hostnames.is_empty()
         && hostnames.len() <= MAX_HOSTNAMES
@@ -154,7 +154,11 @@ fn validate_hostnames(hostnames: &[String]) -> Result<(), CaError> {
     }
 }
 
-fn window(now: SystemTime, validity: Duration, max: Duration) -> Result<Window, CaError> {
+pub(crate) fn window(
+    now: SystemTime,
+    validity: Duration,
+    max: Duration,
+) -> Result<Window, CaError> {
     if !(MIN_VALIDITY..=max).contains(&validity) {
         return Err(CaError::InvalidValidity { max });
     }

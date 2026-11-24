@@ -4,6 +4,7 @@ use std::fmt;
 pub enum CaKind {
     User,
     Host,
+    Internal,
 }
 
 impl CaKind {
@@ -11,6 +12,7 @@ impl CaKind {
         match self {
             CaKind::User => "user",
             CaKind::Host => "host",
+            CaKind::Internal => "internal",
         }
     }
 }
