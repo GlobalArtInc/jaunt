@@ -100,12 +100,12 @@ impl fmt::Debug for HostIdentity {
 }
 
 #[derive(Clone, Copy)]
-enum Access {
+pub(crate) enum Access {
     OwnerOnly,
     Any,
 }
 
-fn read_limited(path: &Path, access: Access) -> Result<Zeroizing<Vec<u8>>, SshError> {
+pub(crate) fn read_limited(path: &Path, access: Access) -> Result<Zeroizing<Vec<u8>>, SshError> {
     let io_error = |source: std::io::Error| SshError::ReadFile {
         path: path.to_path_buf(),
         source,

@@ -2,13 +2,6 @@ mod cert;
 mod config;
 mod error;
 mod host;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the terminator issues inner certificates from S17a on"
-    )
-)]
 mod inner_ca;
 mod intake;
 mod limits;
@@ -17,6 +10,11 @@ mod proxy;
 mod target;
 #[cfg(test)]
 mod test_support;
+
+mod bridge;
+mod inner;
+mod observer;
+mod terminate;
 
 pub use cert::{CertRejection, UserCaKeys, UserCaSource, UserIdentity, verify_user_certificate};
 pub use config::{ServerConfigCell, ServerProfile};
@@ -30,3 +28,13 @@ pub use outer::{
 };
 pub use proxy::{MAX_PROXY_PAYLOAD, ProxiedAddr, ProxyError, decode_proxy_v2, read_proxy_v2};
 pub use target::parse_node_target;
+
+pub use inner::InnerTarget;
+pub use observer::{
+    ChannelExit, ChannelProgram, ChannelStart, NoObserver, ObserverFactory, OutputStream,
+    Recording, SessionObserver, Terminal, TerminalSize,
+};
+pub use terminate::{
+    AgentLimits, AuthorityError, EndReason, SessionAuthority, SessionOutcome, StreamContext,
+    Terminator,
+};

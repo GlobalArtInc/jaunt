@@ -98,7 +98,7 @@ impl fmt::Debug for InnerCa {
     }
 }
 
-fn is_portable_login(login: &str) -> bool {
+pub(crate) fn is_portable_login(login: &str) -> bool {
     let bytes = login.as_bytes();
     let Some((first, rest)) = bytes.split_first() else {
         return false;

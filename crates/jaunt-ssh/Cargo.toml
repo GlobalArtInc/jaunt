@@ -13,10 +13,12 @@ workspace = true
 [dependencies]
 arc-swap = "1.9.5"
 bytes = "1.12.2"
+jaunt-proto = { workspace = true }
 russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 zeroize = "1.9.2"
 
 [dev-dependencies]

@@ -2331,11 +2331,13 @@ version = "0.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "jaunt-proto",
  "russh",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tracing",
  "zeroize",
 ]
 
