@@ -11,7 +11,11 @@ async fn codes_that_are_wrong_expired_rejected_or_used_are_refused_with_typed_er
     let rejected = harness.enroll("web-02").await;
     let used = harness.enroll("web-03").await;
     harness.approve(&used).await;
-    harness.admin.reject(&rejected.code).await.unwrap();
+    harness
+        .admin
+        .reject(&rejected.code, "cli:tester")
+        .await
+        .unwrap();
     harness.clock.advance(900);
     let admin = &harness.admin;
 
@@ -37,7 +41,7 @@ async fn codes_that_are_wrong_expired_rejected_or_used_are_refused_with_typed_er
     assert!(matches!(after_reject, ApproveError::Rejected));
     assert_eq!(unknown.to_string(), expired.to_string());
     assert!(matches!(
-        admin.reject("ZZZZ-ZZZZ").await,
+        admin.reject("ZZZZ-ZZZZ", "cli:tester").await,
         Err(ApproveError::UnknownCode)
     ));
 }
@@ -157,7 +161,11 @@ async fn nodes_can_be_listed_and_removed_once() {
     harness.approve(&harness.enroll("web-01").await).await;
     harness.approve(&harness.enroll("web-02").await).await;
 
-    let removed = harness.admin.remove_node("web-01").await.unwrap();
+    let removed = harness
+        .admin
+        .remove_node("web-01", "cli:tester")
+        .await
+        .unwrap();
 
     assert_eq!(
         (removed.name.as_str(), removed.state),
@@ -173,11 +181,11 @@ async fn nodes_can_be_listed_and_removed_once() {
     assert!(states.contains(&("web-01", NodeState::Removed)));
     assert!(states.contains(&("web-02", NodeState::Active)));
     assert!(matches!(
-        harness.admin.remove_node("web-01").await,
+        harness.admin.remove_node("web-01", "cli:tester").await,
         Err(RemoveError::NoActiveNode)
     ));
     assert!(matches!(
-        harness.admin.remove_node("nope").await,
+        harness.admin.remove_node("nope", "cli:tester").await,
         Err(RemoveError::NoActiveNode)
     ));
     harness.approve(&harness.enroll("web-01").await).await;
@@ -207,4 +215,26 @@ async fn the_listing_tells_collected_waiting_and_lapsed_certificates_apart() {
     assert_eq!(later["collected"], CertificateState::Delivered);
     assert_eq!(later["waiting"], CertificateState::None);
     assert_eq!(now.len(), 2);
+}
+
+#[tokio::test]
+async fn operator_commands_refuse_an_invalid_operator_name_and_change_nothing() {
+    let harness = Harness::new().await;
+    let pending = harness.enroll("web-01").await;
+    let approved = harness.enroll("web-02").await;
+    harness.approve(&approved).await;
+
+    for bad in ["", "has space", "line\nbreak", &"x".repeat(129)] {
+        assert!(matches!(
+            harness.admin.reject(&pending.code, bad).await,
+            Err(ApproveError::InvalidApprover)
+        ));
+        assert!(matches!(
+            harness.admin.remove_node("web-02", bad).await,
+            Err(RemoveError::InvalidOperator)
+        ));
+    }
+
+    assert!(harness.admin.pending(&pending.code).await.is_ok());
+    assert_eq!(harness.admin.list_nodes().await.unwrap().len(), 1);
 }

@@ -32,6 +32,7 @@ tokio = { version = "1.54.1", default-features = false, features = ["net", "rt",
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+jaunt-audit = { workspace = true, features = ["testing"] }
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "tokio"] }
 jsonwebtoken = { version = "12.0.0", default-features = false, features = ["rust_crypto"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }

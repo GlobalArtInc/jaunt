@@ -2,12 +2,14 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_control::{
     ApproveError, Clock, LabelError, Labels, ListError, NodeAdmin, NodeListing, PendingEnrollment,
     system_clock,
 };
 use jaunt_store::{NodeState, Store, StoreError};
 
+use crate::audit::{self, AuditStartError, Surface};
 use crate::config::{self, EnvLookup};
 use crate::logging;
 
@@ -57,6 +59,8 @@ enum NodeCommandError {
     },
     #[error("cannot migrate the database: {0}")]
     Migrate(#[source] StoreError),
+    #[error("cannot start the audit pipeline: {0}")]
+    Audit(#[from] AuditStartError),
     #[error("cannot read the answer: {0}")]
     Input(#[source] io::Error),
     #[error("cannot write the output: {0}")]
@@ -86,7 +90,8 @@ impl NodeCommandError {
 
 pub fn run(config_path: &Path, action: NodeAction) -> ExitCode {
     let env = |name: &str| std::env::var_os(name);
-    if let Err(err) = logging::init(&env) {
+    let tap = AuditTap::new(audit_clock());
+    if let Err(err) = logging::init(&env, &tap) {
         eprintln!("{err}");
         return ExitCode::from(EXIT_FAILED);
     }
@@ -106,6 +111,7 @@ pub fn run(config_path: &Path, action: NodeAction) -> ExitCode {
         &approver,
         system_clock(),
         &mut terminal,
+        &tap,
     ))
 }
 
@@ -135,8 +141,9 @@ pub fn execute(
     approver: &str,
     clock: Clock,
     terminal: &mut Terminal<'_>,
+    tap: &AuditTap,
 ) -> u8 {
-    match attempt(config_path, action, approver, clock, terminal) {
+    match attempt(config_path, action, approver, clock, terminal, tap) {
         Ok(()) => EXIT_OK,
         Err(err) => {
             let code = err.exit_code();
@@ -154,6 +161,7 @@ fn attempt(
     approver: &str,
     clock: Clock,
     terminal: &mut Terminal<'_>,
+    tap: &AuditTap,
 ) -> Result<(), NodeCommandError> {
     let labels = match &action {
         NodeAction::Approve {
@@ -166,11 +174,22 @@ fn attempt(
     if !database.is_file() {
         return Err(NodeCommandError::NoDatabase(database));
     }
+    let read_only = matches!(action, NodeAction::List);
+    let audit_settings = if read_only {
+        None
+    } else {
+        Some(
+            config
+                .audit
+                .into_settings()
+                .map_err(|err| NodeCommandError::Config(err.to_string()))?,
+        )
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(NodeCommandError::Runtime)?;
-    runtime.block_on(async {
+    let outcome = runtime.block_on(async {
         let store = Store::open(&database)
             .await
             .map_err(|source| NodeCommandError::Open {
@@ -178,9 +197,18 @@ fn attempt(
                 source,
             })?;
         store.migrate().await.map_err(NodeCommandError::Migrate)?;
+        let audit = audit_settings
+            .map(|settings| audit::start(&settings, Surface::Cli, &store, tap, audit_clock()))
+            .transpose()?;
         let admin = NodeAdmin::new(store, clock);
-        dispatch(&admin, action, labels, approver, terminal).await
-    })
+        let outcome = dispatch(&admin, action, labels, approver, terminal).await;
+        if let Some(audit) = audit {
+            audit.shutdown(audit::FLUSH_DEADLINE).await;
+        }
+        outcome
+    });
+    audit::finish_runtime(runtime, audit::RUNTIME_GRACE);
+    outcome
 }
 
 async fn dispatch(
@@ -195,13 +223,13 @@ async fn dispatch(
             approve(admin, &code, labels, yes, approver, terminal).await
         }
         NodeAction::Reject { code } => {
-            let rejected = admin.reject(&code).await?;
+            let rejected = admin.reject(&code, approver).await?;
             say(
                 terminal,
                 &format!("rejected the enrollment of {}\n", printable(&rejected.name)),
             )
         }
-        NodeAction::Rm { name, yes } => remove(admin, &name, yes, terminal).await,
+        NodeAction::Rm { name, yes } => remove(admin, &name, yes, approver, terminal).await,
         NodeAction::List => list(admin, terminal).await,
     }
 }
@@ -241,6 +269,7 @@ async fn remove(
     admin: &NodeAdmin,
     name: &str,
     yes: bool,
+    approver: &str,
     terminal: &mut Terminal<'_>,
 ) -> Result<(), NodeCommandError> {
     let nodes = admin.list_nodes().await?;
@@ -257,7 +286,7 @@ async fn remove(
     if !yes && !confirm(terminal, &question)? {
         return Err(NodeCommandError::Declined);
     }
-    let removed = admin.remove_node(name).await?;
+    let removed = admin.remove_node(name, approver).await?;
     say(
         terminal,
         &format!("removed node {}\n", printable(&removed.name)),
@@ -409,15 +438,20 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use jaunt_audit::{
+        AuditTap, keep_callsites_enabled_for_scoped_capture, system_clock as audit_clock,
+    };
     use jaunt_ca::ssh_key::rand_core::OsRng;
     use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
     use jaunt_ca::ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey};
     use jaunt_control::Clock;
     use jaunt_store::{
-        CreateOutcome, EnrollmentLimits, NewEnrollment, NewNodeCertificate, Node,
+        AuditQuery, CreateOutcome, EnrollmentLimits, NewEnrollment, NewNodeCertificate, Node,
         NodeCertificateKind, NodeState, Store,
     };
     use tempfile::TempDir;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{NodeAction, Terminal, approver_from_env, execute, format_utc};
 
@@ -550,6 +584,22 @@ mod tests {
     }
 
     fn run_at_time(config: &Path, action: NodeAction, answer: &str, now_secs: i64) -> Outcome {
+        run_with_tap(
+            config,
+            action,
+            answer,
+            now_secs,
+            &AuditTap::new(audit_clock()),
+        )
+    }
+
+    fn run_with_tap(
+        config: &Path,
+        action: NodeAction,
+        answer: &str,
+        now_secs: i64,
+        tap: &AuditTap,
+    ) -> Outcome {
         let mut input = answer.as_bytes();
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let code = execute(
@@ -562,6 +612,7 @@ mod tests {
                 stdout: &mut stdout,
                 stderr: &mut stderr,
             },
+            tap,
         );
         Outcome {
             code,
@@ -609,6 +660,104 @@ mod tests {
         assert_eq!(created[0].approved_by, "cli:tester");
         assert_eq!(created[0].labels["role"], "db");
         assert!(!created[0].labels.contains_key("env"));
+    }
+
+    fn run_audited(fixture: &Fixture, action: NodeAction) -> Outcome {
+        keep_callsites_enabled_for_scoped_capture();
+        let tap = AuditTap::new(audit_clock());
+        let _guard = tracing::subscriber::set_default(Registry::default().with(tap.layer()));
+        run_with_tap(&fixture.config, action, "", NOW, &tap)
+    }
+
+    #[test]
+    fn cli_decisions_are_written_to_the_audit_table_with_the_operator_before_the_command_returns() {
+        let fixture = fixture(true);
+
+        let approved = run_audited(&fixture, approve(CODE, None, true));
+        let rejected = run_audited(
+            &fixture,
+            NodeAction::Reject {
+                code: OTHER_CODE.to_owned(),
+            },
+        );
+        let removed = run_audited(
+            &fixture,
+            NodeAction::Rm {
+                name: "web-01".to_owned(),
+                yes: true,
+            },
+        );
+
+        for outcome in [&approved, &rejected, &removed] {
+            assert_eq!(outcome.code, 0, "{}", outcome.stderr);
+        }
+        let rows = runtime().block_on(async {
+            open(&fixture.config)
+                .await
+                .audit_events()
+                .query(&AuditQuery::newest(10))
+                .await
+                .unwrap()
+        });
+        let shown: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.event_type.as_str(), row.actor.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("node.removed", "cli:tester"),
+                ("node.enroll.rejected", "cli:tester"),
+                ("node.enroll.approved", "cli:tester")
+            ]
+        );
+        assert!(rows.iter().all(|row| row.actor != "system"));
+        assert!(rows[0].node.is_some());
+    }
+
+    #[test]
+    fn read_only_commands_ignore_the_audit_section_while_changing_ones_refuse_to_run_without_it() {
+        let fixture = fixture(true);
+        let missing = fixture
+            .config
+            .parent()
+            .unwrap()
+            .join("missing")
+            .join("audit.jsonl");
+        let mut text = std::fs::read_to_string(&fixture.config).unwrap();
+        text.push_str(&format!(
+            "audit:\n  jsonl:\n    file: {}\n",
+            missing.display()
+        ));
+        std::fs::write(&fixture.config, text).unwrap();
+
+        let listed = run(&fixture, NodeAction::List, "");
+        let approved = run(&fixture, approve(CODE, None, true), "");
+
+        assert_eq!(listed.code, 0, "{}", listed.stderr);
+        assert_eq!(approved.code, 1);
+        assert!(approved.stderr.contains("audit"), "{}", approved.stderr);
+        assert!(nodes(&fixture).is_empty());
+    }
+
+    #[test]
+    fn a_changing_command_refuses_to_run_when_the_audit_config_leaves_no_sink() {
+        let fixture = fixture(true);
+        let mut text = std::fs::read_to_string(&fixture.config).unwrap();
+        text.push_str("audit:\n  database: false\n");
+        std::fs::write(&fixture.config, text).unwrap();
+
+        let approved = run(&fixture, approve(CODE, None, true), "");
+        let listed = run(&fixture, NodeAction::List, "");
+
+        assert_eq!(approved.code, 1);
+        assert!(
+            approved.stderr.contains("no audit sink"),
+            "{}",
+            approved.stderr
+        );
+        assert!(nodes(&fixture).is_empty());
+        assert_eq!(listed.code, 0, "{}", listed.stderr);
     }
 
     #[test]

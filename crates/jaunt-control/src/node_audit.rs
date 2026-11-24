@@ -58,12 +58,13 @@ pub(crate) fn enroll_approved(event: &EnrollApproved<'_>) {
     );
 }
 
-pub(crate) fn enroll_rejected(enrollment_id: &str, name: &str) {
+pub(crate) fn enroll_rejected(enrollment_id: &str, name: &str, rejected_by: &str) {
     tracing::info!(
         target: "jaunt::audit",
         event = "node.enroll.rejected",
         enrollment_id,
-        name
+        name,
+        rejected_by
     );
 }
 
@@ -88,13 +89,14 @@ pub(crate) fn enroll_delivered(event: &Delivered<'_>) {
     );
 }
 
-pub(crate) fn node_removed(node_id: &str, name: &str, reason: &'static str) {
+pub(crate) fn node_removed(node_id: &str, name: &str, reason: &'static str, removed_by: &str) {
     tracing::info!(
         target: "jaunt::audit",
         event = "node.removed",
         node_id,
         name,
-        reason
+        reason,
+        removed_by
     );
 }
 

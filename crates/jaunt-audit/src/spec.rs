@@ -1,0 +1,342 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Text(usize),
+    Int,
+    Bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldSpec {
+    pub name: &'static str,
+    pub kind: FieldKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorRule {
+    Anonymous,
+    System,
+    User(&'static str),
+    Node(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    Critical,
+    Noisy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventSpec {
+    pub name: &'static str,
+    pub class: Class,
+    pub emitted: &'static str,
+    pub actor: ActorRule,
+    pub node: Option<&'static str>,
+    pub session: Option<&'static str>,
+    pub policy_hash: Option<&'static str>,
+    pub fields: &'static [FieldSpec],
+}
+
+pub const ENVELOPE_TEXT_MAX: usize = 128;
+
+pub const DISCARDED_FIELDS: &[&str] = &["event", "message", "email"];
+
+const ID: FieldKind = FieldKind::Text(64);
+const SHORT: FieldKind = FieldKind::Text(32);
+const NAME: FieldKind = FieldKind::Text(128);
+const ADDR: FieldKind = FieldKind::Text(64);
+const HOST: FieldKind = FieldKind::Text(255);
+const LIST: FieldKind = FieldKind::Text(512);
+const ERROR: FieldKind = FieldKind::Text(256);
+const INT: FieldKind = FieldKind::Int;
+const BOOL: FieldKind = FieldKind::Bool;
+
+const NODE: Option<&str> = Some("node_id");
+const SESSION: Option<&str> = Some("session_id");
+const HASH: Option<&str> = Some("policy_hash");
+
+macro_rules! class_or_critical {
+    () => {
+        Class::Critical
+    };
+    ($class:expr) => {
+        $class
+    };
+}
+
+macro_rules! events {
+    ($(
+        $variant:ident => (
+            $name:literal,
+            $emitted:literal,
+            $actor:expr,
+            $node:expr,
+            $session:expr,
+            $hash:expr,
+            [$(($field:literal, $kind:expr)),* $(,)?]
+            $(, $class:expr)?
+        )
+    ),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum EventType {
+            $($variant),*
+        }
+
+        impl EventType {
+            pub const ALL: &'static [EventType] = &[$(EventType::$variant),*];
+
+            pub fn class(self) -> Class {
+                self.spec().class
+            }
+
+            pub fn spec(self) -> &'static EventSpec {
+                match self {
+                    $(EventType::$variant => &EventSpec {
+                        name: $name,
+                        class: class_or_critical!($($class)?),
+                        emitted: $emitted,
+                        actor: $actor,
+                        node: $node,
+                        session: $session,
+                        policy_hash: $hash,
+                        fields: &[$(FieldSpec { name: $field, kind: $kind }),*],
+                    }),*
+                }
+            }
+        }
+    };
+}
+
+events! {
+    LoginStarted => ("login.started", "login.started", ActorRule::Anonymous, None, None, None,
+        [("login_id", ID)]),
+    LoginApproved => ("login.approved", "login.approved", ActorRule::User("user_id"), None, None, None,
+        [("login_id", ID), ("kind", SHORT)]),
+    LoginDenied => ("login.denied", "login.denied", ActorRule::Anonymous, None, None, None,
+        [("login_id", ID), ("reason", NAME)]),
+    LoginFinishFailed => ("login.finish_failed", "login.finish_failed", ActorRule::User("user_id"), None, None, None,
+        [("login_id", ID), ("reason", NAME)]),
+    LoginDeviceStarted => ("login.device.started", "login.device.started", ActorRule::Anonymous, None, None, None,
+        [("login_id", ID), ("ip", ADDR)]),
+    LoginDeviceCodeFailed => ("login.device.code_failed", "login.device.code_failed", ActorRule::Anonymous, None, None, None,
+        [("ip", ADDR)], Class::Noisy),
+    LoginDeviceLockedOut => ("login.device.locked_out", "login.device.locked_out", ActorRule::Anonymous, None, None, None,
+        [("ip", ADDR), ("reason", NAME)]),
+    LoginDeviceContinued => ("login.device.continued", "login.device.continued", ActorRule::Anonymous, None, None, None,
+        [("login_id", ID)]),
+    LoginWebStarted => ("login.web.started", "web.login.started", ActorRule::Anonymous, None, None, None,
+        [("login_id", ID)]),
+    LoginWebSessionCreated => ("login.web.session_created", "web.session.created", ActorRule::User("user_id"), None, None, None,
+        [("login_id", ID), ("ip", ADDR), ("expires_at", INT)]),
+    LoginWebSessionEnded => ("login.web.session_ended", "web.session.ended", ActorRule::User("user_id"), None, None, None,
+        [("reason", NAME)]),
+    CertIssued => ("cert.issued", "cert.issued", ActorRule::User("user_id"), None, None, None,
+        [("login_id", ID), ("serial", INT)]),
+    CertRotated => ("cert.rotated", "agent.cert.rotated", ActorRule::System, None, None, None,
+        [("not_after", INT)]),
+    AdminCsrfDenied => ("admin.csrf_denied", "web.csrf.denied", ActorRule::User("user_id"), None, None, None,
+        [("reason", NAME)]),
+    AuthzDeny => ("authz.deny", "authz.deny", ActorRule::User("user_id"), NODE, SESSION, HASH,
+        [("phase", SHORT), ("reason", NAME), ("permission", NAME), ("serial", INT), ("node_name", NAME),
+         ("login", NAME), ("client_addr", ADDR)]),
+    SessionRouted => ("session.routed", "session.routed", ActorRule::User("user_id"), NODE, SESSION, HASH,
+        [("serial", INT), ("node_name", NAME), ("client_addr", ADDR)]),
+    SessionStart => ("session.start", "session.start", ActorRule::User("user_id"), NODE, SESSION, HASH,
+        [("serial", INT), ("login", NAME), ("pty", BOOL), ("port_forwarding", BOOL), ("record_input", BOOL),
+         ("max_duration_secs", INT), ("roles", LIST), ("client_addr", ADDR)]),
+    SessionEnd => ("session.end", "session.end", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("serial", INT), ("login", NAME), ("exit_status", INT), ("bytes_in", INT), ("bytes_out", INT),
+         ("recording_incomplete", BOOL)]),
+    SessionEndRejected => ("session.end_rejected", "session.end.rejected", ActorRule::Node("node_id"), NODE, SESSION, None,
+        [("reason", NAME)]),
+    GateConnect => ("gate.connect", "gate.ssh.connect", ActorRule::Anonymous, None, None, None,
+        [("client_addr", ADDR), ("peer_addr", ADDR), ("proxied", BOOL)], Class::Noisy),
+    GateAuth => ("gate.auth", "gate.ssh.auth", ActorRule::User("user_id"), None, None, None,
+        [("outcome", SHORT), ("reason", NAME), ("client_addr", ADDR), ("serial", INT), ("login", NAME)]),
+    GateSessionRefused => ("gate.session_refused", "gate.ssh.session_refused", ActorRule::Anonymous, None, None, None,
+        [("client_addr", ADDR)], Class::Noisy),
+    GateForward => ("gate.forward", "gate.ssh.forward", ActorRule::Anonymous, None, SESSION, None,
+        [("outcome", NAME), ("node", NAME), ("client_addr", ADDR)]),
+    GateStreamEnd => ("gate.stream_end", "gate.ssh.stream_end", ActorRule::Anonymous, None, SESSION, None,
+        [("node", NAME), ("client_addr", ADDR), ("bytes_up", INT), ("bytes_down", INT), ("duration_ms", INT), ("reason", NAME)]),
+    GateDisconnect => ("gate.disconnect", "gate.ssh.disconnect", ActorRule::Anonymous, None, None, None,
+        [("client_addr", ADDR), ("reason", NAME)], Class::Noisy),
+    AgentConnected => ("agent.connected", "agent.connected", ActorRule::Node("node_id"), NODE, None, None,
+        [("remote_addr", ADDR), ("alpn", SHORT), ("replaced", BOOL)]),
+    AgentDisconnected => ("agent.disconnected", "agent.disconnected", ActorRule::Node("node_id"), NODE, None, None,
+        [("reason", NAME), ("alpn", SHORT)]),
+    AgentRejected => ("agent.rejected", "agent.rejected", ActorRule::Anonymous, NODE, None, None,
+        [("reason", NAME), ("remote_addr", ADDR)], Class::Noisy),
+    AgentTrustServed => ("agent.trust.served", "agent.trust.served", ActorRule::Node("node_id"), NODE, None, None,
+        [("keys", INT)]),
+    NodeEnrollRequested => ("node.enroll.requested", "node.enroll.requested", ActorRule::Anonymous, None, None, None,
+        [("enrollment_id", ID), ("name", NAME), ("hostname", HOST), ("source_ip", ADDR),
+         ("source_network", ADDR), ("agent_version", SHORT), ("replace", BOOL)]),
+    NodeEnrollApproved => ("node.enroll.approved", "node.enroll.approved", ActorRule::User("approved_by"), NODE, None, None,
+        [("enrollment_id", ID), ("name", NAME), ("replaced_node_id", ID)]),
+    NodeEnrollRejected => ("node.enroll.rejected", "node.enroll.rejected", ActorRule::User("rejected_by"), None, None, None,
+        [("enrollment_id", ID), ("name", NAME)]),
+    NodeEnrollExpired => ("node.enroll.expired", "node.enroll.expired", ActorRule::System, None, None, None,
+        [("enrollment_id", ID), ("name", NAME)]),
+    NodeEnrollDelivered => ("node.enroll.delivered", "node.enroll.delivered", ActorRule::Node("node_id"), NODE, None, None,
+        [("enrollment_id", ID), ("name", NAME), ("x509_serial", ID), ("ssh_serial", ID)]),
+    NodeRemoved => ("node.removed", "node.removed", ActorRule::User("removed_by"), NODE, None, None,
+        [("name", NAME), ("reason", NAME)]),
+    NodeCertRenewed => ("node.cert.renewed", "node.cert.renewed", ActorRule::Node("node_id"), NODE, None, None,
+        [("name", NAME), ("x509_serial", ID), ("ssh_serial", ID), ("rotated", BOOL)]),
+    PolicyReload => ("policy.reload", "policy.reload", ActorRule::System, None, None, Some("hash"),
+        [("applied", BOOL), ("error_count", INT), ("error_1", ERROR), ("error_2", ERROR), ("error_3", ERROR)]),
+}
+
+pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Classified {
+    Mapped(EventType),
+    Ignored,
+    Unknown,
+}
+
+impl EventType {
+    pub fn from_name(name: &str) -> Option<EventType> {
+        EventType::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.spec().name == name)
+    }
+
+    pub fn from_emitted(emitted: &str) -> Option<EventType> {
+        EventType::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.spec().emitted == emitted)
+    }
+
+    pub fn name(self) -> &'static str {
+        self.spec().name
+    }
+
+    pub fn classify(emitted: &str) -> Classified {
+        if let Some(kind) = EventType::from_emitted(emitted) {
+            Classified::Mapped(kind)
+        } else if IGNORED_PREFIXES
+            .iter()
+            .any(|prefix| emitted.starts_with(prefix))
+        {
+            Classified::Ignored
+        } else {
+            Classified::Unknown
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{Classified, EventType, FieldKind};
+
+    #[test]
+    fn names_and_emitted_names_are_unique_and_fields_never_repeat_envelope_sources() {
+        let mut names = HashSet::new();
+        let mut emitted = HashSet::new();
+        for kind in EventType::ALL {
+            let spec = kind.spec();
+            assert!(names.insert(spec.name), "{}", spec.name);
+            assert!(emitted.insert(spec.emitted), "{}", spec.emitted);
+            let mut fields = HashSet::new();
+            for field in spec.fields {
+                assert!(fields.insert(field.name), "{} {}", spec.name, field.name);
+                assert!(
+                    !matches!(field.kind, FieldKind::Text(0)),
+                    "{} {}",
+                    spec.name,
+                    field.name
+                );
+                assert!(
+                    !["event", "message", "target", "id", "time", "v"].contains(&field.name),
+                    "{} {}",
+                    spec.name,
+                    field.name
+                );
+            }
+            let mut sources: Vec<&str> = [spec.node, spec.session, spec.policy_hash]
+                .into_iter()
+                .flatten()
+                .collect();
+            if let super::ActorRule::User(field) | super::ActorRule::Node(field) = spec.actor {
+                sources.push(field);
+            }
+            for source in sources {
+                assert!(
+                    !spec.fields.iter().any(|field| field.name == source),
+                    "{} {source}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_field_name_can_carry_a_secret_by_its_name() {
+        let forbidden = [
+            "token",
+            "secret",
+            "password",
+            "key",
+            "code",
+            "certificate",
+            "cert",
+            "email",
+            "verifier",
+            "handle",
+            "authorization",
+            "cookie",
+        ];
+        for kind in EventType::ALL {
+            for field in kind.spec().fields {
+                let name = field.name;
+                for word in forbidden {
+                    let allowed = name == "keys" || name == "kind";
+                    assert!(allowed || !name.contains(word), "{} {name}", kind.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exactly_the_connection_level_noise_is_in_the_noisy_class() {
+        let noisy: Vec<&str> = EventType::ALL
+            .iter()
+            .filter(|kind| kind.class() == super::Class::Noisy)
+            .map(|kind| kind.name())
+            .collect();
+
+        assert_eq!(
+            noisy,
+            [
+                "login.device.code_failed",
+                "gate.connect",
+                "gate.session_refused",
+                "gate.disconnect",
+                "agent.rejected"
+            ]
+        );
+    }
+
+    #[test]
+    fn classification_distinguishes_mapped_ignored_and_unknown_events() {
+        assert_eq!(
+            EventType::classify("gate.ssh.auth"),
+            Classified::Mapped(EventType::GateAuth)
+        );
+        assert_eq!(EventType::classify("agent.ssh.end"), Classified::Ignored);
+        assert_eq!(EventType::classify("revoke.thing"), Classified::Unknown);
+        assert_eq!(EventType::classify(""), Classified::Unknown);
+        assert_eq!(
+            EventType::from_name("login.web.started"),
+            Some(EventType::LoginWebStarted)
+        );
+        assert_eq!(EventType::from_name("web.login.started"), None);
+    }
+}

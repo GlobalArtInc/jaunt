@@ -180,7 +180,11 @@ async fn nodes_lists_only_active_nodes_the_current_policy_routes_sorted_by_name(
     node(&harness, 2, "db-1", "dev").await;
     node(&harness, 3, "web-1", "prod").await;
     node(&harness, 4, "web-2", "prod").await;
-    harness.admin.remove_node("web-2").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-2", "cli:tester")
+        .await
+        .unwrap();
     let alice = format!(
         "Bearer {}",
         bearer(&harness, "alice@example.com", &[]).await
@@ -224,7 +228,11 @@ async fn nodes_lists_only_active_nodes_the_current_policy_routes_sorted_by_name(
         ["web-1", "web-3"]
     );
 
-    harness.admin.remove_node("web-1").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-1", "cli:tester")
+        .await
+        .unwrap();
     assert_eq!(
         names(&get(&harness, "/v1/nodes", Some(&alice)).await),
         ["db-1", "web-3"]

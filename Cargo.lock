@@ -2200,6 +2200,17 @@ dependencies = [
  "jaunt-proto",
  "jaunt-record",
  "jaunt-store",
+ "proc-macro2",
+ "rustix",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2396,6 +2407,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "jaunt-audit",
  "jaunt-ca",
  "jaunt-control",
  "jaunt-gate",
@@ -2407,6 +2419,7 @@ dependencies = [
  "jaunt-tunnel",
  "rcgen",
  "russh",
+ "rustix",
  "rustls",
  "serde",
  "serde-saphyr",

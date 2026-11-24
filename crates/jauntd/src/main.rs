@@ -1,3 +1,4 @@
+mod audit;
 mod ca;
 mod config;
 mod logging;

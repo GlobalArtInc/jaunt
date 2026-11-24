@@ -174,7 +174,11 @@ async fn an_unapproved_request_expires_and_so_does_an_approved_one_nobody_collec
 async fn a_rejected_request_never_receives_certificates() {
     let harness = Harness::new().await;
     let enrolled = harness.enroll("web-01").await;
-    harness.admin.reject(&enrolled.code).await.unwrap();
+    harness
+        .admin
+        .reject(&enrolled.code, "cli:tester")
+        .await
+        .unwrap();
 
     assert_eq!(harness.poll(&enrolled.handle).await.state(), "rejected");
     assert!(
@@ -192,7 +196,11 @@ async fn removing_the_node_before_collection_turns_the_delivery_into_a_rejection
     let harness = Harness::new().await;
     let enrolled = harness.enroll("web-01").await;
     let approved = harness.approve(&enrolled).await;
-    harness.admin.remove_node("web-01").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-01", "cli:tester")
+        .await
+        .unwrap();
 
     assert_eq!(harness.poll(&enrolled.handle).await.state(), "rejected");
     assert!(
@@ -491,7 +499,11 @@ async fn removing_the_node_while_its_certificates_are_being_issued_ends_the_deli
         .unwrap()
         .unwrap();
 
-    harness.admin.remove_node("web-01").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-01", "cli:tester")
+        .await
+        .unwrap();
 
     assert_eq!(harness.poll(&enrolled.handle).await.state(), "rejected");
     assert!(

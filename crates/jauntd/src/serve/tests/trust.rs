@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use jaunt_audit::{AuditTap, system_clock};
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
 use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
@@ -83,7 +84,9 @@ fn the_agent_trust_route_serves_the_user_key_printed_by_ca_init() {
         .build()
         .unwrap();
 
-    let started = runtime.block_on(start(settings, authorities)).unwrap();
+    let started = runtime
+        .block_on(start(settings, authorities, &AuditTap::new(system_clock())))
+        .unwrap();
     let (status, body) = runtime.block_on(async {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         pending_enrollment(&started.store, i64::try_from(now.as_secs()).unwrap()).await;

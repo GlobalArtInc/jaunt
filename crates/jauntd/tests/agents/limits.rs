@@ -54,7 +54,11 @@ async fn api_sessions_of_a_removed_node_are_closed_by_the_reconciler() {
         assert_eq!(reply.status, StatusCode::NOT_FOUND);
     }
 
-    harness.admin.remove_node(&removed.name).await.unwrap();
+    harness
+        .admin
+        .remove_node(&removed.name, "cli:tester")
+        .await
+        .unwrap();
 
     within("the removed node's session to close", &mut doomed.ended)
         .await

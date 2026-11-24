@@ -16,6 +16,8 @@ use jauntd::gate_ssh::GateSshSettings;
 use serde::Deserialize;
 use url::Url;
 
+use crate::audit::{AuditConfigError, AuditSection, AuditSettings};
+
 pub const CLIENT_SECRET_VAR: &str = "JAUNT_OIDC_CLIENT_SECRET";
 
 const DEFAULT_CERT_TTL_SECS: u64 = 28_800;
@@ -56,6 +58,8 @@ pub struct Config {
     pub gate_endpoint: Option<String>,
     pub ssh_gate: Option<SshGateSection>,
     pub oidc: Option<OidcSection>,
+    #[serde(default)]
+    pub audit: AuditSection,
 }
 
 #[derive(Deserialize)]
@@ -100,10 +104,13 @@ pub struct RunSettings {
     pub agents: Option<AgentsSettings>,
     pub ssh_gate: Option<GateSshSettings>,
     pub oidc: OidcConfig,
+    pub audit: AuditSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Audit(#[from] AuditConfigError),
     #[error("public_url is required to run the daemon")]
     MissingPublicUrl,
     #[error("public_url {0}")]
@@ -240,6 +247,7 @@ impl Config {
         if !(MIN_POLICY_POLL_SECS..=MAX_POLICY_POLL_SECS).contains(&self.policy_poll_secs) {
             return Err(ConfigError::PolicyPollOutOfRange);
         }
+        let audit = self.audit.into_settings()?;
         let client_ip_header = self
             .client_ip_header
             .map(|name| validate_header_name(&name))
@@ -320,6 +328,7 @@ impl Config {
             agents,
             ssh_gate,
             oidc,
+            audit,
         })
     }
 }
@@ -507,6 +516,26 @@ mod tests {
 
     fn secret_env(name: &str) -> Option<OsString> {
         (name == CLIENT_SECRET_VAR).then(|| OsString::from(SECRET))
+    }
+
+    #[test]
+    fn the_audit_section_reaches_the_run_settings_and_a_bad_one_stops_startup() {
+        let settings = parse("audit:\n  jsonl: off\n  queue: 64\n  retention_days: 90\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(settings.audit.jsonl, crate::audit::JsonlTarget::Off);
+        assert_eq!(settings.audit.queue, 64);
+        assert_eq!(settings.audit.retention_days, Some(90));
+        assert!(settings.audit.database);
+
+        let defaults = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(defaults.audit.jsonl, crate::audit::JsonlTarget::Stdout);
+
+        let err = parse("audit:\n  queue: 0\n")
+            .into_run_settings(&secret_env)
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConfigError::Audit(_)), "{err}");
     }
 
     fn parse(extra: &str) -> Config {

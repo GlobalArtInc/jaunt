@@ -208,6 +208,7 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber(
             build_filter(None).unwrap(),
             captured.clone(),
+            None,
         ));
         (captured, guard)
     }

@@ -18,6 +18,7 @@ hyper-util = { version = "0.1.21", default-features = false, features = ["http2"
 ipnet = "2.12.2"
 serde = { workspace = true }
 serde-saphyr = { workspace = true }
+jaunt-audit = { workspace = true }
 jaunt-ca = { workspace = true }
 jaunt-control = { workspace = true }
 jaunt-gate = { workspace = true }
@@ -39,12 +40,14 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 url = "2.5.9"
 
 [dev-dependencies]
+jaunt-audit = { workspace = true, features = ["testing"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 bytes = "1.12.2"
 h2 = "0.4.20"
 http = "1.5.0"
 russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
+rustix = { version = "1.1.6", default-features = false, features = ["process", "std"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3.27.0"

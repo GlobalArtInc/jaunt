@@ -38,7 +38,11 @@ async fn an_active_node_gets_a_tunnel_and_loses_it_for_good_after_node_rm() {
     .await;
     assert_eq!(field(&connected, "alpn"), "jaunt-tunnel/1");
 
-    harness.admin.remove_node(&agent.name).await.unwrap();
+    harness
+        .admin
+        .remove_node(&agent.name, "cli:tester")
+        .await
+        .unwrap();
 
     eventually("the removed node to lose its tunnel", || {
         !harness.server.registry().is_connected(&node)
@@ -69,7 +73,11 @@ async fn certificates_that_do_not_belong_to_an_active_node_key_are_refused() {
     let harness = Harness::start(Options::default()).await;
     let agent = harness.enroll("web-01").await;
     let removed = harness.enroll("web-02").await;
-    harness.admin.remove_node(&removed.name).await.unwrap();
+    harness
+        .admin
+        .remove_node(&removed.name, "cli:tester")
+        .await
+        .unwrap();
     let other_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
     let stranger = Uuid::new_v4().hyphenated().to_string();
 
@@ -202,7 +210,11 @@ async fn the_agent_api_serves_only_the_agent_router_as_the_authenticated_node() 
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
     }
 
-    harness.admin.remove_node(&agent.name).await.unwrap();
+    harness
+        .admin
+        .remove_node(&agent.name, "cli:tester")
+        .await
+        .unwrap();
     let after_removal = api_request(
         &mut client.sender,
         Method::POST,

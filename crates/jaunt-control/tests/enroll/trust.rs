@@ -86,7 +86,11 @@ async fn the_trust_route_needs_an_authenticated_active_node_on_the_agent_router(
     assert_eq!(public.status, StatusCode::NOT_FOUND);
     assert!(!public.text().contains("ssh-ed25519"));
 
-    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    harness
+        .admin
+        .remove_node(NODE_NAME, "cli:tester")
+        .await
+        .unwrap();
     for id in [node_id.as_str(), UNKNOWN_NODE, ""] {
         let refused = fetch_trust(&harness.agent_router, Some(id)).await;
         assert_eq!(refused.status, StatusCode::FORBIDDEN, "{id:?}");

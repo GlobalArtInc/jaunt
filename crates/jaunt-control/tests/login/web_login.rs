@@ -63,7 +63,12 @@ async fn a_browser_login_ends_in_a_strict_host_cookie_and_a_session_with_the_pol
     assert_eq!(body["groups"], serde_json::json!(["dev", "ops"]));
     assert_eq!(
         body["permissions"],
-        serde_json::json!(["nodes.approve", "sessions.read", "recordings.read"])
+        serde_json::json!([
+            "nodes.approve",
+            "sessions.read",
+            "recordings.read",
+            "audit.read"
+        ])
     );
     assert_eq!(
         body["expires_at"],

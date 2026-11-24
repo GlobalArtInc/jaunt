@@ -71,7 +71,11 @@ async fn route_denies_every_holder_and_node_that_does_not_check_out() {
         .await
         .unwrap();
     node(harness, "web-02").await;
-    harness.admin.remove_node("web-02").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-02", "cli:tester")
+        .await
+        .unwrap();
     let to_node = alice.route_to(NODE_NAME);
 
     let cases = [

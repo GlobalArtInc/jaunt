@@ -54,6 +54,8 @@ impl From<CodeFailure> for ApproveError {
 pub enum RemoveError {
     #[error("no active node has this name")]
     NoActiveNode,
+    #[error("the operator name is not valid")]
+    InvalidOperator,
     #[error("the clock is before the unix epoch")]
     Clock,
     #[error("the database failed: {0}")]
@@ -175,7 +177,7 @@ impl NodeAdmin {
                     replaced_node_id: replaced_id,
                 });
                 if let Some(old) = &approved.replaced {
-                    node_audit::node_removed(&old.id, &old.name, "replaced");
+                    node_audit::node_removed(&old.id, &old.name, "replaced", approver);
                 }
                 Ok(ApprovedNode {
                     enrollment_id: approved.enrollment.id.clone(),
@@ -188,7 +190,14 @@ impl NodeAdmin {
         }
     }
 
-    pub async fn reject(&self, code: &str) -> Result<RejectedEnrollment, ApproveError> {
+    pub async fn reject(
+        &self,
+        code: &str,
+        rejected_by: &str,
+    ) -> Result<RejectedEnrollment, ApproveError> {
+        if !is_valid_approver(rejected_by) {
+            return Err(ApproveError::InvalidApprover);
+        }
         let now = self.now().ok_or(ApproveError::Clock)?;
         let code_hash = hash_typed_code(code)?;
         match self
@@ -198,7 +207,7 @@ impl NodeAdmin {
             .await?
         {
             RejectOutcome::Rejected(enrollment) => {
-                node_audit::enroll_rejected(&enrollment.id, &enrollment.name);
+                node_audit::enroll_rejected(&enrollment.id, &enrollment.name, rejected_by);
                 Ok(RejectedEnrollment {
                     id: enrollment.id,
                     name: enrollment.name,
@@ -208,7 +217,14 @@ impl NodeAdmin {
         }
     }
 
-    pub async fn remove_node(&self, name: &str) -> Result<NodeSummary, RemoveError> {
+    pub async fn remove_node(
+        &self,
+        name: &str,
+        removed_by: &str,
+    ) -> Result<NodeSummary, RemoveError> {
+        if !is_valid_approver(removed_by) {
+            return Err(RemoveError::InvalidOperator);
+        }
         let now = self.now().ok_or(RemoveError::Clock)?;
         let removed = self
             .store
@@ -217,7 +233,7 @@ impl NodeAdmin {
             .await
             .map_err(RemoveError::Store)?
             .ok_or(RemoveError::NoActiveNode)?;
-        node_audit::node_removed(&removed.id, &removed.name, "admin");
+        node_audit::node_removed(&removed.id, &removed.name, "admin", removed_by);
         summary(removed).map_err(RemoveError::Store)
     }
 

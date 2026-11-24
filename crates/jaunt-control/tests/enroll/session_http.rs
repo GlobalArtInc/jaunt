@@ -248,7 +248,11 @@ async fn a_removed_node_is_refused_before_its_session_is_looked_up() {
         }
         other => panic!("the route was denied: {other:?}"),
     };
-    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    harness
+        .admin
+        .remove_node(NODE_NAME, "cli:tester")
+        .await
+        .unwrap();
     start_recording();
 
     let unknown = s.authorize_over_http(&s.node_id, UNKNOWN_SESSION).await;
@@ -294,7 +298,11 @@ async fn a_removed_node_is_refused_on_connections_opened_before_the_removal() {
     let running = routed(harness, &s.alice).await;
     let allowed = s.authorize_over_http(&s.node_id, &running).await;
     assert_eq!(allowed.json()["decision"], "allow");
-    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    harness
+        .admin
+        .remove_node(NODE_NAME, "cli:tester")
+        .await
+        .unwrap();
     start_recording();
 
     let denied = s.authorize_over_http(&s.node_id, &waiting).await;

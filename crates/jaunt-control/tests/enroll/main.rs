@@ -1,5 +1,6 @@
 mod admin;
 mod audit;
+mod audit_events;
 mod authorize;
 mod authorize_checks;
 mod client_api;

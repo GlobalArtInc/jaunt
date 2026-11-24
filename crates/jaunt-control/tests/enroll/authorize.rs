@@ -133,7 +133,11 @@ async fn authorize_rechecks_the_login_the_policy_and_the_node() {
     );
 
     apply_policy(harness, &[role("ops", "ops", false, false)]);
-    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    harness
+        .admin
+        .remove_node(NODE_NAME, "cli:tester")
+        .await
+        .unwrap();
     assert_eq!(
         s.decide(s.alice.authorize(&before_removal, LOGIN)).await,
         deny(DenyReason::NodeInactive)

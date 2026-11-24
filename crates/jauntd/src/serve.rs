@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::{Signer, TrustSet};
 use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, system_clock};
 use jaunt_gate::HostCertIssuer;
@@ -20,6 +21,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
+use crate::audit::{self, AuditRuntime, AuditStartError, Surface};
 use crate::ca::{self, Authorities};
 use crate::config::{self, ConfigError, EnvLookup, RunSettings};
 use crate::logging::{self, LoggingError};
@@ -68,6 +70,8 @@ pub enum ServeError {
     GateTrust(String),
     #[error(transparent)]
     Gate(#[from] GateSshError),
+    #[error("cannot start the audit pipeline: {0}")]
+    Audit(#[from] AuditStartError),
 }
 
 pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
@@ -75,12 +79,15 @@ pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
     let settings = config.into_run_settings(env)?;
     let authorities =
         ca::load_authorities(&settings.data_dir, env).map_err(ServeError::Authorities)?;
-    logging::init(env)?;
+    let tap = AuditTap::new(audit_clock());
+    logging::init(env, &tap)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(ServeError::Runtime)?;
-    runtime.block_on(serve(settings, authorities))
+    let served = runtime.block_on(serve(settings, authorities, tap));
+    audit::finish_runtime(runtime, audit::RUNTIME_GRACE);
+    served
 }
 
 struct Started {
@@ -90,6 +97,7 @@ struct Started {
     store: Store,
     agents: Option<AgentsSettings>,
     gate: Option<GatePlan>,
+    audit: AuditRuntime,
 }
 
 struct GatePlan {
@@ -99,7 +107,11 @@ struct GatePlan {
     user_cas: Arc<UserCaSource>,
 }
 
-async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), ServeError> {
+async fn serve(
+    settings: RunSettings,
+    authorities: Authorities,
+    tap: AuditTap,
+) -> Result<(), ServeError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(ServeError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(ServeError::Signals)?;
 
@@ -110,11 +122,13 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         store,
         agents,
         gate,
-    } = start(settings, authorities).await?;
+        audit,
+    } = start(settings, authorities, &tap).await?;
     let listener = match bind(listen).await {
         Ok(listener) => listener,
         Err(err) => {
             policy::stop_watcher(watcher).await;
+            audit.shutdown(audit::FLUSH_DEADLINE).await;
             return Err(err);
         }
     };
@@ -122,6 +136,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         Ok(agents) => agents,
         Err(err) => {
             policy::stop_watcher(watcher).await;
+            audit.shutdown(audit::FLUSH_DEADLINE).await;
             return Err(err);
         }
     };
@@ -132,6 +147,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
                 agents.shutdown(SHUTDOWN_GRACE).await;
             }
             policy::stop_watcher(watcher).await;
+            audit.shutdown(audit::FLUSH_DEADLINE).await;
             return Err(err);
         }
     };
@@ -166,16 +182,18 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
             None => std::future::pending().await,
         }
     };
-    tokio::select! {
-        served = control.serve(listener, shutdown) => served?,
+    let served = tokio::select! {
+        served = control.serve(listener, shutdown) => served.map_err(ServeError::from),
         () = overdue => {
             tracing::warn!(
                 target: "jaunt::daemon",
                 "the http server did not stop within the shutdown grace"
             );
+            Ok(())
         }
-    }
-    Ok(())
+    };
+    audit.shutdown(audit::FLUSH_DEADLINE).await;
+    served
 }
 
 async fn start_agents(
@@ -251,7 +269,11 @@ fn gate_plan(
     })
 }
 
-async fn start(settings: RunSettings, authorities: Authorities) -> Result<Started, ServeError> {
+async fn start(
+    settings: RunSettings,
+    authorities: Authorities,
+    tap: &AuditTap,
+) -> Result<Started, ServeError> {
     let policy = policy::load_at_startup(&settings.policy_dir)?;
 
     let prepared = storage::prepare(&settings.data_dir)?;
@@ -265,51 +287,60 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
             source,
         })?;
     store.migrate().await.map_err(ServeError::Migrate)?;
+    let audit = audit::start(&settings.audit, Surface::Daemon, &store, tap, audit_clock())?;
 
-    let oidc = OidcClient::discover(settings.oidc)
-        .await
-        .map_err(ServeError::Oidc)?;
-    let agents_store = store.clone();
-    let host_authority: Arc<dyn Signer> = Arc::new(authorities.host);
-    let gate = settings
-        .ssh_gate
-        .map(|gate| {
-            gate_plan(
-                gate,
-                settings.ssh_suffix.as_str(),
-                &authorities.user_trust,
-                &host_authority,
-                &store,
-            )
+    let started: Result<Started, ServeError> = async {
+        let oidc = OidcClient::discover(settings.oidc)
+            .await
+            .map_err(ServeError::Oidc)?;
+        let agents_store = store.clone();
+        let host_authority: Arc<dyn Signer> = Arc::new(authorities.host);
+        let gate = settings
+            .ssh_gate
+            .map(|gate| {
+                gate_plan(
+                    gate,
+                    settings.ssh_suffix.as_str(),
+                    &authorities.user_trust,
+                    &host_authority,
+                    &store,
+                )
+            })
+            .transpose()?;
+        let control = Control::new(ControlParts {
+            store,
+            oidc,
+            user_authority: Arc::new(authorities.user),
+            user_trust: authorities.user_trust,
+            host_trust: authorities.host_trust,
+            host_authority,
+            internal_ca: authorities.internal,
+            ssh_suffix: settings.ssh_suffix,
+            gate_endpoint: settings.gate_endpoint,
+            agent_endpoint: settings.agent_endpoint,
+            cert_ttl: settings.cert_ttl,
+            pending_capacity: PENDING_CAPACITY,
+            device: settings.device,
+            policy: policy.clone(),
+            web_enabled: settings.web,
+            clock: system_clock(),
+        })?;
+        let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
+        Ok(Started {
+            control,
+            watcher,
+            listen: settings.listen,
+            store: agents_store,
+            agents: settings.agents,
+            gate,
+            audit: audit.clone(),
         })
-        .transpose()?;
-    let control = Control::new(ControlParts {
-        store,
-        oidc,
-        user_authority: Arc::new(authorities.user),
-        user_trust: authorities.user_trust,
-        host_trust: authorities.host_trust,
-        host_authority,
-        internal_ca: authorities.internal,
-        ssh_suffix: settings.ssh_suffix,
-        gate_endpoint: settings.gate_endpoint,
-        agent_endpoint: settings.agent_endpoint,
-        cert_ttl: settings.cert_ttl,
-        pending_capacity: PENDING_CAPACITY,
-        device: settings.device,
-        policy: policy.clone(),
-        web_enabled: settings.web,
-        clock: system_clock(),
-    })?;
-    let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
-    Ok(Started {
-        control,
-        watcher,
-        listen: settings.listen,
-        store: agents_store,
-        agents: settings.agents,
-        gate,
-    })
+    }
+    .await;
+    if started.is_err() {
+        audit.shutdown(audit::FLUSH_DEADLINE).await;
+    }
+    started
 }
 
 async fn bind(listen: SocketAddr) -> Result<TcpListener, ServeError> {
@@ -352,8 +383,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
+    use jaunt_audit::{
+        AuditEvent, AuditTap, keep_callsites_enabled_for_scoped_capture,
+        system_clock as audit_clock,
+    };
     use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa};
     use jaunt_policy::PolicySet;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{ServeError, run, serve, start};
     use crate::ca::Authorities;
@@ -437,7 +474,11 @@ mod tests {
             .unwrap();
 
         let err = runtime
-            .block_on(serve(settings, authorities(dir.path())))
+            .block_on(serve(
+                settings,
+                authorities(dir.path()),
+                AuditTap::new(audit_clock()),
+            ))
             .err()
             .unwrap();
 
@@ -448,6 +489,168 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("roles.yaml"), "{shown}");
         assert!(!dir.path().join("jaunt.db").exists());
+    }
+
+    #[test]
+    fn stopping_the_daemon_flushes_the_queued_audit_events() {
+        keep_callsites_enabled_for_scoped_capture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let path = write_config(
+            dir.path(),
+            &format!("audit:\n  jsonl:\n    file: {}\n", log.display()),
+        );
+        let mut settings = config::load(&path)
+            .unwrap()
+            .into_run_settings(&secret_only)
+            .unwrap();
+        settings.oidc.issuer_url = fake_discovery();
+        settings.listen = "127.0.0.1:0".parse().unwrap();
+        settings.agents = None;
+        let tap = AuditTap::new(audit_clock());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(tap.layer()));
+
+        let served = runtime.block_on(async {
+            let emit_then_stop = async {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let before = tap.snapshot().captured;
+                    tracing::info!(
+                        target: "jaunt::audit",
+                        event = "login.started",
+                        login_id = "flush-me"
+                    );
+                    if tap.snapshot().captured > before {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the daemon never bound the audit tap"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::TERM,
+                )
+                .unwrap();
+            };
+            let serving = serve(settings, authorities(dir.path()), tap.clone());
+            let (served, ()) = tokio::join!(serving, emit_then_stop);
+            served
+        });
+
+        assert!(served.is_ok(), "{:?}", served.err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let written: Vec<AuditEvent> = text
+            .lines()
+            .map(|line| AuditEvent::from_json_line(line).unwrap())
+            .collect();
+        assert!(
+            written
+                .iter()
+                .any(|event| event.text("login_id") == Some("flush-me"))
+        );
+        let captured = usize::try_from(tap.snapshot().captured).unwrap();
+        assert_eq!(written.len(), captured);
+        tracing::info!(
+            target: "jaunt::audit",
+            event = "login.started",
+            login_id = "after-the-stop"
+        );
+        assert_eq!(tap.snapshot().dropped_after_close, 1);
+    }
+
+    fn issuer_failing_on_demand() -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                wait.recv().ok();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .ok();
+            }
+        });
+        (base, go)
+    }
+
+    #[test]
+    fn a_startup_that_fails_after_the_audit_pipeline_started_flushes_it_before_returning() {
+        keep_callsites_enabled_for_scoped_capture();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let path = write_config(
+            dir.path(),
+            &format!("audit:\n  jsonl:\n    file: {}\n", log.display()),
+        );
+        let mut settings = config::load(&path)
+            .unwrap()
+            .into_run_settings(&secret_only)
+            .unwrap();
+        let (issuer, release) = issuer_failing_on_demand();
+        settings.oidc.issuer_url = issuer;
+        let tap = AuditTap::new(audit_clock());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(tap.layer()));
+
+        let served = runtime.block_on(async {
+            let emit_then_fail_discovery = async {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let before = tap.snapshot().captured;
+                    tracing::info!(
+                        target: "jaunt::audit",
+                        event = "login.started",
+                        login_id = "flush-on-failure"
+                    );
+                    if tap.snapshot().captured > before {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the startup never bound the audit tap"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                release.send(()).unwrap();
+            };
+            let serving = serve(settings, authorities(dir.path()), tap.clone());
+            let (served, ()) = tokio::join!(serving, emit_then_fail_discovery);
+            served
+        });
+
+        assert!(matches!(served, Err(ServeError::Oidc(_))), "{served:?}");
+        runtime.block_on(async {
+            tracing::info!(
+                target: "jaunt::audit",
+                event = "login.started",
+                login_id = "after-the-failure"
+            );
+        });
+        assert_eq!(tap.snapshot().dropped_after_close, 1);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("flush-on-failure"), "{text}");
     }
 
     fn role(login: &str) -> String {
@@ -512,7 +715,11 @@ mod tests {
             .unwrap();
 
         let started = runtime
-            .block_on(start(settings, authorities(dir.path())))
+            .block_on(start(
+                settings,
+                authorities(dir.path()),
+                &AuditTap::new(audit_clock()),
+            ))
             .unwrap();
 
         let loaded = started.control.policy().snapshot().hash().to_owned();
@@ -545,7 +752,11 @@ mod tests {
             .build()
             .unwrap();
         let started = runtime
-            .block_on(start(settings, authorities(dir.path())))
+            .block_on(start(
+                settings,
+                authorities(dir.path()),
+                &AuditTap::new(audit_clock()),
+            ))
             .unwrap();
         let answer = runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

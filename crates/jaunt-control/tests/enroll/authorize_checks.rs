@@ -79,7 +79,11 @@ async fn a_re_enrolled_node_with_the_same_name_cannot_take_the_old_nodes_session
     let s = scenario().await;
     let harness = &s.harness;
     let session_id = routed(harness, &s.alice).await;
-    harness.admin.remove_node(NODE_NAME).await.unwrap();
+    harness
+        .admin
+        .remove_node(NODE_NAME, "cli:tester")
+        .await
+        .unwrap();
     let successor = node(harness, NODE_NAME).await;
     assert_ne!(successor, s.node_id);
     assert_eq!(

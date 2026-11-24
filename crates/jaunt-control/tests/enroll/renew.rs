@@ -216,7 +216,11 @@ async fn a_removed_or_unknown_node_is_refused() {
     let harness = Harness::new().await;
     let (_enrolled, delivered) = harness.enrolled_node("web-01").await;
     let node_id = node_id_of(&delivered);
-    harness.admin.remove_node("web-01").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-01", "cli:tester")
+        .await
+        .unwrap();
 
     for id in [node_id.as_str(), "00000000-0000-4000-8000-000000000000", ""] {
         let reply = harness.renew(Some(id), &json!({})).await;

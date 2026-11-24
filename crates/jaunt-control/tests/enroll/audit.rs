@@ -99,11 +99,19 @@ async fn the_lifecycle_emits_stable_events_and_none_of_them_carries_a_secret() {
         )
         .await;
     let second = harness.enroll("web-02").await;
-    harness.admin.reject(&second.code).await.unwrap();
+    harness
+        .admin
+        .reject(&second.code, "cli:tester")
+        .await
+        .unwrap();
     let third = harness.enroll("web-03").await;
     harness.clock.advance(901);
     harness.poll(&third.handle).await;
-    harness.admin.remove_node("web-01").await.unwrap();
+    harness
+        .admin
+        .remove_node("web-01", "cli:tester")
+        .await
+        .unwrap();
 
     let events: Vec<Captured> = take_recording()
         .into_iter()

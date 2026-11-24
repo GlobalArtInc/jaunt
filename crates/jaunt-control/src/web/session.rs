@@ -197,6 +197,12 @@ impl Permission for NodesApprove {
     const REQUIRED: AdminPermission = AdminPermission::NodesApprove;
 }
 
+pub(crate) struct AuditRead;
+
+impl Permission for AuditRead {
+    const REQUIRED: AdminPermission = AdminPermission::AuditRead;
+}
+
 pub(crate) struct RequireAdmin<P: Permission> {
     pub(crate) session: WebSession,
     permission: PhantomData<P>,

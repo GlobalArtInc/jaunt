@@ -15,6 +15,13 @@ kind: Role
 metadata: { name: approvers }
 spec:
   members: { users: [alice@example.com] }
+  admin: [nodes.approve, sessions.read, audit.read]
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: approvers-without-audit }
+spec:
+  members: { users: [carol@example.com] }
   admin: [nodes.approve, sessions.read]
 ---
 apiVersion: jaunt/v1
@@ -40,6 +47,15 @@ pub fn bob() -> Identity {
         email: "bob@example.com".to_owned(),
         email_verified: true,
         username: "bob".to_owned(),
+    }
+}
+
+pub fn carol() -> Identity {
+    Identity {
+        subject: "user-3".to_owned(),
+        email: "carol@example.com".to_owned(),
+        email_verified: true,
+        username: "carol".to_owned(),
     }
 }
 

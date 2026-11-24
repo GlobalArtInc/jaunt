@@ -25,6 +25,10 @@ fn schema_accepts_valid_documents_and_rejects_deviations() {
 
     assert!(valid(&validator, ROLE));
     assert!(valid(&validator, TESTS));
+    assert!(valid(
+        &validator,
+        &ROLE.replace("sessions.read", "audit.read")
+    ));
 
     let rejected = [
         ("unknown field", ROLE.replace("members:", "memberz:")),

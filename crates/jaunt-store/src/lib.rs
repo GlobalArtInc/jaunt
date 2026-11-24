@@ -1,4 +1,5 @@
 mod api_tokens;
+mod audit_events;
 mod certificates;
 mod enrollments;
 mod error;
@@ -16,6 +17,9 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
+pub use audit_events::{
+    AuditCursor, AuditEvents, AuditQuery, AuditRecord, MAX_AUDIT_PAGE, MAX_AUDIT_PAYLOAD_BYTES,
+};
 pub use certificates::{Certificate, Certificates, NewCertificate};
 pub use enrollments::{
     ApproveEnrollment, ApproveOutcome, Approved, CodeFailure, CreateOutcome, Enrollment,
@@ -69,6 +73,10 @@ impl Store {
 
     pub fn api_tokens(&self) -> ApiTokens {
         ApiTokens::new(self.pool.clone())
+    }
+
+    pub fn audit_events(&self) -> AuditEvents {
+        AuditEvents::new(self.pool.clone())
     }
 
     pub fn users(&self) -> Users {

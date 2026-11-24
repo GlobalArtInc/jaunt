@@ -1,4 +1,5 @@
 mod audit;
+mod audit_events;
 mod callback;
 mod control;
 mod device_audit;
@@ -17,6 +18,7 @@ mod support;
 mod sweep;
 mod web_admin;
 mod web_audit;
+mod web_audit_api;
 mod web_csrf;
 mod web_gate;
 mod web_login;

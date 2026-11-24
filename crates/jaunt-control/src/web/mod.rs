@@ -1,5 +1,6 @@
 mod api;
 mod assets;
+mod audit_log;
 mod cookies;
 mod csrf;
 mod headers;
@@ -47,6 +48,7 @@ pub(crate) fn mount(
         .route("/v1/web/session", get(api::session))
         .route("/v1/web/logout", post(api::logout))
         .route("/v1/admin/whoami", get(api::whoami))
+        .route("/v1/admin/audit", get(audit_log::list))
         .merge(extra)
         .fallback(assets::serve)
         .layer(middleware::from_fn_with_state(
