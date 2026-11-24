@@ -38,8 +38,12 @@ impl Fixture {
         Self { authority, root }
     }
 
-    fn ca(&self) -> InternalCa<'_> {
-        InternalCa::new(&self.authority.backend, self.root.certificate_der.clone()).unwrap()
+    fn ca(&self) -> InternalCa {
+        InternalCa::new(
+            self.authority.shared_signer(),
+            self.root.certificate_der.clone(),
+        )
+        .unwrap()
     }
 }
 

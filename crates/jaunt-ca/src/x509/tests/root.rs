@@ -55,7 +55,6 @@ fn root_certificate_has_the_authority_profile() {
 #[test]
 fn internal_ca_accepts_only_its_own_root() {
     let fixture = Fixture::new();
-    let backend = &fixture.authority.backend;
     let der = fixture.root.certificate_der.clone();
     let other = Fixture::new();
     let node = fixture
@@ -78,7 +77,7 @@ fn internal_ca_accepts_only_its_own_root() {
     ] {
         assert!(
             matches!(
-                InternalCa::new(backend, root),
+                InternalCa::new(fixture.authority.shared_signer(), root),
                 Err(CaError::InvalidRootCertificate { .. })
             ),
             "{label}"
@@ -87,7 +86,7 @@ fn internal_ca_accepts_only_its_own_root() {
 
     let user = authority(CaKind::User);
     assert!(matches!(
-        InternalCa::new(&user.backend, der.clone()),
+        InternalCa::new(user.shared_signer(), der.clone()),
         Err(CaError::WrongAuthorityKind {
             expected: CaKind::Internal
         })
@@ -98,7 +97,7 @@ fn internal_ca_accepts_only_its_own_root() {
             expected: CaKind::Internal
         })
     ));
-    assert!(InternalCa::new(backend, der).is_ok());
+    assert!(InternalCa::new(fixture.authority.shared_signer(), der).is_ok());
 }
 
 type Edit = fn(&mut CertificateParams);
@@ -127,7 +126,7 @@ fn each_root_check_rejects_an_otherwise_valid_root() {
     let foreign = subject();
 
     let control = crafted_root(&key, &own, |_| {});
-    assert!(InternalCa::new(backend, control).is_ok());
+    assert!(InternalCa::new(fixture.authority.shared_signer(), control).is_ok());
 
     let cases: [Case<'_>; 6] = [
         (
@@ -169,7 +168,7 @@ fn each_root_check_rejects_an_otherwise_valid_root() {
     ];
     for (label, subject_key, edit, expected) in cases {
         let der = crafted_root(&key, subject_key, edit);
-        match InternalCa::new(backend, der) {
+        match InternalCa::new(fixture.authority.shared_signer(), der) {
             Err(CaError::InvalidRootCertificate { reason }) => {
                 assert!(reason.contains(expected), "{label}: {reason}");
             }

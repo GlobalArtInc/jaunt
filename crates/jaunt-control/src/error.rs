@@ -13,6 +13,10 @@ pub enum ControlError {
     InvalidPublicOrigin,
     #[error("the client address header is not a valid http header name")]
     InvalidClientIpHeader,
+    #[error("the host signing authority is not a host certificate authority")]
+    NotHostAuthority,
+    #[error("the host signing authority is not the active key of the host trust set")]
+    HostAuthorityNotTrusted,
     #[error("the host authority keys cannot be listed: {0}")]
     HostKeys(#[source] CaError),
     #[error("the http server failed: {0}")]
@@ -21,4 +25,8 @@ pub enum ControlError {
     Clock,
     #[error("purging stored login requests failed: {0}")]
     Purge(#[source] StoreError),
+    #[error("recovering interrupted deliveries failed: {0}")]
+    RecoverDeliveries(#[source] StoreError),
+    #[error("purging stored enrollments failed: {0}")]
+    PurgeEnrollments(#[source] StoreError),
 }

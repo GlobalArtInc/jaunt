@@ -87,6 +87,10 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         oidc,
         user_authority: Arc::new(authorities.user),
         host_trust: authorities.host_trust,
+        host_authority: Arc::new(authorities.host),
+        internal_ca: authorities.internal,
+        ssh_suffix: settings.ssh_suffix,
+        agent_endpoint: settings.agent_endpoint,
         cert_ttl: settings.cert_ttl,
         pending_capacity: PENDING_CAPACITY,
         device: settings.device,
@@ -149,6 +153,7 @@ mod tests {
         let path = dir.join("jauntd.yaml");
         let text = format!(
             "data_dir: {}\npublic_url: https://jaunt.example.com\n{extra}\
+             ssh_suffix: jaunt.example.com\nagent_endpoint: agents.example.com:443\n\
              oidc:\n  issuer_url: https://idp.example.com\n  client_id: jaunt\n",
             dir.display()
         );

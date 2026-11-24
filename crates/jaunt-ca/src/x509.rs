@@ -7,6 +7,7 @@ mod tests;
 
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::string::Ia5String;
@@ -63,15 +64,15 @@ pub struct IssuedCertificate {
     pub not_after: SystemTime,
 }
 
-pub struct InternalCa<'a> {
-    signer: &'a dyn Signer,
+pub struct InternalCa {
+    signer: Arc<dyn Signer>,
     root_der: Vec<u8>,
     root_validity: RootValidity,
 }
 
-impl<'a> InternalCa<'a> {
-    pub fn new(signer: &'a dyn Signer, root_der: Vec<u8>) -> Result<Self, CaError> {
-        let key = SignerKey::new(signer, CaKind::Internal)?;
+impl InternalCa {
+    pub fn new(signer: Arc<dyn Signer>, root_der: Vec<u8>) -> Result<Self, CaError> {
+        let key = SignerKey::new(signer.as_ref(), CaKind::Internal)?;
         let root_validity = root::validate(&root_der, key.raw())?;
         Ok(Self {
             signer,
@@ -182,7 +183,7 @@ impl<'a> InternalCa<'a> {
         params: &CertificateParams,
         subject: &SubjectPublicKey,
     ) -> Result<Vec<u8>, CaError> {
-        let key = SignerKey::new(self.signer, CaKind::Internal)?;
+        let key = SignerKey::new(self.signer.as_ref(), CaKind::Internal)?;
         if subject.raw() == key.raw() {
             return Err(CaError::InvalidSubjectKey);
         }
@@ -195,7 +196,7 @@ impl<'a> InternalCa<'a> {
     }
 }
 
-impl fmt::Debug for InternalCa<'_> {
+impl fmt::Debug for InternalCa {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InternalCa")
             .field("kind", &self.signer.kind())

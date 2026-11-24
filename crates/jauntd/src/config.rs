@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jaunt_control::DeviceSettings;
+use jaunt_control::{AgentEndpoint, DeviceSettings, NamingError, SshSuffix};
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use serde::Deserialize;
 use url::Url;
@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default = "default_device_login")]
     pub device_login: bool,
     pub client_ip_header: Option<String>,
+    pub ssh_suffix: Option<String>,
+    pub agent_endpoint: Option<String>,
     pub oidc: Option<OidcSection>,
 }
 
@@ -52,6 +54,8 @@ pub struct RunSettings {
     pub listen: SocketAddr,
     pub cert_ttl: Duration,
     pub device: DeviceSettings,
+    pub ssh_suffix: SshSuffix,
+    pub agent_endpoint: AgentEndpoint,
     pub oidc: OidcConfig,
 }
 
@@ -65,6 +69,14 @@ pub enum ConfigError {
     CertTtlOutOfRange,
     #[error("client_ip_header must be a header name of letters, digits and hyphens")]
     InvalidClientIpHeader,
+    #[error("ssh_suffix is required to run the daemon")]
+    MissingSshSuffix,
+    #[error("ssh_suffix: {0}")]
+    InvalidSshSuffix(#[source] NamingError),
+    #[error("agent_endpoint is required to run the daemon")]
+    MissingAgentEndpoint,
+    #[error("agent_endpoint: {0}")]
+    InvalidAgentEndpoint(#[source] NamingError),
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -118,6 +130,13 @@ impl Config {
             .client_ip_header
             .map(|name| validate_header_name(&name))
             .transpose()?;
+        let ssh_suffix = self.ssh_suffix.ok_or(ConfigError::MissingSshSuffix)?;
+        let ssh_suffix = SshSuffix::parse(&ssh_suffix).map_err(ConfigError::InvalidSshSuffix)?;
+        let agent_endpoint = self
+            .agent_endpoint
+            .ok_or(ConfigError::MissingAgentEndpoint)?;
+        let agent_endpoint =
+            AgentEndpoint::parse(&agent_endpoint).map_err(ConfigError::InvalidAgentEndpoint)?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -157,6 +176,8 @@ impl Config {
                 public_origin: origin,
                 client_ip_header,
             },
+            ssh_suffix,
+            agent_endpoint,
             oidc,
         })
     }
@@ -248,6 +269,7 @@ mod tests {
     fn parse(extra: &str) -> Config {
         let text = format!(
             "data_dir: /var/lib/jaunt\npublic_url: https://jaunt.example.com\n\
+             ssh_suffix: jaunt.example.com\nagent_endpoint: agents.example.com:443\n\
              oidc:\n  issuer_url: https://idp.example.com\n  client_id: jaunt\n{extra}"
         );
         serde_saphyr::from_str(&text).unwrap()
@@ -265,6 +287,7 @@ mod tests {
         assert_eq!(config.listen.to_string(), "127.0.0.1:8443");
         assert_eq!(config.cert_ttl_secs, 28_800);
         assert!(config.public_url.is_none() && config.oidc.is_none());
+        assert!(config.ssh_suffix.is_none() && config.agent_endpoint.is_none());
     }
 
     #[test]
@@ -339,13 +362,69 @@ cert_ttl_secs: {SECRET}
             no_url.into_run_settings(&secret_env),
             Err(ConfigError::MissingPublicUrl)
         ));
-        let no_oidc: Config =
-            serde_saphyr::from_str("data_dir: /d\npublic_url: https://jaunt.example.com\n")
-                .unwrap();
+        let no_oidc: Config = serde_saphyr::from_str(
+            "data_dir: /d\npublic_url: https://jaunt.example.com\n\
+             ssh_suffix: jaunt.example.com\nagent_endpoint: agents.example.com:443\n",
+        )
+        .unwrap();
         assert!(matches!(
             no_oidc.into_run_settings(&secret_env),
             Err(ConfigError::MissingOidc)
         ));
+    }
+
+    #[test]
+    fn run_requires_a_valid_ssh_suffix_and_agent_endpoint() {
+        let settings = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(settings.ssh_suffix.as_str(), "jaunt.example.com");
+        assert_eq!(settings.agent_endpoint.as_str(), "agents.example.com:443");
+
+        let mut no_suffix = parse("");
+        no_suffix.ssh_suffix = None;
+        assert!(matches!(
+            no_suffix.into_run_settings(&secret_env),
+            Err(ConfigError::MissingSshSuffix)
+        ));
+        let mut no_endpoint = parse("");
+        no_endpoint.agent_endpoint = None;
+        assert!(matches!(
+            no_endpoint.into_run_settings(&secret_env),
+            Err(ConfigError::MissingAgentEndpoint)
+        ));
+        for suffix in [
+            "",
+            "Jaunt.Example.com",
+            ".example.com",
+            "a b.example.com",
+            "*.example.com",
+        ] {
+            let mut config = parse("");
+            config.ssh_suffix = Some(suffix.to_owned());
+            assert!(
+                matches!(
+                    config.into_run_settings(&secret_env),
+                    Err(ConfigError::InvalidSshSuffix(_))
+                ),
+                "{suffix:?}"
+            );
+        }
+        for endpoint in [
+            "agents.example.com",
+            "agents.example.com:0",
+            ":443",
+            "https://a.example.com:443",
+            "A.example.com:443",
+        ] {
+            let mut config = parse("");
+            config.agent_endpoint = Some(endpoint.to_owned());
+            assert!(
+                matches!(
+                    config.into_run_settings(&secret_env),
+                    Err(ConfigError::InvalidAgentEndpoint(_))
+                ),
+                "{endpoint:?}"
+            );
+        }
     }
 
     #[test]

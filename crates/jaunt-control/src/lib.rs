@@ -1,19 +1,39 @@
+mod admin;
+mod agent;
 mod audit;
 mod callback;
 mod clock;
 mod completion;
 mod control;
 mod device;
+mod enroll;
+mod enroll_secrets;
 mod error;
 mod finish;
 mod http;
+mod issuance;
+mod labels;
+mod naming;
+mod node_audit;
+mod node_keys;
 mod pending;
 mod pkce;
+mod poll;
+mod rate_limit;
+mod renew;
+mod source_ip;
 mod start;
 mod token;
 mod whoami;
 
+pub use admin::{
+    ApproveError, ApprovedNode, ListError, NodeAdmin, NodeListing, NodeSummary, PendingEnrollment,
+    RejectedEnrollment, RemoveError,
+};
+pub use agent::AuthenticatedNode;
 pub use clock::{Clock, system_clock};
 pub use control::{Control, ControlParts, PENDING_CAPACITY};
 pub use device::DeviceSettings;
 pub use error::ControlError;
+pub use labels::{LabelError, Labels, MAX_LABELS};
+pub use naming::{AgentEndpoint, NamingError, SshSuffix};

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use jaunt_ca::{
@@ -38,6 +39,8 @@ struct Output {
 pub struct Authorities {
     pub user: FileBackend,
     pub host_trust: TrustSet,
+    pub host: FileBackend,
+    pub internal: InternalCa,
 }
 
 pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authorities, String> {
@@ -45,9 +48,19 @@ pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authoriti
     let identity = resolve_identity(&ca_dir, env)?;
     let (_user_trust, user) =
         FileBackend::load(&ca_dir, CaKind::User, &identity).map_err(|err| err.to_string())?;
-    let (host_trust, _host) =
+    let (host_trust, host) =
         FileBackend::load(&ca_dir, CaKind::Host, &identity).map_err(|err| err.to_string())?;
-    Ok(Authorities { user, host_trust })
+    let (_internal_trust, internal_signer) =
+        FileBackend::load(&ca_dir, CaKind::Internal, &identity).map_err(|err| err.to_string())?;
+    let root = FileBackend::load_root_certificate(&ca_dir).map_err(|err| err.to_string())?;
+    let internal =
+        InternalCa::new(Arc::new(internal_signer), root).map_err(|err| err.to_string())?;
+    Ok(Authorities {
+        user,
+        host_trust,
+        host,
+        internal,
+    })
 }
 
 fn resolve_identity(ca_dir: &Path, env: EnvLookup<'_>) -> Result<AgeIdentity, String> {
@@ -278,7 +291,7 @@ fn create_internal_authority(
     FileBackend::store_root_certificate(staging, &root.certificate_der)
         .map_err(|err| err.to_string())?;
     let internal =
-        InternalCa::new(&backend, root.certificate_der).map_err(|err| err.to_string())?;
+        InternalCa::new(Arc::new(backend), root.certificate_der).map_err(|err| err.to_string())?;
     Ok(internal.root_sha256_hex())
 }
 
@@ -288,6 +301,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
@@ -368,7 +382,7 @@ mod tests {
 
         let (_, backend) = FileBackend::load(&ca_dir, CaKind::Internal, &identity).unwrap();
         let root = FileBackend::load_root_certificate(&ca_dir).unwrap();
-        let internal = InternalCa::new(&backend, root.clone()).unwrap();
+        let internal = InternalCa::new(Arc::new(backend), root.clone()).unwrap();
         assert_eq!(internal.root_der(), root.as_slice());
         assert_eq!(internal.root_sha256_hex(), initialized.internal_ca);
         let names = entries(&ca_dir.join("internal"));
@@ -609,6 +623,11 @@ mod tests {
         let authorities = load_authorities(&data_dir, &no_env).unwrap();
 
         assert_eq!(authorities.user.kind(), CaKind::User);
+        assert_eq!(authorities.host.kind(), CaKind::Host);
+        assert_eq!(
+            authorities.internal.root_sha256_hex(),
+            initialized.internal_ca
+        );
         assert_eq!(
             authorities.user.public_key().to_openssh().unwrap(),
             initialized.user_ca

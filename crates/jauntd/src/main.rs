@@ -1,6 +1,7 @@
 mod ca;
 mod config;
 mod logging;
+mod node;
 mod serve;
 mod storage;
 
@@ -59,10 +60,41 @@ enum CaCommand {
 
 #[derive(Subcommand)]
 enum NodeCommand {
-    #[command(about = "Approve a pending node by its code")]
-    Approve { code: String },
+    #[command(about = "Approve a pending node by the code shown on the node")]
+    Approve {
+        code: String,
+        #[arg(
+            long,
+            value_name = "K=V,K=V",
+            help = "Replace the proposed labels with these"
+        )]
+        labels: Option<String>,
+        #[arg(long, help = "Do not ask for confirmation")]
+        yes: bool,
+    },
+    #[command(about = "Reject a pending node by its code")]
+    Reject { code: String },
     #[command(about = "Remove a node")]
-    Rm { name: String },
+    Rm {
+        name: String,
+        #[arg(long, help = "Do not ask for confirmation")]
+        yes: bool,
+    },
+    #[command(about = "List nodes")]
+    List,
+}
+
+impl From<NodeCommand> for node::NodeAction {
+    fn from(command: NodeCommand) -> node::NodeAction {
+        match command {
+            NodeCommand::Approve { code, labels, yes } => {
+                node::NodeAction::Approve { code, labels, yes }
+            }
+            NodeCommand::Reject { code } => node::NodeAction::Reject { code },
+            NodeCommand::Rm { name, yes } => node::NodeAction::Rm { name, yes },
+            NodeCommand::List => node::NodeAction::List,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -78,12 +110,7 @@ fn main() -> ExitCode {
         Command::Ca {
             command: CaCommand::Init { generate_identity },
         } => ca::init(&cli.config, generate_identity),
-        Command::Node {
-            command: NodeCommand::Approve { .. },
-        } => not_implemented("node approve"),
-        Command::Node {
-            command: NodeCommand::Rm { .. },
-        } => not_implemented("node rm"),
+        Command::Node { command } => node::run(&cli.config, command.into()),
         Command::Db {
             command: DbCommand::Copy,
         } => not_implemented("db copy"),

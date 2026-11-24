@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::Arc;
 
 use rcgen::{KeyPair, PublicKeyData};
 use ssh_key::public::{KeyData, SkEd25519};
@@ -15,7 +16,7 @@ use crate::x509::{DEFAULT_SERVER_VALIDITY, InternalCa, SubjectPublicKey};
 #[test]
 fn internal_ca_can_be_shared_between_threads() {
     fn assert_shareable<T: Send + Sync>() {}
-    assert_shareable::<InternalCa<'static>>();
+    assert_shareable::<InternalCa>();
 }
 
 #[test]
@@ -118,25 +119,25 @@ fn signer_failures_forged_signatures_and_wrong_algorithms_are_rejected() {
         actual,
     };
 
-    let failing = broken(None);
+    let failing: Arc<dyn Signer> = Arc::new(broken(None));
     assert!(matches!(
-        InternalCa::create_root(&failing, now()),
+        InternalCa::create_root(failing.as_ref(), now()),
         Err(CaError::Sign)
     ));
-    let ca = InternalCa::new(&failing, fixture.root.certificate_der.clone()).unwrap();
+    let ca = InternalCa::new(failing, fixture.root.certificate_der.clone()).unwrap();
     assert!(matches!(
         ca.issue_node_certificate(node_params(DEFAULT_NODE_VALIDITY), now()),
         Err(CaError::Sign)
     ));
 
-    let impostor = broken(Some(
+    let impostor: Arc<dyn Signer> = Arc::new(broken(Some(
         PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-    ));
+    )));
     assert!(matches!(
-        InternalCa::create_root(&impostor, now()),
+        InternalCa::create_root(impostor.as_ref(), now()),
         Err(CaError::Sign)
     ));
-    let ca = InternalCa::new(&impostor, fixture.root.certificate_der.clone()).unwrap();
+    let ca = InternalCa::new(impostor, fixture.root.certificate_der.clone()).unwrap();
     assert!(matches!(
         ca.issue_server_certificate(
             server_params(&["agents.example.com"], DEFAULT_SERVER_VALIDITY),

@@ -2022,9 +2022,11 @@ dependencies = [
  "jaunt-store",
  "jaunt-tunnel",
  "jsonwebtoken",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sqlx",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -2137,6 +2139,7 @@ dependencies = [
 name = "jauntd"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "jaunt-ca",
  "jaunt-control",

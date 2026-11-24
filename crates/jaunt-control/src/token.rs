@@ -35,8 +35,12 @@ pub(crate) fn hash_presented(presented: &str) -> Option<String> {
 }
 
 pub(crate) fn hash_secret(secret: &str) -> String {
+    hex_digest(secret.as_bytes())
+}
+
+pub(crate) fn hex_digest(data: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(secret.as_bytes());
+    let digest = Sha256::digest(data);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest.as_slice() {
         hex.push(char::from(DIGITS[usize::from(byte >> 4)]));

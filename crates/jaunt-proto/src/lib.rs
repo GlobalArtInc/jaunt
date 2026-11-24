@@ -1,9 +1,14 @@
 mod device;
+mod enroll;
 mod error;
 mod login;
 mod whoami;
 
 pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
+pub use enroll::{
+    EnrollRequest, EnrollResponse, EnrollmentApproved, NodeCertificates, PollRequest, PollResponse,
+    RenewRequest, RenewResponse,
+};
 pub use error::ErrorBody;
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
 pub use whoami::WhoamiResponse;

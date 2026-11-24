@@ -12,8 +12,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
-use jaunt_ca::{AgeIdentity, CaKind, FileBackend, Signer};
-use jaunt_control::{Clock, Control, ControlError, ControlParts, DeviceSettings};
+use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
+use jaunt_control::{
+    AgentEndpoint, Clock, Control, ControlError, ControlParts, DeviceSettings, SshSuffix,
+};
 use jaunt_store::Store;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -230,6 +232,11 @@ impl Harness {
             CaKind::Internal => Arc::new(internal_authority),
         };
         let host_keys = host_trust.to_authorized_lines().unwrap();
+        let (_, host_signer) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
+        let (_, internal_signer) =
+            FileBackend::load(&ca_root, CaKind::Internal, &identity).unwrap();
+        let root = InternalCa::create_root(&internal_signer, SystemTime::now()).unwrap();
+        let internal_ca = InternalCa::new(Arc::new(internal_signer), root.certificate_der).unwrap();
 
         let store = Store::open(&dir.path().join("jaunt.db")).await.unwrap();
         store.migrate().await.unwrap();
@@ -241,6 +248,10 @@ impl Harness {
             oidc: provider.oidc_client().await,
             user_authority: authority,
             host_trust,
+            host_authority: Arc::new(host_signer),
+            internal_ca,
+            ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
+            agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
             cert_ttl: Duration::from_secs(options.cert_ttl_secs),
             pending_capacity: options.pending_capacity,
             device: DeviceSettings {

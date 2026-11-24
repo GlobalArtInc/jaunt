@@ -1,7 +1,9 @@
 mod api_tokens;
 mod certificates;
+mod enrollments;
 mod error;
 mod login_requests;
+mod nodes;
 mod users;
 
 use std::path::Path;
@@ -13,9 +15,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 
 pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
 pub use certificates::{Certificate, Certificates, NewCertificate};
+pub use enrollments::{
+    ApproveEnrollment, ApproveOutcome, Approved, CodeFailure, CreateOutcome, Enrollment,
+    EnrollmentLimits, EnrollmentState, Enrollments, NewEnrollment, PurgedEnrollment, RejectOutcome,
+};
 pub use error::StoreError;
 pub use login_requests::{
     LoginRequest, LoginRequestState, LoginRequests, NewDeviceLoginRequest, NewLoginRequest,
+};
+pub use nodes::{
+    CertificateState, Labels, NewNodeCertificate, Node, NodeCertificate, NodeCertificateKind,
+    NodeKeys, NodeState, Nodes,
 };
 pub use users::{NewUser, User, Users};
 
@@ -64,5 +74,13 @@ impl Store {
 
     pub fn certificates(&self) -> Certificates {
         Certificates::new(self.pool.clone())
+    }
+
+    pub fn nodes(&self) -> Nodes {
+        Nodes::new(self.pool.clone())
+    }
+
+    pub fn enrollments(&self) -> Enrollments {
+        Enrollments::new(self.pool.clone())
     }
 }
