@@ -14,6 +14,9 @@ use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const FULL_SERVER_FLIGHT: usize = 300;
+const HANGING_TIMEOUT: Duration = Duration::from_millis(300);
+
 #[derive(Debug)]
 struct CertificateRequestRecorder(Arc<AtomicBool>);
 
@@ -66,7 +69,10 @@ async fn agent_sni_with_a_valid_certificate_reaches_the_tunnel_path() {
     );
     wait_connected(&mut gate, "node-a").await;
     assert_eq!(gate.registry.connected_nodes(), [node("node-a")]);
-    assert_eq!(gate.stats.snapshot().tunnels_established, 1);
+    eventually("the tunnel to be counted", || {
+        gate.stats.snapshot().tunnels_established == 1
+    })
+    .await;
     agent.stop().await;
     gate.stop().await;
 }
@@ -201,7 +207,10 @@ async fn connections_beyond_the_handshake_cap_are_dropped() {
         .await
         .unwrap();
     assert!(!matches!(read, Ok(count) if count > 0));
-    assert_eq!(gate.stats.snapshot().refused_busy, 1);
+    eventually("the refusal to be counted", || {
+        gate.stats.snapshot().refused_busy == 1
+    })
+    .await;
     gate.stop().await;
 }
 
@@ -219,7 +228,10 @@ async fn a_silent_connection_is_dropped_at_the_handshake_deadline() {
         .await
         .unwrap();
     assert!(!matches!(read, Ok(count) if count > 0));
-    assert_eq!(gate.stats.snapshot().handshake_timeouts, 1);
+    eventually("the timeout to be counted", || {
+        gate.stats.snapshot().handshake_timeouts == 1
+    })
+    .await;
     eventually("the handshake slot to be released", || {
         gate.gate.handshaking() == 0
     })
@@ -246,20 +258,25 @@ async fn agent_names_match_without_regard_to_case_or_a_trailing_dot() {
         tcp.write_all(&with_server_name(&hello, name))
             .await
             .unwrap();
-        let mut flight = Vec::new();
-        let outcome =
-            tokio::time::timeout(Duration::from_millis(500), tcp.read_to_end(&mut flight)).await;
         let label = String::from_utf8_lossy(name);
         if reaches_agent_path {
-            assert!(
-                outcome.is_err(),
-                "{label} was closed after {} bytes",
-                flight.len()
-            );
+            let mut flight = [0_u8; FULL_SERVER_FLIGHT];
+            soon("the server flight", tcp.read_exact(&mut flight))
+                .await
+                .unwrap_or_else(|error| panic!("{label} was closed early: {error}"));
+            assert_eq!(gate.gate.handshaking(), 1, "{label}");
             assert_eq!(gate.stats.snapshot().handshake_failures, 0, "{label}");
         } else {
-            assert!(outcome.is_ok(), "{label} was left waiting for a client");
-            assert_eq!(gate.stats.snapshot().handshake_failures, 1, "{label}");
+            let mut flight = Vec::new();
+            drop(soon("the server to close", tcp.read_to_end(&mut flight)).await);
+            assert!(
+                flight.len() < FULL_SERVER_FLIGHT,
+                "{label} was left waiting for a client"
+            );
+            eventually("the handshake failure to be counted", || {
+                gate.stats.snapshot().handshake_failures == 1
+            })
+            .await;
         }
         gate.stop().await;
     }
@@ -304,19 +321,19 @@ async fn an_authenticator_that_never_answers_is_cut_off_at_the_handshake_timeout
     let pki = Pki::new("ca");
     let leaf = pki.client_leaf("node-a");
     let options = GateOptions {
-        handshake_timeout: Duration::from_millis(300),
+        handshake_timeout: HANGING_TIMEOUT,
         ..GateOptions::default()
     };
     let gate = TestGate::start(&pki, Arc::new(HangingAuthenticator), options).await;
     let config = raw_client_config(pki.roots(), Some(&leaf), &[&TLS13], &[ALPN_TUNNEL]);
+    let started = Instant::now();
     let mut client = tls_connect(gate.addr, config, dns_name(AGENT_SNI))
         .await
         .unwrap();
-    let started = Instant::now();
     let mut byte = [0_u8; 1];
     let read = soon("the server to give up", client.read(&mut byte)).await;
     assert!(!matches!(read, Ok(count) if count > 0));
-    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert!(started.elapsed() >= HANGING_TIMEOUT);
     eventually("the rejection to be counted", || {
         gate.stats.snapshot().auth_rejections == 1
     })

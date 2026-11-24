@@ -199,10 +199,11 @@ async fn a_reader_that_does_not_read_stalls_the_writer_and_loses_nothing() {
                     tokio::time::timeout(Duration::from_millis(500), io.write(&chunk[offset..]));
                 match attempt.await {
                     Ok(count) => offset += count.unwrap(),
-                    Err(_) => {
+                    Err(_) if written + offset > 0 => {
                         stalled_at.get_or_insert(written + offset);
                         resume.cancel();
                     }
+                    Err(_) => {}
                 }
             }
             hasher.update(&chunk);
@@ -250,6 +251,7 @@ async fn consuming_in_small_steps_opens_the_window_no_faster_than_consumption() 
     let harness = connect(agent_side, GateOptions::default(), AgentOptions::default()).await;
     let mut io = harness.open("small-steps").await;
 
+    let window = DEFAULT_STREAM_WINDOW as usize;
     let accepted = within("the writer to stall", Duration::from_secs(30), async {
         let chunk = vec![7_u8; 16 * 1024];
         let mut accepted = 0;
@@ -261,7 +263,9 @@ async fn consuming_in_small_steps_opens_the_window_no_faster_than_consumption() 
                     accepted += count.unwrap();
                     stalls_after_consumption = 0;
                 }
-                Err(_) if consumed.load(Ordering::SeqCst) => stalls_after_consumption += 1,
+                Err(_) if consumed.load(Ordering::SeqCst) && accepted >= window => {
+                    stalls_after_consumption += 1;
+                }
                 Err(_) => {}
             }
         }
@@ -269,7 +273,6 @@ async fn consuming_in_small_steps_opens_the_window_no_faster_than_consumption() 
     })
     .await;
 
-    let window = DEFAULT_STREAM_WINDOW as usize;
     assert!(accepted >= window, "{accepted} bytes accepted");
     assert!(
         accepted <= window + consumed_bytes,
@@ -324,15 +327,14 @@ async fn a_returning_handler_resets_the_peer_and_releases_its_session() {
     let mut buffer = [0_u8; 16];
     let error = soon("the reset", io.read(&mut buffer)).await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
-    let mut writes_failed = false;
-    for _ in 0..200 {
-        if io.write_all(&[0_u8; 1024]).await.is_err() {
-            writes_failed = true;
-            break;
-        }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while io.write_all(&[0_u8; 1024]).await.is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "writing to a reset stream kept succeeding"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(writes_failed, "writing to a reset stream kept succeeding");
     eventually("the session to be released", || {
         harness.agent.sessions.active().is_empty()
     })

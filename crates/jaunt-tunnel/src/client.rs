@@ -245,6 +245,7 @@ impl Context {
                 },
             }
         };
+        let graceful = shutdown_is_graceful(graceful, shutdown.is_cancelled());
         token.cancel();
         drop(keepalive_task);
         if graceful {
@@ -313,6 +314,10 @@ impl Context {
     }
 }
 
+fn shutdown_is_graceful(loop_graceful: bool, shutdown_cancelled: bool) -> bool {
+    loop_graceful || shutdown_cancelled
+}
+
 fn refuse(mut respond: SendResponse<Bytes>, status: StatusCode) {
     let mut response = Response::new(());
     *response.status_mut() = status;
@@ -345,6 +350,28 @@ async fn control_loop(
             }
             Ok(Some(ServerMessage::TrustUpdate {})) => handler.trust_update(),
             Ok(None) | Err(_) => return TaskEnd::Control,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_shutdown_is_graceful_whichever_branch_ended_the_loop() {
+        let cases = [
+            ("loop saw shutdown", true, true, true),
+            ("loop saw shutdown, flag not yet visible", true, false, true),
+            ("keepalive child token won the race", false, true, true),
+            ("peer or keepalive failure", false, false, false),
+        ];
+        for (name, loop_graceful, cancelled, expected) in cases {
+            assert_eq!(
+                shutdown_is_graceful(loop_graceful, cancelled),
+                expected,
+                "{name}"
+            );
         }
     }
 }

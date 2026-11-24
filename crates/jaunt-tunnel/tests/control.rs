@@ -55,8 +55,11 @@ async fn a_missing_hello_closes_the_connection_and_registers_nothing() {
         fake.closed.load(Ordering::SeqCst)
     })
     .await;
+    eventually("the setup failure to be counted", || {
+        gate.stats.snapshot().tunnel_setup_failures == 1
+    })
+    .await;
     assert!(gate.registry.connected_nodes().is_empty());
-    assert_eq!(gate.stats.snapshot().tunnel_setup_failures, 1);
     gate.stop().await;
 }
 
@@ -96,8 +99,12 @@ async fn invalid_first_messages_close_the_connection_and_register_nothing() {
             fake.closed.load(Ordering::SeqCst)
         })
         .await;
+        eventually(
+            &format!("the setup failure of {name} to be counted"),
+            || gate.stats.snapshot().tunnel_setup_failures == 1,
+        )
+        .await;
         assert!(gate.registry.connected_nodes().is_empty(), "{name}");
-        assert_eq!(gate.stats.snapshot().tunnel_setup_failures, 1, "{name}");
         gate.stop().await;
     }
 }

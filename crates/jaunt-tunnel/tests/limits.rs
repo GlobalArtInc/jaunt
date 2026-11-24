@@ -187,13 +187,15 @@ async fn the_agent_sends_goaway_when_it_shuts_down_normally() {
     let leaf = pki.client_leaf("node-a");
     let (addr, gate_rx) = start_fake_gate(&pki).await;
     let mut agent = spawn_agent(addr, &pki, &leaf, idle_handler(), AgentOptions::default());
-    let gate = soon("the agent connection", gate_rx).await.unwrap();
+    let mut gate = soon("the agent connection", gate_rx).await.unwrap();
     next_event(
         &mut agent.events,
         "the agent to serve the connection",
         |event| matches!(event, ClientEvent::Connected),
     )
     .await;
+    let (status, _) = gate.request(Method::POST, "/v1/other", &[], true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(gate.goaway_codes.lock().unwrap().is_empty());
     agent.stop().await;
     eventually("goaway from the agent", || {

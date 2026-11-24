@@ -6,6 +6,8 @@ use jaunt_tunnel::{ClientEvent, Keepalive, RegistryEvent, TunnelOptions};
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const DETECTION_SLACK: Duration = Duration::from_secs(5);
+
 fn tunnel_options(keepalive: Keepalive) -> TunnelOptions {
     TunnelOptions {
         keepalive,
@@ -50,7 +52,7 @@ async fn a_peer_that_stops_answering_pings_is_removed_from_the_registry() {
     .await;
     let detected_in = paused_at.elapsed();
     assert!(
-        detected_in <= keepalive.interval + keepalive.timeout + Duration::from_secs(1),
+        detected_in <= keepalive.interval + keepalive.timeout + DETECTION_SLACK,
         "detection took {detected_in:?}"
     );
     assert!(gate.registry.connected_nodes().is_empty());

@@ -71,11 +71,11 @@ async fn a_second_connection_of_the_same_node_replaces_the_first_with_goaway() {
     assert_ne!(first_id, second_id);
 
     eventually("goaway on the replaced connection", || first.goaway_seen()).await;
-    assert_eq!(*first.goaway_codes.lock().unwrap(), [0]);
     eventually("the replaced connection to close", || {
         first.closed.load(Ordering::SeqCst)
     })
     .await;
+    assert_eq!(*first.goaway_codes.lock().unwrap(), [0]);
     assert_eq!(gate.registry.connected_nodes(), [node("node-a")]);
     assert!(!second.goaway_seen());
 
