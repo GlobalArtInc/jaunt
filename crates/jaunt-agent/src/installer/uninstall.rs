@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::account;
-use super::args::{UninstallOptions, check_state_dir};
+use super::args::UninstallOptions;
 use super::env::{Env, require_root};
 use super::error::InstallError;
 use super::files;
@@ -10,6 +10,7 @@ use super::render::{DROPIN_HEADER, is_foreign_dropin};
 use super::runner::excerpt;
 use super::service;
 use super::sshd::{Sshd, split_keyword};
+use crate::paths::check_state_dir;
 
 pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), InstallError> {
     require_root(env)?;

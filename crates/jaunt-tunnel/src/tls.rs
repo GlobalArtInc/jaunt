@@ -4,7 +4,7 @@ use std::io;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
-use rustls::client::Resumption;
+use rustls::client::{ResolvesClientCert, Resumption};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{
@@ -12,7 +12,7 @@ use rustls::server::{
     WantsServerCert, WebPkiClientVerifier,
 };
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, ConfigBuilder, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ConfigBuilder, RootCertStore, ServerConfig, SignatureScheme};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -169,6 +169,90 @@ pub fn agent_client_config(
     config.alpn_protocols = vec![ALPN_TUNNEL.to_vec()];
     config.resumption = Resumption::disabled();
     Ok(config)
+}
+
+pub fn agent_client_config_swappable(
+    roots: RootCertStore,
+    identity: Arc<SwappableClientCert>,
+) -> Result<ClientConfig, TlsConfigError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_client_cert_resolver(identity);
+    config.alpn_protocols = vec![ALPN_TUNNEL.to_vec()];
+    config.resumption = Resumption::disabled();
+    Ok(config)
+}
+
+pub struct SwappableClientCert {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl SwappableClientCert {
+    pub fn new(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, TlsConfigError> {
+        Ok(Self {
+            current: RwLock::new(certified_key(cert_chain, key)?),
+        })
+    }
+
+    pub fn replace_certificate(
+        &self,
+        cert_chain: Vec<CertificateDer<'static>>,
+    ) -> Result<(), TlsConfigError> {
+        let next = CertifiedKey::new(cert_chain, self.current().key.clone());
+        next.keys_match()?;
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(next);
+        Ok(())
+    }
+
+    pub fn end_entity(&self) -> Option<CertificateDer<'static>> {
+        self.current()
+            .cert
+            .first()
+            .map(|cert| cert.clone().into_owned())
+    }
+
+    fn current(&self) -> Arc<CertifiedKey> {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl fmt::Debug for SwappableClientCert {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwappableClientCert")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvesClientCert for SwappableClientCert {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+fn certified_key(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<CertifiedKey>, TlsConfigError> {
+    let provider = rustls::crypto::ring::default_provider();
+    Ok(Arc::new(CertifiedKey::from_der(
+        cert_chain, key, &provider,
+    )?))
 }
 
 #[derive(Debug, Error)]
@@ -368,7 +452,41 @@ fn normalize_server_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
     use super::*;
+
+    fn certificate_for(key: &rcgen::KeyPair, name: &str) -> CertificateDer<'static> {
+        rcgen::CertificateParams::new(vec![name.to_owned()])
+            .unwrap()
+            .self_signed(key)
+            .unwrap()
+            .der()
+            .clone()
+    }
+
+    #[test]
+    fn a_swappable_identity_keeps_its_key_and_refuses_a_certificate_for_another_key() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let first = certificate_for(&key, "first.test");
+        let identity = SwappableClientCert::new(
+            vec![first.clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+        let resolved = identity.resolve(&[], &[]).unwrap();
+        assert_eq!(resolved.cert, std::slice::from_ref(&first));
+        assert!(identity.has_certs());
+
+        let unrelated = certificate_for(&rcgen::KeyPair::generate().unwrap(), "other.test");
+        assert!(identity.replace_certificate(vec![unrelated]).is_err());
+        assert_eq!(identity.end_entity(), Some(first));
+
+        let second = certificate_for(&key, "second.test");
+        identity.replace_certificate(vec![second.clone()]).unwrap();
+        assert_eq!(identity.end_entity(), Some(second));
+        assert_eq!(format!("{identity:?}"), "SwappableClientCert { .. }");
+    }
 
     #[test]
     fn server_names_compare_case_insensitively_without_trailing_dot() {

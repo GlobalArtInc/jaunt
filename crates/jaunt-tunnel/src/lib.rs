@@ -42,9 +42,9 @@ pub use session::SessionRegistry;
 pub use stats::{GateStats, GateStatsSnapshot};
 pub use tls::{
     AcceptError, Accepted, AcceptorConfig, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_HANDSHAKING,
-    GateAcceptor, HandshakePermit, PeerStream, RotatingCertificate, TlsConfigError,
-    agent_client_config, agent_server_config, main_server_config, refusing_server_config,
-    rotating_agent_server_config,
+    GateAcceptor, HandshakePermit, PeerStream, RotatingCertificate, SwappableClientCert,
+    TlsConfigError, agent_client_config, agent_client_config_swappable, agent_server_config,
+    main_server_config, refusing_server_config, rotating_agent_server_config,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
