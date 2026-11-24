@@ -12,6 +12,7 @@ mod target;
 mod test_support;
 
 mod bridge;
+mod forward;
 mod inner;
 mod observer;
 mod output;
@@ -32,8 +33,8 @@ pub use target::parse_node_target;
 
 pub use inner::{InnerTarget, OUTPUT_WINDOW};
 pub use observer::{
-    ChannelExit, ChannelProgram, ChannelStart, NoObserver, ObserverFactory, OutputStream,
-    Recording, SessionObserver, Terminal, TerminalSize,
+    ChannelExit, ChannelProgram, ChannelStart, ForwardTarget, NoObserver, ObserverFactory,
+    OutputStream, Recording, SessionObserver, Terminal, TerminalSize,
 };
 pub use terminate::{
     AgentLimits, AuthorityError, EndReason, SessionAuthority, SessionOutcome, StreamContext,

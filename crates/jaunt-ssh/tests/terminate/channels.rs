@@ -486,6 +486,7 @@ async fn a_reply_timeout_closes_the_channel_on_both_sides() {
         | Event::Output(channel, ..)
         | Event::End(channel, _) => *channel == alive,
         Event::Resize(..) | Event::Finish => true,
+        Event::ForwardOpen(..) | Event::ForwardClose(_) => false,
     }));
 }
 

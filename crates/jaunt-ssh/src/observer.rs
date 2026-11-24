@@ -53,6 +53,12 @@ pub enum OutputStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardTarget {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelExit {
     Status(u32),
     Signal(String),
@@ -75,6 +81,10 @@ pub trait SessionObserver: Send {
     fn resize(&mut self, _channel: u32, _size: TerminalSize) {}
 
     fn channel_end(&mut self, _channel: u32, _exit: &ChannelExit) {}
+
+    fn forward_open(&mut self, _channel: u32, _target: &ForwardTarget) {}
+
+    fn forward_close(&mut self, _channel: u32) {}
 
     fn finish(&mut self) -> Recording {
         Recording::Complete

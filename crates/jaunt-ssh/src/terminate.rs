@@ -18,9 +18,11 @@ use tokio_util::task::TaskTracker;
 
 use crate::bridge::{
     BridgeContext, InnerOpen, LiveChannels, SessionBridge, StartReply, Traffic, Verdict,
+    audit_forward,
 };
 use crate::cert::{UserCaSource, UserIdentity, verify_user_certificate};
 use crate::config::ServerConfigCell;
+use crate::forward::{ForwardBridge, ForwardOpen, Originator, loopback_destination};
 use crate::inner::{self, InnerClient, InnerSession, InnerTarget};
 use crate::inner_ca::{InnerCa, InnerCertRequest, is_portable_login};
 use crate::intake::IntakeError;
@@ -38,6 +40,8 @@ const TIME_LIMIT_TEXT: &str = "jaunt: session time limit reached";
 const TIME_LIMIT_LINE: &[u8] = b"jaunt: session time limit reached\r\n";
 const NODE_CLOSED_TEXT: &str = "jaunt: the node closed the session";
 const FORWARDING_REFUSED: &str = "jaunt: port forwarding is not allowed by your roles";
+const LOOPBACK_ONLY: &str = "jaunt: forwarding is limited to localhost on the node";
+const TOO_MANY_FORWARDS: &str = "jaunt: too many open sessions";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorityError {
@@ -207,6 +211,7 @@ impl Terminator {
             attempted: false,
             login: None,
             bridges: HashMap::new(),
+            forwards: HashMap::new(),
         };
         let stream = Guarded::new(stream, &shared.cut);
         let ended = match server::run_stream(config, stream, handler).await {
@@ -512,6 +517,7 @@ struct Gatekeeper {
     attempted: bool,
     login: Option<Login>,
     bridges: HashMap<ChannelId, SessionBridge>,
+    forwards: HashMap<ChannelId, ForwardBridge>,
 }
 
 impl Drop for Gatekeeper {
@@ -638,6 +644,15 @@ impl Gatekeeper {
             }
         }
     }
+}
+
+async fn refuse_forward(reply: ChannelOpenHandle, code: u32, reason: &str) {
+    reply
+        .reject(ChannelOpenFailure::Other {
+            code,
+            reason: reason.to_owned(),
+        })
+        .await;
 }
 
 fn abandon(session: &mut Session, channel: ChannelId) -> Result<(), russh::Error> {
@@ -769,6 +784,60 @@ impl server::Handler for Gatekeeper {
 
     async fn channel_open_direct_tcpip(
         &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(login) = &self.login else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        let session_id = self.shared.session_id.as_str();
+        if !login.permissions.port_forwarding {
+            audit_forward(session_id, port_to_connect, "refused");
+            refuse_forward(reply, 1, FORWARDING_REFUSED).await;
+            return Ok(());
+        }
+        let Some(target) = loopback_destination(host_to_connect, port_to_connect) else {
+            audit_forward(session_id, port_to_connect, "bad_target");
+            refuse_forward(reply, 1, LOOPBACK_ONLY).await;
+            return Ok(());
+        };
+        self.forwards.retain(|_, forward| !forward.finished());
+        if self.forwards.len() >= self.limits.max_forwards {
+            audit_forward(session_id, port_to_connect, "limit");
+            refuse_forward(reply, 4, TOO_MANY_FORWARDS).await;
+            return Ok(());
+        }
+        let open = ForwardOpen {
+            inner: InnerOpen {
+                handle: Arc::clone(&login.inner),
+                deadline: self.limits.inner_login_timeout,
+            },
+            target,
+            originator: Originator::of_client(&self.shared.client_addr),
+        };
+        let id = channel.id();
+        let forward = ForwardBridge::open(
+            channel,
+            reply,
+            open,
+            session.handle(),
+            self.window,
+            &self.bridge,
+        );
+        self.forwards.insert(id, forward);
+        Ok(())
+    }
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
         _channel: Channel<Msg>,
         _host_to_connect: &str,
         _port_to_connect: u32,
@@ -777,14 +846,40 @@ impl server::Handler for Gatekeeper {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        audit_channel(&self.shared, "direct-tcpip", "refused");
-        reply
-            .reject(ChannelOpenFailure::Other {
-                code: 1,
-                reason: FORWARDING_REFUSED.to_owned(),
-            })
-            .await;
+        audit_channel(&self.shared, "forwarded-tcpip", "refused");
+        refuse_forward(reply, 1, LOOPBACK_ONLY).await;
         Ok(())
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<Msg>,
+        _socket_path: &str,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        audit_channel(&self.shared, "direct-streamlocal", "refused");
+        refuse_forward(reply, 1, LOOPBACK_ONLY).await;
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        _address: &str,
+        _port: &mut u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        audit_channel(&self.shared, "tcpip-forward", "refused");
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        _socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        audit_channel(&self.shared, "streamlocal-forward", "refused");
+        Ok(false)
     }
 
     async fn pty_request(
@@ -951,10 +1046,12 @@ impl server::Handler for Gatekeeper {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        match self.bridges.get(&channel) {
-            Some(bridge) => bridge.data(data).map_err(|error| self.violation(error)),
-            None => Ok(()),
-        }
+        let pushed = match (self.bridges.get(&channel), self.forwards.get(&channel)) {
+            (Some(bridge), _) => bridge.data(data),
+            (None, Some(forward)) => forward.data(data),
+            (None, None) => Ok(()),
+        };
+        pushed.map_err(|error| self.violation(error))
     }
 
     async fn extended_data(
@@ -964,12 +1061,12 @@ impl server::Handler for Gatekeeper {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        match self.bridges.get(&channel) {
-            Some(bridge) => bridge
-                .extended_data(data.len())
-                .map_err(|error| self.violation(error)),
-            None => Ok(()),
-        }
+        let consumed = match (self.bridges.get(&channel), self.forwards.get(&channel)) {
+            (Some(bridge), _) => bridge.extended_data(data.len()),
+            (None, Some(forward)) => forward.extended_data(data.len()),
+            (None, None) => Ok(()),
+        };
+        consumed.map_err(|error| self.violation(error))
     }
 
     async fn channel_eof(
@@ -979,6 +1076,8 @@ impl server::Handler for Gatekeeper {
     ) -> Result<(), Self::Error> {
         if let Some(bridge) = self.bridges.get(&channel) {
             bridge.eof();
+        } else if let Some(forward) = self.forwards.get(&channel) {
+            forward.eof();
         }
         Ok(())
     }
@@ -990,6 +1089,8 @@ impl server::Handler for Gatekeeper {
     ) -> Result<(), Self::Error> {
         if let Some(bridge) = self.bridges.remove(&channel) {
             bridge.close();
+        } else if let Some(forward) = self.forwards.remove(&channel) {
+            forward.close();
         }
         Ok(())
     }

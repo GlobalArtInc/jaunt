@@ -304,7 +304,7 @@ async fn answer(
                 (
                     StatusCode::OK,
                     serde_json::json!({"decision": "allow", "permissions": {
-                        "pty": true, "port_forwarding": false, "record_input": false,
+                        "pty": true, "port_forwarding": stand.flag("forward"), "record_input": false,
                         "max_duration_secs": 3600,
                     }}),
                 )

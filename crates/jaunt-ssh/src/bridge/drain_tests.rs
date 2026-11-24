@@ -10,7 +10,7 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-use super::{LiveChannels, OutputDrain, OutputPump, Replies, Traffic};
+use super::{ChannelKind, LiveChannels, OutputDrain, OutputPump, Replies, Traffic};
 use crate::config::ServerProfile;
 use crate::intake::{SessionGone, WindowGrant};
 use crate::observer::{ChannelExit, ObserverCell};
@@ -162,6 +162,7 @@ async fn overrun(cancel_at_warning: bool) {
         replies: Replies::default(),
         observer: Arc::clone(&observer),
         traffic: Arc::clone(&traffic),
+        kind: ChannelKind::Session,
         number: 0,
         session_id: Arc::from("s1"),
         cancel: cancel.clone(),
@@ -174,6 +175,7 @@ async fn overrun(cancel_at_warning: bool) {
         outer: outer_write,
         server,
         id: outer_id,
+        kind: ChannelKind::Session,
         traffic,
         observer,
         live: Arc::new(LiveChannels::default()),

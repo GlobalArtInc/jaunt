@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -57,6 +58,10 @@ impl Traffic {
         counter.fetch_add(u64::try_from(len).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
 
+    pub(crate) fn add_in(&self, len: usize) {
+        Self::add(&self.bytes_in, len);
+    }
+
     fn record_exit(&self, status: Option<i32>) {
         *lock(&self.exit_status) = status;
     }
@@ -89,6 +94,119 @@ pub(crate) struct BridgeContext {
     pub(crate) live: Arc<LiveChannels>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelKind {
+    Session,
+    Forward,
+}
+
+pub(crate) const DIRECT_TCPIP: &str = "direct-tcpip";
+
+pub(crate) enum InnerOpened {
+    Ready(Channel<client::Msg>),
+    Refused(russh::Error),
+    TimedOut,
+    Cancelled,
+}
+
+pub(crate) async fn wait_open<F>(
+    open: Pin<&mut F>,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) -> InnerOpened
+where
+    F: Future<Output = Result<Channel<client::Msg>, russh::Error>>,
+{
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => InnerOpened::Cancelled,
+        opened = open => match opened {
+            Ok(channel) => InnerOpened::Ready(channel),
+            Err(error) => InnerOpened::Refused(error),
+        },
+        () = tokio::time::sleep(deadline) => InnerOpened::TimedOut,
+    }
+}
+
+pub(crate) async fn close_late<F>(open: Pin<&mut F>, deadline: Duration, stop: &CancellationToken)
+where
+    F: Future<Output = Result<Channel<client::Msg>, russh::Error>>,
+{
+    let late = async {
+        match open.await {
+            Ok(late) => late.close().await,
+            Err(_) => Ok(()),
+        }
+    };
+    let bounded = tokio::time::timeout(deadline.saturating_mul(2), late);
+    if !matches!(stop.run_until_cancelled(bounded).await, Some(Ok(Ok(())))) {
+        tracing::debug!(
+            target: "jaunt::agent",
+            event = "agent.ssh.late_channel_abandoned"
+        );
+    }
+}
+
+pub(crate) struct DataPath {
+    pub(crate) outer: ChannelWriteHalf<Msg>,
+    pub(crate) server: server::Handle,
+    pub(crate) id: ChannelId,
+    pub(crate) reader: IntakeReader,
+    pub(crate) replies: Replies,
+    pub(crate) kind: ChannelKind,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) closing: CancellationToken,
+}
+
+impl DataPath {
+    pub(crate) fn spawn(
+        self,
+        channel: Channel<client::Msg>,
+        handle: &Arc<client::Handle<InnerClient>>,
+        context: &BridgeContext,
+    ) -> Arc<ChannelWriteHalf<client::Msg>> {
+        let grants = InnerGrant::new(handle, channel.id());
+        let (output, events) = OutputQueue::new(OUTPUT_WINDOW, grants);
+        let (inner_read, inner_write) = channel.split();
+        let inner_write = Arc::new(inner_write);
+        context.tracker.spawn(pump_input(
+            self.reader,
+            Arc::clone(&inner_write),
+            self.cancel.clone(),
+            self.closing,
+        ));
+        let drain = OutputDrain {
+            inner: inner_read,
+            inner_write: Arc::clone(&inner_write),
+            output,
+            replies: self.replies,
+            observer: Arc::clone(&context.observer),
+            traffic: Arc::clone(&context.traffic),
+            kind: self.kind,
+            number: self.id.number(),
+            session_id: Arc::clone(&context.session_id),
+            cancel: self.cancel.clone(),
+            started: false,
+            exit: ChannelExit::Unknown,
+        };
+        let drained = context.tracker.spawn(drain.run());
+        let pump = OutputPump {
+            events,
+            drained,
+            outer: self.outer,
+            server: self.server,
+            id: self.id,
+            kind: self.kind,
+            traffic: Arc::clone(&context.traffic),
+            observer: Arc::clone(&context.observer),
+            live: Arc::clone(&context.live),
+            cancel: self.cancel,
+        };
+        context.tracker.spawn(pump.run());
+        inner_write
+    }
+}
+
 pub(crate) struct InnerOpen {
     pub(crate) handle: Arc<client::Handle<InnerClient>>,
     pub(crate) deadline: Duration,
@@ -100,7 +218,7 @@ struct Pending {
 }
 
 #[derive(Clone, Default)]
-struct Replies(Arc<Mutex<VecDeque<Pending>>>);
+pub(crate) struct Replies(Arc<Mutex<VecDeque<Pending>>>);
 
 impl Replies {
     fn push(&self, reply: oneshot::Sender<bool>, start: Option<ChannelStart>) {
@@ -461,91 +579,45 @@ impl Establish {
         let _settled = self.settled.clone().drop_guard();
         let open = self.inner.handle.channel_open_session();
         tokio::pin!(open);
-        let opened = tokio::select! {
-            biased;
-            () = self.cancel.cancelled() => return,
-            opened = &mut open => Some(opened),
-            () = tokio::time::sleep(self.inner.deadline) => None,
-        };
-        let channel = match opened {
-            Some(Ok(channel)) => channel,
-            refused => {
+        let session_id = &self.context.session_id;
+        let channel = match wait_open(open.as_mut(), &self.cancel, self.inner.deadline).await {
+            InnerOpened::Ready(channel) => channel,
+            InnerOpened::Cancelled => return,
+            InnerOpened::Refused(_) => {
                 self.cancel.cancel();
                 self.reply.reject(ChannelOpenFailure::ConnectFailed).await;
-                let outcome = if refused.is_some() {
-                    "failed"
-                } else {
-                    "timeout"
-                };
-                audit_open(&self.context.session_id, outcome);
-                if refused.is_none() {
-                    let late = async {
-                        match open.await {
-                            Ok(late) => late.close().await,
-                            Err(_) => Ok(()),
-                        }
-                    };
-                    let bounded = tokio::time::timeout(self.inner.deadline.saturating_mul(2), late);
-                    if !matches!(
-                        self.context.stop.run_until_cancelled(bounded).await,
-                        Some(Ok(Ok(())))
-                    ) {
-                        tracing::debug!(
-                            target: "jaunt::agent",
-                            event = "agent.ssh.late_channel_abandoned"
-                        );
-                    }
-                }
+                audit_open(session_id, "failed");
+                return;
+            }
+            InnerOpened::TimedOut => {
+                self.cancel.cancel();
+                self.reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                audit_open(session_id, "timeout");
+                close_late(open, self.inner.deadline, &self.context.stop).await;
                 return;
             }
         };
         self.reply.accept().await;
-        audit_open(&self.context.session_id, "opened");
-        let grants = InnerGrant::new(&self.inner.handle, channel.id());
-        let (output, events) = OutputQueue::new(OUTPUT_WINDOW, grants);
-        let (inner_read, inner_write) = channel.split();
-        let inner_write = Arc::new(inner_write);
-        let context = &self.context;
-        context.live.insert(self.id);
-        context.tracker.spawn(pump_input(
-            self.reader,
-            Arc::clone(&inner_write),
-            self.cancel.clone(),
-            self.closing,
-        ));
-        context.tracker.spawn(forward_requests(
-            self.queue,
-            Arc::clone(&inner_write),
-            self.replies.clone(),
-            self.resize,
-            self.cancel.clone(),
-        ));
-        let drain = OutputDrain {
-            inner: inner_read,
-            inner_write,
-            output,
-            replies: self.replies,
-            observer: Arc::clone(&context.observer),
-            traffic: Arc::clone(&context.traffic),
-            number: self.id.number(),
-            session_id: Arc::clone(&context.session_id),
-            cancel: self.cancel.clone(),
-            started: false,
-            exit: ChannelExit::Unknown,
-        };
-        let drained = context.tracker.spawn(drain.run());
-        let pump = OutputPump {
-            events,
-            drained,
+        audit_open(session_id, "opened");
+        self.context.live.insert(self.id);
+        let path = DataPath {
             outer: self.outer,
             server: self.server,
             id: self.id,
-            traffic: Arc::clone(&context.traffic),
-            observer: Arc::clone(&context.observer),
-            live: Arc::clone(&context.live),
-            cancel: self.cancel,
+            reader: self.reader,
+            replies: self.replies.clone(),
+            kind: ChannelKind::Session,
+            cancel: self.cancel.clone(),
+            closing: self.closing,
         };
-        context.tracker.spawn(pump.run());
+        let inner_write = path.spawn(channel, &self.inner.handle, &self.context);
+        self.context.tracker.spawn(forward_requests(
+            self.queue,
+            inner_write,
+            self.replies,
+            self.resize,
+            self.cancel,
+        ));
     }
 }
 
@@ -555,6 +627,17 @@ fn audit_open(session_id: &str, outcome: &str) {
         event = "agent.ssh.channel",
         session_id,
         kind = "session",
+        outcome
+    );
+}
+
+pub(crate) fn audit_forward(session_id: &str, port: u32, outcome: &str) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "agent.ssh.channel",
+        session_id,
+        kind = DIRECT_TCPIP,
+        port,
         outcome
     );
 }
@@ -709,6 +792,7 @@ struct OutputDrain {
     replies: Replies,
     observer: Arc<ObserverCell>,
     traffic: Arc<Traffic>,
+    kind: ChannelKind,
     number: u32,
     session_id: Arc<str>,
     cancel: CancellationToken,
@@ -778,6 +862,8 @@ impl OutputDrain {
                 self.output.discard_extended(data.len())?
             }
             Some(ChannelMsg::Eof) => self.output.push_eof(),
+            Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. })
+                if self.kind == ChannelKind::Forward => {}
             Some(ChannelMsg::ExitStatus { exit_status }) => {
                 if self.first_exit(ChannelExit::Status(exit_status)) {
                     self.traffic.record_exit(i32::try_from(exit_status).ok());
@@ -826,6 +912,7 @@ struct OutputPump {
     outer: ChannelWriteHalf<Msg>,
     server: server::Handle,
     id: ChannelId,
+    kind: ChannelKind,
     traffic: Arc<Traffic>,
     observer: Arc<ObserverCell>,
     live: Arc<LiveChannels>,
@@ -864,10 +951,15 @@ impl OutputPump {
                 }
             }
         };
-        if drained.started {
-            let number = self.id.number();
-            self.observer
-                .call(|observer| observer.channel_end(number, &drained.exit));
+        let number = self.id.number();
+        match self.kind {
+            ChannelKind::Session if drained.started => self
+                .observer
+                .call(|observer| observer.channel_end(number, &drained.exit)),
+            ChannelKind::Session => {}
+            ChannelKind::Forward => self
+                .observer
+                .call(|observer| observer.forward_close(number)),
         }
     }
 
@@ -909,8 +1001,10 @@ impl OutputPump {
     async fn output(&mut self, stream: OutputStream, data: Bytes) -> Result<(), Ending> {
         let len = data.len();
         let number = self.id.number();
-        self.observer
-            .call(|observer| observer.output(number, stream, &data));
+        if self.kind == ChannelKind::Session {
+            self.observer
+                .call(|observer| observer.output(number, stream, &data));
+        }
         match stream {
             OutputStream::Stdout => self.deliver(self.outer.data_bytes(data)).await?,
             OutputStream::Stderr => {

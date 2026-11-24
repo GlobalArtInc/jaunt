@@ -9,10 +9,15 @@ use bytes::Bytes;
 use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{Algorithm, Certificate, PublicKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
-use russh::{Channel, ChannelId, ChannelWriteHalf, MethodKind, MethodSet, Preferred, Pty, Sig};
-use tokio::net::TcpListener;
+use russh::{
+    Channel, ChannelId, ChannelOpenFailure, ChannelWriteHalf, MethodKind, MethodSet, Preferred,
+    Pty, Sig,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::support::key;
 
@@ -28,6 +33,9 @@ pub struct SshdOptions {
     pub login: LoginMode,
     pub window: u32,
     pub open_delay: Option<Duration>,
+    pub refuse_forwards: bool,
+    pub forward_delay: Option<Duration>,
+    pub forward_exit_status: Option<u32>,
 }
 
 impl Default for SshdOptions {
@@ -36,6 +44,9 @@ impl Default for SshdOptions {
             login: LoginMode::Accept,
             window: 2 * 1024 * 1024,
             open_delay: None,
+            refuse_forwards: false,
+            forward_delay: None,
+            forward_exit_status: None,
         }
     }
 }
@@ -52,6 +63,8 @@ pub struct SshdStats {
     pub closes: AtomicUsize,
     pub finished: AtomicUsize,
     pub certificates: Mutex<Vec<(String, Certificate)>>,
+    pub forward_opens: AtomicUsize,
+    pub originators: Mutex<Vec<(String, u32)>>,
     pub requests: Mutex<Vec<String>>,
 }
 
@@ -114,6 +127,9 @@ impl FakeSshd {
                     ca: ca.clone(),
                     mode: options.login,
                     open_delay: options.open_delay,
+                    refuse_forwards: options.refuse_forwards,
+                    forward_delay: options.forward_delay,
+                    forward_exit_status: options.forward_exit_status,
                     channels: HashMap::new(),
                 };
                 let config = Arc::clone(&config);
@@ -147,6 +163,7 @@ struct Script {
     pending: Option<(mpsc::UnboundedReceiver<Input>, ChannelWriteHalf<Msg>)>,
     env: Vec<String>,
     pty: Option<String>,
+    _closed: DropGuard,
 }
 
 struct Sshd {
@@ -154,7 +171,58 @@ struct Sshd {
     ca: KeyData,
     mode: LoginMode,
     open_delay: Option<Duration>,
+    refuse_forwards: bool,
+    forward_delay: Option<Duration>,
+    forward_exit_status: Option<u32>,
     channels: HashMap<ChannelId, Script>,
+}
+
+async fn relay(
+    tcp: TcpStream,
+    mut input: mpsc::UnboundedReceiver<Input>,
+    out: ChannelWriteHalf<Msg>,
+    server: server::Handle,
+    id: ChannelId,
+    exit_status: Option<u32>,
+) {
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+    let upstream = async move {
+        while let Some(item) = input.recv().await {
+            match item {
+                Input::Data(data) => {
+                    if tcp_write.write_all(&data).await.is_err() {
+                        return;
+                    }
+                    let _ = server.grant_window(id, u32::try_from(data.len()).unwrap());
+                }
+                Input::Eof => {
+                    let _ = tcp_write.shutdown().await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    };
+    let downstream = async {
+        let mut buffer = vec![0; 16 * 1024];
+        loop {
+            match tcp_read.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let chunk = Bytes::copy_from_slice(&buffer[..read]);
+                    if out.data_bytes(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = out.eof().await;
+    };
+    tokio::join!(upstream, downstream);
+    if let Some(status) = exit_status {
+        let _ = out.exit_status(status).await;
+    }
+    let _ = out.close().await;
 }
 
 struct Program {
@@ -416,6 +484,7 @@ impl server::Handler for Sshd {
                 pending: Some((receiver, write_half)),
                 env: Vec::new(),
                 pty: None,
+                _closed: CancellationToken::new().drop_guard(),
             },
         );
         let first = self.stats.opens.fetch_add(1, Ordering::SeqCst) == 0;
@@ -428,6 +497,73 @@ impl server::Handler for Sshd {
             }
             None => reply.accept().await,
         }
+        Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.stats
+            .note(format!("direct-tcpip:{host_to_connect}:{port_to_connect}"));
+        self.stats
+            .originators
+            .lock()
+            .unwrap()
+            .push((originator_address.to_owned(), originator_port));
+        let first = self.stats.forward_opens.fetch_add(1, Ordering::SeqCst) == 0;
+        let delay = self.forward_delay.filter(|_| first);
+        if self.refuse_forwards {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+        let host = match host_to_connect {
+            "localhost" => "127.0.0.1",
+            other => other,
+        };
+        let port = u16::try_from(port_to_connect).unwrap();
+        let Ok(tcp) = TcpStream::connect((host, port)).await else {
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        let id = channel.id();
+        let (read_half, write_half) = channel.split();
+        drop(read_half);
+        let (input, receiver) = mpsc::unbounded_channel();
+        let closed = CancellationToken::new();
+        self.channels.insert(
+            id,
+            Script {
+                input,
+                pending: None,
+                env: Vec::new(),
+                pty: None,
+                _closed: closed.clone().drop_guard(),
+            },
+        );
+        let relaying = relay(
+            tcp,
+            receiver,
+            write_half,
+            session.handle(),
+            id,
+            self.forward_exit_status,
+        );
+        tokio::spawn(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            reply.accept().await;
+            closed.run_until_cancelled(relaying).await
+        });
         Ok(())
     }
 

@@ -9,10 +9,10 @@ use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, BoxFuture, DenyReason, SessionEnd, SessionPermissions,
 };
 use jaunt_ssh::{
-    AgentLimits, AuthorityError, ChannelExit, ChannelStart, HostKey, InnerCa, InnerTarget,
-    ObserverFactory, OutputStream, Recording, ServerConfigCell, ServerProfile, SessionAuthority,
-    SessionObserver, SessionOutcome, StreamContext, TerminalSize, Terminator, TunnelStream,
-    UserCaKeys, UserCaSource,
+    AgentLimits, AuthorityError, ChannelExit, ChannelStart, ForwardTarget, HostKey, InnerCa,
+    InnerTarget, ObserverFactory, OutputStream, Recording, ServerConfigCell, ServerProfile,
+    SessionAuthority, SessionObserver, SessionOutcome, StreamContext, TerminalSize, Terminator,
+    TunnelStream, UserCaKeys, UserCaSource,
 };
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::{Builder, CertType};
@@ -72,6 +72,13 @@ pub fn permissions() -> SessionPermissions {
         port_forwarding: false,
         record_input: true,
         max_duration_secs: 3600,
+    }
+}
+
+pub fn forwarding() -> SessionPermissions {
+    SessionPermissions {
+        port_forwarding: true,
+        ..permissions()
     }
 }
 
@@ -143,6 +150,8 @@ pub enum Event {
     Output(u32, OutputStream, usize),
     Resize(u32, TerminalSize),
     End(u32, ChannelExit),
+    ForwardOpen(u32, ForwardTarget),
+    ForwardClose(u32),
     Finish,
 }
 
@@ -205,6 +214,14 @@ impl SessionObserver for Recorder {
 
     fn channel_end(&mut self, channel: u32, exit: &ChannelExit) {
         self.push(Event::End(channel, exit.clone()));
+    }
+
+    fn forward_open(&mut self, channel: u32, target: &ForwardTarget) {
+        self.push(Event::ForwardOpen(channel, target.clone()));
+    }
+
+    fn forward_close(&mut self, channel: u32) {
+        self.push(Event::ForwardClose(channel));
     }
 
     fn finish(&mut self) -> Recording {
@@ -407,6 +424,7 @@ impl Fixture {
 #[derive(Default)]
 pub struct ClientSeen {
     pub open_failures: Mutex<Vec<String>>,
+    pub open_codes: Mutex<Vec<u32>>,
     pub disconnect: Mutex<Option<String>>,
 }
 
@@ -425,11 +443,12 @@ impl client::Handler for TestClient {
     async fn channel_open_failure(
         &mut self,
         _channel: russh::ChannelId,
-        _reason: russh::ChannelOpenFailure,
+        reason: russh::ChannelOpenFailure,
         description: &str,
         _language: &str,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
+        self.0.open_codes.lock().unwrap().push(reason.code());
         self.0
             .open_failures
             .lock()

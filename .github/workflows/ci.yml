@@ -46,7 +46,7 @@ jobs:
           CONTAINER_ENGINE: docker
   ssh-containers:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
