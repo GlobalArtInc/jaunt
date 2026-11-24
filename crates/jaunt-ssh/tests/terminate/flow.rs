@@ -9,7 +9,9 @@ use crate::sshd::{SshdOptions, SshdStats};
 use russh::client;
 use tokio_util::sync::CancellationToken;
 
-use crate::support::{Fixture, LOGIN, Options, TRANSPORT, Tap, alive_tasks, transcript, until};
+use crate::support::{
+    Fixture, LOGIN, OUTPUT_WINDOW, Options, TRANSPORT, Tap, alive_tasks, transcript, until,
+};
 
 const CHUNK: usize = 32 * 1024;
 const CYCLE: usize = 251;
@@ -188,7 +190,7 @@ async fn a_close_reaches_sshd_while_its_output_is_blocked() {
         let before = SshdStats::count(&stats.written);
         let channel = client.exec("flood 8").await;
         until("sshd output is blocked", || {
-            SshdStats::count(&stats.written) >= before + 2 * 1024 * 1024
+            SshdStats::count(&stats.written) >= before + OUTPUT_WINDOW
         })
         .await;
         channel.close().await.unwrap();

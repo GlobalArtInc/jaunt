@@ -50,6 +50,7 @@ pub struct SshdStats {
     pub written: AtomicUsize,
     pub opens: AtomicUsize,
     pub closes: AtomicUsize,
+    pub finished: AtomicUsize,
     pub certificates: Mutex<Vec<(String, Certificate)>>,
     pub requests: Mutex<Vec<String>>,
 }
@@ -169,10 +170,22 @@ impl Program {
         let _ = self.out.data_bytes(Bytes::from(text.into())).await;
     }
 
+    async fn write_records(&self, mib: &str, record: usize) -> bool {
+        let chunk = Bytes::from(vec![b'y'; record]);
+        for _ in 0..mib.parse::<usize>().unwrap() * 1024 * 1024 / record {
+            if self.out.data_bytes(chunk.clone()).await.is_err() {
+                return false;
+            }
+            self.stats.written.fetch_add(chunk.len(), Ordering::SeqCst);
+        }
+        true
+    }
+
     async fn finish(self, status: u32) {
         let _ = self.out.eof().await;
         let _ = self.out.exit_status(status).await;
         let _ = self.out.close().await;
+        self.stats.finished.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn cat(&mut self) {
@@ -250,13 +263,38 @@ impl Program {
                 self.finish(0).await;
             }
             (Some("flood"), Some(mib)) => {
-                let chunk = Bytes::from(vec![b'y'; 32 * 1024]);
-                for _ in 0..mib.parse::<usize>().unwrap() * 32 {
+                if self.write_records(mib, 32 * 1024).await {
+                    self.finish(0).await;
+                }
+            }
+            (Some("floodsmall"), Some(mib)) => {
+                if self.write_records(mib, 512).await {
+                    self.finish(0).await;
+                }
+            }
+            (Some("spill"), Some(kib)) => {
+                let status = words.next().unwrap().parse().unwrap();
+                let chunk = Bytes::from(vec![b's'; 1024]);
+                for _ in 0..kib.parse::<usize>().unwrap() {
                     if self.out.data_bytes(chunk.clone()).await.is_err() {
                         return;
                     }
-                    self.stats.written.fetch_add(chunk.len(), Ordering::SeqCst);
                 }
+                self.finish(status).await;
+            }
+            (Some("ext2"), Some(chunks)) => {
+                let chunk = Bytes::from(vec![b'z'; 32 * 1024]);
+                for _ in 0..chunks.parse::<usize>().unwrap() {
+                    if self
+                        .out
+                        .extended_data_bytes(2, chunk.clone())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                self.say("ok\n").await;
                 self.finish(0).await;
             }
             (Some("late"), None) => {

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::sshd::{SshdOptions, SshdStats};
 use crate::support::{
-    Decision, Event, Fixture, LOGIN, Options, SESSION_ID, STEP, TRANSPORT, permissions, read_until,
-    reply, transcript, until,
+    Decision, Event, Fixture, LOGIN, OUTPUT_WINDOW, Options, SESSION_ID, STEP, TRANSPORT,
+    permissions, read_until, reply, transcript, until,
 };
 
 #[tokio::test(flavor = "multi_thread")]
@@ -208,8 +208,13 @@ async fn x11_agent_forwarding_and_port_forwarding_are_refused() {
         .channel_open_direct_tcpip("localhost", 8080, "127.0.0.1", 50000)
         .await;
     assert!(forward.is_err());
+    until("open failure recorded", || {
+        !client.seen.open_failures.lock().unwrap().is_empty()
+    })
+    .await;
+    let failures = client.seen.open_failures.lock().unwrap().clone();
     assert_eq!(
-        *client.seen.open_failures.lock().unwrap(),
+        failures,
         ["jaunt: port forwarding is not allowed by your roles"]
     );
     client.finish().await;
@@ -357,6 +362,24 @@ async fn client_extended_data_is_dropped_but_its_window_comes_back() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sshd_extended_data_other_than_stderr_is_dropped_but_its_window_comes_back() {
+    let fixture = Fixture::new(Options::default()).await;
+    let client = fixture.login().await;
+    let mut channel = client.exec("ext2 64").await;
+    let seen = transcript(&mut channel).await;
+    assert_eq!(
+        (
+            seen.stdout.as_slice(),
+            seen.stderr.as_slice(),
+            seen.exit_status
+        ),
+        (&b"ok\n"[..], &b""[..], Some(0))
+    );
+    let outcome = client.finish().await;
+    assert_eq!(outcome.bytes_out, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_late_inner_channel_holds_its_slot_until_it_is_closed() {
     let fixture = Fixture::new(Options {
         limits: AgentLimits {
@@ -467,7 +490,7 @@ async fn a_reply_timeout_closes_the_channel_on_both_sides() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn requests_pile_up_only_to_the_queue_bound_on_an_idle_channel() {
+async fn a_burst_of_requests_on_an_idle_channel_next_to_a_stuck_one_is_answered_promptly() {
     let fixture = Fixture::new(Options::default()).await;
     let (client_io, agent_io) = tokio::io::duplex(TRANSPORT);
     let serve = fixture.serve_on(agent_io, CancellationToken::new());
@@ -480,7 +503,7 @@ async fn requests_pile_up_only_to_the_queue_bound_on_an_idle_channel() {
     let mut idle = client.open().await;
     let _streaming = client.exec("flood 8").await;
     until("sshd is stuck behind the closed user window", || {
-        SshdStats::count(&fixture.sshd.stats.written) >= 2 * 1024 * 1024
+        SshdStats::count(&fixture.sshd.stats.written) >= OUTPUT_WINDOW
     })
     .await;
     for _ in 0..300 {
@@ -488,9 +511,10 @@ async fn requests_pile_up_only_to_the_queue_bound_on_an_idle_channel() {
     }
     let started = Instant::now();
     idle.exec(true, "echo again").await.unwrap();
-    assert!(!reply(&mut idle).await);
+    reply(&mut idle).await;
     assert!(started.elapsed() < Duration::from_secs(2));
     client.finish().await;
+    assert_eq!(fixture.authority.ends().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

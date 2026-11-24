@@ -11,19 +11,22 @@ use russh::{
     Sig, client,
 };
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::inner::InnerClient;
+use crate::inner::{InnerClient, OUTPUT_WINDOW};
 use crate::intake::{ChannelGrant, ChannelIntake, IntakeError, IntakeEvent, IntakeReader};
 use crate::observer::{
     ChannelExit, ChannelProgram, ChannelStart, ObserverCell, OutputStream, Terminal, TerminalSize,
 };
+use crate::output::{ExitSignal, InnerGrant, OutputError, OutputEvent, OutputQueue, OutputReader};
 
 const REQUEST_QUEUE: usize = 32;
 const MAX_ENV_NAME: usize = 64;
 const MAX_ENV_VALUE: usize = 256;
 const STDERR: u32 = 1;
+const INNER_CLOSE_GRACE: Duration = Duration::from_secs(1);
 pub(crate) const TERMINAL_REFUSED: &[u8] = b"jaunt: a terminal is not allowed by your roles\r\n";
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -411,18 +414,22 @@ impl SessionBridge {
         request: impl FnOnce(oneshot::Sender<bool>) -> InnerRequest,
         timeout: Duration,
     ) -> Verdict {
-        let (reply, answer) = oneshot::channel();
+        let (reply, mut answer) = oneshot::channel();
         if self.requests.try_send(request(reply)).is_err() {
             return Verdict::Refused;
         }
         match self
             .cancel
-            .run_until_cancelled(tokio::time::timeout(timeout, answer))
+            .run_until_cancelled(tokio::time::timeout(timeout, &mut answer))
             .await
         {
             Some(Ok(Ok(true))) => Verdict::Granted,
             Some(Err(_)) => Verdict::TimedOut,
-            Some(Ok(Ok(false) | Err(_))) | None => Verdict::Refused,
+            Some(Ok(Ok(false) | Err(_))) => Verdict::Refused,
+            None => match answer.try_recv() {
+                Ok(true) => Verdict::Granted,
+                Ok(false) | Err(_) => Verdict::Refused,
+            },
         }
     }
 }
@@ -494,6 +501,8 @@ impl Establish {
         };
         self.reply.accept().await;
         audit_open(&self.context.session_id, "opened");
+        let grants = InnerGrant::new(&self.inner.handle, channel.id());
+        let (output, events) = OutputQueue::new(OUTPUT_WINDOW, grants);
         let (inner_read, inner_write) = channel.split();
         let inner_write = Arc::new(inner_write);
         let context = &self.context;
@@ -506,24 +515,37 @@ impl Establish {
         ));
         context.tracker.spawn(forward_requests(
             self.queue,
-            inner_write,
+            Arc::clone(&inner_write),
             self.replies.clone(),
             self.resize,
             self.cancel.clone(),
         ));
-        let output = OutputPump {
+        let drain = OutputDrain {
             inner: inner_read,
+            inner_write,
+            output,
+            replies: self.replies,
+            observer: Arc::clone(&context.observer),
+            traffic: Arc::clone(&context.traffic),
+            number: self.id.number(),
+            session_id: Arc::clone(&context.session_id),
+            cancel: self.cancel.clone(),
+            started: false,
+            exit: ChannelExit::Unknown,
+        };
+        let drained = context.tracker.spawn(drain.run());
+        let pump = OutputPump {
+            events,
+            drained,
             outer: self.outer,
             server: self.server,
             id: self.id,
-            replies: self.replies,
             traffic: Arc::clone(&context.traffic),
             observer: Arc::clone(&context.observer),
             live: Arc::clone(&context.live),
             cancel: self.cancel,
-            started: false,
         };
-        context.tracker.spawn(output.run());
+        context.tracker.spawn(pump.run());
     }
 }
 
@@ -670,24 +692,149 @@ enum Ending {
     Cancelled,
 }
 
-struct OutputPump {
+enum Drained {
+    Open,
+    Ended,
+}
+
+struct DrainEnd {
+    started: bool,
+    exit: ChannelExit,
+}
+
+struct OutputDrain {
     inner: ChannelReadHalf,
+    inner_write: Arc<ChannelWriteHalf<client::Msg>>,
+    output: OutputQueue,
+    replies: Replies,
+    observer: Arc<ObserverCell>,
+    traffic: Arc<Traffic>,
+    number: u32,
+    session_id: Arc<str>,
+    cancel: CancellationToken,
+    started: bool,
+    exit: ChannelExit,
+}
+
+impl OutputDrain {
+    async fn run(mut self) -> DrainEnd {
+        let failure = loop {
+            let Some(message) = self.cancel.run_until_cancelled(self.inner.wait()).await else {
+                break None;
+            };
+            match self.take(message) {
+                Ok(Drained::Open) => {}
+                Ok(Drained::Ended) => break None,
+                Err(error) => break Some(error),
+            }
+        };
+        let Self {
+            inner,
+            inner_write,
+            output,
+            replies,
+            session_id,
+            started,
+            exit,
+            ..
+        } = self;
+        drop(inner);
+        replies.fail_all();
+        if let Some(error) = failure {
+            let closed = tokio::time::timeout(INNER_CLOSE_GRACE, inner_write.close()).await;
+            if !matches!(closed, Ok(Ok(()))) {
+                tracing::debug!(target: "jaunt::agent", event = "agent.ssh.inner_close_lost");
+            }
+            output.push_gone();
+            if error != OutputError::SessionGone {
+                tracing::warn!(
+                    target: "jaunt::audit",
+                    event = "agent.ssh.node_protocol_violation",
+                    session_id = &*session_id,
+                    error = %error
+                );
+            }
+        }
+        DrainEnd { started, exit }
+    }
+
+    fn take(&mut self, message: Option<ChannelMsg>) -> Result<Drained, OutputError> {
+        match message {
+            None => {
+                self.output.push_gone();
+                return Ok(Drained::Ended);
+            }
+            Some(ChannelMsg::Close) => {
+                self.output.push_close();
+                return Ok(Drained::Ended);
+            }
+            Some(ChannelMsg::Data { data }) => {
+                self.output.push_data(OutputStream::Stdout, &data)?
+            }
+            Some(ChannelMsg::ExtendedData { data, ext: STDERR }) => {
+                self.output.push_data(OutputStream::Stderr, &data)?
+            }
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                self.output.discard_extended(data.len())?
+            }
+            Some(ChannelMsg::Eof) => self.output.push_eof(),
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                if self.first_exit(ChannelExit::Status(exit_status)) {
+                    self.traffic.record_exit(i32::try_from(exit_status).ok());
+                }
+                self.output.push_exit_status(exit_status)
+            }
+            Some(ChannelMsg::ExitSignal {
+                signal_name,
+                core_dumped,
+                error_message,
+                lang_tag,
+            }) => {
+                if self.first_exit(ChannelExit::Signal(signal_text(&signal_name))) {
+                    self.traffic.record_exit(None);
+                }
+                self.output.push_exit_signal(ExitSignal {
+                    name: signal_name,
+                    core_dumped,
+                    message: error_message,
+                    lang: lang_tag,
+                })
+            }
+            Some(ChannelMsg::Success) => {
+                self.started |= self.replies.resolve(true, &self.observer, self.number);
+            }
+            Some(ChannelMsg::Failure) => {
+                self.replies.resolve(false, &self.observer, self.number);
+            }
+            Some(_) => {}
+        }
+        Ok(Drained::Open)
+    }
+
+    fn first_exit(&mut self, exit: ChannelExit) -> bool {
+        if self.exit != ChannelExit::Unknown {
+            return false;
+        }
+        self.exit = exit;
+        true
+    }
+}
+
+struct OutputPump {
+    events: OutputReader,
+    drained: JoinHandle<DrainEnd>,
     outer: ChannelWriteHalf<Msg>,
     server: server::Handle,
     id: ChannelId,
-    replies: Replies,
     traffic: Arc<Traffic>,
     observer: Arc<ObserverCell>,
     live: Arc<LiveChannels>,
     cancel: CancellationToken,
-    started: bool,
 }
 
 impl OutputPump {
     async fn run(mut self) {
-        let mut exit = ChannelExit::Unknown;
-        let ending = self.forward(&mut exit).await;
-        self.replies.fail_all();
+        let ending = self.forward().await;
         self.live.remove(self.id);
         let closed = match ending {
             Ending::Closed { eof_sent: false } => {
@@ -702,63 +849,56 @@ impl OutputPump {
         if !closed {
             tracing::debug!(target: "jaunt::agent", event = "agent.ssh.outer_close_lost");
         }
-        if self.started {
+        self.cancel.cancel();
+        let drained = match (&mut self.drained).await {
+            Ok(drained) => drained,
+            Err(error) => {
+                tracing::error!(
+                    target: "jaunt::agent",
+                    event = "agent.ssh.output_drain_failed",
+                    panicked = error.is_panic()
+                );
+                DrainEnd {
+                    started: false,
+                    exit: ChannelExit::Unknown,
+                }
+            }
+        };
+        if drained.started {
             let number = self.id.number();
             self.observer
-                .call(|observer| observer.channel_end(number, &exit));
+                .call(|observer| observer.channel_end(number, &drained.exit));
         }
-        self.cancel.cancel();
     }
 
-    async fn forward(&mut self, exit: &mut ChannelExit) -> Ending {
+    async fn forward(&mut self) -> Ending {
         let mut eof_sent = false;
         loop {
-            let Some(message) = self.cancel.run_until_cancelled(self.inner.wait()).await else {
+            let Some(event) = self.cancel.run_until_cancelled(self.events.next()).await else {
                 return Ending::Cancelled;
             };
-            let delivered = match message {
-                None => return Ending::InnerGone,
-                Some(ChannelMsg::Close) => return Ending::Closed { eof_sent },
-                Some(ChannelMsg::Data { data }) => self.output(OutputStream::Stdout, data).await,
-                Some(ChannelMsg::ExtendedData { data, ext: STDERR }) => {
-                    self.output(OutputStream::Stderr, data).await
-                }
-                Some(ChannelMsg::Eof) if !eof_sent => {
+            let delivered = match event {
+                None | Some(OutputEvent::Gone) => return Ending::InnerGone,
+                Some(OutputEvent::Close) => return Ending::Closed { eof_sent },
+                Some(OutputEvent::Stdout(data)) => self.output(OutputStream::Stdout, data).await,
+                Some(OutputEvent::Stderr(data)) => self.output(OutputStream::Stderr, data).await,
+                Some(OutputEvent::Eof) => {
                     eof_sent = true;
                     self.deliver(self.outer.eof()).await
                 }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    *exit = ChannelExit::Status(exit_status);
-                    self.traffic.record_exit(i32::try_from(exit_status).ok());
-                    self.deliver(self.outer.exit_status(exit_status)).await
+                Some(OutputEvent::ExitStatus(status)) => {
+                    self.deliver(self.outer.exit_status(status)).await
                 }
-                Some(ChannelMsg::ExitSignal {
-                    signal_name,
-                    core_dumped,
-                    error_message,
-                    lang_tag,
-                }) => {
-                    *exit = ChannelExit::Signal(signal_text(&signal_name));
-                    self.traffic.record_exit(None);
+                Some(OutputEvent::ExitSignal(signal)) => {
                     let request = self.server.exit_signal_request(
                         self.id,
-                        signal_name,
-                        core_dumped,
-                        error_message,
-                        lang_tag,
+                        signal.name,
+                        signal.core_dumped,
+                        signal.message,
+                        signal.lang,
                     );
                     self.deliver(request).await
                 }
-                Some(ChannelMsg::Success) => {
-                    self.started |= self.replies.resolve(true, &self.observer, self.id.number());
-                    Ok(())
-                }
-                Some(ChannelMsg::Failure) => {
-                    self.replies
-                        .resolve(false, &self.observer, self.id.number());
-                    Ok(())
-                }
-                Some(_) => Ok(()),
             };
             if let Err(ending) = delivered {
                 return ending;
@@ -766,7 +906,7 @@ impl OutputPump {
         }
     }
 
-    async fn output(&self, stream: OutputStream, data: Bytes) -> Result<(), Ending> {
+    async fn output(&mut self, stream: OutputStream, data: Bytes) -> Result<(), Ending> {
         let len = data.len();
         let number = self.id.number();
         self.observer
@@ -779,7 +919,7 @@ impl OutputPump {
             }
         }
         Traffic::add(&self.traffic.bytes_out, len);
-        Ok(())
+        self.events.consumed(len).map_err(|_gone| Ending::InnerGone)
     }
 
     async fn deliver<E>(&self, write: impl Future<Output = Result<(), E>>) -> Result<(), Ending> {
@@ -811,19 +951,98 @@ pub(crate) fn signal_text(signal: &Sig) -> String {
 }
 
 #[cfg(test)]
+mod drain_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+    use std::time::Duration;
 
     use jaunt_proto::SessionPermissions;
     use russh::Sig;
-    use tokio::sync::oneshot;
     use tokio::sync::oneshot::error::TryRecvError;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
-    use super::{Replies, env_allowed, signal_text};
+    use super::{
+        InnerRequest, Phase, REQUEST_QUEUE, Replies, ResizeSlot, SessionBridge, StartReply,
+        TerminalState, Traffic, env_allowed, signal_text,
+    };
+    use crate::intake::{ChannelIntake, SessionGone, WindowGrant};
     use crate::observer::{
         ChannelProgram, ChannelStart, ObserverCell, ObserverFactory, SessionObserver,
     };
+
+    struct NoGrants;
+
+    impl WindowGrant for NoGrants {
+        fn grant(&self, _bytes: u32) -> Result<(), SessionGone> {
+            Ok(())
+        }
+    }
+
+    fn opened_bridge() -> (SessionBridge, mpsc::Receiver<InnerRequest>) {
+        let (requests, queue) = mpsc::channel(REQUEST_QUEUE);
+        let (intake, _reader) = ChannelIntake::new(1024, NoGrants);
+        let bridge = SessionBridge {
+            number: 0,
+            phase: Phase::Opened,
+            terminal: TerminalState::None,
+            env_count: 0,
+            intake,
+            requests,
+            resize: Arc::new(ResizeSlot::default()),
+            cancel: CancellationToken::new(),
+            closing: CancellationToken::new(),
+            settled: CancellationToken::new(),
+            observer: Arc::new(ObserverCell::new(CancellationToken::new())),
+            traffic: Arc::new(Traffic::default()),
+        };
+        (bridge, queue)
+    }
+
+    fn exec() -> ChannelProgram {
+        ChannelProgram::Exec(b"true".to_vec())
+    }
+
+    #[tokio::test]
+    async fn requests_pile_up_only_to_the_queue_bound_and_a_start_is_then_refused_at_once() {
+        let (mut bridge, _queue) = opened_bridge();
+        let queued = (0..300).filter(|_| bridge.signal(Sig::USR1)).count();
+        assert_eq!(queued, REQUEST_QUEUE);
+        assert!(!bridge.env("LANG", "C", 16));
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.start(exec(), Duration::from_secs(30)),
+        )
+        .await
+        .expect("a full queue must refuse at once");
+        assert_eq!(refused, StartReply::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_reply_given_before_the_bridge_ended_counts_even_without_task_budget() {
+        let (mut bridge, mut queue) = opened_bridge();
+        let cancel = bridge.cancel.clone();
+        let mut start = std::pin::pin!(bridge.start(exec(), Duration::from_secs(30)));
+        let waiting =
+            std::future::poll_fn(|cx| Poll::Ready(start.as_mut().poll(cx).is_pending())).await;
+        assert!(waiting);
+        let Some(InnerRequest::Start { reply, .. }) = queue.recv().await else {
+            panic!("the start was not forwarded");
+        };
+        reply.send(true).unwrap();
+        cancel.cancel();
+        let verdict = std::future::poll_fn(|cx| {
+            while let Poll::Ready(progress) = tokio::task::coop::poll_proceed(cx) {
+                progress.made_progress();
+            }
+            start.as_mut().poll(cx)
+        })
+        .await;
+        assert_eq!(verdict, StartReply::Started);
+    }
 
     type Answer = Arc<Mutex<oneshot::Receiver<bool>>>;
 

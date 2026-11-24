@@ -26,6 +26,7 @@ use crate::sshd::{FakeSshd, SshdOptions};
 
 pub const STEP: Duration = Duration::from_secs(20);
 pub const TRANSPORT: usize = 8 * 1024 * 1024;
+pub const OUTPUT_WINDOW: usize = jaunt_ssh::OUTPUT_WINDOW as usize;
 pub const USER_ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 pub const SESSION_ID: &str = "4f1c2a8e-5d3b-4c6a-9e7f-0a1b2c3d4e5f";
 pub const CLIENT_ADDR: &str = "203.0.113.5:40000";

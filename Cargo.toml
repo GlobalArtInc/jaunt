@@ -34,4 +34,4 @@ jaunt-gate = { path = "crates/jaunt-gate" }
 jaunt-web = { path = "crates/jaunt-web" }
 
 [patch.crates-io]
-russh = { git = "https://github.com/GlobalArtInc/russh", rev = "ce50409b1dfac56e436686969576487a34832653" }
+russh = { git = "https://github.com/GlobalArtInc/russh", rev = "78763c760decca7309ec82cffc8c859861b99c91" }

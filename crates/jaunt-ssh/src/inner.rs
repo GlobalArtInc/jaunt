@@ -16,7 +16,9 @@ use crate::inner_ca::{InnerCa, InnerCertRequest};
 
 const CLIENT_ID: &str = "SSH-2.0-Jaunt-agent";
 const CHANNEL_BUFFER: usize = 32;
+const MAX_PACKET: u32 = 32 * 1024;
 const HOST_KEY_ALGORITHMS: &[Algorithm] = &[Algorithm::Ed25519];
+pub const OUTPUT_WINDOW: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerTarget {
@@ -92,6 +94,9 @@ pub(crate) struct InnerSession {
 pub(crate) fn client_config() -> client::Config {
     client::Config {
         client_id: SshId::Standard(Cow::Borrowed(CLIENT_ID)),
+        window_size: OUTPUT_WINDOW,
+        maximum_packet_size: MAX_PACKET,
+        manual_window: true,
         channel_buffer_size: CHANNEL_BUFFER,
         preferred: Preferred {
             key: Cow::Borrowed(HOST_KEY_ALGORITHMS),
@@ -161,9 +166,22 @@ mod tests {
     use russh::keys::{Algorithm, EcdsaCurve, PublicKeyOrCertificate};
     use tokio_util::sync::CancellationToken;
 
-    use super::{InnerClient, InnerLoginError, InnerTarget, client_config, login, read_pin};
+    use super::{
+        InnerClient, InnerLoginError, InnerTarget, MAX_PACKET, OUTPUT_WINDOW, client_config, login,
+        read_pin,
+    };
     use crate::inner_ca::{InnerCa, InnerCertRequest};
     use crate::test_support::{NOW, host_certificate, key};
+
+    #[test]
+    fn the_inner_client_gives_sshd_window_only_by_hand_and_at_most_the_output_window() {
+        let config = client_config();
+        assert!(config.manual_window);
+        assert_eq!(
+            (config.window_size, config.maximum_packet_size),
+            (OUTPUT_WINDOW, MAX_PACKET)
+        );
+    }
 
     #[tokio::test]
     async fn only_the_bare_pinned_key_is_accepted_as_the_sshd_host_key() {

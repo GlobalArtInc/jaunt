@@ -14,6 +14,7 @@ mod test_support;
 mod bridge;
 mod inner;
 mod observer;
+mod output;
 mod terminate;
 
 pub use cert::{CertRejection, UserCaKeys, UserCaSource, UserIdentity, verify_user_certificate};
@@ -29,7 +30,7 @@ pub use outer::{
 pub use proxy::{MAX_PROXY_PAYLOAD, ProxiedAddr, ProxyError, decode_proxy_v2, read_proxy_v2};
 pub use target::parse_node_target;
 
-pub use inner::InnerTarget;
+pub use inner::{InnerTarget, OUTPUT_WINDOW};
 pub use observer::{
     ChannelExit, ChannelProgram, ChannelStart, NoObserver, ObserverFactory, OutputStream,
     Recording, SessionObserver, Terminal, TerminalSize,
