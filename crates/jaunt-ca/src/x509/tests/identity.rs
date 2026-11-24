@@ -1,9 +1,38 @@
 use rcgen::SanType;
+use ssh_key::sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Fixture, NODE_ID, crafted, dns, now, server_params, subject, uri};
+use super::{Fixture, NODE_ID, crafted, dns, node_params, now, server_params, subject, uri};
 use crate::error::CaError;
-use crate::x509::{DEFAULT_SERVER_VALIDITY, parse_node_identity};
+use crate::x509::{DEFAULT_NODE_VALIDITY, DEFAULT_SERVER_VALIDITY, parse_node_identity};
+
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+#[test]
+fn node_identity_carries_the_sha256_of_the_certified_key() {
+    let fixture = Fixture::new();
+    let ca = fixture.ca();
+    let params = node_params(DEFAULT_NODE_VALIDITY);
+    let spki = [
+        ED25519_SPKI_PREFIX.as_slice(),
+        params.subject_public_key.raw(),
+    ]
+    .concat();
+    let expected: [u8; 32] = Sha256::digest(&spki).into();
+    let issued = ca.issue_node_certificate(params, now()).unwrap();
+
+    let identity = parse_node_identity(&issued.certificate_der).unwrap();
+
+    assert_eq!(identity.subject_public_key_sha256, expected);
+    let other = ca
+        .issue_node_certificate(node_params(DEFAULT_NODE_VALIDITY), now())
+        .unwrap();
+    let other_identity = parse_node_identity(&other.certificate_der).unwrap();
+    assert_eq!(other_identity.node_id, identity.node_id);
+    assert_ne!(other_identity.subject_public_key_sha256, expected);
+}
 
 #[test]
 fn node_identity_requires_exactly_one_canonical_uri() {

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
+use jauntd::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
 use serde::Deserialize;
 use url::Url;
 
@@ -29,6 +30,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+    #[serde(default = "default_agents_listen")]
+    pub agents_listen: Option<String>,
     pub public_url: Option<String>,
     #[serde(default = "default_cert_ttl_secs")]
     pub cert_ttl_secs: u64,
@@ -70,6 +73,7 @@ pub struct RunSettings {
     pub policy_dir: PathBuf,
     pub policy_poll: Duration,
     pub web: bool,
+    pub agents: Option<AgentsSettings>,
     pub oidc: OidcConfig,
 }
 
@@ -95,6 +99,11 @@ pub enum ConfigError {
     InvalidAgentEndpoint(#[source] NamingError),
     #[error("gate_endpoint: {0}")]
     InvalidGateEndpoint(#[source] NamingError),
+    #[error(
+        "agents_listen must be a socket address such as 0.0.0.0:8444, or empty to disable the \
+         agents' listener"
+    )]
+    InvalidAgentsListen,
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -120,6 +129,10 @@ pub enum ConfigError {
 
 fn default_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8443))
+}
+
+fn default_agents_listen() -> Option<String> {
+    Some(DEFAULT_AGENTS_LISTEN.to_string())
 }
 
 fn default_cert_ttl_secs() -> u64 {
@@ -170,6 +183,7 @@ impl Config {
             .gate_endpoint
             .map(|text| GateEndpoint::parse(&text).map_err(ConfigError::InvalidGateEndpoint))
             .transpose()?;
+        let agents = agents_settings(self.agents_listen.as_deref(), &agent_endpoint)?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -218,9 +232,26 @@ impl Config {
             policy_dir,
             policy_poll: Duration::from_secs(self.policy_poll_secs),
             web: self.web,
+            agents,
             oidc,
         })
     }
+}
+
+fn agents_settings(
+    listen: Option<&str>,
+    endpoint: &AgentEndpoint,
+) -> Result<Option<AgentsSettings>, ConfigError> {
+    let Some(text) = listen.filter(|text| !text.is_empty()) else {
+        return Ok(None);
+    };
+    let listen = text
+        .parse::<SocketAddr>()
+        .map_err(|_| ConfigError::InvalidAgentsListen)?;
+    Ok(Some(AgentsSettings {
+        listen,
+        server_name: endpoint.host().to_owned(),
+    }))
 }
 
 fn validate_public_url(text: &str) -> Result<String, ConfigError> {
@@ -294,6 +325,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use jauntd::agents::AgentsSettings;
+
     use super::{CLIENT_SECRET_VAR, Config, ConfigError, load};
 
     const SECRET: &str = "s3cr3t-value-that-must-never-be-printed";
@@ -325,6 +358,7 @@ mod tests {
     fn a_data_dir_alone_is_a_valid_config_with_defaults() {
         let config: Config = serde_saphyr::from_str("data_dir: /var/lib/jaunt\n").unwrap();
         assert_eq!(config.listen.to_string(), "127.0.0.1:8443");
+        assert_eq!(config.agents_listen.as_deref(), Some("0.0.0.0:8444"));
         assert_eq!(config.cert_ttl_secs, 28_800);
         assert!(config.public_url.is_none() && config.oidc.is_none());
         assert!(config.ssh_suffix.is_none() && config.agent_endpoint.is_none());
@@ -454,6 +488,15 @@ cert_ttl_secs: {SECRET}
             ":443",
             "https://a.example.com:443",
             "A.example.com:443",
+            "10.0.0.1:443",
+            "[::1]:443",
+            "0x7f.1:443",
+            "2130706433:443",
+            "127.1:443",
+            "1.2.3:443",
+            "0x7f.0.0.1:443",
+            "017700000001:443",
+            "0:443",
         ] {
             let mut config = parse("");
             config.agent_endpoint = Some(endpoint.to_owned());
@@ -505,6 +548,50 @@ cert_ttl_secs: {SECRET}
                     Err(ConfigError::InvalidGateEndpoint(_))
                 ),
                 "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agents_listener_serves_the_endpoint_host_and_can_be_disabled() {
+        let defaults = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(
+            defaults.agents,
+            Some(AgentsSettings {
+                listen: "0.0.0.0:8444".parse().unwrap(),
+                server_name: "agents.example.com".to_owned(),
+            })
+        );
+        let moved = parse("agents_listen: 127.0.0.1:9444\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(
+            moved.agents.map(|agents| agents.listen.to_string()),
+            Some("127.0.0.1:9444".to_owned())
+        );
+        for disabled in [
+            "agents_listen: \"\"\n",
+            "agents_listen: null\n",
+            "agents_listen:\n",
+        ] {
+            let settings = parse(disabled).into_run_settings(&secret_env).unwrap();
+            assert_eq!(settings.agents, None, "{disabled:?}");
+        }
+        for invalid in [
+            "localhost:8444",
+            "0.0.0.0",
+            "8444",
+            "0.0.0.0:65536",
+            " 0.0.0.0:8444",
+        ] {
+            let mut config = parse("");
+            config.agents_listen = Some(invalid.to_owned());
+            assert!(
+                matches!(
+                    config.into_run_settings(&secret_env),
+                    Err(ConfigError::InvalidAgentsListen)
+                ),
+                "{invalid:?}"
             );
         }
     }

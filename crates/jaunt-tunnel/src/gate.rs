@@ -18,7 +18,7 @@ use crate::registry::AgentRegistry;
 use crate::server::TunnelConnection;
 use crate::stats::GateStats;
 use crate::tls::{Accepted, GateAcceptor, PeerStream};
-use crate::{PeerAuthenticator, Rejection};
+use crate::{PeerAuthenticator, RejectReason, Rejection};
 
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const REJECT_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -46,12 +46,18 @@ pub trait Handover: Send + Sync {
     fn agent_api(&self, connection: AgentApiConnection);
 }
 
+pub trait GateObserver: Send + Sync {
+    fn tunnel_registered(&self, node: &NodeId, peer_addr: SocketAddr, replaced: bool);
+    fn peer_rejected(&self, peer_addr: SocketAddr, rejection: &Rejection);
+}
+
 #[derive(Clone)]
 pub struct Gate {
     acceptor: Arc<GateAcceptor>,
     registry: AgentRegistry,
     authenticator: Arc<dyn PeerAuthenticator>,
     handover: Arc<dyn Handover>,
+    observer: Option<Arc<dyn GateObserver>>,
     options: Arc<TunnelOptions>,
 }
 
@@ -69,8 +75,14 @@ impl Gate {
             registry,
             authenticator,
             handover,
+            observer: None,
             options: Arc::new(options),
         })
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn GateObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn registry(&self) -> &AgentRegistry {
@@ -126,8 +138,14 @@ impl Gate {
             self.stats().record_accept_error();
             return;
         }
-        let Ok((accepted, permit)) = self.acceptor.accept(tcp).await else {
-            return;
+        let (accepted, permit) = match self.acceptor.accept(tcp).await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if error.is_missing_peer_certificate() {
+                    self.observe_rejection(peer_addr, &Rejection::new(RejectReason::NoCertificate));
+                }
+                return;
+            }
         };
         match accepted {
             Accepted::Main(stream) => {
@@ -146,18 +164,30 @@ impl Gate {
                             peer_addr,
                         });
                     }
-                    Err(Rejection) => close_rejected(stream).await,
+                    Err(rejection) => {
+                        self.observe_rejection(peer_addr, &rejection);
+                        close_rejected(stream).await;
+                    }
                 }
             }
             Accepted::Tunnel(peer) => {
                 let PeerStream { stream, peer_cert } = peer;
                 match self.authenticate(&peer_cert).await {
-                    Ok(node) => self.establish_tunnel(node, stream, &token).await,
-                    Err(Rejection) => close_rejected(stream).await,
+                    Ok(node) => self.establish_tunnel(node, stream, peer_addr, &token).await,
+                    Err(rejection) => {
+                        self.observe_rejection(peer_addr, &rejection);
+                        close_rejected(stream).await;
+                    }
                 }
             }
         }
         drop(permit);
+    }
+
+    fn observe_rejection(&self, peer_addr: SocketAddr, rejection: &Rejection) {
+        if let Some(observer) = &self.observer {
+            observer.peer_rejected(peer_addr, rejection);
+        }
     }
 
     async fn authenticate(&self, peer_cert: &CertificateDer<'static>) -> Result<NodeId, Rejection> {
@@ -166,19 +196,20 @@ impl Gate {
             self.authenticator.authenticate(peer_cert.as_ref()),
         )
         .await;
-        match decision {
-            Ok(Ok(node)) => Ok(node),
-            Ok(Err(Rejection)) | Err(_) => {
-                self.stats().record_auth_rejection();
-                Err(Rejection)
-            }
-        }
+        let rejection = match decision {
+            Ok(Ok(node)) => return Ok(node),
+            Ok(Err(rejection)) => rejection,
+            Err(_) => Rejection::new(RejectReason::Timeout),
+        };
+        self.stats().record_auth_rejection();
+        Err(rejection)
     }
 
     async fn establish_tunnel(
         &self,
         node: NodeId,
         stream: TlsStream<TcpStream>,
+        peer_addr: SocketAddr,
         token: &CancellationToken,
     ) {
         let established = TunnelConnection::establish(stream, &self.options, token).await;
@@ -186,8 +217,13 @@ impl Gate {
             self.stats().record_tunnel_setup_failure();
             return;
         };
-        match self.registry.register(node, connection) {
-            Ok(_) => self.stats().record_tunnel_established(),
+        match self.registry.register_tracked(node.clone(), connection) {
+            Ok((_, replaced)) => {
+                self.stats().record_tunnel_established();
+                if let Some(observer) = &self.observer {
+                    observer.tunnel_registered(&node, peer_addr, replaced);
+                }
+            }
             Err(_) => self.stats().record_tunnel_setup_failure(),
         }
     }

@@ -2,10 +2,13 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::Router;
-use jaunt_ca::{CaKind, InternalCa, MAX_USER_VALIDITY, Signer, TrustSet};
+use jaunt_ca::{
+    CaError, CaKind, InternalCa, IssuedCertificate, MAX_USER_VALIDITY, ServerCertParams, Signer,
+    TrustSet,
+};
 use jaunt_oidc::OidcClient;
 use jaunt_policy::{PolicyHandle, PolicySet};
 use jaunt_store::{EnrollmentState, Store};
@@ -154,6 +157,18 @@ impl Control {
 
     pub fn node_admin(&self) -> NodeAdmin {
         NodeAdmin::new(self.store.clone(), self.clock.clone())
+    }
+
+    pub fn issue_server_certificate(
+        &self,
+        params: ServerCertParams,
+        now: SystemTime,
+    ) -> Result<IssuedCertificate, CaError> {
+        self.internal_ca.issue_server_certificate(params, now)
+    }
+
+    pub fn internal_root_der(&self) -> &[u8] {
+        self.internal_ca.root_der()
     }
 
     pub fn sweep_expired(&self) -> usize {

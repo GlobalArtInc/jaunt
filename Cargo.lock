@@ -2042,9 +2042,20 @@ dependencies = [
 name = "jaunt-gate"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "h2",
+ "http",
  "jaunt-proto",
  "jaunt-ssh",
  "jaunt-tunnel",
+ "rcgen",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2152,19 +2163,33 @@ version = "0.0.0"
 name = "jauntd"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "base64 0.23.1",
+ "bytes",
  "clap",
+ "h2",
+ "http",
+ "hyper",
+ "hyper-util",
  "jaunt-ca",
  "jaunt-control",
  "jaunt-gate",
  "jaunt-oidc",
  "jaunt-policy",
  "jaunt-store",
+ "jaunt-tunnel",
+ "rcgen",
+ "rustls",
  "serde",
  "serde-saphyr",
+ "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4444,6 +4469,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

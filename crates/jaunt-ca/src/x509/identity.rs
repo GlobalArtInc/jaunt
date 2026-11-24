@@ -1,3 +1,4 @@
+use ssh_key::sha2::{Digest, Sha256};
 use uuid::Uuid;
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
@@ -9,6 +10,7 @@ const NODE_URN_PREFIX: &str = "urn:jaunt:node:";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeIdentity {
     pub node_id: Uuid,
+    pub subject_public_key_sha256: [u8; 32],
 }
 
 pub fn parse_node_identity(cert_der: &[u8]) -> Result<NodeIdentity, CaError> {
@@ -25,7 +27,11 @@ pub fn parse_node_identity(cert_der: &[u8]) -> Result<NodeIdentity, CaError> {
         return Err(CaError::InvalidNodeIdentity);
     };
     let node_id = node_id_from_urn(uri).ok_or(CaError::InvalidNodeIdentity)?;
-    Ok(NodeIdentity { node_id })
+    let subject_public_key_sha256 = Sha256::digest(certificate.public_key().raw).into();
+    Ok(NodeIdentity {
+        node_id,
+        subject_public_key_sha256,
+    })
 }
 
 pub(super) fn node_urn(node_id: Uuid) -> String {

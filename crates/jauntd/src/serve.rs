@@ -7,8 +7,11 @@ use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, syste
 use jaunt_oidc::{OidcClient, OidcError};
 use jaunt_policy::Watcher;
 use jaunt_store::{Store, StoreError};
+use jauntd::agents::{AgentServer, AgentServerParts, AgentsError, AgentsSettings, SHUTDOWN_GRACE};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
+use tokio::time::{Instant, sleep_until};
 
 use crate::ca::{self, Authorities};
 use crate::config::{self, ConfigError, EnvLookup, RunSettings};
@@ -52,6 +55,8 @@ pub enum ServeError {
         #[source]
         source: io::Error,
     },
+    #[error(transparent)]
+    Agents(#[from] AgentsError),
 }
 
 pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
@@ -71,6 +76,8 @@ struct Started {
     control: Control,
     watcher: Watcher,
     listen: SocketAddr,
+    store: Store,
+    agents: Option<AgentsSettings>,
 }
 
 async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), ServeError> {
@@ -81,6 +88,8 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         control,
         watcher,
         listen,
+        store,
+        agents,
     } = start(settings, authorities).await?;
     let listener = match bind(listen).await {
         Ok(listener) => listener,
@@ -89,18 +98,69 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
             return Err(err);
         }
     };
-
-    control
-        .serve(listener, async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-            tracing::info!(target: "jaunt::daemon", "shutting down");
+    let agents = match start_agents(agents, &control, store).await {
+        Ok(agents) => agents,
+        Err(err) => {
             policy::stop_watcher(watcher).await;
-        })
-        .await?;
+            return Err(err);
+        }
+    };
+
+    let (deadline_tx, mut deadline_rx) = watch::channel(None);
+    let shutdown = async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        tracing::info!(target: "jaunt::daemon", "shutting down");
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        deadline_tx.send_replace(Some(deadline));
+        if let Some(agents) = agents {
+            agents
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        policy::stop_watcher(watcher).await;
+    };
+    let overdue = async move {
+        let deadline = match deadline_rx.wait_for(Option::is_some).await {
+            Ok(seen) => *seen,
+            Err(_) => None,
+        };
+        match deadline {
+            Some(deadline) => sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        served = control.serve(listener, shutdown) => served?,
+        () = overdue => {
+            tracing::warn!(
+                target: "jaunt::daemon",
+                "the http server did not stop within the shutdown grace"
+            );
+        }
+    }
     Ok(())
+}
+
+async fn start_agents(
+    settings: Option<AgentsSettings>,
+    control: &Control,
+    store: Store,
+) -> Result<Option<AgentServer>, ServeError> {
+    let Some(settings) = settings else {
+        tracing::info!(target: "jaunt::daemon", "the agents' listener is disabled");
+        return Ok(None);
+    };
+    let parts = AgentServerParts::new(settings, control.clone(), store, system_clock());
+    let server = AgentServer::start(parts).await?;
+    tracing::info!(
+        target: "jaunt::daemon",
+        listen = %server.local_addr(),
+        "serving agents"
+    );
+    Ok(Some(server))
 }
 
 async fn start(settings: RunSettings, authorities: Authorities) -> Result<Started, ServeError> {
@@ -121,6 +181,7 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
     let oidc = OidcClient::discover(settings.oidc)
         .await
         .map_err(ServeError::Oidc)?;
+    let agents_store = store.clone();
     let control = Control::new(ControlParts {
         store,
         oidc,
@@ -143,6 +204,8 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         control,
         watcher,
         listen: settings.listen,
+        store: agents_store,
+        agents: settings.agents,
     })
 }
 

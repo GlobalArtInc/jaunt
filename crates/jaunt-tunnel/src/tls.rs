@@ -1,14 +1,18 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use rustls::client::Resumption;
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{
-    Acceptor, NoServerSessionStorage, VerifierBuilderError, WebPkiClientVerifier,
+    Acceptor, ClientHello, NoServerSessionStorage, ResolvesServerCert, VerifierBuilderError,
+    WantsServerCert, WebPkiClientVerifier,
 };
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::sign::CertifiedKey;
+use rustls::{ClientConfig, ConfigBuilder, RootCertStore, ServerConfig};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -36,18 +40,105 @@ pub fn agent_server_config(
     key: PrivateKeyDer<'static>,
     client_roots: RootCertStore,
 ) -> Result<ServerConfig, TlsConfigError> {
+    let mut config = agent_config_builder(client_roots)?.with_single_cert(cert_chain, key)?;
+    finish_agent_config(&mut config);
+    Ok(config)
+}
+
+pub fn rotating_agent_server_config(
+    certificate: Arc<RotatingCertificate>,
+    client_roots: RootCertStore,
+) -> Result<ServerConfig, TlsConfigError> {
+    let mut config = agent_config_builder(client_roots)?.with_cert_resolver(certificate);
+    finish_agent_config(&mut config);
+    Ok(config)
+}
+
+pub fn refusing_server_config() -> Result<ServerConfig, TlsConfigError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(NoCertificate));
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    Ok(config)
+}
+
+fn agent_config_builder(
+    client_roots: RootCertStore,
+) -> Result<ConfigBuilder<ServerConfig, WantsServerCert>, TlsConfigError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier =
         WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
             .build()?;
-    let mut config = ServerConfig::builder_with_provider(provider)
+    Ok(ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(cert_chain, key)?;
+        .with_client_cert_verifier(verifier))
+}
+
+fn finish_agent_config(config: &mut ServerConfig) {
     config.alpn_protocols = vec![ALPN_TUNNEL.to_vec(), ALPN_AGENT_API.to_vec()];
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
-    Ok(config)
+}
+
+pub struct RotatingCertificate {
+    current: RwLock<Arc<CertifiedKey>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl RotatingCertificate {
+    pub fn new(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, TlsConfigError> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certified = CertifiedKey::from_der(cert_chain, key, &provider)?;
+        Ok(Self {
+            current: RwLock::new(Arc::new(certified)),
+            provider,
+        })
+    }
+
+    pub fn replace(
+        &self,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<(), TlsConfigError> {
+        let certified = Arc::new(CertifiedKey::from_der(cert_chain, key, &self.provider)?);
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = certified;
+        Ok(())
+    }
+
+    fn current(&self) -> Arc<CertifiedKey> {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl fmt::Debug for RotatingCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RotatingCertificate")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResolvesServerCert for RotatingCertificate {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificate;
+
+impl ResolvesServerCert for NoCertificate {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        None
+    }
 }
 
 pub fn main_server_config(
@@ -94,6 +185,19 @@ pub enum AcceptError {
     NoApplicationProtocol,
     #[error("client certificate is missing after the handshake")]
     NoPeerCertificate,
+}
+
+impl AcceptError {
+    pub fn is_missing_peer_certificate(&self) -> bool {
+        match self {
+            Self::NoPeerCertificate => true,
+            Self::Handshake(error) => error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+                .is_some_and(|inner| matches!(inner, rustls::Error::NoCertificatesPresented)),
+            _ => false,
+        }
+    }
 }
 
 pub struct AcceptorConfig {

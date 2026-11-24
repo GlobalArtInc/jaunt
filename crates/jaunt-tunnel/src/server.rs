@@ -139,6 +139,7 @@ pub struct TunnelConnection {
     opener: StreamOpener,
     control: mpsc::Sender<ServerMessage>,
     closed: CancellationToken,
+    finished: CancellationToken,
     _close_on_drop: DropGuard,
 }
 
@@ -167,6 +168,7 @@ impl TunnelConnection {
         let pings = connection.ping_pong().ok_or(TunnelError::Internal)?;
 
         let closed = parent.child_token();
+        let finished = CancellationToken::new();
         let slot = Arc::new(Mutex::new(Some(sender.clone())));
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -180,6 +182,7 @@ impl TunnelConnection {
             },
             control: control_tx,
             closed: closed.clone(),
+            finished: finished.clone(),
             _close_on_drop: closed.clone().drop_guard(),
         };
 
@@ -192,6 +195,7 @@ impl TunnelConnection {
             control_task,
             slot,
             closed,
+            finished,
             options.close_grace,
         ));
 
@@ -209,6 +213,10 @@ impl TunnelConnection {
 
     pub(crate) fn closed_token(&self) -> CancellationToken {
         self.closed.clone()
+    }
+
+    pub(crate) fn finished_token(&self) -> CancellationToken {
+        self.finished.clone()
     }
 
     pub(crate) fn opener(&self) -> StreamOpener {
@@ -239,6 +247,7 @@ async fn supervise<IO>(
     mut control_task: BoxTask,
     slot: Arc<Mutex<Option<SendRequest<Bytes>>>>,
     token: CancellationToken,
+    finished: CancellationToken,
     close_grace: Duration,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -257,6 +266,8 @@ async fn supervise<IO>(
     if !matches!(end, End::PeerClosed) {
         drop(timeout(close_grace, &mut connection).await);
     }
+    drop(connection);
+    finished.cancel();
 }
 
 async fn run_control(

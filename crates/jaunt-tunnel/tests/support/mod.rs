@@ -21,8 +21,8 @@ use http::Request;
 use jaunt_tunnel::{
     AcceptorConfig, AgentApiConnection, AgentRegistry, BackoffPolicy, BoxFuture, ClientError,
     ClientEvent, Gate, GateAcceptor, GateStats, H2Io, Handover, IncomingStream, MainConnection,
-    NodeId, PeerAuthenticator, Rejection, SessionId, SessionRegistry, StreamHandler, StreamKind,
-    StreamMeta, TunnelClient, TunnelClientConfig, TunnelOptions, agent_client_config,
+    NodeId, PeerAuthenticator, RejectReason, Rejection, SessionId, SessionRegistry, StreamHandler,
+    StreamKind, StreamMeta, TunnelClient, TunnelClientConfig, TunnelOptions, agent_client_config,
     agent_server_config, main_server_config,
 };
 use rcgen::{
@@ -148,7 +148,7 @@ impl PeerAuthenticator for MapAuthenticator {
                 .unwrap()
                 .get(peer_cert_der)
                 .cloned()
-                .ok_or(Rejection)
+                .ok_or(Rejection::new(RejectReason::UnknownNode))
         })
     }
 }

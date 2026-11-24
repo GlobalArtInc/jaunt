@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use thiserror::Error;
@@ -35,9 +36,35 @@ pub enum RegisterError {
     NoRuntime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisconnectReason {
+    Closed,
+    Replaced,
+    Removed,
+    Requested,
+    Shutdown,
+}
+
+impl DisconnectReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Replaced => "replaced",
+            Self::Removed => "removed",
+            Self::Requested => "requested",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+pub trait RegistryObserver: Send + Sync {
+    fn connection_ended(&self, node: &NodeId, connection: ConnectionId, reason: DisconnectReason);
+}
+
 struct RegistryInner {
     connections: Mutex<HashMap<NodeId, TunnelConnection>>,
     events: broadcast::Sender<RegistryEvent>,
+    observer: Option<Arc<dyn RegistryObserver>>,
 }
 
 impl RegistryInner {
@@ -49,6 +76,12 @@ impl RegistryInner {
 
     fn publish(&self, event: RegistryEvent) {
         drop(self.events.send(event));
+    }
+
+    fn ended(&self, node: &NodeId, connection: ConnectionId, reason: DisconnectReason) {
+        if let Some(observer) = &self.observer {
+            observer.connection_ended(node, connection, reason);
+        }
     }
 
     fn connection_ended(&self, node: &NodeId, connection: ConnectionId) {
@@ -66,6 +99,9 @@ impl RegistryInner {
                 _ => None,
             }
         };
+        if removed.is_some() {
+            self.ended(node, connection, DisconnectReason::Closed);
+        }
         drop(removed);
     }
 }
@@ -83,11 +119,20 @@ impl Default for AgentRegistry {
 
 impl AgentRegistry {
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    pub fn with_observer(observer: Arc<dyn RegistryObserver>) -> Self {
+        Self::build(Some(observer))
+    }
+
+    fn build(observer: Option<Arc<dyn RegistryObserver>>) -> Self {
         let (events, _) = broadcast::channel(EVENT_BACKLOG);
         Self {
             inner: Arc::new(RegistryInner {
                 connections: Mutex::new(HashMap::new()),
                 events,
+                observer,
             }),
         }
     }
@@ -97,6 +142,14 @@ impl AgentRegistry {
         node: NodeId,
         connection: TunnelConnection,
     ) -> Result<ConnectionId, RegisterError> {
+        self.register_tracked(node, connection).map(|(id, _)| id)
+    }
+
+    pub(crate) fn register_tracked(
+        &self,
+        node: NodeId,
+        connection: TunnelConnection,
+    ) -> Result<(ConnectionId, bool), RegisterError> {
         let runtime = Handle::try_current().map_err(|_| RegisterError::NoRuntime)?;
         let id = connection.id();
         let closed = connection.closed_token();
@@ -116,13 +169,19 @@ impl AgentRegistry {
             });
             previous
         };
-        drop(replaced);
+        let was_replaced = replaced.is_some();
         let inner = self.inner.clone();
+        let watched = node.clone();
         runtime.spawn(async move {
             closed.cancelled().await;
-            inner.connection_ended(&node, id);
+            inner.connection_ended(&watched, id);
         });
-        Ok(id)
+        if let Some(previous) = &replaced {
+            self.inner
+                .ended(&node, previous.id(), DisconnectReason::Replaced);
+        }
+        drop(replaced);
+        Ok((id, was_replaced))
     }
 
     pub async fn open_stream(&self, node: &NodeId, meta: &StreamMeta) -> Result<H2Io, OpenError> {
@@ -144,6 +203,10 @@ impl AgentRegistry {
     }
 
     pub fn disconnect(&self, node: &NodeId) -> bool {
+        self.disconnect_because(node, DisconnectReason::Requested)
+    }
+
+    pub fn disconnect_because(&self, node: &NodeId, reason: DisconnectReason) -> bool {
         let removed = {
             let mut connections = self.inner.lock();
             let removed = connections.remove(node);
@@ -155,7 +218,41 @@ impl AgentRegistry {
             }
             removed
         };
-        removed.is_some()
+        let Some(connection) = removed else {
+            return false;
+        };
+        self.inner.ended(node, connection.id(), reason);
+        drop(connection);
+        true
+    }
+
+    pub fn shutdown(&self) -> impl Future<Output = ()> + Send + 'static {
+        let drained: Vec<(NodeId, TunnelConnection)> = {
+            let mut connections = self.inner.lock();
+            connections
+                .drain()
+                .inspect(|(node, connection)| {
+                    self.inner.publish(RegistryEvent::Disconnected {
+                        node: node.clone(),
+                        connection: connection.id(),
+                    });
+                })
+                .collect()
+        };
+        for (node, connection) in &drained {
+            self.inner
+                .ended(node, connection.id(), DisconnectReason::Shutdown);
+        }
+        let finished: Vec<_> = drained
+            .iter()
+            .map(|(_, connection)| connection.finished_token())
+            .collect();
+        drop(drained);
+        async move {
+            for token in finished {
+                token.cancelled().await;
+            }
+        }
     }
 
     pub fn is_connected(&self, node: &NodeId) -> bool {

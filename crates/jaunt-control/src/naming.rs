@@ -9,8 +9,8 @@ pub enum NamingError {
     #[error("the ssh suffix must be a lowercase dns name of at most {MAX_SUFFIX_LEN} characters")]
     SshSuffix,
     #[error(
-        "the agent endpoint must be host:port with a lowercase dns name or an ip address and a \
-         port from 1 to 65535"
+        "the agent endpoint must be host:port with a lowercase dns name, not an ip address, and \
+         a port from 1 to 65535"
     )]
     AgentEndpoint,
     #[error(
@@ -43,13 +43,7 @@ pub struct AgentEndpoint(String);
 impl AgentEndpoint {
     pub fn parse(text: &str) -> Result<AgentEndpoint, NamingError> {
         let (host, port) = text.rsplit_once(':').ok_or(NamingError::AgentEndpoint)?;
-        let host_ok = match host
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            Some(inner) => inner.parse::<Ipv6Addr>().is_ok(),
-            None => host.parse::<Ipv4Addr>().is_ok() || is_dns_name(host),
-        };
+        let host_ok = is_dns_name(host) && !ends_in_a_number(host);
         let port_ok = !port.is_empty()
             && port.len() <= 5
             && port.bytes().all(|byte| byte.is_ascii_digit())
@@ -63,6 +57,12 @@ impl AgentEndpoint {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn host(&self) -> &str {
+        self.0
+            .rsplit_once(':')
+            .map_or(self.0.as_str(), |(host, _)| host)
     }
 }
 
@@ -152,6 +152,16 @@ fn is_dns_name(text: &str) -> bool {
     text.len() <= MAX_DNS_NAME_LEN && text.split('.').all(is_dns_label)
 }
 
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host.rsplit('.').next().unwrap_or(host);
+    let decimal = !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit());
+    let hexadecimal = last
+        .strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    decimal || hexadecimal
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AgentEndpoint, GateEndpoint, SshSuffix, is_dns_label};
@@ -212,8 +222,24 @@ mod tests {
         for (text, ok) in [
             ("agents.example.com:443", true),
             ("localhost:8443", true),
-            ("10.0.0.1:443", true),
-            ("[::1]:443", true),
+            ("10.0.0.1:443", false),
+            ("127.0.0.1:8444", false),
+            ("[::1]:443", false),
+            ("[2001:db8::1]:443", false),
+            ("0x7f.1:443", false),
+            ("2130706433:443", false),
+            ("127.1:443", false),
+            ("1.2.3:443", false),
+            ("0x7f.0.0.1:443", false),
+            ("017700000001:443", false),
+            ("0:443", false),
+            ("0x:443", false),
+            ("agents.example.0x1f:443", false),
+            ("agents.123:443", false),
+            ("agents.0x1g:443", true),
+            ("agents.example.1a:443", true),
+            ("0x7f.example.com:443", true),
+            ("1.2.3.example.com:443", true),
             ("agents.example.com", false),
             ("agents.example.com:", false),
             ("agents.example.com:0", false),
@@ -274,6 +300,16 @@ mod tests {
             "-gate.example.com",
         ] {
             assert!(GateEndpoint::parse(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_endpoint_host_is_everything_before_the_port() {
+        for (text, host) in [
+            ("agents.example.com:443", "agents.example.com"),
+            ("localhost:8443", "localhost"),
+        ] {
+            assert_eq!(AgentEndpoint::parse(text).unwrap().host(), host);
         }
     }
 }
