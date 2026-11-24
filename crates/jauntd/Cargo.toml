@@ -15,6 +15,7 @@ axum = { version = "0.8.9", default-features = false }
 clap = { workspace = true }
 hyper = { version = "1.13.0", default-features = false, features = ["http2", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["http2", "tokio"] }
+ipnet = "2.12.2"
 serde = { workspace = true }
 serde-saphyr = { workspace = true }
 jaunt-ca = { workspace = true }
@@ -22,6 +23,8 @@ jaunt-control = { workspace = true }
 jaunt-gate = { workspace = true }
 jaunt-oidc = { workspace = true }
 jaunt-policy = { workspace = true }
+jaunt-proto = { workspace = true }
+jaunt-ssh = { workspace = true }
 jaunt-store = { workspace = true }
 jaunt-tunnel = { workspace = true }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
@@ -41,7 +44,8 @@ base64 = "0.23.1"
 bytes = "1.12.2"
 h2 = "0.4.20"
 http = "1.5.0"
+russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

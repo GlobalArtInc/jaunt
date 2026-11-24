@@ -1,12 +1,18 @@
 use std::ffi::OsString;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ipnet::IpNet;
 use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
+use jaunt_gate::{
+    DEFAULT_MAX_UNAUTHENTICATED, MAX_HOSTNAMES, MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem,
+    normalize_dns_name, trusted_proxy_problem,
+};
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use jauntd::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
+use jauntd::gate_ssh::GateSshSettings;
 use serde::Deserialize;
 use url::Url;
 
@@ -21,6 +27,8 @@ const DEFAULT_POLICY_POLL_SECS: u64 = 5;
 const MIN_POLICY_POLL_SECS: u64 = 1;
 const MAX_POLICY_POLL_SECS: u64 = 3600;
 const DEFAULT_POLICY_DIR: &str = "policy";
+const DEFAULT_WRITE_STALL_SECS: u64 = 900;
+const MAX_WRITE_STALL_SECS: u64 = 86_400;
 
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
@@ -46,7 +54,23 @@ pub struct Config {
     #[serde(default = "default_policy_poll_secs")]
     pub policy_poll_secs: u64,
     pub gate_endpoint: Option<String>,
+    pub ssh_gate: Option<SshGateSection>,
     pub oidc: Option<OidcSection>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGateSection {
+    pub listen: SocketAddr,
+    pub hostnames: Vec<String>,
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    #[serde(default = "default_max_unauthenticated")]
+    pub max_unauthenticated: usize,
+    #[serde(default = "default_write_stall_secs")]
+    pub write_stall_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +98,7 @@ pub struct RunSettings {
     pub policy_poll: Duration,
     pub web: bool,
     pub agents: Option<AgentsSettings>,
+    pub ssh_gate: Option<GateSshSettings>,
     pub oidc: OidcConfig,
 }
 
@@ -104,6 +129,45 @@ pub enum ConfigError {
          agents' listener"
     )]
     InvalidAgentsListen,
+    #[error("ssh_gate needs the agents' listener: set agents_listen as well")]
+    GateWithoutAgents,
+    #[error(
+        "ssh_gate needs gate_endpoint: clients learn the gate address from it and client-config \
+         answers 404 without it"
+    )]
+    GateWithoutEndpoint,
+    #[error("gate_endpoint must be a dns name when ssh_gate is on, not an ipv6 address")]
+    GateEndpointIpv6,
+    #[error(
+        "the host of gate_endpoint must be listed in ssh_gate.hostnames, or clients cannot verify \
+         the gate host certificate"
+    )]
+    GateEndpointNotInHostnames,
+    #[error("ssh_gate.listen must not use the address or port of listen or agents_listen")]
+    GateListenCollision,
+    #[error("ssh_gate.hostnames must name at least one host")]
+    MissingGateHostnames,
+    #[error("ssh_gate.hostnames must name at most {MAX_HOSTNAMES} hosts")]
+    TooManyGateHostnames,
+    #[error("ssh_gate.hostnames[{0}] is not a dns name")]
+    InvalidGateHostname(usize),
+    #[error("ssh_gate.hostnames[{0}] repeats an earlier host name")]
+    DuplicateGateHostname(usize),
+    #[error("ssh_gate.trusted_proxies[{0}] is not a cidr block such as 10.0.0.0/8")]
+    InvalidTrustedProxy(usize),
+    #[error("ssh_gate.trusted_proxies[{index}]: {problem}")]
+    UnusableTrustedProxy {
+        index: usize,
+        problem: TrustedProxyProblem,
+    },
+    #[error("ssh_gate.proxy_protocol needs at least one entry in ssh_gate.trusted_proxies")]
+    MissingTrustedProxies,
+    #[error("ssh_gate.trusted_proxies is set but ssh_gate.proxy_protocol is false")]
+    TrustedProxiesWithoutProxyProtocol,
+    #[error("ssh_gate.max_unauthenticated must be between 1 and {MAX_UNAUTHENTICATED_LIMIT}")]
+    GateUnauthenticatedOutOfRange,
+    #[error("ssh_gate.write_stall_secs must be at most {MAX_WRITE_STALL_SECS} (0 turns it off)")]
+    WriteStallOutOfRange,
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -151,6 +215,14 @@ fn default_web() -> bool {
     true
 }
 
+fn default_max_unauthenticated() -> usize {
+    DEFAULT_MAX_UNAUTHENTICATED
+}
+
+fn default_write_stall_secs() -> u64 {
+    DEFAULT_WRITE_STALL_SECS
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let options = serde_saphyr::options! { with_snippet: false };
@@ -184,6 +256,19 @@ impl Config {
             .map(|text| GateEndpoint::parse(&text).map_err(ConfigError::InvalidGateEndpoint))
             .transpose()?;
         let agents = agents_settings(self.agents_listen.as_deref(), &agent_endpoint)?;
+        let ssh_gate = self
+            .ssh_gate
+            .map(|section| {
+                gate_settings(
+                    section,
+                    gate_endpoint.as_ref(),
+                    &[
+                        Some(self.listen),
+                        agents.as_ref().map(|agents| agents.listen),
+                    ],
+                )
+            })
+            .transpose()?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -233,6 +318,7 @@ impl Config {
             policy_poll: Duration::from_secs(self.policy_poll_secs),
             web: self.web,
             agents,
+            ssh_gate,
             oidc,
         })
     }
@@ -252,6 +338,88 @@ fn agents_settings(
         listen,
         server_name: endpoint.host().to_owned(),
     }))
+}
+
+fn gate_settings(
+    section: SshGateSection,
+    endpoint: Option<&GateEndpoint>,
+    listeners: &[Option<SocketAddr>; 2],
+) -> Result<GateSshSettings, ConfigError> {
+    let [listen, agents_listen] = *listeners;
+    let Some(agents_listen) = agents_listen else {
+        return Err(ConfigError::GateWithoutAgents);
+    };
+    if [listen, Some(agents_listen)]
+        .into_iter()
+        .flatten()
+        .any(|other| listeners_collide(section.listen, other))
+    {
+        return Err(ConfigError::GateListenCollision);
+    }
+    let endpoint = endpoint.ok_or(ConfigError::GateWithoutEndpoint)?;
+    if endpoint.host().parse::<Ipv6Addr>().is_ok() {
+        return Err(ConfigError::GateEndpointIpv6);
+    }
+    if section.hostnames.is_empty() {
+        return Err(ConfigError::MissingGateHostnames);
+    }
+    if section.hostnames.len() > MAX_HOSTNAMES {
+        return Err(ConfigError::TooManyGateHostnames);
+    }
+    let mut hostnames: Vec<String> = Vec::with_capacity(section.hostnames.len());
+    for (index, name) in section.hostnames.iter().enumerate() {
+        let name = normalize_dns_name(name).ok_or(ConfigError::InvalidGateHostname(index))?;
+        if hostnames.contains(&name) {
+            return Err(ConfigError::DuplicateGateHostname(index));
+        }
+        hostnames.push(name);
+    }
+    let trusted_proxies = section
+        .trusted_proxies
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            text.parse::<IpNet>()
+                .map_err(|_| ConfigError::InvalidTrustedProxy(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((index, problem)) = trusted_proxies
+        .iter()
+        .enumerate()
+        .find_map(|(index, network)| trusted_proxy_problem(network).map(|problem| (index, problem)))
+    {
+        return Err(ConfigError::UnusableTrustedProxy { index, problem });
+    }
+    match (section.proxy_protocol, trusted_proxies.is_empty()) {
+        (true, true) => return Err(ConfigError::MissingTrustedProxies),
+        (false, false) => return Err(ConfigError::TrustedProxiesWithoutProxyProtocol),
+        (true, false) | (false, true) => {}
+    }
+    if normalize_dns_name(endpoint.host()).is_none_or(|host| !hostnames.contains(&host)) {
+        return Err(ConfigError::GateEndpointNotInHostnames);
+    }
+    if !(1..=MAX_UNAUTHENTICATED_LIMIT).contains(&section.max_unauthenticated) {
+        return Err(ConfigError::GateUnauthenticatedOutOfRange);
+    }
+    if section.write_stall_secs > MAX_WRITE_STALL_SECS {
+        return Err(ConfigError::WriteStallOutOfRange);
+    }
+    Ok(GateSshSettings {
+        listen: section.listen,
+        hostnames,
+        proxy_protocol: section.proxy_protocol,
+        trusted_proxies,
+        max_unauthenticated: section.max_unauthenticated,
+        write_stall: (section.write_stall_secs > 0)
+            .then(|| Duration::from_secs(section.write_stall_secs)),
+    })
+}
+
+fn listeners_collide(first: SocketAddr, second: SocketAddr) -> bool {
+    first.port() == second.port()
+        && (first.ip() == second.ip()
+            || first.ip().is_unspecified()
+            || second.ip().is_unspecified())
 }
 
 fn validate_public_url(text: &str) -> Result<String, ConfigError> {
@@ -325,7 +493,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use jaunt_gate::TrustedProxyProblem;
     use jauntd::agents::AgentsSettings;
+    use jauntd::gate_ssh::GateSshSettings;
 
     use super::{CLIENT_SECRET_VAR, Config, ConfigError, load};
 
@@ -594,6 +764,219 @@ cert_ttl_secs: {SECRET}
                 "{invalid:?}"
             );
         }
+    }
+
+    fn gate_with(endpoint: &str, section: &str) -> Result<Option<GateSshSettings>, ConfigError> {
+        parse(&format!("{endpoint}ssh_gate:\n{section}"))
+            .into_run_settings(&secret_env)
+            .map(|settings| settings.ssh_gate)
+    }
+
+    fn gate(section: &str) -> Result<Option<GateSshSettings>, ConfigError> {
+        gate_with("gate_endpoint: Gate.Example.com:2222\n", section)
+    }
+
+    #[test]
+    fn the_ssh_gate_is_off_by_default_and_takes_its_defaults() {
+        let absent = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(absent.ssh_gate, None);
+        let settings =
+            gate("  listen: 0.0.0.0:2222\n  hostnames: [Gate.Example.com., gate2.example.com]\n")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            settings,
+            GateSshSettings {
+                listen: "0.0.0.0:2222".parse().unwrap(),
+                hostnames: vec![
+                    "gate.example.com".to_owned(),
+                    "gate2.example.com".to_owned()
+                ],
+                proxy_protocol: false,
+                trusted_proxies: Vec::new(),
+                max_unauthenticated: 512,
+                write_stall: Some(Duration::from_secs(900)),
+            }
+        );
+        let tuned = gate(
+            "  listen: 127.0.0.1:2200\n  hostnames: [gate.example.com]\n  proxy_protocol: true\n  \
+             trusted_proxies: [10.0.0.0/8, \"2001:db8::/32\"]\n  max_unauthenticated: 64\n  \
+             write_stall_secs: 0\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(tuned.proxy_protocol);
+        assert_eq!(tuned.trusted_proxies.len(), 2);
+        assert_eq!(tuned.max_unauthenticated, 64);
+        assert_eq!(tuned.write_stall, None);
+    }
+
+    #[test]
+    fn the_ssh_gate_section_is_strict() {
+        for section in [
+            "  hostnames: [gate.example.com]\n",
+            "  listen: 0.0.0.0:2222\n",
+            "  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com]\n  extra: 1\n",
+            "  listen: gate.example.com:2222\n  hostnames: [gate.example.com]\n",
+            "  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com]\n  proxy_protocol: maybe\n",
+        ] {
+            let text = format!("data_dir: /d\nssh_gate:\n{section}");
+            assert!(
+                serde_saphyr::from_str::<Config>(&text).is_err(),
+                "{section:?}"
+            );
+        }
+        type Expected = fn(&ConfigError) -> bool;
+        let listen = "  listen: 0.0.0.0:2222\n";
+        let many = (0..=64)
+            .map(|index| format!("g{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cases: Vec<(String, Expected)> = vec![
+            (format!("{listen}  hostnames: [{many}]\n"), |error| {
+                matches!(error, ConfigError::TooManyGateHostnames)
+            }),
+            (
+                format!("{listen}  hostnames: [other.example.com]\n"),
+                |error| matches!(error, ConfigError::GateEndpointNotInHostnames),
+            ),
+            (
+                "  listen: 127.0.0.1:8443\n  hostnames: [gate.example.com]\n".to_owned(),
+                |error| matches!(error, ConfigError::GateListenCollision),
+            ),
+            (
+                "  listen: 0.0.0.0:8444\n  hostnames: [gate.example.com]\n".to_owned(),
+                |error| matches!(error, ConfigError::GateListenCollision),
+            ),
+            (
+                "  listen: 127.0.0.1:8444\n  hostnames: [gate.example.com]\n".to_owned(),
+                |error| matches!(error, ConfigError::GateListenCollision),
+            ),
+            (
+                format!(
+                    "{listen}  hostnames: [gate.example.com]\n  trusted_proxies: [10.0.0.0/8]\n"
+                ),
+                |error| matches!(error, ConfigError::TrustedProxiesWithoutProxyProtocol),
+            ),
+            (
+                format!(
+                    "{listen}  hostnames: [gate.example.com]\n  proxy_protocol: true\n  \
+                     trusted_proxies: [10.0.0.0/8, \"::ffff:10.0.0.0/104\"]\n"
+                ),
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableTrustedProxy {
+                            index: 1,
+                            problem: TrustedProxyProblem::Ipv4Mapped
+                        }
+                    ) && error.to_string().contains("IPv4 form")
+                },
+            ),
+            (
+                format!(
+                    "{listen}  hostnames: [gate.example.com]\n  proxy_protocol: true\n  \
+                     trusted_proxies: [0.0.0.0/0]\n"
+                ),
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableTrustedProxy {
+                            index: 0,
+                            problem: TrustedProxyProblem::Everything
+                        }
+                    )
+                },
+            ),
+            (
+                format!(
+                    "{listen}  hostnames: [gate.example.com]\n  proxy_protocol: true\n  \
+                     trusted_proxies: [10.0.0.0/8, 128.0.0.0/1]\n"
+                ),
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableTrustedProxy {
+                            index: 1,
+                            problem: TrustedProxyProblem::TooWide
+                        }
+                    ) && error.to_string().contains("too wide")
+                },
+            ),
+            (format!("{listen}  hostnames: []\n"), |error| {
+                matches!(error, ConfigError::MissingGateHostnames)
+            }),
+            (format!("{listen}  hostnames: [\"bad host\"]\n"), |error| {
+                matches!(error, ConfigError::InvalidGateHostname(0))
+            }),
+            (
+                format!("{listen}  hostnames: [gate.example.com, \"*.example.com\"]\n"),
+                |error| matches!(error, ConfigError::InvalidGateHostname(1)),
+            ),
+            (
+                format!("{listen}  hostnames: [gate.example.com, GATE.example.com]\n"),
+                |error| matches!(error, ConfigError::DuplicateGateHostname(1)),
+            ),
+            (
+                format!("{listen}  hostnames: [gate.example.com]\n  trusted_proxies: [10.0.0.1]\n"),
+                |error| matches!(error, ConfigError::InvalidTrustedProxy(0)),
+            ),
+            (
+                format!(
+                    "{listen}  hostnames: [gate.example.com]\n  trusted_proxies: [10.0.0.0/33]\n"
+                ),
+                |error| matches!(error, ConfigError::InvalidTrustedProxy(0)),
+            ),
+            (
+                format!("{listen}  hostnames: [gate.example.com]\n  proxy_protocol: true\n"),
+                |error| matches!(error, ConfigError::MissingTrustedProxies),
+            ),
+            (
+                format!("{listen}  hostnames: [gate.example.com]\n  max_unauthenticated: 0\n"),
+                |error| matches!(error, ConfigError::GateUnauthenticatedOutOfRange),
+            ),
+            (
+                format!("{listen}  hostnames: [gate.example.com]\n  write_stall_secs: 86401\n"),
+                |error| matches!(error, ConfigError::WriteStallOutOfRange),
+            ),
+        ];
+        for (section, expected) in cases {
+            let error = gate(&section).expect_err("the section must be refused");
+            assert!(expected(&error), "{section:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_ssh_gate_needs_a_dns_gate_endpoint() {
+        let section = "  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com]\n";
+        let missing = gate_with("", section).expect_err("the gate needs an endpoint");
+        assert!(
+            matches!(missing, ConfigError::GateWithoutEndpoint),
+            "{missing}"
+        );
+        let literal = gate_with("gate_endpoint: \"[2001:db8::1]:2222\"\n", section)
+            .expect_err("an ipv6 endpoint cannot be a principal");
+        assert!(
+            matches!(literal, ConfigError::GateEndpointIpv6),
+            "{literal}"
+        );
+        let address = gate_with(
+            "gate_endpoint: 192.0.2.10\n",
+            "  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com, 192.0.2.10]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(address.hostnames, ["gate.example.com", "192.0.2.10"]);
+    }
+
+    #[test]
+    fn the_ssh_gate_needs_the_agents_listener() {
+        let config = parse(
+            "agents_listen: \"\"\ngate_endpoint: gate.example.com\nssh_gate:\n  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com]\n",
+        );
+        let error = config.into_run_settings(&secret_env).err().unwrap();
+        assert!(matches!(error, ConfigError::GateWithoutAgents), "{error}");
+        assert!(error.to_string().contains("agents_listen"));
     }
 
     #[test]

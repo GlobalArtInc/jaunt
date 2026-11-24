@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, agent_client_config};
+use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, TunnelOptions, agent_client_config};
 use rustls::HandshakeKind;
 use rustls::client::ResolvesClientCert;
 use rustls::sign::CertifiedKey;
@@ -376,6 +376,51 @@ async fn peers_stuck_in_authentication_keep_their_handshake_slots() {
     .await;
     assert_eq!(gate.gate.handshaking(), CAP);
     assert_eq!(gate.stats.snapshot().auth_rejections, 0);
+    gate.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authenticated_peer_silent_on_http2_keeps_its_slot_only_until_the_handshake_deadline() {
+    const H2_PREFACE: usize = 24;
+    let pki = Pki::new("ca");
+    let leaf = pki.client_leaf("node-a");
+    let auth = MapAuthenticator::new();
+    auth.allow(&leaf, "node-a");
+    let options = GateOptions {
+        handshake_timeout: Duration::from_secs(3),
+        max_handshaking: 1,
+        tunnel: TunnelOptions {
+            handshake_timeout: Duration::from_secs(120),
+            hello_timeout: Duration::from_secs(120),
+            ..TunnelOptions::default()
+        },
+    };
+    let gate = TestGate::start(&pki, auth, options).await;
+    let config = raw_client_config(pki.roots(), Some(&leaf), &[&TLS13], &[ALPN_TUNNEL]);
+    let started = Instant::now();
+    let mut silent = tls_connect(gate.addr, config, dns_name(AGENT_SNI))
+        .await
+        .unwrap();
+    let mut preface = [0_u8; H2_PREFACE];
+    soon("the gate to start http/2", silent.read_exact(&mut preface))
+        .await
+        .unwrap();
+    assert!(preface.starts_with(b"PRI * HTTP/2.0"));
+    let mut extra = TcpStream::connect(gate.addr).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = soon("the busy refusal", extra.read(&mut byte)).await;
+    assert!(!matches!(read, Ok(count) if count > 0));
+    assert_eq!(gate.stats.snapshot().refused_busy, 1);
+    eventually("the slot to be released at the handshake deadline", || {
+        gate.gate.handshaking() == 0
+    })
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(60));
+    eventually("the setup failure to be counted", || {
+        gate.stats.snapshot().tunnel_setup_failures == 1
+    })
+    .await;
+    assert!(gate.registry.connected_nodes().is_empty());
     gate.stop().await;
 }
 

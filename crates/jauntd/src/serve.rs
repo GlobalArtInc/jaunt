@@ -3,11 +3,18 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use jaunt_ca::{Signer, TrustSet};
 use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, system_clock};
+use jaunt_gate::HostCertIssuer;
 use jaunt_oidc::{OidcClient, OidcError};
 use jaunt_policy::Watcher;
+use jaunt_proto::ControlPlane;
+use jaunt_ssh::{UserCaKeys, UserCaSource};
 use jaunt_store::{Store, StoreError};
 use jauntd::agents::{AgentServer, AgentServerParts, AgentsError, AgentsSettings, SHUTDOWN_GRACE};
+use jauntd::gate_ssh::{
+    GateSshError, GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer,
+};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -57,6 +64,10 @@ pub enum ServeError {
     },
     #[error(transparent)]
     Agents(#[from] AgentsError),
+    #[error("cannot read the user certificate authority keys for the ssh gate: {0}")]
+    GateTrust(String),
+    #[error(transparent)]
+    Gate(#[from] GateSshError),
 }
 
 pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
@@ -78,6 +89,14 @@ struct Started {
     listen: SocketAddr,
     store: Store,
     agents: Option<AgentsSettings>,
+    gate: Option<GatePlan>,
+}
+
+struct GatePlan {
+    settings: GateSshSettings,
+    ssh_suffix: String,
+    issuer: Arc<dyn HostCertIssuer>,
+    user_cas: Arc<UserCaSource>,
 }
 
 async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), ServeError> {
@@ -90,6 +109,7 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         listen,
         store,
         agents,
+        gate,
     } = start(settings, authorities).await?;
     let listener = match bind(listen).await {
         Ok(listener) => listener,
@@ -105,6 +125,16 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
             return Err(err);
         }
     };
+    let gate = match start_gate(gate, agents.as_ref(), &control).await {
+        Ok(gate) => gate,
+        Err(err) => {
+            if let Some(agents) = agents {
+                agents.shutdown(SHUTDOWN_GRACE).await;
+            }
+            policy::stop_watcher(watcher).await;
+            return Err(err);
+        }
+    };
 
     let (deadline_tx, mut deadline_rx) = watch::channel(None);
     let shutdown = async move {
@@ -115,6 +145,10 @@ async fn serve(settings: RunSettings, authorities: Authorities) -> Result<(), Se
         tracing::info!(target: "jaunt::daemon", "shutting down");
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         deadline_tx.send_replace(Some(deadline));
+        if let Some(gate) = gate {
+            gate.shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
         if let Some(agents) = agents {
             agents
                 .shutdown(deadline.saturating_duration_since(Instant::now()))
@@ -163,6 +197,60 @@ async fn start_agents(
     Ok(Some(server))
 }
 
+async fn start_gate(
+    plan: Option<GatePlan>,
+    agents: Option<&AgentServer>,
+    control: &Control,
+) -> Result<Option<GateSshServer>, ServeError> {
+    let Some(plan) = plan else {
+        tracing::info!(target: "jaunt::daemon", "the ssh gate is disabled");
+        return Ok(None);
+    };
+    let Some(agents) = agents else {
+        return Err(ServeError::Settings(ConfigError::GateWithoutAgents));
+    };
+    let control: Arc<dyn ControlPlane> = Arc::new(control.clone());
+    let server = GateSshServer::start(GateSshParts {
+        settings: plan.settings,
+        ssh_suffix: plan.ssh_suffix,
+        issuer: plan.issuer,
+        user_cas: plan.user_cas,
+        control,
+        registry: agents.registry().clone(),
+    })
+    .await?;
+    tracing::info!(
+        target: "jaunt::daemon",
+        listen = %server.local_addr(),
+        "serving ssh"
+    );
+    Ok(Some(server))
+}
+
+fn gate_plan(
+    settings: GateSshSettings,
+    ssh_suffix: &str,
+    user_trust: &TrustSet,
+    host_authority: &Arc<dyn Signer>,
+    store: &Store,
+) -> Result<GatePlan, ServeError> {
+    let lines = user_trust
+        .to_authorized_lines()
+        .map_err(|err| ServeError::GateTrust(err.to_string()))?;
+    let keys = UserCaKeys::from_openssh_lines(lines)
+        .map_err(|err| ServeError::GateTrust(err.to_string()))?;
+    Ok(GatePlan {
+        settings,
+        ssh_suffix: ssh_suffix.to_owned(),
+        issuer: Arc::new(HostAuthorityIssuer::new(
+            Arc::clone(host_authority),
+            store.clone(),
+            system_clock(),
+        )),
+        user_cas: Arc::new(UserCaSource::new(keys)),
+    })
+}
+
 async fn start(settings: RunSettings, authorities: Authorities) -> Result<Started, ServeError> {
     let policy = policy::load_at_startup(&settings.policy_dir)?;
 
@@ -182,13 +270,26 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         .await
         .map_err(ServeError::Oidc)?;
     let agents_store = store.clone();
+    let host_authority: Arc<dyn Signer> = Arc::new(authorities.host);
+    let gate = settings
+        .ssh_gate
+        .map(|gate| {
+            gate_plan(
+                gate,
+                settings.ssh_suffix.as_str(),
+                &authorities.user_trust,
+                &host_authority,
+                &store,
+            )
+        })
+        .transpose()?;
     let control = Control::new(ControlParts {
         store,
         oidc,
         user_authority: Arc::new(authorities.user),
         user_trust: authorities.user_trust,
         host_trust: authorities.host_trust,
-        host_authority: Arc::new(authorities.host),
+        host_authority,
         internal_ca: authorities.internal,
         ssh_suffix: settings.ssh_suffix,
         gate_endpoint: settings.gate_endpoint,
@@ -207,6 +308,7 @@ async fn start(settings: RunSettings, authorities: Authorities) -> Result<Starte
         listen: settings.listen,
         store: agents_store,
         agents: settings.agents,
+        gate,
     })
 }
 

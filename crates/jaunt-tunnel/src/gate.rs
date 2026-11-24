@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
@@ -147,6 +147,7 @@ impl Gate {
                 return;
             }
         };
+        let deadline = permit.deadline();
         match accepted {
             Accepted::Main(stream) => {
                 self.stats().record_main_handed_over();
@@ -154,7 +155,7 @@ impl Gate {
             }
             Accepted::AgentApi(peer) => {
                 let PeerStream { stream, peer_cert } = peer;
-                match self.authenticate(&peer_cert).await {
+                match self.authenticate(&peer_cert, deadline).await {
                     Ok(node) => {
                         self.stats().record_agent_api_handed_over();
                         self.handover.agent_api(AgentApiConnection {
@@ -172,8 +173,11 @@ impl Gate {
             }
             Accepted::Tunnel(peer) => {
                 let PeerStream { stream, peer_cert } = peer;
-                match self.authenticate(&peer_cert).await {
-                    Ok(node) => self.establish_tunnel(node, stream, peer_addr, &token).await,
+                match self.authenticate(&peer_cert, deadline).await {
+                    Ok(node) => {
+                        self.establish_tunnel(node, stream, peer_addr, &token, deadline)
+                            .await;
+                    }
                     Err(rejection) => {
                         self.observe_rejection(peer_addr, &rejection);
                         close_rejected(stream).await;
@@ -190,9 +194,13 @@ impl Gate {
         }
     }
 
-    async fn authenticate(&self, peer_cert: &CertificateDer<'static>) -> Result<NodeId, Rejection> {
-        let decision = timeout(
-            self.acceptor.handshake_timeout(),
+    async fn authenticate(
+        &self,
+        peer_cert: &CertificateDer<'static>,
+        deadline: Instant,
+    ) -> Result<NodeId, Rejection> {
+        let decision = timeout_at(
+            deadline,
             self.authenticator.authenticate(peer_cert.as_ref()),
         )
         .await;
@@ -211,9 +219,14 @@ impl Gate {
         stream: TlsStream<TcpStream>,
         peer_addr: SocketAddr,
         token: &CancellationToken,
+        deadline: Instant,
     ) {
-        let established = TunnelConnection::establish(stream, &self.options, token).await;
-        let Ok(connection) = established else {
+        let established = timeout_at(
+            deadline,
+            TunnelConnection::establish(stream, &self.options, token),
+        )
+        .await;
+        let Ok(Ok(connection)) = established else {
             self.stats().record_tunnel_setup_failure();
             return;
         };
@@ -231,4 +244,68 @@ impl Gate {
 
 async fn close_rejected(mut stream: TlsStream<TcpStream>) {
     drop(timeout(REJECT_CLOSE_TIMEOUT, stream.shutdown()).await);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rustls::pki_types::CertificateDer;
+    use tokio::time::Instant;
+
+    use super::{AgentApiConnection, Gate, Handover, MainConnection};
+    use crate::options::TunnelOptions;
+    use crate::proto::NodeId;
+    use crate::registry::AgentRegistry;
+    use crate::stats::GateStats;
+    use crate::tls::{AcceptorConfig, GateAcceptor, refusing_server_config};
+    use crate::{BoxFuture, PeerAuthenticator, RejectReason, Rejection};
+
+    struct Hanging;
+
+    impl PeerAuthenticator for Hanging {
+        fn authenticate<'a>(
+            &'a self,
+            _peer_cert_der: &'a [u8],
+        ) -> BoxFuture<'a, Result<NodeId, Rejection>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct Nobody;
+
+    impl Handover for Nobody {
+        fn main(&self, _connection: MainConnection) {}
+
+        fn agent_api(&self, _connection: AgentApiConnection) {}
+    }
+
+    #[tokio::test]
+    async fn authentication_gets_only_what_is_left_of_the_handshake_deadline() {
+        let refusing = Arc::new(refusing_server_config().unwrap());
+        let mut config = AcceptorConfig::new(Vec::new(), refusing.clone(), refusing);
+        config.handshake_timeout = Duration::from_secs(3600);
+        let acceptor = GateAcceptor::new(config, Arc::new(GateStats::default())).unwrap();
+        let gate = Gate::new(
+            acceptor,
+            AgentRegistry::new(),
+            Arc::new(Hanging),
+            Arc::new(Nobody),
+            TunnelOptions::default(),
+        )
+        .unwrap();
+        let certificate = CertificateDer::from(vec![1_u8]);
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            gate.authenticate(&certificate, Instant::now()),
+        )
+        .await
+        .expect("authentication outlived the handshake deadline");
+        assert_eq!(
+            refused.err().map(|rejection| rejection.reason),
+            Some(RejectReason::Timeout)
+        );
+        assert_eq!(gate.stats().snapshot().auth_rejections, 1);
+    }
 }

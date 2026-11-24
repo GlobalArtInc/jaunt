@@ -8,10 +8,10 @@ use bytes::Bytes;
 use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, Response, StatusCode};
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use rustls::{AlertDescription, ClientConfig};
 use thiserror::Error;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
@@ -60,10 +60,74 @@ pub enum ClientError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFailure {
     Timeout,
+    Dns(io::ErrorKind),
     Tcp(io::ErrorKind),
     Tls(io::ErrorKind),
+    ServerCertificate,
+    CertificateRefused,
     UnexpectedProtocol,
     Http2,
+}
+
+impl ConnectFailure {
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Dns(_) => "dns",
+            Self::Tcp(_) => "tcp",
+            Self::Tls(_) | Self::UnexpectedProtocol => "tls",
+            Self::ServerCertificate | Self::CertificateRefused => "auth",
+            Self::Http2 => "h2",
+        }
+    }
+
+    fn from_tls(error: &io::Error) -> Self {
+        match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        {
+            Some(rustls::Error::InvalidCertificate(_)) => Self::ServerCertificate,
+            Some(rustls::Error::AlertReceived(alert)) if refuses_our_certificate(*alert) => {
+                Self::CertificateRefused
+            }
+            _ => Self::Tls(error.kind()),
+        }
+    }
+
+    fn from_http2(io_error: Option<&io::Error>) -> Self {
+        match io_error.map(Self::from_tls) {
+            Some(Self::CertificateRefused) => Self::CertificateRefused,
+            _ => Self::Http2,
+        }
+    }
+}
+
+fn refuses_our_certificate(alert: AlertDescription) -> bool {
+    matches!(
+        alert,
+        AlertDescription::BadCertificate
+            | AlertDescription::UnsupportedCertificate
+            | AlertDescription::CertificateRevoked
+            | AlertDescription::CertificateExpired
+            | AlertDescription::CertificateUnknown
+            | AlertDescription::UnknownCA
+            | AlertDescription::AccessDenied
+            | AlertDescription::CertificateRequired
+    )
+}
+
+async fn dial(server_addr: &str) -> Result<TcpStream, ConnectFailure> {
+    let addresses = lookup_host(server_addr)
+        .await
+        .map_err(|error| ConnectFailure::Dns(error.kind()))?;
+    let mut failure = ConnectFailure::Dns(io::ErrorKind::NotFound);
+    for address in addresses {
+        match TcpStream::connect(address).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(error) => failure = ConnectFailure::Tcp(error.kind()),
+        }
+    }
+    Err(failure)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,16 +257,15 @@ impl Context {
 
     async fn connect(&self) -> Result<Connection, ConnectFailure> {
         let limit = self.options.handshake_timeout;
-        let tcp = timeout(limit, TcpStream::connect(self.server_addr.as_str()))
+        let tcp = timeout(limit, dial(&self.server_addr))
             .await
-            .map_err(|_| ConnectFailure::Timeout)?
-            .map_err(|error| ConnectFailure::Tcp(error.kind()))?;
+            .map_err(|_| ConnectFailure::Timeout)??;
         tcp.set_nodelay(true)
             .map_err(|error| ConnectFailure::Tcp(error.kind()))?;
         let tls = timeout(limit, self.connector.connect(self.server_name.clone(), tcp))
             .await
             .map_err(|_| ConnectFailure::Timeout)?
-            .map_err(|error| ConnectFailure::Tls(error.kind()))?;
+            .map_err(|error| ConnectFailure::from_tls(&error))?;
         if tls.get_ref().1.alpn_protocol() != Some(ALPN_TUNNEL) {
             return Err(ConnectFailure::UnexpectedProtocol);
         }
@@ -215,7 +278,7 @@ impl Context {
         timeout(limit, builder.handshake::<_, Bytes>(tls))
             .await
             .map_err(|_| ConnectFailure::Timeout)?
-            .map_err(|_| ConnectFailure::Http2)
+            .map_err(|error| ConnectFailure::from_http2(error.get_io()))
     }
 
     async fn serve_connection(&self, mut connection: Connection, shutdown: &CancellationToken) {
@@ -356,7 +419,85 @@ async fn control_loop(
 
 #[cfg(test)]
 mod tests {
+    use rustls::CertificateError;
+
     use super::*;
+
+    #[test]
+    fn connect_failures_name_their_cause_and_carry_no_details() {
+        let tls = |inner: rustls::Error| {
+            ConnectFailure::from_tls(&io::Error::new(io::ErrorKind::InvalidData, inner))
+        };
+        let cases = [
+            (
+                ConnectFailure::Dns(io::ErrorKind::NotFound),
+                ConnectFailure::Dns(io::ErrorKind::NotFound),
+                "dns",
+            ),
+            (
+                ConnectFailure::Tcp(io::ErrorKind::ConnectionRefused),
+                ConnectFailure::Tcp(io::ErrorKind::ConnectionRefused),
+                "tcp",
+            ),
+            (
+                ConnectFailure::from_tls(&io::Error::from(io::ErrorKind::ConnectionReset)),
+                ConnectFailure::Tls(io::ErrorKind::ConnectionReset),
+                "tls",
+            ),
+            (
+                tls(rustls::Error::AlertReceived(
+                    AlertDescription::HandshakeFailure,
+                )),
+                ConnectFailure::Tls(io::ErrorKind::InvalidData),
+                "tls",
+            ),
+            (
+                tls(rustls::Error::InvalidCertificate(
+                    CertificateError::UnknownIssuer,
+                )),
+                ConnectFailure::ServerCertificate,
+                "auth",
+            ),
+            (
+                tls(rustls::Error::AlertReceived(
+                    AlertDescription::CertificateRequired,
+                )),
+                ConnectFailure::CertificateRefused,
+                "auth",
+            ),
+            (
+                tls(rustls::Error::AlertReceived(AlertDescription::UnknownCA)),
+                ConnectFailure::CertificateRefused,
+                "auth",
+            ),
+            (
+                ConnectFailure::UnexpectedProtocol,
+                ConnectFailure::UnexpectedProtocol,
+                "tls",
+            ),
+            (ConnectFailure::Http2, ConnectFailure::Http2, "h2"),
+            (ConnectFailure::Timeout, ConnectFailure::Timeout, "timeout"),
+        ];
+        for (failure, expected, cause) in cases {
+            assert_eq!(failure, expected);
+            assert_eq!(failure.cause(), cause, "{failure:?}");
+            assert!(!format!("{failure:?}").contains("Issuer"), "{failure:?}");
+        }
+        let refused = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(AlertDescription::BadCertificate),
+        );
+        assert_eq!(
+            ConnectFailure::from_http2(Some(&refused)),
+            ConnectFailure::CertificateRefused
+        );
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            ConnectFailure::from_http2(Some(&reset)),
+            ConnectFailure::Http2
+        );
+        assert_eq!(ConnectFailure::from_http2(None), ConnectFailure::Http2);
+    }
 
     #[test]
     fn a_cancelled_shutdown_is_graceful_whichever_branch_ended_the_loop() {

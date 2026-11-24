@@ -283,6 +283,15 @@ impl TestAgent {
 }
 
 pub fn spawn_agent(addr: SocketAddr, pki: &Pki, leaf: &Leaf) -> TestAgent {
+    spawn_agent_with(addr, pki, leaf, Arc::new(Idle))
+}
+
+pub fn spawn_agent_with(
+    addr: SocketAddr,
+    pki: &Pki,
+    leaf: &Leaf,
+    handler: Arc<dyn StreamHandler>,
+) -> TestAgent {
     let tls = agent_client_config(pki.roots(), leaf.chain.clone(), leaf.key()).unwrap();
     let mut config =
         TunnelClientConfig::new(Arc::new(tls), addr.to_string(), AGENT_SNI, "test-agent/1");
@@ -294,9 +303,7 @@ pub fn spawn_agent(addr: SocketAddr, pki: &Pki, leaf: &Leaf) -> TestAgent {
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
     let join = tokio::spawn(async move {
-        TunnelClient::run(config, Arc::new(Idle), token)
-            .await
-            .unwrap();
+        TunnelClient::run(config, handler, token).await.unwrap();
     });
     TestAgent { shutdown, join }
 }

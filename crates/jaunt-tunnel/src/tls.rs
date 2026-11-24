@@ -321,6 +321,13 @@ impl AcceptorConfig {
 #[derive(Debug)]
 pub struct HandshakePermit {
     _permit: OwnedSemaphorePermit,
+    deadline: Instant,
+}
+
+impl HandshakePermit {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
 }
 
 pub struct PeerStream<IO> {
@@ -385,7 +392,13 @@ impl GateAcceptor {
         };
         let deadline = Instant::now() + self.handshake_timeout;
         match self.handshake(io, deadline).await {
-            Ok(accepted) => Ok((accepted, HandshakePermit { _permit: permit })),
+            Ok(accepted) => Ok((
+                accepted,
+                HandshakePermit {
+                    _permit: permit,
+                    deadline,
+                },
+            )),
             Err(error) => {
                 match &error {
                     AcceptError::Timeout => self.stats.record_handshake_timeout(),

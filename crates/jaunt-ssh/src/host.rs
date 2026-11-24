@@ -83,6 +83,14 @@ impl HostIdentity {
         HostKey::from_private(key)?.with_certificate(certificate, now_unix)
     }
 
+    pub fn valid_after(&self) -> u64 {
+        self.certificate.valid_after()
+    }
+
+    pub fn valid_before(&self) -> u64 {
+        self.certificate.valid_before()
+    }
+
     pub(crate) fn into_parts(self) -> (PrivateKey, Certificate) {
         (self.key, self.certificate)
     }
@@ -218,6 +226,10 @@ mod tests {
         let identity = host
             .with_certificate(&cert.to_openssh().unwrap(), NOW)
             .unwrap();
+        assert_eq!(
+            (identity.valid_after(), identity.valid_before()),
+            (AFTER, BEFORE)
+        );
         let (_, certificate) = identity.into_parts();
         assert_eq!(certificate, cert);
     }

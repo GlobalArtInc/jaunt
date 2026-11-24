@@ -12,7 +12,9 @@ use jaunt_ca::CaError;
 use jaunt_control::{Clock, Control};
 use jaunt_gate::{AgentHub, AgentHubConfig, HubError, HubStatsSnapshot, ShutdownReport};
 use jaunt_store::Store;
-use jaunt_tunnel::{AgentRegistry, GateStats, TlsConfigError, rotating_agent_server_config};
+use jaunt_tunnel::{
+    AgentRegistry, GateStats, TlsConfigError, TunnelOptions, rotating_agent_server_config,
+};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
@@ -31,6 +33,8 @@ pub const DEFAULT_AGENTS_LISTEN: SocketAddr =
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub const SSH_STREAM_WINDOW: u32 = 1024 * 1024;
+pub const SSH_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 const _: () = assert!(RECONCILE_INTERVAL.as_secs() <= 5);
 
@@ -48,6 +52,15 @@ pub struct AgentServerParts {
     pub reconcile_interval: Duration,
     pub certificate_check_interval: Duration,
     pub api_limits: ApiLimits,
+    pub tunnel: TunnelOptions,
+}
+
+pub fn ssh_tunnel_options() -> TunnelOptions {
+    TunnelOptions {
+        stream_window: SSH_STREAM_WINDOW,
+        connection_window: SSH_CONNECTION_WINDOW,
+        ..TunnelOptions::default()
+    }
 }
 
 impl AgentServerParts {
@@ -60,6 +73,7 @@ impl AgentServerParts {
             reconcile_interval: RECONCILE_INTERVAL,
             certificate_check_interval: CERTIFICATE_CHECK_INTERVAL,
             api_limits: ApiLimits::default(),
+            tunnel: ssh_tunnel_options(),
         }
     }
 }
@@ -101,6 +115,7 @@ impl AgentServer {
             reconcile_interval,
             certificate_check_interval,
             api_limits,
+            tunnel,
         } = parts;
         let certificate = Arc::new(ServerCertificate::issue(
             control.clone(),
@@ -119,9 +134,11 @@ impl AgentServer {
                     addr: settings.listen,
                     source,
                 })?;
+        let mut hub_config = AgentHubConfig::new(settings.server_name, Arc::new(tls));
+        hub_config.tunnel = tunnel;
         let hub = AgentHub::start(
             listener,
-            AgentHubConfig::new(settings.server_name, Arc::new(tls)),
+            hub_config,
             Arc::new(NodeAuthenticator::new(store.nodes())),
             Arc::new(AgentApi::new(control.agent_router(), api_limits)),
         )?;
@@ -183,5 +200,29 @@ impl AgentServer {
             }
         }
         hub.shutdown(grace).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jaunt_tunnel::TunnelOptions;
+
+    use super::{SSH_CONNECTION_WINDOW, SSH_STREAM_WINDOW, ssh_tunnel_options};
+
+    #[test]
+    fn the_agents_tunnel_uses_the_ssh_windows() {
+        let options = ssh_tunnel_options();
+        assert_eq!(options.stream_window, 1024 * 1024);
+        assert_eq!(options.connection_window, 16 * 1024 * 1024);
+        assert_eq!(SSH_CONNECTION_WINDOW / SSH_STREAM_WINDOW, 16);
+        assert_eq!(
+            TunnelOptions {
+                stream_window: TunnelOptions::default().stream_window,
+                connection_window: TunnelOptions::default().connection_window,
+                ..options.clone()
+            },
+            TunnelOptions::default()
+        );
+        assert_eq!(options.validate(), Ok(()));
     }
 }
