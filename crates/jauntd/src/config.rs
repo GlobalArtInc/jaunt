@@ -7,8 +7,8 @@ use std::time::Duration;
 use ipnet::IpNet;
 use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
 use jaunt_gate::{
-    DEFAULT_MAX_UNAUTHENTICATED, MAX_HOSTNAMES, MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem,
-    normalize_dns_name, trusted_proxy_problem,
+    DEFAULT_MAX_UNAUTHENTICATED, DEFAULT_SSH_CLIENT_LIMITS, MAX_HOSTNAMES,
+    MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem, normalize_dns_name, trusted_proxy_problem,
 };
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use jauntd::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::audit::{AuditConfigError, AuditSection, AuditSettings};
+use crate::limits::{LimitSettings, LimitsError, LimitsSection};
 
 pub const CLIENT_SECRET_VAR: &str = "JAUNT_OIDC_CLIENT_SECRET";
 
@@ -50,6 +51,8 @@ pub struct Config {
     #[serde(default = "default_web")]
     pub web: bool,
     pub client_ip_header: Option<String>,
+    #[serde(default)]
+    pub client_ip_trusted_proxies: Vec<String>,
     pub ssh_suffix: Option<String>,
     pub agent_endpoint: Option<String>,
     pub policy_dir: Option<PathBuf>,
@@ -60,6 +63,8 @@ pub struct Config {
     pub oidc: Option<OidcSection>,
     #[serde(default)]
     pub audit: AuditSection,
+    #[serde(default)]
+    pub limits: LimitsSection,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +110,7 @@ pub struct RunSettings {
     pub ssh_gate: Option<GateSshSettings>,
     pub oidc: OidcConfig,
     pub audit: AuditSettings,
+    pub limits: LimitSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +127,22 @@ pub enum ConfigError {
     PolicyPollOutOfRange,
     #[error("client_ip_header must be a header name of letters, digits and hyphens")]
     InvalidClientIpHeader,
+    #[error(
+        "client_ip_header needs client_ip_trusted_proxies: the header is believed only from those \
+         networks"
+    )]
+    ClientIpHeaderWithoutTrustedProxies,
+    #[error("client_ip_trusted_proxies is set but client_ip_header is not")]
+    ClientIpTrustedProxiesWithoutHeader,
+    #[error("client_ip_trusted_proxies[{0}] is not a cidr block such as 10.0.0.0/8")]
+    InvalidClientIpTrustedProxy(usize),
+    #[error("client_ip_trusted_proxies[{index}]: {problem}")]
+    UnusableClientIpTrustedProxy {
+        index: usize,
+        problem: TrustedProxyProblem,
+    },
+    #[error(transparent)]
+    Limits(#[from] LimitsError),
     #[error("ssh_suffix is required to run the daemon")]
     MissingSshSuffix,
     #[error("ssh_suffix: {0}")]
@@ -252,6 +274,15 @@ impl Config {
             .client_ip_header
             .map(|name| validate_header_name(&name))
             .transpose()?;
+        let client_ip_trusted_proxies = client_ip_proxies(&self.client_ip_trusted_proxies)?;
+        match (
+            client_ip_header.is_some(),
+            client_ip_trusted_proxies.is_empty(),
+        ) {
+            (true, true) => return Err(ConfigError::ClientIpHeaderWithoutTrustedProxies),
+            (false, false) => return Err(ConfigError::ClientIpTrustedProxiesWithoutHeader),
+            (true, false) | (false, true) => {}
+        }
         let ssh_suffix = self.ssh_suffix.ok_or(ConfigError::MissingSshSuffix)?;
         let ssh_suffix = SshSuffix::parse(&ssh_suffix).map_err(ConfigError::InvalidSshSuffix)?;
         let agent_endpoint = self
@@ -264,6 +295,7 @@ impl Config {
             .map(|text| GateEndpoint::parse(&text).map_err(ConfigError::InvalidGateEndpoint))
             .transpose()?;
         let agents = agents_settings(self.agents_listen.as_deref(), &agent_endpoint)?;
+        let limits = self.limits.into_settings()?;
         let ssh_gate = self
             .ssh_gate
             .map(|section| {
@@ -276,7 +308,11 @@ impl Config {
                     ],
                 )
             })
-            .transpose()?;
+            .transpose()?
+            .map(|gate| GateSshSettings {
+                client_limits: limits.ssh,
+                ..gate
+            });
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -318,6 +354,7 @@ impl Config {
                 enabled: self.device_login,
                 public_origin: origin,
                 client_ip_header,
+                client_ip_trusted_proxies,
             },
             ssh_suffix,
             gate_endpoint,
@@ -329,6 +366,7 @@ impl Config {
             ssh_gate,
             oidc,
             audit,
+            limits,
         })
     }
 }
@@ -419,9 +457,29 @@ fn gate_settings(
         proxy_protocol: section.proxy_protocol,
         trusted_proxies,
         max_unauthenticated: section.max_unauthenticated,
+        client_limits: DEFAULT_SSH_CLIENT_LIMITS,
         write_stall: (section.write_stall_secs > 0)
             .then(|| Duration::from_secs(section.write_stall_secs)),
     })
+}
+
+fn client_ip_proxies(given: &[String]) -> Result<Vec<IpNet>, ConfigError> {
+    let networks = given
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            text.parse::<IpNet>()
+                .map_err(|_| ConfigError::InvalidClientIpTrustedProxy(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((index, problem)) = networks
+        .iter()
+        .enumerate()
+        .find_map(|(index, network)| trusted_proxy_problem(network).map(|problem| (index, problem)))
+    {
+        return Err(ConfigError::UnusableClientIpTrustedProxy { index, problem });
+    }
+    Ok(networks)
 }
 
 fn listeners_collide(first: SocketAddr, second: SocketAddr) -> bool {
@@ -623,6 +681,32 @@ cert_ttl_secs: {SECRET}
         assert_eq!(settings.oidc.scopes, ["openid", "email"]);
         assert!(!settings.oidc.require_verified_email);
         assert_eq!(settings.oidc.client_secret.expose(), SECRET);
+        assert_eq!(settings.limits, crate::limits::LimitSettings::default());
+    }
+
+    #[test]
+    fn the_limits_section_reaches_the_gate_and_refuses_bad_values() {
+        let tuned = gate_with(
+            "gate_endpoint: gate.example.com\n\
+             limits:\n  ssh:\n    unauthenticated_per_address: 3\n",
+            "  listen: 0.0.0.0:2222\n  hostnames: [gate.example.com]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tuned.client_limits.concurrent, 3);
+        let refused = parse("limits:\n  http:\n    max_connections: 0\n")
+            .into_run_settings(&secret_env)
+            .err();
+        assert!(
+            matches!(
+                refused,
+                Some(ConfigError::Limits(
+                    crate::limits::LimitsError::MaxConnections
+                ))
+            ),
+            "{refused:?}"
+        );
+        assert!(serde_saphyr::from_str::<Config>("data_dir: /d\nlimits:\n  extra: 1\n").is_err());
     }
 
     #[test]
@@ -824,6 +908,7 @@ cert_ttl_secs: {SECRET}
                 proxy_protocol: false,
                 trusted_proxies: Vec::new(),
                 max_unauthenticated: 512,
+                client_limits: jaunt_gate::DEFAULT_SSH_CLIENT_LIMITS,
                 write_stall: Some(Duration::from_secs(900)),
             }
         );
@@ -1091,9 +1176,11 @@ cert_ttl_secs: {SECRET}
             ("CF-Connecting-IP", "cf-connecting-ip"),
         ];
         for (given, normalised) in accepted {
-            let settings = parse(&format!("client_ip_header: {given}\n"))
-                .into_run_settings(&secret_env)
-                .unwrap();
+            let settings = parse(&format!(
+                "client_ip_header: {given}\nclient_ip_trusted_proxies: [10.0.0.0/8]\n"
+            ))
+            .into_run_settings(&secret_env)
+            .unwrap();
             assert_eq!(
                 settings.device.client_ip_header.as_deref(),
                 Some(normalised)
@@ -1109,7 +1196,7 @@ cert_ttl_secs: {SECRET}
             too_long.as_str(),
         ];
         for given in rejected {
-            let mut config = parse("");
+            let mut config = parse("client_ip_trusted_proxies: [10.0.0.0/8]\n");
             config.client_ip_header = Some(given.to_owned());
             assert!(
                 matches!(
@@ -1117,6 +1204,60 @@ cert_ttl_secs: {SECRET}
                     Err(ConfigError::InvalidClientIpHeader)
                 ),
                 "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_ip_header_is_believed_only_from_valid_trusted_proxy_networks() {
+        let settings = parse(
+            "client_ip_header: x-forwarded-for\nclient_ip_trusted_proxies: [10.0.0.0/8, \"2001:db8::/32\"]\n",
+        )
+        .into_run_settings(&secret_env)
+        .unwrap();
+        assert_eq!(settings.device.client_ip_trusted_proxies.len(), 2);
+        type Expected = fn(&ConfigError) -> bool;
+        let cases: [(&str, Expected); 5] = [
+            ("client_ip_header: x-forwarded-for\n", |error| {
+                matches!(error, ConfigError::ClientIpHeaderWithoutTrustedProxies)
+            }),
+            ("client_ip_trusted_proxies: [10.0.0.0/8]\n", |error| {
+                matches!(error, ConfigError::ClientIpTrustedProxiesWithoutHeader)
+            }),
+            (
+                "client_ip_header: x-real-ip\nclient_ip_trusted_proxies: [10.0.0.0/8, nonsense]\n",
+                |error| matches!(error, ConfigError::InvalidClientIpTrustedProxy(1)),
+            ),
+            (
+                "client_ip_header: x-real-ip\nclient_ip_trusted_proxies: [0.0.0.0/0]\n",
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableClientIpTrustedProxy {
+                            index: 0,
+                            problem: TrustedProxyProblem::Everything
+                        }
+                    )
+                },
+            ),
+            (
+                "client_ip_header: x-real-ip\nclient_ip_trusted_proxies: [\"::ffff:10.0.0.0/104\"]\n",
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableClientIpTrustedProxy {
+                            index: 0,
+                            problem: TrustedProxyProblem::Ipv4Mapped
+                        }
+                    )
+                },
+            ),
+        ];
+        for (extra, expected) in cases {
+            let refused = parse(extra).into_run_settings(&secret_env).err();
+            assert!(
+                refused.as_ref().is_some_and(expected),
+                "{extra:?}: {refused:?}"
             );
         }
     }

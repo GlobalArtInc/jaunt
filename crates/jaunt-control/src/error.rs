@@ -1,4 +1,5 @@
 use jaunt_ca::CaError;
+use jaunt_limits::UnusableProxy;
 use jaunt_store::StoreError;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +18,15 @@ pub enum ControlError {
     NonCanonicalPublicOrigin,
     #[error("the client address header is not a valid http header name")]
     InvalidClientIpHeader,
+    #[error(
+        "the client address header is set but no trusted proxy network is: the header would be \
+         believed from anybody"
+    )]
+    ClientIpHeaderWithoutTrustedProxies,
+    #[error("trusted proxy networks are set but no client address header is")]
+    TrustedProxiesWithoutClientIpHeader,
+    #[error(transparent)]
+    UnusableTrustedProxy(UnusableProxy),
     #[error("the host signing authority is not a host certificate authority")]
     NotHostAuthority,
     #[error("the host signing authority is not the active key of the host trust set")]
@@ -27,8 +37,6 @@ pub enum ControlError {
     UserAuthorityNotTrusted,
     #[error("the user authority keys cannot be listed: {0}")]
     UserKeys(#[source] CaError),
-    #[error("the http server failed: {0}")]
-    Serve(#[source] std::io::Error),
     #[error("the clock is before the unix epoch")]
     Clock,
     #[error("purging stored login requests failed: {0}")]

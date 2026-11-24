@@ -1,0 +1,83 @@
+[package]
+name = "jaunt-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+http = "1.5.0"
+jaunt-policy = { path = "../crates/jaunt-policy" }
+jaunt-proto = { path = "../crates/jaunt-proto" }
+jaunt-ssh = { path = "../crates/jaunt-ssh" }
+jaunt-tunnel = { path = "../crates/jaunt-tunnel" }
+libfuzzer-sys = "0.4.13"
+russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+
+[patch.crates-io]
+russh = { git = "https://github.com/GlobalArtInc/russh", rev = "78763c760decca7309ec82cffc8c859861b99c91" }
+
+[[bin]]
+name = "policy_yaml"
+path = "fuzz_targets/policy_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_v2"
+path = "fuzz_targets/proxy_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_meta"
+path = "fuzz_targets/stream_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node_target"
+path = "fuzz_targets/node_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "user_certificate"
+path = "fuzz_targets/user_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_trust"
+path = "fuzz_targets/agent_trust.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_config"
+path = "fuzz_targets/client_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_requests"
+path = "fuzz_targets/control_requests.rs"
+test = false
+doc = false
+bench = false

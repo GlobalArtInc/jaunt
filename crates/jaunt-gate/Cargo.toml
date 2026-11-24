@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 ipnet = "2.12.2"
+jaunt-limits = { workspace = true }
 jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }

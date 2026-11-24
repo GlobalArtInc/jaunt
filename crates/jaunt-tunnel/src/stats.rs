@@ -13,6 +13,7 @@ pub struct GateStats {
     main_handed_over: AtomicU64,
     accept_errors: AtomicU64,
     task_panics: AtomicU64,
+    refused_per_address: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub struct GateStatsSnapshot {
     pub main_handed_over: u64,
     pub accept_errors: u64,
     pub task_panics: u64,
+    pub refused_per_address: u64,
 }
 
 macro_rules! counters {
@@ -60,6 +62,7 @@ counters! {
     record_main_handed_over => main_handed_over,
     record_accept_error => accept_errors,
     record_task_panic => task_panics,
+    record_refused_per_address => refused_per_address,
 }
 
 #[cfg(test)]

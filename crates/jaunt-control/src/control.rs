@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -9,6 +8,7 @@ use jaunt_ca::{
     CaError, CaKind, InternalCa, IssuedCertificate, MAX_USER_VALIDITY, ServerCertParams, Signer,
     TrustSet,
 };
+use jaunt_limits::RateLimiter;
 use jaunt_oidc::OidcClient;
 use jaunt_policy::{PolicyHandle, PolicySet};
 use jaunt_store::{EnrollmentState, Store};
@@ -17,14 +17,16 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admin::NodeAdmin;
 use crate::audit::{self, SessionEnd};
-use crate::clock::{Clock, Moment};
+use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
 use crate::http;
+use crate::limits::{NoiseLog, RequestLimiters, RequestLimits};
 use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit;
+use crate::serve;
 use crate::web::WebState;
 
 pub const PENDING_CAPACITY: usize = 10_000;
@@ -68,11 +70,13 @@ pub struct Inner {
     pub(crate) cert_ttl: Duration,
     pub(crate) pending: PendingLogins,
     pub(crate) device: DeviceState,
-    pub(crate) poll_limiter: RateLimiter,
-    pub(crate) enroll_limiter: RateLimiter,
+    pub(crate) poll_limiter: RateLimiter<String>,
+    pub(crate) request_limits: RequestLimiters,
+    pub(crate) callback_noise: NoiseLog,
     policy: PolicyHandle,
     pub(crate) web: WebState,
     clock: Clock,
+    ticker: Ticker,
 }
 
 #[derive(Clone)]
@@ -90,6 +94,31 @@ impl Deref for Control {
 
 impl Control {
     pub fn new(parts: ControlParts) -> Result<Control, ControlError> {
+        Control::with_request_limits(parts, RequestLimits::default())
+    }
+
+    pub fn with_request_limits(
+        parts: ControlParts,
+        limits: RequestLimits,
+    ) -> Result<Control, ControlError> {
+        Control::build(parts, limits, monotonic_ticker())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_limits_and_ticker(
+        parts: ControlParts,
+        limits: RequestLimits,
+        ticker: Ticker,
+    ) -> Result<Control, ControlError> {
+        Control::build(parts, limits, ticker)
+    }
+
+    fn build(
+        parts: ControlParts,
+        limits: RequestLimits,
+        ticker: Ticker,
+    ) -> Result<Control, ControlError> {
         if parts.user_authority.kind() != CaKind::User {
             return Err(ControlError::NotUserAuthority);
         }
@@ -129,11 +158,13 @@ impl Control {
                 cert_ttl,
                 pending: PendingLogins::new(parts.pending_capacity),
                 device,
-                poll_limiter: RateLimiter::polls(),
-                enroll_limiter: RateLimiter::enrollments(),
+                poll_limiter: rate_limit::handle_polls(),
+                request_limits: RequestLimiters::new(&limits),
+                callback_noise: NoiseLog::new(),
                 policy: parts.policy,
                 web,
                 clock: parts.clock,
+                ticker,
             }),
         })
     }
@@ -176,14 +207,15 @@ impl Control {
     }
 
     pub fn sweep_expired(&self) -> usize {
+        let tick = self.tick();
+        self.request_limits.sweep(tick);
+        let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {
-                self.device.sweep(now.secs);
-                self.pending.sweep(now.secs)
-                    + self.poll_limiter.sweep(now.secs)
-                    + self.enroll_limiter.sweep(now.secs)
+                self.device.sweep(now.secs, whole_secs(tick));
+                self.pending.sweep(now.secs) + polls
             }
-            None => 0,
+            None => polls,
         }
     }
 
@@ -271,19 +303,27 @@ impl Control {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ControlError> {
         let sweeper = tokio::spawn(sweep_forever(self.clone()));
-        let served = axum::serve(
+        serve::serve(
+            self.router(),
             listener,
-            self.router()
-                .into_make_service_with_connect_info::<SocketAddr>(),
+            serve::ServerLimits::new(
+                self.request_limits.max_connections,
+                self.request_limits.max_connections_per_address,
+                self.device.client_ip.trusted_proxies().clone(),
+            ),
+            shutdown,
         )
-        .with_graceful_shutdown(shutdown)
         .await;
         sweeper.abort();
-        served.map_err(ControlError::Serve)
+        Ok(())
     }
 
     pub(crate) fn now(&self) -> Option<Moment> {
         Moment::read(&self.clock)
+    }
+
+    pub(crate) fn tick(&self) -> Duration {
+        (self.ticker)()
     }
 
     pub(crate) fn public_origin(&self) -> &str {
@@ -438,6 +478,7 @@ mod tests {
                 enabled: false,
                 public_origin: "https://jaunt.example".to_owned(),
                 client_ip_header: None,
+                client_ip_trusted_proxies: Vec::new(),
             },
             policy: policy.clone(),
             web_enabled: false,

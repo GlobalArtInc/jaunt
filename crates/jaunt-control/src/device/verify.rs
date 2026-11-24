@@ -1,17 +1,17 @@
-use std::net::SocketAddr;
-
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use jaunt_store::LoginRequest;
 
 use crate::audit;
+use crate::clock::whole_secs;
 use crate::control::Control;
 
 use super::forms::{Form, FormFailure};
 use super::limiter::Verdict;
+use super::net::ClientAddress;
 use super::page::{self, RequestFacts};
 use super::tokens::IssueError;
 use super::{code, net};
@@ -29,7 +29,7 @@ pub(super) fn form_failure(failure: FormFailure) -> Response {
 
 pub(super) async fn submit(
     State(control): State<Control>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(ClientAddress(ip)): Extension<ClientAddress>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -48,11 +48,13 @@ pub(super) async fn submit(
         return page::server_error();
     };
 
-    let ip = net::client_ip(control.device.client_ip_header.as_ref(), &headers, peer);
     if let Verdict::Limited {
         retry_after_secs,
         newly_locked,
-    } = control.device.failures.admit(ip, now.secs)
+    } = control
+        .device
+        .failures
+        .admit(ip, whole_secs(control.tick()))
     {
         if newly_locked {
             audit::device_locked_out(ip);

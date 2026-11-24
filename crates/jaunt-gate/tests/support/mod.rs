@@ -229,6 +229,7 @@ pub struct HubOptions {
     pub handshake_timeout: Duration,
     pub sessions_per_node: usize,
     pub sessions: usize,
+    pub client_limits: jaunt_limits::AddressLimits,
 }
 
 impl Default for HubOptions {
@@ -237,6 +238,7 @@ impl Default for HubOptions {
             handshake_timeout: Duration::from_secs(10),
             sessions_per_node: DEFAULT_MAX_API_SESSIONS_PER_NODE,
             sessions: DEFAULT_MAX_API_SESSIONS,
+            client_limits: jaunt_gate::DEFAULT_AGENT_CLIENT_LIMITS,
         }
     }
 }
@@ -252,6 +254,7 @@ where
     config.handshake_timeout = options.handshake_timeout;
     config.max_api_sessions_per_node = options.sessions_per_node;
     config.max_api_sessions = options.sessions;
+    config.client_limits = options.client_limits;
     let (opened, sessions) = mpsc::unbounded_channel();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub = AgentHub::start(listener, config, auth, Arc::new(HeldSessions { opened })).unwrap();

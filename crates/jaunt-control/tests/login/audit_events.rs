@@ -23,7 +23,7 @@ async fn a_login_a_certificate_and_a_denied_callback_leave_exactly_these_schema_
             "login.started",
             "login.approved",
             "cert.issued",
-            "login.denied"
+            "login.callback_refused"
         ]
     );
     assert_eq!(events[0].actor(), &Actor::Anonymous);
@@ -37,6 +37,8 @@ async fn a_login_a_certificate_and_a_denied_callback_leave_exactly_these_schema_
     assert_eq!(events[2].text("login_id"), Some(login_id));
     assert!(events[2].int("serial").is_some());
     assert_eq!(events[3].text("reason"), Some("unknown_state"));
+    assert_eq!(events[3].text("client"), Some("198.51.100.7"));
+    assert_eq!(events[3].kind().class(), jaunt_audit::Class::Noisy);
     let lines: String = events
         .iter()
         .map(|event| serde_json::to_string(event.as_ref()).unwrap())

@@ -174,7 +174,7 @@ impl StreamMeta {
         &self.client
     }
 
-    pub(crate) fn from_headers(headers: &HeaderMap) -> Result<Self, MetaError> {
+    pub fn from_headers(headers: &HeaderMap) -> Result<Self, MetaError> {
         let session = SessionId::new(single_header(headers, HEADER_SESSION)?)?;
         let kind = StreamKind::parse(&single_header(headers, HEADER_KIND)?)?;
         let client = single_header(headers, HEADER_CLIENT)?;

@@ -1744,6 +1744,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -2239,8 +2240,14 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "form_urlencoded",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ipnet",
  "jaunt-audit",
  "jaunt-ca",
+ "jaunt-control",
+ "jaunt-limits",
  "jaunt-oidc",
  "jaunt-policy",
  "jaunt-proto",
@@ -2270,6 +2277,7 @@ dependencies = [
  "h2",
  "http",
  "ipnet",
+ "jaunt-limits",
  "jaunt-proto",
  "jaunt-ssh",
  "jaunt-tunnel",
@@ -2282,6 +2290,14 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "jaunt-limits"
+version = "0.0.0"
+dependencies = [
+ "ipnet",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2377,6 +2393,7 @@ dependencies = [
  "bytes",
  "h2",
  "http",
+ "jaunt-limits",
  "jaunt-proto",
  "rand 0.10.4",
  "rcgen",
@@ -2411,6 +2428,7 @@ dependencies = [
  "jaunt-ca",
  "jaunt-control",
  "jaunt-gate",
+ "jaunt-limits",
  "jaunt-oidc",
  "jaunt-policy",
  "jaunt-proto",

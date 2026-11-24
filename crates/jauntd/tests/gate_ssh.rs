@@ -11,7 +11,11 @@ use jaunt_ca::{
     AgeIdentity, CaKind, DEFAULT_HOST_VALIDITY, FileBackend, HostCertParams, Signer,
     UserCertParams, Uuid, sign_host_certificate, sign_user_certificate,
 };
-use jaunt_gate::{AgentApiHandler, AgentHub, AgentHubConfig, HostCertIssuer, IssueError};
+use jaunt_gate::{
+    AgentApiHandler, AgentHub, AgentHubConfig, DEFAULT_SSH_CLIENT_LIMITS, HostCertIssuer,
+    IssueError,
+};
+use jaunt_limits::{AddressLimits, Rate};
 use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, ControlError, ControlPlane, DenyReason, NodeCaller,
     RouteDecision, RouteRequest, SessionEnd, SessionEndOutcome,
@@ -402,6 +406,7 @@ impl Stand {
             proxy_protocol: false,
             trusted_proxies: Vec::new(),
             max_unauthenticated: 16,
+            client_limits: DEFAULT_SSH_CLIENT_LIMITS,
             write_stall: Some(Duration::from_secs(900)),
         };
         configure(&mut settings);
@@ -846,6 +851,103 @@ async fn a_proxy_header_from_a_trusted_peer_sets_the_address_route_sees() {
     stand.stop().await;
 }
 
+async fn proxied_connection(stand: &Stand, client: [u8; 4], port: u16) -> TcpStream {
+    let mut tcp = TcpStream::connect(stand.gate_addr).await.unwrap();
+    tcp.write_all(&proxy_header(client, port)).await.unwrap();
+    tcp
+}
+
+async fn banner_arrives(tcp: &mut TcpStream) -> bool {
+    let mut banner = [0_u8; 13];
+    let read = tokio::time::timeout(STEP, tcp.read_exact(&mut banner))
+        .await
+        .expect("the gate neither answered nor closed");
+    read.is_ok() && &banner == b"SSH-2.0-Jaunt"
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_silent_connections_from_one_address_does_not_stop_a_login_from_another() {
+    let stand = Stand::start_with(|settings| {
+        settings.proxy_protocol = true;
+        settings.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+        settings.max_unauthenticated = 8;
+        settings.client_limits = AddressLimits {
+            rate: Rate::new(6, 1).unwrap(),
+            concurrent: 3,
+            tracked: 64,
+        };
+    })
+    .await;
+    let flooder = [203, 0, 113, 66];
+    let mut held = Vec::new();
+    for port in 0..50 {
+        let mut tcp = proxied_connection(&stand, flooder, 40_000 + port).await;
+        if banner_arrives(&mut tcp).await {
+            held.push(tcp);
+        }
+    }
+    assert_eq!(held.len(), 3);
+
+    let user = [198, 51, 100, 7];
+    let tcp = proxied_connection(&stand, user, 50_000).await;
+    let mut handle = tokio::time::timeout(
+        STEP,
+        client::connect_stream(Arc::new(client::Config::default()), tcp, AnyHostKey),
+    )
+    .await
+    .expect("the handshake hung")
+    .unwrap();
+    let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let certificate = stand.certificate_for(&key);
+    let login = handle
+        .authenticate_openssh_cert("jaunt", Arc::new(key), certificate)
+        .await
+        .unwrap();
+    assert!(login.success());
+
+    let mut silent = Vec::new();
+    for port in 0..3 {
+        let mut tcp = proxied_connection(&stand, user, 50_001 + port).await;
+        assert!(banner_arrives(&mut tcp).await, "{port}");
+        silent.push(tcp);
+    }
+
+    drop(held);
+    let mut late = proxied_connection(&stand, flooder, 41_000).await;
+    assert!(!banner_arrives(&mut late).await);
+    drop((handle, silent));
+    stand.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_health_checks_sent_as_local_are_not_held_to_the_per_address_limits() {
+    let stand = Stand::start_with(|settings| {
+        settings.proxy_protocol = true;
+        settings.trusted_proxies = vec!["127.0.0.0/8".parse().unwrap()];
+        settings.client_limits = AddressLimits {
+            rate: Rate::new(2, 1).unwrap(),
+            concurrent: 1,
+            tracked: 64,
+        };
+    })
+    .await;
+    let mut local = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    local.extend_from_slice(&[0x20, 0x00, 0, 0]);
+    let mut held = Vec::new();
+    for index in 0..6 {
+        let mut tcp = TcpStream::connect(stand.gate_addr).await.unwrap();
+        tcp.write_all(&local).await.unwrap();
+        assert!(banner_arrives(&mut tcp).await, "{index}");
+        held.push(tcp);
+    }
+    let mut proxied = proxied_connection(&stand, [127, 0, 0, 1], 40_000).await;
+    assert!(banner_arrives(&mut proxied).await);
+    let mut over = proxied_connection(&stand, [127, 0, 0, 1], 40_001).await;
+    assert!(!banner_arrives(&mut over).await);
+    drop((held, proxied));
+    stand.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_silent_connection_is_closed_when_one_unauthenticated_is_allowed() {
     let stand = Stand::start_with(|settings| settings.max_unauthenticated = 1).await;
@@ -892,6 +994,7 @@ async fn a_busy_port_stops_the_gate_before_any_certificate_is_issued() {
             proxy_protocol: false,
             trusted_proxies: Vec::new(),
             max_unauthenticated: 16,
+            client_limits: DEFAULT_SSH_CLIENT_LIMITS,
             write_stall: None,
         },
         ssh_suffix: SUFFIX.to_owned(),

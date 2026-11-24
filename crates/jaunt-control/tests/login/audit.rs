@@ -168,7 +168,7 @@ async fn audit_events_have_stable_fields_and_never_carry_secrets() {
             ("cert.issued", None),
             ("login.started", None),
             ("login.denied", Some("provider_error")),
-            ("login.denied", Some("unknown_state")),
+            ("login.callback_refused", Some("unknown_state")),
         ]
     );
 

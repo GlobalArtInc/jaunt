@@ -1,0 +1,6 @@
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: ops }
+spec:
+  members: { groups: [ops] }
+  ssh: { nodes: { env: [prod] }, logins: [deploy] }

@@ -1,11 +1,15 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use ipnet::IpNet;
+use jaunt_limits::{
+    AddressGate, AddressLimits, AddressLimitsError, ClientKey, ConcurrencyGuard, DEFAULT_CAPACITY,
+    LogThrottle, Rate, TrustedProxies, TrustedProxyProblem,
+};
 use jaunt_proto::ControlPlane;
-use jaunt_ssh::{OuterHop, OuterLimits, RouteBackend, UserCaSource, read_proxy_v2};
+use jaunt_ssh::{OuterEvent, OuterHop, OuterLimits, RouteBackend, UserCaSource, read_proxy_v2};
 use jaunt_tunnel::AgentRegistry;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -21,13 +25,17 @@ use crate::route::{ControlRoute, DEFAULT_MAX_STREAMS_PER_USER_NODE, StreamBook};
 pub const DEFAULT_MAX_UNAUTHENTICATED: usize = 512;
 pub const MAX_UNAUTHENTICATED_LIMIT: usize = 1 << 20;
 pub const MAX_HOSTNAMES: usize = 64;
-pub const MIN_IPV4_PREFIX: u8 = 8;
-pub const MIN_IPV6_PREFIX: u8 = 16;
 pub const DEFAULT_PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_SSH_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_RENEWAL_CHECK: Duration = Duration::from_secs(60);
 pub const DEFAULT_RENEWAL_RETRY: Duration = Duration::from_secs(5);
+pub const DEFAULT_SSH_CLIENT_LIMITS: AddressLimits = AddressLimits {
+    rate: Rate::clamped(600, 600),
+    concurrent: 128,
+    tracked: DEFAULT_CAPACITY,
+};
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_LABEL_LEN: usize = 63;
 const MAX_DNS_NAME_LEN: usize = 253;
 const MAX_SUFFIX_LEN: usize = MAX_DNS_NAME_LEN - MAX_LABEL_LEN - 1;
@@ -39,6 +47,7 @@ pub struct SshGateConfig {
     pub proxy_protocol: bool,
     pub trusted_proxies: Vec<IpNet>,
     pub max_unauthenticated: usize,
+    pub client_limits: AddressLimits,
     pub max_streams_per_user_node: usize,
     pub limits: OuterLimits,
     pub proxy_header_timeout: Duration,
@@ -55,6 +64,7 @@ impl SshGateConfig {
             proxy_protocol: false,
             trusted_proxies: Vec::new(),
             max_unauthenticated: DEFAULT_MAX_UNAUTHENTICATED,
+            client_limits: DEFAULT_SSH_CLIENT_LIMITS,
             max_streams_per_user_node: DEFAULT_MAX_STREAMS_PER_USER_NODE,
             limits: OuterLimits::default(),
             proxy_header_timeout: DEFAULT_PROXY_HEADER_TIMEOUT,
@@ -88,6 +98,8 @@ pub enum SshGateError {
     },
     #[error("max_unauthenticated must be between 1 and {MAX_UNAUTHENTICATED_LIMIT}")]
     UnauthenticatedLimit,
+    #[error("the per address limits are invalid: {0}")]
+    ClientLimits(#[from] AddressLimitsError),
     #[error("the per user and node stream limit must be at least one")]
     StreamLimit,
     #[error("the renewal check and retry intervals must not be zero")]
@@ -98,55 +110,20 @@ pub enum SshGateError {
     NoRuntime,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum TrustedProxyProblem {
-    #[error("an IPv4-mapped IPv6 network never matches, write it in the IPv4 form")]
-    Ipv4Mapped,
-    #[error("a network of prefix length 0 trusts every peer and defeats the PROXY check")]
-    Everything,
-    #[error(
-        "the network is too wide to be a proxy fleet (IPv4 needs /{MIN_IPV4_PREFIX} or longer, \
-         IPv6 /{MIN_IPV6_PREFIX} or longer) and would trust a large part of the internet"
-    )]
-    TooWide,
-}
-
-pub fn trusted_proxy_problem(network: &IpNet) -> Option<TrustedProxyProblem> {
-    if network.prefix_len() == 0 {
-        return Some(TrustedProxyProblem::Everything);
-    }
-    match network {
-        IpNet::V6(v6) if v6.network().to_ipv4_mapped().is_some() => {
-            Some(TrustedProxyProblem::Ipv4Mapped)
-        }
-        IpNet::V4(v4) if v4.prefix_len() < MIN_IPV4_PREFIX => Some(TrustedProxyProblem::TooWide),
-        IpNet::V6(v6) if v6.prefix_len() < MIN_IPV6_PREFIX => Some(TrustedProxyProblem::TooWide),
-        IpNet::V4(_) | IpNet::V6(_) => None,
-    }
-}
-
 fn check_trusted_proxies(
     proxy_protocol: bool,
     proxies: Vec<IpNet>,
-) -> Result<Option<Vec<IpNet>>, SshGateError> {
-    if let Some((index, problem)) = proxies
-        .iter()
-        .enumerate()
-        .find_map(|(index, network)| trusted_proxy_problem(network).map(|problem| (index, problem)))
-    {
-        return Err(SshGateError::TrustedProxy { index, problem });
-    }
+) -> Result<Option<TrustedProxies>, SshGateError> {
+    let proxies = TrustedProxies::new(proxies).map_err(|unusable| SshGateError::TrustedProxy {
+        index: unusable.index,
+        problem: unusable.problem,
+    })?;
     match (proxy_protocol, proxies.is_empty()) {
         (false, true) => Ok(None),
         (false, false) => Err(SshGateError::TrustedProxiesWithoutProxyProtocol),
         (true, true) => Err(SshGateError::NoTrustedProxies),
         (true, false) => Ok(Some(proxies)),
     }
-}
-
-fn is_trusted(proxies: &[IpNet], peer: IpAddr) -> bool {
-    let peer = peer.to_canonical();
-    proxies.iter().any(|network| network.contains(&peer))
 }
 
 pub fn normalize_dns_name(name: &str) -> Option<String> {
@@ -196,7 +173,7 @@ struct Shared {
     host: HostCertificate,
     cas: Arc<UserCaSource>,
     suffix: String,
-    trusted_proxies: Option<Vec<IpNet>>,
+    trusted_proxies: Option<TrustedProxies>,
     limits: OuterLimits,
     proxy_header_timeout: Duration,
     shutdown_grace: Duration,
@@ -206,6 +183,9 @@ struct Shared {
     book: Arc<StreamBook>,
     pre_auth: Arc<Semaphore>,
     max_unauthenticated: usize,
+    clients: AddressGate,
+    refusals: LogThrottle,
+    started: Instant,
 }
 
 pub struct SshGate {
@@ -245,6 +225,7 @@ impl SshGate {
         if !(1..=MAX_UNAUTHENTICATED_LIMIT).contains(&config.max_unauthenticated) {
             return Err(SshGateError::UnauthenticatedLimit);
         }
+        config.client_limits.validate()?;
         if config.max_streams_per_user_node == 0 {
             return Err(SshGateError::StreamLimit);
         }
@@ -277,6 +258,9 @@ impl SshGate {
                 book,
                 pre_auth: Arc::new(Semaphore::new(config.max_unauthenticated)),
                 max_unauthenticated: config.max_unauthenticated,
+                clients: AddressGate::new(config.client_limits),
+                refusals: LogThrottle::new(REFUSAL_LOG_INTERVAL),
+                started: Instant::now(),
             }),
         })
     }
@@ -356,7 +340,20 @@ impl Shared {
     fn trusts(&self, peer: SocketAddr) -> bool {
         self.trusted_proxies
             .as_ref()
-            .is_none_or(|proxies| is_trusted(proxies, peer.ip()))
+            .is_none_or(|proxies| proxies.contains(peer.ip()))
+    }
+
+    fn admit_client(&self, client: IpAddr) -> Option<ConcurrencyGuard<ClientKey>> {
+        let now = self.started.elapsed();
+        match self.clients.admit(client, now) {
+            Ok(guard) => Some(guard),
+            Err(refused) => {
+                if let Some(suppressed) = self.refusals.admit(now) {
+                    audit::ssh_limited(ClientKey::of(client), refused, suppressed);
+                }
+                None
+            }
+        }
     }
 
     async fn client_addr(
@@ -364,9 +361,9 @@ impl Shared {
         tcp: &mut TcpStream,
         peer: SocketAddr,
         token: &CancellationToken,
-    ) -> Option<(SocketAddr, bool)> {
+    ) -> Option<Client> {
         if self.trusted_proxies.is_none() {
-            return Some((peer, false));
+            return Some(Client::Direct(peer));
         }
         let header = tokio::select! {
             biased;
@@ -374,7 +371,8 @@ impl Shared {
             header = tokio::time::timeout(self.proxy_header_timeout, read_proxy_v2(tcp)) => header,
         };
         match header {
-            Ok(Ok(proxied)) => Some((proxied.client_or(peer), !proxied.local)),
+            Ok(Ok(proxied)) if proxied.local => Some(Client::ProxyLocal(peer)),
+            Ok(Ok(proxied)) => Some(Client::Proxied(proxied.client_or(peer))),
             Ok(Err(error)) => {
                 tracing::debug!(target: "jaunt::gate", peer_addr = %peer, error = %error, "a PROXY header was refused");
                 None
@@ -404,10 +402,21 @@ impl Shared {
             tracing::debug!(target: "jaunt::gate", peer_addr = %peer, "too many unauthenticated ssh connections");
             return;
         };
-        let Some((client, proxied)) = self.client_addr(&mut tcp, peer, &token).await else {
+        let Some(client) = self.client_addr(&mut tcp, peer, &token).await else {
             return;
         };
+        let (client, proxied, slot) = match client {
+            Client::ProxyLocal(addr) => (addr, false, None),
+            Client::Direct(addr) | Client::Proxied(addr) => {
+                let Some(guard) = self.admit_client(addr.ip()) else {
+                    return;
+                };
+                (addr, matches!(client, Client::Proxied(_)), Some(guard))
+            }
+        };
         audit::ssh_connected(client, peer, proxied);
+        let slot = Arc::new(Mutex::new(slot));
+        let release = Arc::clone(&slot);
         let backend: Arc<dyn RouteBackend> = self.backend.clone();
         let hop = OuterHop::new(
             self.host.cell(),
@@ -416,20 +425,35 @@ impl Shared {
             self.limits,
             backend,
         )
-        .with_events(move |event| audit::ssh_event(client, event));
+        .with_events(move |event| {
+            if matches!(event, OuterEvent::AuthAccepted { .. }) {
+                take_slot(&release);
+            }
+            audit::ssh_event(client, event);
+        });
         hop.serve(tcp, client, permit, token).await;
+        take_slot(&slot);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Client {
+    Direct(SocketAddr),
+    Proxied(SocketAddr),
+    ProxyLocal(SocketAddr),
+}
+
+fn take_slot(slot: &Mutex<Option<ConcurrencyGuard<ClientKey>>>) {
+    drop(slot.lock().unwrap_or_else(PoisonError::into_inner).take());
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
-
     use ipnet::IpNet;
 
     use super::{
         MAX_SUFFIX_LEN, SshGateError, TrustedProxyProblem, check_trusted_proxies, hostnames,
-        is_trusted, normalize, normalize_dns_name, trusted_proxy_problem,
+        normalize, normalize_dns_name,
     };
 
     fn nets(given: &[&str]) -> Vec<IpNet> {
@@ -437,51 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn the_trust_check_matches_canonical_peer_addresses() {
-        let mixed = nets(&["10.0.0.0/8", "192.0.2.7/32", "2001:db8::1/128", "fd00::/8"]);
-        for (proxies, peer, trusted) in [
-            (&mixed, "10.1.2.3", true),
-            (&mixed, "::ffff:10.1.2.3", true),
-            (&mixed, "192.0.2.7", true),
-            (&mixed, "192.0.2.8", false),
-            (&mixed, "::ffff:192.0.2.8", false),
-            (&mixed, "2001:db8::1", true),
-            (&mixed, "2001:db8::2", false),
-            (&mixed, "fd12::1", true),
-            (&mixed, "11.0.0.1", false),
-            (&nets(&["10.0.0.0/8"]), "fd00::a00:1", false),
-            (&nets(&["fd00::/8"]), "10.0.0.1", false),
-            (&nets(&[]), "10.0.0.1", false),
-            (&nets(&[]), "::1", false),
-        ] {
-            let peer: IpAddr = peer.parse().unwrap();
-            assert_eq!(is_trusted(proxies, peer), trusted, "{peer} in {proxies:?}");
-        }
-    }
-
-    #[test]
-    fn trusted_proxy_networks_that_cannot_work_are_refused() {
-        for (network, problem) in [
-            ("10.0.0.0/8", None),
-            ("2001:db8::/32", None),
-            ("0.0.0.0/0", Some(TrustedProxyProblem::Everything)),
-            ("::/0", Some(TrustedProxyProblem::Everything)),
-            ("::ffff:10.0.0.0/104", Some(TrustedProxyProblem::Ipv4Mapped)),
-            ("::ffff:0:0/96", Some(TrustedProxyProblem::Ipv4Mapped)),
-            ("0.0.0.0/1", Some(TrustedProxyProblem::TooWide)),
-            ("128.0.0.0/1", Some(TrustedProxyProblem::TooWide)),
-            ("8.0.0.0/7", Some(TrustedProxyProblem::TooWide)),
-            ("::/1", Some(TrustedProxyProblem::TooWide)),
-            ("2000::/15", Some(TrustedProxyProblem::TooWide)),
-            ("2001::/16", None),
-            ("::/64", None),
-            ("::/96", None),
-            ("192.0.2.7/32", None),
-            ("2001:db8::1/128", None),
-        ] {
-            let parsed: IpNet = network.parse().unwrap();
-            assert_eq!(trusted_proxy_problem(&parsed), problem, "{network}");
-        }
+    fn the_proxy_protocol_and_the_trusted_networks_go_together() {
         assert!(matches!(check_trusted_proxies(false, Vec::new()), Ok(None)));
         assert!(matches!(
             check_trusted_proxies(true, nets(&["10.0.0.0/8"])),

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use jaunt_limits::{AddressLimits, Rate};
 use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, TunnelOptions, agent_client_config};
 use rustls::HandshakeKind;
 use rustls::client::ResolvesClientCert;
@@ -214,6 +215,54 @@ async fn connections_beyond_the_handshake_cap_are_dropped() {
     gate.stop().await;
 }
 
+async fn closed_without_a_byte(tcp: &mut TcpStream) -> bool {
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(10), tcp.read(&mut byte))
+        .await
+        .unwrap();
+    !matches!(read, Ok(count) if count > 0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_address_gets_its_share_of_handshakes_and_no_more() {
+    let pki = Pki::new("ca");
+    let options = GateOptions {
+        handshake_timeout: Duration::from_secs(30),
+        client_limits: Some(AddressLimits {
+            rate: Rate::new(3, 1).unwrap(),
+            concurrent: 2,
+            tracked: 16,
+        }),
+        ..GateOptions::default()
+    };
+    let gate = TestGate::start(&pki, MapAuthenticator::new(), options).await;
+    let first = TcpStream::connect(gate.addr).await.unwrap();
+    let second = TcpStream::connect(gate.addr).await.unwrap();
+    eventually("two silent connections to hold handshake slots", || {
+        gate.gate.handshaking() == 2
+    })
+    .await;
+
+    let mut third = TcpStream::connect(gate.addr).await.unwrap();
+    assert!(closed_without_a_byte(&mut third).await);
+    eventually("the concurrent refusal to be counted", || {
+        gate.stats.snapshot().refused_per_address == 1
+    })
+    .await;
+    assert_eq!(gate.gate.handshaking(), 2);
+
+    drop((first, second));
+    eventually("the slots to be released", || gate.gate.handshaking() == 0).await;
+    let mut fourth = TcpStream::connect(gate.addr).await.unwrap();
+    assert!(closed_without_a_byte(&mut fourth).await);
+    eventually("the rate refusal to be counted", || {
+        gate.stats.snapshot().refused_per_address == 2
+    })
+    .await;
+    assert_eq!(gate.stats.snapshot().refused_busy, 0);
+    gate.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_connection_is_dropped_at_the_handshake_deadline() {
     let pki = Pki::new("ca");
@@ -389,6 +438,7 @@ async fn an_authenticated_peer_silent_on_http2_keeps_its_slot_only_until_the_han
     let options = GateOptions {
         handshake_timeout: Duration::from_secs(3),
         max_handshaking: 1,
+        client_limits: None,
         tunnel: TunnelOptions {
             handshake_timeout: Duration::from_secs(120),
             hello_timeout: Duration::from_secs(120),

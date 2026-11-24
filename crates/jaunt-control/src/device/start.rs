@@ -1,8 +1,6 @@
-use std::net::SocketAddr;
-
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use jaunt_proto::{DeviceStartRequest, DeviceStartResponse};
@@ -15,7 +13,8 @@ use crate::pkce;
 use crate::start::{CHALLENGE_METHOD, LOGIN_TTL_SECS, busy, is_valid_label};
 use crate::token::EntropyUnavailable;
 
-use super::{EXPIRES_IN_SECS, POLL_INTERVAL_SECS, code, net};
+use super::net::ClientAddress;
+use super::{EXPIRES_IN_SECS, POLL_INTERVAL_SECS, code};
 
 const MAX_CODE_ATTEMPTS: usize = 5;
 
@@ -57,7 +56,7 @@ fn is_valid_request(request: &DeviceStartRequest) -> bool {
 
 pub(super) async fn handle(
     State(control): State<Control>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(ClientAddress(ip)): Extension<ClientAddress>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -83,7 +82,6 @@ pub(super) async fn handle(
         }
     }
 
-    let ip = net::client_ip(control.device.client_ip_header.as_ref(), &headers, peer);
     let template = NewDeviceLoginRequest {
         pkce_challenge: request.code_challenge,
         client_label: request.client_label,

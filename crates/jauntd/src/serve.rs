@@ -7,6 +7,7 @@ use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::{Signer, TrustSet};
 use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, system_clock};
 use jaunt_gate::HostCertIssuer;
+use jaunt_limits::AddressLimits;
 use jaunt_oidc::{OidcClient, OidcError};
 use jaunt_policy::Watcher;
 use jaunt_proto::ControlPlane;
@@ -96,6 +97,7 @@ struct Started {
     listen: SocketAddr,
     store: Store,
     agents: Option<AgentsSettings>,
+    agent_limits: AddressLimits,
     gate: Option<GatePlan>,
     audit: AuditRuntime,
 }
@@ -121,6 +123,7 @@ async fn serve(
         listen,
         store,
         agents,
+        agent_limits,
         gate,
         audit,
     } = start(settings, authorities, &tap).await?;
@@ -132,7 +135,7 @@ async fn serve(
             return Err(err);
         }
     };
-    let agents = match start_agents(agents, &control, store).await {
+    let agents = match start_agents(agents, agent_limits, &control, store).await {
         Ok(agents) => agents,
         Err(err) => {
             policy::stop_watcher(watcher).await;
@@ -198,6 +201,7 @@ async fn serve(
 
 async fn start_agents(
     settings: Option<AgentsSettings>,
+    client_limits: AddressLimits,
     control: &Control,
     store: Store,
 ) -> Result<Option<AgentServer>, ServeError> {
@@ -205,7 +209,8 @@ async fn start_agents(
         tracing::info!(target: "jaunt::daemon", "the agents' listener is disabled");
         return Ok(None);
     };
-    let parts = AgentServerParts::new(settings, control.clone(), store, system_clock());
+    let mut parts = AgentServerParts::new(settings, control.clone(), store, system_clock());
+    parts.client_limits = client_limits;
     let server = AgentServer::start(parts).await?;
     tracing::info!(
         target: "jaunt::daemon",
@@ -307,24 +312,27 @@ async fn start(
                 )
             })
             .transpose()?;
-        let control = Control::new(ControlParts {
-            store,
-            oidc,
-            user_authority: Arc::new(authorities.user),
-            user_trust: authorities.user_trust,
-            host_trust: authorities.host_trust,
-            host_authority,
-            internal_ca: authorities.internal,
-            ssh_suffix: settings.ssh_suffix,
-            gate_endpoint: settings.gate_endpoint,
-            agent_endpoint: settings.agent_endpoint,
-            cert_ttl: settings.cert_ttl,
-            pending_capacity: PENDING_CAPACITY,
-            device: settings.device,
-            policy: policy.clone(),
-            web_enabled: settings.web,
-            clock: system_clock(),
-        })?;
+        let control = Control::with_request_limits(
+            ControlParts {
+                store,
+                oidc,
+                user_authority: Arc::new(authorities.user),
+                user_trust: authorities.user_trust,
+                host_trust: authorities.host_trust,
+                host_authority,
+                internal_ca: authorities.internal,
+                ssh_suffix: settings.ssh_suffix,
+                gate_endpoint: settings.gate_endpoint,
+                agent_endpoint: settings.agent_endpoint,
+                cert_ttl: settings.cert_ttl,
+                pending_capacity: PENDING_CAPACITY,
+                device: settings.device,
+                policy: policy.clone(),
+                web_enabled: settings.web,
+                clock: system_clock(),
+            },
+            settings.limits.http,
+        )?;
         let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
         Ok(Started {
             control,
@@ -332,6 +340,7 @@ async fn start(
             listen: settings.listen,
             store: agents_store,
             agents: settings.agents,
+            agent_limits: settings.limits.agents,
             gate,
             audit: audit.clone(),
         })
@@ -738,7 +747,7 @@ mod tests {
         started.watcher.stop();
     }
 
-    fn client_config_answer(extra: &str) -> String {
+    fn started_with(extra: &str) -> (tempfile::TempDir, tokio::runtime::Runtime, super::Started) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("policy")).unwrap();
         let path = write_config(dir.path(), extra);
@@ -747,7 +756,8 @@ mod tests {
             .into_run_settings(&secret_only)
             .unwrap();
         settings.oidc.issuer_url = fake_discovery();
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
@@ -758,7 +768,12 @@ mod tests {
                 &AuditTap::new(audit_clock()),
             ))
             .unwrap();
-        let answer = runtime.block_on(async {
+        (dir, runtime, started)
+    }
+
+    fn answers(extra: &str, path: &'static str, count: usize) -> Vec<String> {
+        let (_dir, runtime, started) = started_with(extra);
+        let answers = runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(
@@ -768,18 +783,22 @@ mod tests {
                     .serve(listener, std::future::pending()),
             );
             let fetched = tokio::task::spawn_blocking(move || {
-                let mut stream = std::net::TcpStream::connect(address).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                write!(
-                    stream,
-                    "GET /v1/client-config HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
-                )
-                .unwrap();
-                let mut answer = String::new();
-                stream.read_to_string(&mut answer).unwrap();
-                answer
+                (0..count)
+                    .map(|_| {
+                        let mut stream = std::net::TcpStream::connect(address).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        write!(
+                            stream,
+                            "GET {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        let mut answer = String::new();
+                        stream.read_to_string(&mut answer).unwrap();
+                        answer
+                    })
+                    .collect::<Vec<_>>()
             })
             .await
             .unwrap();
@@ -787,7 +806,56 @@ mod tests {
             fetched
         });
         started.watcher.stop();
-        answer
+        answers
+    }
+
+    fn client_config_answer(extra: &str) -> String {
+        answers(extra, "/v1/client-config", 1).remove(0)
+    }
+
+    #[test]
+    fn the_configured_http_limits_reach_the_running_server() {
+        let answered = answers(
+            "limits:\n  http:\n    other: { burst: 2, per_minute: 1 }\n",
+            "/v1/client-config",
+            3,
+        );
+        assert!(!answered[0].starts_with("HTTP/1.1 429"), "{}", answered[0]);
+        assert!(!answered[1].starts_with("HTTP/1.1 429"), "{}", answered[1]);
+        assert!(answered[2].starts_with("HTTP/1.1 429"), "{}", answered[2]);
+        assert!(answered[2].contains("retry-after: 60"), "{}", answered[2]);
+    }
+
+    #[test]
+    fn the_configured_agent_limits_reach_the_agents_listener() {
+        let (_dir, runtime, started) = started_with(
+            "agents_listen: 127.0.0.1:0\nlimits:\n  agents:\n    handshaking_per_address: 1\n",
+        );
+        assert_eq!(started.agent_limits.concurrent, 1);
+        runtime.block_on(async {
+            let agents = super::start_agents(
+                started.agents.clone(),
+                started.agent_limits,
+                &started.control,
+                started.store.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let address = agents.local_addr();
+            let _first = tokio::net::TcpStream::connect(address).await.unwrap();
+            let _second = tokio::net::TcpStream::connect(address).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while agents.stats().snapshot().refused_per_address != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the second connection was not refused"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            agents.shutdown(Duration::from_secs(5)).await;
+        });
+        started.watcher.stop();
     }
 
     #[test]

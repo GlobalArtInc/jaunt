@@ -14,7 +14,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 
 use crate::support::{
-    Enrolled, Harness, host_certificate_is_valid, new_agent, request, send, verify_node_certificate,
+    DEFAULT_PEER, Enrolled, Harness, host_certificate_is_valid, new_agent, request, send,
+    verify_node_certificate,
 };
 
 const FAIL_RECORDING: &str = "CREATE TRIGGER fail_certificate_insert BEFORE INSERT ON \
@@ -137,7 +138,7 @@ async fn unknown_and_malformed_handles_get_the_same_not_found_answer() {
         request(
             "/v1/agent/enroll/poll",
             &json!({"handle": enrolled.handle, "x": 1}),
-            None,
+            Some(DEFAULT_PEER),
             None,
         ),
     )
@@ -251,7 +252,7 @@ async fn exactly_one_of_sixteen_concurrent_polls_receives_the_certificates() {
                 request(
                     "/v1/agent/enroll/poll",
                     &json!({"handle": handle}),
-                    None,
+                    Some(DEFAULT_PEER),
                     None,
                 ),
             )
@@ -377,7 +378,7 @@ async fn drive_then_drop(router: Router, handle: &str, polls: usize) {
         request(
             "/v1/agent/enroll/poll",
             &json!({"handle": handle}),
-            None,
+            Some(DEFAULT_PEER),
             None,
         ),
     ));

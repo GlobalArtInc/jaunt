@@ -8,6 +8,7 @@ use jaunt_ca::ssh_key::PublicKey;
 use jaunt_ca::{CaError, DEFAULT_HOST_VALIDITY, HostCertParams, Signer, sign_host_certificate};
 use jaunt_control::Clock;
 use jaunt_gate::{HostCertIssuer, IssueError, SshGate, SshGateConfig, SshGateError};
+use jaunt_limits::AddressLimits;
 use jaunt_proto::{BoxFuture, ControlPlane};
 use jaunt_ssh::{OuterLimits, UserCaSource};
 use jaunt_store::Store;
@@ -23,6 +24,7 @@ pub struct GateSshSettings {
     pub proxy_protocol: bool,
     pub trusted_proxies: Vec<IpNet>,
     pub max_unauthenticated: usize,
+    pub client_limits: AddressLimits,
     pub write_stall: Option<Duration>,
 }
 
@@ -98,6 +100,7 @@ pub fn gate_config(settings: GateSshSettings, ssh_suffix: String) -> SshGateConf
     config.proxy_protocol = settings.proxy_protocol;
     config.trusted_proxies = settings.trusted_proxies;
     config.max_unauthenticated = settings.max_unauthenticated;
+    config.client_limits = settings.client_limits;
     config.limits = OuterLimits {
         write_stall_timeout: settings.write_stall,
         ..OuterLimits::default()
@@ -203,12 +206,18 @@ impl GateSshServer {
 mod tests {
     use std::time::Duration;
 
+    use jaunt_limits::{AddressLimits, Rate};
     use jaunt_ssh::OuterLimits;
 
     use super::{GateSshSettings, gate_config};
 
     #[test]
     fn the_settings_reach_the_gate_configuration() {
+        let client_limits = AddressLimits {
+            rate: Rate::new(5, 7).unwrap(),
+            concurrent: 3,
+            tracked: 11,
+        };
         for stall in [
             Some(Duration::from_secs(900)),
             Some(Duration::from_secs(1)),
@@ -220,6 +229,7 @@ mod tests {
                 proxy_protocol: true,
                 trusted_proxies: vec!["10.0.0.0/8".parse().unwrap()],
                 max_unauthenticated: 7,
+                client_limits,
                 write_stall: stall,
             };
             let config = gate_config(settings, "nodes.example.com".to_owned());
@@ -236,6 +246,7 @@ mod tests {
             assert!(config.proxy_protocol);
             assert_eq!(config.trusted_proxies.len(), 1);
             assert_eq!(config.max_unauthenticated, 7);
+            assert_eq!(config.client_limits, client_limits);
         }
     }
 }

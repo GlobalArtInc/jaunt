@@ -20,20 +20,31 @@ jaunt-audit = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
 jaunt-web = { workspace = true }
+jaunt-limits = { workspace = true }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"
 form_urlencoded = "1.2.3"
+http-body-util = "0.1.5"
+ipnet = "2.12.2"
+hyper = { version = "1.13.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 serde = { workspace = true }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", default-features = false, features = ["net", "rt", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
+[features]
+test-support = []
+
 [dev-dependencies]
+jaunt-control = { path = ".", features = ["test-support"] }
 jaunt-audit = { workspace = true, features = ["testing"] }
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "tokio"] }
+http-body-util = { version = "0.1.5", features = ["channel"] }
 jsonwebtoken = { version = "12.0.0", default-features = false, features = ["rust_crypto"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite"] }

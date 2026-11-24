@@ -55,6 +55,34 @@ async fn the_public_origin_and_the_client_header_must_be_usable() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_client_address_header_needs_trusted_proxies_and_they_need_the_header() {
+    type Check = fn(&ControlError) -> bool;
+    let cases: [(Option<&'static str>, &'static [&'static str], Check); 3] = [
+        (Some("x-forwarded-for"), &[], |error| {
+            matches!(error, ControlError::ClientIpHeaderWithoutTrustedProxies)
+        }),
+        (None, &["10.0.0.0/8"], |error| {
+            matches!(error, ControlError::TrustedProxiesWithoutClientIpHeader)
+        }),
+        (
+            Some("x-forwarded-for"),
+            &["10.0.0.0/8", "0.0.0.0/0"],
+            |error| matches!(error, ControlError::UnusableTrustedProxy(unusable) if unusable.index == 1),
+        ),
+    ];
+    for (header, proxies, check) in cases {
+        let refused = Harness::try_with(Options {
+            client_ip_header: header,
+            trusted_proxies: Some(proxies),
+            ..Options::default()
+        })
+        .await;
+        let error = refused.err().expect("the settings were accepted");
+        assert!(check(&error), "{error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn control_exposes_the_policy_it_was_given() {
     let harness = Harness::new().await;
     let policy = harness.control.policy().snapshot();

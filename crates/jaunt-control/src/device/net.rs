@@ -1,21 +1,92 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::http::{HeaderMap, HeaderName, header};
+use jaunt_limits::{LogThrottle, TrustedProxies};
 
-pub(crate) fn client_ip(
-    forwarded_header: Option<&HeaderName>,
-    headers: &HeaderMap,
-    peer: SocketAddr,
-) -> IpAddr {
-    forwarded_header
-        .and_then(|name| forwarded_address(headers, name))
-        .unwrap_or_else(|| peer.ip().to_canonical())
+const IGNORED_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClientAddress(pub(crate) IpAddr);
+
+pub(crate) struct ClientIp {
+    header: Option<HeaderName>,
+    proxies: TrustedProxies,
+    ignored: AtomicU64,
+    ignored_log: LogThrottle,
+    origin: Instant,
 }
 
-fn forwarded_address(headers: &HeaderMap, name: &HeaderName) -> Option<IpAddr> {
-    let line = headers.get_all(name).iter().next_back()?.to_str().ok()?;
-    let last = line.rsplit(',').next()?.trim();
-    last.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+impl ClientIp {
+    pub(crate) fn new(header: Option<HeaderName>, proxies: TrustedProxies) -> ClientIp {
+        ClientIp {
+            header,
+            proxies,
+            ignored: AtomicU64::new(0),
+            ignored_log: LogThrottle::new(IGNORED_LOG_INTERVAL),
+            origin: Instant::now(),
+        }
+    }
+
+    pub(crate) fn trusted_proxies(&self) -> &TrustedProxies {
+        &self.proxies
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ignored(&self) -> u64 {
+        self.ignored.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn resolve(&self, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+        let peer = peer.ip().to_canonical();
+        let Some(name) = &self.header else {
+            return peer;
+        };
+        if !self.proxies.contains(peer) {
+            if headers.contains_key(name) {
+                self.report_ignored(peer);
+            }
+            return peer;
+        }
+        forwarded_address(headers, name, &self.proxies).unwrap_or(peer)
+    }
+
+    fn report_ignored(&self, peer: IpAddr) {
+        let total = self
+            .ignored
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if let Some(suppressed) = self.ignored_log.admit(self.origin.elapsed()) {
+            tracing::info!(
+                target: "jaunt::audit",
+                event = "http.client_ip_header_ignored",
+                peer_addr = %peer,
+                total,
+                suppressed
+            );
+        }
+    }
+}
+
+fn forwarded_address(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    proxies: &TrustedProxies,
+) -> Option<IpAddr> {
+    let mut elements = Vec::new();
+    for value in headers.get_all(name) {
+        elements.extend(value.to_str().ok()?.split(','));
+    }
+    let mut leftmost = None;
+    for element in elements.iter().rev() {
+        let ip = element.trim().parse::<IpAddr>().ok()?.to_canonical();
+        if !proxies.contains(ip) {
+            return Some(ip);
+        }
+        leftmost = Some(ip);
+    }
+    leftmost
 }
 
 pub(crate) fn origin_allowed(headers: &HeaderMap, public_origin: &str) -> bool {
@@ -63,10 +134,12 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
 
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use jaunt_limits::TrustedProxies;
 
-    use super::{client_ip, is_canonical_origin, is_valid_origin, origin_allowed};
+    use super::{ClientIp, is_canonical_origin, is_valid_origin, origin_allowed};
 
-    const PEER: &str = "198.51.100.7:40000";
+    const PROXY: &str = "198.51.100.7:40000";
+    const STRANGER: &str = "203.0.113.200:40000";
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -79,10 +152,26 @@ mod tests {
         map
     }
 
+    fn client_ip(configured: Option<&'static str>) -> ClientIp {
+        let proxies = TrustedProxies::new(vec![
+            "198.51.100.0/24".parse().unwrap(),
+            "10.0.0.0/8".parse().unwrap(),
+        ])
+        .unwrap();
+        ClientIp::new(configured.map(HeaderName::from_static), proxies)
+    }
+
+    fn resolve_from(
+        peer: &str,
+        configured: Option<&'static str>,
+        pairs: &[(&'static str, &str)],
+    ) -> IpAddr {
+        let peer: SocketAddr = peer.parse().unwrap();
+        client_ip(configured).resolve(&headers(pairs), peer)
+    }
+
     fn resolve(configured: Option<&'static str>, pairs: &[(&'static str, &str)]) -> IpAddr {
-        let name = configured.map(HeaderName::from_static);
-        let peer: SocketAddr = PEER.parse().unwrap();
-        client_ip(name.as_ref(), &headers(pairs), peer)
+        resolve_from(PROXY, configured, pairs)
     }
 
     fn ip(text: &str) -> IpAddr {
@@ -99,36 +188,48 @@ mod tests {
     }
 
     #[test]
-    fn the_last_forwarded_value_wins_because_the_proxy_appends_the_real_peer() {
+    fn a_header_from_a_peer_outside_the_trusted_networks_is_ignored_and_counted() {
+        let resolver = client_ip(Some("x-forwarded-for"));
+        let stranger: SocketAddr = STRANGER.parse().unwrap();
+        let forged = headers(&[("x-forwarded-for", "192.0.2.1")]);
+        for _ in 0..3 {
+            assert_eq!(resolver.resolve(&forged, stranger), ip("203.0.113.200"));
+        }
+        assert_eq!(
+            resolver.resolve(&headers(&[]), stranger),
+            ip("203.0.113.200")
+        );
+        assert_eq!(resolver.ignored(), 3);
+        let proxy: SocketAddr = PROXY.parse().unwrap();
+        assert_eq!(resolver.resolve(&forged, proxy), ip("192.0.2.1"));
+        assert_eq!(resolver.ignored(), 3);
+    }
+
+    #[test]
+    fn the_walk_skips_trusted_hops_from_the_right_and_takes_the_first_stranger() {
         let name = Some("x-forwarded-for");
-        assert_eq!(
-            resolve(
-                name,
-                &[("x-forwarded-for", "203.0.113.1, 10.0.0.1, 203.0.113.50")]
+        for (lines, expected) in [
+            (vec!["203.0.113.1, 10.0.0.1, 203.0.113.50"], "203.0.113.50"),
+            (
+                vec!["203.0.113.1, 203.0.113.50, 10.0.0.1, 10.0.0.2"],
+                "203.0.113.50",
             ),
-            ip("203.0.113.50")
-        );
-        assert_eq!(
-            resolve(
-                name,
-                &[
-                    ("x-forwarded-for", "203.0.113.1"),
-                    ("x-forwarded-for", "192.0.2.4, 192.0.2.5")
-                ]
-            ),
-            ip("192.0.2.5")
-        );
+            (vec!["203.0.113.1", "192.0.2.4, 192.0.2.5"], "192.0.2.5"),
+            (vec!["192.0.2.4", "10.0.0.9", "198.51.100.3"], "192.0.2.4"),
+            (vec!["10.0.0.5, 10.0.0.6"], "10.0.0.5"),
+            (vec!["2001:db8::1"], "2001:db8::1"),
+            (vec!["::ffff:192.0.2.9"], "192.0.2.9"),
+            (vec!["192.0.2.4, ::ffff:10.0.0.9"], "192.0.2.4"),
+        ] {
+            let pairs: Vec<(&'static str, &str)> = lines
+                .iter()
+                .map(|line| ("x-forwarded-for", *line))
+                .collect();
+            assert_eq!(resolve(name, &pairs), ip(expected), "{lines:?}");
+        }
         assert_eq!(
             resolve(Some("x-real-ip"), &[("x-real-ip", " 192.0.2.8 ")]),
             ip("192.0.2.8")
-        );
-        assert_eq!(
-            resolve(name, &[("x-forwarded-for", "2001:db8::1")]),
-            ip("2001:db8::1")
-        );
-        assert_eq!(
-            resolve(name, &[("x-forwarded-for", "::ffff:192.0.2.9")]),
-            ip("192.0.2.9")
         );
     }
 
@@ -144,6 +245,7 @@ mod tests {
             "[2001:db8::1]",
             "192.0.2.1,",
             "192.0.2.1, unknown",
+            "unknown, 10.0.0.1",
             "192.0.2.256",
             "0192.0.2.1",
         ] {

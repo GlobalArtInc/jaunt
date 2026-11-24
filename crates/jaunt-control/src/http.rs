@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -6,17 +8,19 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
+use http_body_util::BodyExt;
 use jaunt_proto::ErrorBody;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
 use crate::{
-    agent_trust, callback, client_config, device, enroll, finish, nodes, poll, renew, session_http,
-    start, web, whoami,
+    agent_trust, callback, client_config, device, enroll, finish, limits, nodes, poll, renew,
+    session_http, start, web, whoami,
 };
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
+pub(crate) const BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) fn router(control: Control, extra_web_routes: Router<Control>) -> Router {
     let routes = Router::new()
@@ -32,6 +36,11 @@ pub(crate) fn router(control: Control, extra_web_routes: Router<Control>) -> Rou
     let routes = device::mount(routes, &control);
     web::mount(routes, &control, extra_web_routes)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(read_body_in_time))
+        .layer(middleware::from_fn_with_state(
+            control.clone(),
+            limits::enforce,
+        ))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)
 }
@@ -49,6 +58,39 @@ pub(crate) fn agent_router(control: Control) -> Router {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn collect(mut body: Body, limit: usize) -> Result<Vec<u8>, axum::Error> {
+    let mut buffer = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            let room = limit.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&data[..data.len().min(room)]);
+            if data.len() > room {
+                break;
+            }
+        }
+    }
+    Ok(buffer)
+}
+
+async fn read_body_in_time(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let collected =
+        tokio::time::timeout(BODY_READ_TIMEOUT, collect(body, MAX_BODY_BYTES + 1)).await;
+    let bytes = match collected {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return error_response(StatusCode::BAD_REQUEST, "invalid_request"),
+        Err(_) => {
+            let mut response = error_response(StatusCode::REQUEST_TIMEOUT, "request_timeout");
+            response
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            return response;
+        }
+    };
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
 }
 
 async fn response_headers(request: Request, next: Next) -> Response {
@@ -144,5 +186,96 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
             .and_then(|text| text.split(';').next())
             .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json")),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::extract::DefaultBodyLimit;
+    use axum::http::{Request, StatusCode};
+    use axum::middleware;
+    use axum::routing::post;
+    use http_body_util::channel::Channel;
+    use tokio::time::Instant;
+    use tower::ServiceExt;
+
+    use super::{BODY_READ_TIMEOUT, MAX_BODY_BYTES, read_body_in_time};
+
+    fn app() -> Router {
+        Router::new()
+            .route(
+                "/",
+                post(|body: Bytes| async move { body.len().to_string() }),
+            )
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .layer(middleware::from_fn(read_body_in_time))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_stops_arriving_is_answered_with_408_at_the_deadline() {
+        let (mut sender, body) = Channel::<Bytes, std::io::Error>::new(1);
+        sender.send_data(Bytes::from_static(b"{")).await.unwrap();
+        let started = Instant::now();
+
+        let response = app()
+            .oneshot(Request::post("/").body(Body::new(body)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.headers()["connection"], "close");
+        assert!(started.elapsed() >= BODY_READ_TIMEOUT);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_body_at_the_limit_passes_and_one_byte_more_is_too_large() {
+        for (len, status) in [
+            (0, StatusCode::OK),
+            (MAX_BODY_BYTES, StatusCode::OK),
+            (MAX_BODY_BYTES + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            (4 * MAX_BODY_BYTES, StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let request = Request::post("/")
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap();
+            let response = app().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status, "{len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_is_cut_at_the_limit_while_its_source_is_still_sending() {
+        let (mut sender, body) = Channel::<Bytes, std::io::Error>::new(1);
+        let feeder = tokio::spawn(async move {
+            let chunk = Bytes::from(vec![b'x'; 4 * 1024]);
+            let mut sent = 0_usize;
+            while sender.send_data(chunk.clone()).await.is_ok() {
+                sent += chunk.len();
+            }
+            sent
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app().oneshot(Request::post("/").body(Body::new(body)).unwrap()),
+        )
+        .await
+        .expect("the oversized body was read to its end")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        drop(response);
+        let sent = feeder.await.unwrap();
+        assert!(sent < 4 * MAX_BODY_BYTES, "{sent}");
+    }
+
+    #[test]
+    fn the_body_limits_stay_tight() {
+        assert_eq!(MAX_BODY_BYTES, 16 * 1024);
+        assert!(BODY_READ_TIMEOUT <= std::time::Duration::from_secs(30));
+        assert!(BODY_READ_TIMEOUT >= std::time::Duration::from_secs(5));
     }
 }

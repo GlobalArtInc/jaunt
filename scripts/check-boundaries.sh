@@ -12,6 +12,7 @@ while read -r package forbidden; do
     fi
   done
 done <<'RULES'
+jaunt-limits jaunt-proto jaunt-ca jaunt-store jaunt-control jaunt-gate jaunt-tunnel jaunt-ssh jaunt-agent jaunt-oidc jaunt-audit jaunt-policy jaunt-record jaunt-web
 jaunt-policy jaunt-ca jaunt-store
 jaunt-oidc jaunt-ca jaunt-store
 jaunt-tunnel jaunt-ca jaunt-store

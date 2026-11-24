@@ -10,7 +10,11 @@ use std::time::{Duration, SystemTime};
 
 use jaunt_ca::CaError;
 use jaunt_control::{Clock, Control};
-use jaunt_gate::{AgentHub, AgentHubConfig, HubError, HubStatsSnapshot, ShutdownReport};
+use jaunt_gate::{
+    AgentHub, AgentHubConfig, DEFAULT_AGENT_CLIENT_LIMITS, HubError, HubStatsSnapshot,
+    ShutdownReport,
+};
+use jaunt_limits::AddressLimits;
 use jaunt_store::Store;
 use jaunt_tunnel::{
     AgentRegistry, GateStats, TlsConfigError, TunnelOptions, rotating_agent_server_config,
@@ -53,6 +57,7 @@ pub struct AgentServerParts {
     pub certificate_check_interval: Duration,
     pub api_limits: ApiLimits,
     pub tunnel: TunnelOptions,
+    pub client_limits: AddressLimits,
 }
 
 pub fn ssh_tunnel_options() -> TunnelOptions {
@@ -74,6 +79,7 @@ impl AgentServerParts {
             certificate_check_interval: CERTIFICATE_CHECK_INTERVAL,
             api_limits: ApiLimits::default(),
             tunnel: ssh_tunnel_options(),
+            client_limits: DEFAULT_AGENT_CLIENT_LIMITS,
         }
     }
 }
@@ -116,6 +122,7 @@ impl AgentServer {
             certificate_check_interval,
             api_limits,
             tunnel,
+            client_limits,
         } = parts;
         let certificate = Arc::new(ServerCertificate::issue(
             control.clone(),
@@ -136,6 +143,7 @@ impl AgentServer {
                 })?;
         let mut hub_config = AgentHubConfig::new(settings.server_name, Arc::new(tls));
         hub_config.tunnel = tunnel;
+        hub_config.client_limits = client_limits;
         let hub = AgentHub::start(
             listener,
             hub_config,

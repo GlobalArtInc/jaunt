@@ -6,7 +6,8 @@ use jaunt_store::{CreateOutcome, EnrollmentLimits, EnrollmentState, NewEnrollmen
 use serde_json::{Map, Value, json};
 
 use crate::support::{
-    DEFAULT_PEER, Harness, HostAuthority, Options, new_agent, request_raw, send, sha256_hex,
+    DEFAULT_PEER, Harness, HostAuthority, Options, new_agent, request, request_raw, send,
+    send_without_peer, sha256_hex,
 };
 
 const RSA_SPKI_PREFIX: [u8; 24] = [
@@ -169,7 +170,7 @@ async fn malformed_oversized_and_unaddressed_requests_are_refused() {
     assert_eq!(oversized.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(oversized.error_code(), "payload_too_large");
 
-    let unaddressed = send(
+    let unaddressed = send_without_peer(
         harness.router.clone(),
         request_raw(path, "application/json", body, None, None),
     )
@@ -223,6 +224,52 @@ async fn a_name_held_by_an_active_node_needs_replace_and_pending_requests_may_sh
             .id,
         approved.node.id
     );
+}
+
+#[tokio::test]
+async fn behind_a_trusted_proxy_the_forwarded_address_owns_the_pending_quota_and_is_stored() {
+    let harness = Harness::with(Options {
+        client_ip_header: Some("x-forwarded-for"),
+        trusted_proxies: &["203.0.113.0/24"],
+        ..Options::default()
+    })
+    .await;
+    let through_proxy = |forwarded: &'static str, name: String| {
+        let mut request = request(
+            "/v1/agent/enroll",
+            &new_agent().enroll_body(&name),
+            Some(DEFAULT_PEER),
+            None,
+        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", forwarded.parse().unwrap());
+        send(harness.router.clone(), request)
+    };
+    for n in 0..20 {
+        let reply = through_proxy("192.0.2.1", format!("web-{n}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{n}: {}", reply.text());
+    }
+    let over = through_proxy("192.0.2.1", "web-x".to_owned()).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        over.json(),
+        json!({"error": "too_many_requests", "retry_after": 60})
+    );
+    assert_eq!(over.headers["retry-after"], "60");
+
+    let other = through_proxy("192.0.2.2", "web-y".to_owned()).await;
+    assert_eq!(other.status, StatusCode::OK, "{}", other.text());
+    let handle = other.json()["handle"].as_str().unwrap().to_owned();
+    let stored = harness
+        .store
+        .enrollments()
+        .get_by_handle_hash(&sha256_hex(&handle))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.source_ip, "192.0.2.2");
+    assert_eq!(stored.peer_addr, "192.0.2.2");
 }
 
 #[tokio::test]
@@ -421,4 +468,43 @@ async fn every_enrollment_attempt_counts_against_a_per_source_limit_whatever_its
     harness.clock.advance(600);
     let later = harness.enroll_body(&taken).await;
     assert_eq!(later.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_flood_from_one_address_is_cut_off_while_another_address_enrolls_at_once() {
+    let harness = Harness::new().await;
+    let flooder = "198.51.100.66";
+    let invalid = new_agent().enroll_body("Bad_Name");
+    let mut answered = 0;
+    let mut limited = None;
+    for _ in 0..1000 {
+        let reply = harness.enroll_from(flooder, &invalid).await;
+        match reply.status {
+            StatusCode::BAD_REQUEST => answered += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited = Some(reply),
+            other => panic!("unexpected {other}: {}", reply.text()),
+        }
+    }
+    assert_eq!(answered, 60);
+    let limited = limited.unwrap();
+    assert_eq!(
+        limited.json(),
+        json!({"error": "too_many_requests", "retry_after": 10})
+    );
+    assert_eq!(limited.headers["retry-after"], "10");
+
+    let elsewhere = harness
+        .enroll_from("198.51.100.67", &new_agent().enroll_body("web-01"))
+        .await;
+    assert_eq!(elsewhere.status, StatusCode::OK, "{}", elsewhere.text());
+
+    harness.clock.advance(4);
+    let sooner = harness.enroll_from(flooder, &invalid).await;
+    assert_eq!(sooner.headers["retry-after"], "6");
+    assert_eq!(sooner.json()["retry_after"], 6);
+    harness.clock.advance(6);
+    let after = harness.enroll_from(flooder, &invalid).await;
+    assert_eq!(after.status, StatusCode::BAD_REQUEST);
+    let again = harness.enroll_from(flooder, &invalid).await;
+    assert_eq!(again.headers["retry-after"], "10");
 }

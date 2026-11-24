@@ -1,9 +1,10 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Extension, RawQuery, State};
+use axum::extract::{Extension, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
+use jaunt_limits::ClientKey;
 use jaunt_oidc::{ExchangeFailure, OidcError, PendingAuth, UserInfoFailure};
 use jaunt_store::{LoginRequest, LoginRequestState, NewUser, User};
 
@@ -12,6 +13,7 @@ use crate::clock::Moment;
 use crate::completion;
 use crate::control::Control;
 use crate::device;
+use crate::device::net::ClientAddress;
 use crate::http::server_error;
 use crate::pending::{PendingKind, PendingLogin};
 use crate::start::LOGIN_KIND;
@@ -121,21 +123,28 @@ fn oidc_denial(err: &OidcError) -> Denial {
 
 pub(crate) async fn handle(
     State(control): State<Control>,
-    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    client: Option<Extension<ClientAddress>>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    let refuse = |reason| {
+        let client = ClientKey::of(client.map_or(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            |Extension(ClientAddress(ip))| ip,
+        ));
+        if let Some(suppressed) = control.callback_noise.admit(client, control.tick()) {
+            audit::callback_refused(reason, client, suppressed);
+        }
+        device::page::sign_in_failed()
+    };
     let Some(params) = query.as_deref().and_then(parse_query) else {
-        audit::login_denied(None, DenyReason::MalformedQuery);
-        return device::page::sign_in_failed();
+        return refuse(DenyReason::MalformedQuery);
     };
     let Some(state) = params.state.as_deref().filter(|state| !state.is_empty()) else {
-        audit::login_denied(None, DenyReason::MalformedQuery);
-        return device::page::sign_in_failed();
+        return refuse(DenyReason::MalformedQuery);
     };
     let Some(entry) = control.pending.take(state) else {
-        audit::login_denied(None, DenyReason::UnknownState);
-        return device::page::sign_in_failed();
+        return refuse(DenyReason::UnknownState);
     };
     let kind = entry.kind.clone();
     let login_id = entry.login_id.clone();
@@ -187,8 +196,8 @@ pub(crate) async fn handle(
             return_to,
             browser_hash,
         } => {
-            let mut response = match peer {
-                Some(Extension(ConnectInfo(peer))) => {
+            let mut response = match client {
+                Some(Extension(ClientAddress(client))) => {
                     let request = WebCallback {
                         return_to: &return_to,
                         browser_hash: &browser_hash,
@@ -196,7 +205,7 @@ pub(crate) async fn handle(
                         provider_error: error_reported,
                         state,
                         headers: &headers,
-                        peer,
+                        client,
                     };
                     complete_web(&control, entry, request).await
                 }
@@ -218,7 +227,7 @@ struct WebCallback<'a> {
     provider_error: bool,
     state: &'a str,
     headers: &'a HeaderMap,
-    peer: SocketAddr,
+    client: IpAddr,
 }
 
 async fn complete_web(
@@ -248,7 +257,7 @@ async fn complete_web(
                 &user,
                 now,
                 request.headers,
-                request.peer,
+                request.client,
             )
             .await
         }

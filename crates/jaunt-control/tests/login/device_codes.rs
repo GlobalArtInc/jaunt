@@ -18,6 +18,30 @@ fn is_confirmation(html: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_guesses_from_one_address_does_not_delay_a_user_elsewhere() {
+    let harness = Harness::new().await;
+    let session = harness.device_start().await;
+    let flooder = "198.51.100.66:40000";
+    let mut rejected = 0;
+    let mut limited = 0;
+    for _ in 0..1000 {
+        let reply = harness.enter_code_as(WRONG_CODE, flooder, &[]).await;
+        match reply.status {
+            StatusCode::OK if is_rejection(&reply.text()) => rejected += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert_eq!((rejected, limited), (10, 990));
+
+    let user = harness
+        .enter_code_as(&session.user_code, "198.51.100.67:40000", &[])
+        .await;
+    assert_eq!(user.status, StatusCode::OK);
+    assert!(is_confirmation(&user.text()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_code_finds_its_own_request_whatever_the_case_hyphen_or_spacing() {
     let harness = Harness::new().await;
     let first = harness.device_start().await;

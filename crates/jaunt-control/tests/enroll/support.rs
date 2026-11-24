@@ -15,7 +15,7 @@ use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer, TrustSet};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
-    DeviceSettings, GateEndpoint, NodeAdmin, SshSuffix,
+    DeviceSettings, GateEndpoint, NodeAdmin, RequestLimits, SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -71,6 +71,11 @@ impl TestClock {
         let clock = self.clone();
         Arc::new(move || clock.base + Duration::from_secs(clock.offset_secs.load(Ordering::SeqCst)))
     }
+
+    fn ticker(&self) -> Ticker {
+        let offset = Arc::clone(&self.offset_secs);
+        Arc::new(move || Duration::from_secs(offset.load(Ordering::SeqCst)))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +97,8 @@ pub struct Options {
     pub user_trust: UserTrust,
     pub empty_policy: bool,
     pub gate_endpoint: Option<&'static str>,
+    pub client_ip_header: Option<&'static str>,
+    pub trusted_proxies: &'static [&'static str],
 }
 
 impl Default for Options {
@@ -101,6 +108,8 @@ impl Default for Options {
             user_trust: UserTrust::Matching,
             empty_policy: false,
             gate_endpoint: None,
+            client_ip_header: None,
+            trusted_proxies: &[],
         }
     }
 }
@@ -249,7 +258,19 @@ pub fn request_raw(
     request
 }
 
-pub async fn send(router: Router, request: Request<Body>) -> Reply {
+pub async fn send(router: Router, mut request: Request<Body>) -> Reply {
+    if request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_none()
+    {
+        let peer: SocketAddr = format!("{DEFAULT_PEER}:40000").parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    send_without_peer(router, request).await
+}
+
+pub async fn send_without_peer(router: Router, request: Request<Body>) -> Reply {
     let response = router.oneshot(request).await.unwrap();
     let (parts, body) = response.into_parts();
     let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
@@ -352,30 +373,39 @@ impl Harness {
         } else {
             loaded_policy(&dir.path().join("policy"))
         };
-        let control = Control::new(ControlParts {
-            store: store.clone(),
-            oidc: provider.oidc_client().await,
-            user_authority: Arc::new(user_authority),
-            user_trust: user_trust.clone(),
-            host_trust,
-            host_authority,
-            internal_ca,
-            ssh_suffix: SshSuffix::parse(SUFFIX).unwrap(),
-            gate_endpoint: options
-                .gate_endpoint
-                .map(|text| GateEndpoint::parse(text).unwrap()),
-            agent_endpoint: AgentEndpoint::parse(AGENT_ENDPOINT).unwrap(),
-            cert_ttl: Duration::from_secs(8 * 60 * 60),
-            pending_capacity: 100,
-            device: DeviceSettings {
-                enabled: false,
-                public_origin: "https://jaunt.example.test".to_owned(),
-                client_ip_header: None,
+        let control = Control::with_limits_and_ticker(
+            ControlParts {
+                store: store.clone(),
+                oidc: provider.oidc_client().await,
+                user_authority: Arc::new(user_authority),
+                user_trust: user_trust.clone(),
+                host_trust,
+                host_authority,
+                internal_ca,
+                ssh_suffix: SshSuffix::parse(SUFFIX).unwrap(),
+                gate_endpoint: options
+                    .gate_endpoint
+                    .map(|text| GateEndpoint::parse(text).unwrap()),
+                agent_endpoint: AgentEndpoint::parse(AGENT_ENDPOINT).unwrap(),
+                cert_ttl: Duration::from_secs(8 * 60 * 60),
+                pending_capacity: 100,
+                device: DeviceSettings {
+                    enabled: false,
+                    public_origin: "https://jaunt.example.test".to_owned(),
+                    client_ip_header: options.client_ip_header.map(str::to_owned),
+                    client_ip_trusted_proxies: options
+                        .trusted_proxies
+                        .iter()
+                        .map(|network| network.parse().unwrap())
+                        .collect(),
+                },
+                policy: policy.clone(),
+                web_enabled: false,
+                clock: clock.clock(),
             },
-            policy: policy.clone(),
-            web_enabled: false,
-            clock: clock.clock(),
-        })?;
+            RequestLimits::default(),
+            clock.ticker(),
+        )?;
         Ok(Harness {
             router: control.router(),
             agent_router: control.agent_router(),
@@ -427,7 +457,7 @@ impl Harness {
             request(
                 "/v1/agent/enroll/poll",
                 &json!({"handle": handle}),
-                None,
+                Some(DEFAULT_PEER),
                 None,
             ),
         )

@@ -1,18 +1,20 @@
-use std::net::SocketAddr;
+use std::time::Duration;
 
 use axum::Extension;
 use axum::body::Bytes;
+use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use jaunt_proto::{EnrollRequest, EnrollResponse};
 use jaunt_store::{CreateOutcome, EnrollmentLimits, NewEnrollment};
 
 use crate::control::Control;
+use crate::device::net::ClientAddress;
 use crate::enroll_secrets;
 use crate::http::{error_response, json_body, json_response, server_error};
 use crate::labels::Labels;
+use crate::limits;
 use crate::naming::is_dns_label;
 use crate::node_audit::{self, EnrollRequested};
 use crate::node_keys::{self, SshHostKey, TlsKey};
@@ -22,6 +24,7 @@ pub(crate) const ENROLLMENT_TTL_SECS: i64 = 900;
 pub(crate) const POLL_INTERVAL_SECS: u32 = 3;
 pub(crate) const MAX_PENDING_ENROLLMENTS: i64 = 1000;
 pub(crate) const MAX_PENDING_PER_IP: i64 = 20;
+const PENDING_RETRY_AFTER: Duration = Duration::from_secs(60);
 const CODE_RETRIES: usize = 5;
 const MAX_HOSTNAME_LEN: usize = 253;
 const MAX_AGENT_VERSION_LEN: usize = 64;
@@ -104,22 +107,19 @@ fn validate(request: EnrollRequest) -> Result<ValidEnroll, Invalid> {
 
 pub(crate) async fn handle(
     State(control): State<Control>,
-    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    client: Option<Extension<ClientAddress>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let Some(Extension(ConnectInfo(peer))) = peer else {
+    let Some(Extension(ClientAddress(client))) = client else {
         tracing::error!(target: "jaunt::control", "the peer address is not available");
         return server_error();
     };
-    let source = source_of(peer, &headers);
+    let source = source_of(client);
     let Some(now) = control.now() else {
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return server_error();
     };
-    if !control.enroll_limiter.allow(&source.network, now.secs) {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, "too_many_requests");
-    }
     let request = match json_body::<EnrollRequest>(&headers, body) {
         Ok(request) => request,
         Err(failure) => return failure.into_response(),
@@ -191,7 +191,7 @@ pub(crate) async fn handle(
                 );
             }
             Ok(CreateOutcome::TooManyPending | CreateOutcome::TooManyFromIp) => {
-                return error_response(StatusCode::TOO_MANY_REQUESTS, "too_many_requests");
+                return limits::too_many_requests(PENDING_RETRY_AFTER);
             }
             Ok(CreateOutcome::CodeCollision) => {}
             Err(err) => {

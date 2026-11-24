@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::IpAddr;
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -11,7 +11,6 @@ use crate::audit;
 use crate::clock::Moment;
 use crate::completion;
 use crate::control::Control;
-use crate::device::net;
 use crate::http::empty_response;
 use crate::pending::{InsertError, PendingKind, PendingLogin};
 use crate::start::LOGIN_TTL_SECS;
@@ -155,7 +154,7 @@ pub(crate) async fn establish(
     user: &User,
     now: Moment,
     headers: &HeaderMap,
-    peer: SocketAddr,
+    ip: IpAddr,
 ) -> Response {
     let Some(mut response) = pages::signed_in(return_to) else {
         tracing::error!(target: "jaunt::control", "the sign-in page cannot be built for the return path");
@@ -169,7 +168,6 @@ pub(crate) async fn establish(
         tracing::error!(target: "jaunt::control", "the session cookie could not be built");
         return pages::server_error();
     };
-    let ip = net::client_ip(control.device.client_ip_header.as_ref(), headers, peer);
     let expires_at = now.secs.saturating_add(SESSION_TTL_SECS);
     let stored = control
         .store

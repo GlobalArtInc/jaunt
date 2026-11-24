@@ -320,60 +320,53 @@ async fn only_get_starts_a_web_login() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_connection_address_is_needed_by_a_web_sign_in_but_not_by_loopback_or_device_callbacks()
-{
+async fn every_callback_needs_the_connection_address_and_a_refusal_consumes_nothing() {
     let harness = Harness::with_web().await;
+    let callback = |code: &str, state: &str, cookie: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/login/callback?code={code}&state={state}"));
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+
     let loopback = harness.begin().await;
     let code = harness.browser_code(&loopback);
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "/v1/login/callback?code={code}&state={}",
-            loopback.state
-        ))
-        .body(Body::empty())
-        .unwrap();
-
-    let approved = harness.send_without_peer(request).await;
-
+    let refused = harness
+        .send_without_peer(callback(&code, &loopback.state, None))
+        .await;
+    assert_eq!(refused.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let approved = harness.send(callback(&code, &loopback.state, None)).await;
     assert_eq!(approved.status, StatusCode::FOUND);
     loopback.record_completion(approved.location());
 
     let start = harness.web_start("").await;
     let code = harness.provider.grant(&start.authorize_url, bob());
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "/v1/login/callback?code={code}&state={}",
-            start.state
-        ))
-        .header("cookie", &start.login_cookie)
-        .body(Body::empty())
-        .unwrap();
-
-    let refused = harness.send_without_peer(request).await;
-
+    let refused = harness
+        .send_without_peer(callback(&code, &start.state, Some(&start.login_cookie)))
+        .await;
     assert_eq!(refused.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(refused.set_cookies().is_empty());
-    assert!(refused.headers.contains_key("content-security-policy"));
+    let signed_in = harness
+        .send(callback(&code, &start.state, Some(&start.login_cookie)))
+        .await;
+    assert_ne!(signed_in.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!signed_in.set_cookies().is_empty());
 
     let session = harness.device_start().await;
     let continued = harness.continue_flow(&session).await;
     let code = harness
         .provider
         .grant(&continued.authorize_url, Identity::alice());
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "/v1/login/callback?code={code}&state={}",
-            continued.state
-        ))
-        .header("cookie", &continued.cookie)
-        .body(Body::empty())
-        .unwrap();
-
-    let approval = harness.send_without_peer(request).await;
-
+    let refused = harness
+        .send_without_peer(callback(&code, &continued.state, Some(&continued.cookie)))
+        .await;
+    assert_eq!(refused.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let approval = harness
+        .send(callback(&code, &continued.state, Some(&continued.cookie)))
+        .await;
     assert_eq!(approval.status, StatusCode::OK, "{}", approval.text());
     assert!(
         approval

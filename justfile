@@ -21,6 +21,14 @@ ci:
     just deny
     just boundaries
 
+fuzz-run target seconds:
+    test -n "$(ls fuzz/seeds/{{target}} 2>/dev/null)" || { echo "fuzz target {{target}} has no seeds in fuzz/seeds"; exit 1; }
+    mkdir -p fuzz/corpus/{{target}}
+    CARGO_INCREMENTAL=0 cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{seconds}} -timeout=10 -rss_limit_mb=2048
+
+fuzz-smoke:
+    targets="$(cargo +nightly fuzz list)" && test -n "$targets" && for target in $targets; do just fuzz-run "$target" 60 || exit 1; done
+
 installer-containers:
     scripts/test-installer.sh debian:12 debian:13 rockylinux:9
 

@@ -1,6 +1,7 @@
 mod audit;
 mod ca;
 mod config;
+mod limits;
 mod logging;
 mod node;
 mod policy;

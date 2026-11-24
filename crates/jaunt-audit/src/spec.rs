@@ -186,6 +186,18 @@ events! {
         [("name", NAME), ("x509_serial", ID), ("ssh_serial", ID), ("rotated", BOOL)]),
     PolicyReload => ("policy.reload", "policy.reload", ActorRule::System, None, None, Some("hash"),
         [("applied", BOOL), ("error_count", INT), ("error_1", ERROR), ("error_2", ERROR), ("error_3", ERROR)]),
+    LoginCallbackRefused => ("login.callback_refused", "login.callback_refused", ActorRule::Anonymous, None, None, None,
+        [("reason", SHORT), ("client", ADDR), ("suppressed", INT)], Class::Noisy),
+    HttpRateLimited => ("http.rate_limited", "http.rate_limited", ActorRule::Anonymous, None, None, None,
+        [("endpoint", SHORT), ("client", ADDR), ("retry_after", INT), ("suppressed", INT)], Class::Noisy),
+    HttpConnectionLimited => ("http.connection_limited", "http.connection_limited", ActorRule::Anonymous, None, None, None,
+        [("peer_addr", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
+    HttpClientIpHeaderIgnored => ("http.client_ip_header_ignored", "http.client_ip_header_ignored", ActorRule::Anonymous, None, None, None,
+        [("peer_addr", ADDR), ("total", INT), ("suppressed", INT)], Class::Noisy),
+    GateLimited => ("gate.limited", "gate.ssh.limited", ActorRule::Anonymous, None, None, None,
+        [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
+    AgentLimited => ("agent.limited", "agent.limited", ActorRule::Anonymous, None, None, None,
+        [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];
@@ -305,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_connection_level_noise_is_in_the_noisy_class() {
+    fn exactly_the_connection_level_noise_and_the_flood_refusals_are_in_the_noisy_class() {
         let noisy: Vec<&str> = EventType::ALL
             .iter()
             .filter(|kind| kind.class() == super::Class::Noisy)
@@ -319,7 +331,13 @@ mod tests {
                 "gate.connect",
                 "gate.session_refused",
                 "gate.disconnect",
-                "agent.rejected"
+                "agent.rejected",
+                "login.callback_refused",
+                "http.rate_limited",
+                "http.connection_limited",
+                "http.client_ip_header_ignored",
+                "gate.limited",
+                "agent.limited"
             ]
         );
     }

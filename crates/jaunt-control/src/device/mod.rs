@@ -15,12 +15,15 @@ mod verify;
 use axum::Router;
 use axum::http::HeaderName;
 use axum::routing::{get, post};
+use ipnet::IpNet;
+use jaunt_limits::TrustedProxies;
 
 use crate::control::Control;
 use crate::error::ControlError;
 
 use self::approval::Approval;
 use self::limiter::{FailureLimiter, Limits};
+use self::net::ClientIp;
 use self::polls::PollTracker;
 use self::tokens::TokenBook;
 
@@ -35,12 +38,13 @@ pub struct DeviceSettings {
     pub enabled: bool,
     pub public_origin: String,
     pub client_ip_header: Option<String>,
+    pub client_ip_trusted_proxies: Vec<IpNet>,
 }
 
 pub(crate) struct DeviceState {
     pub(crate) enabled: bool,
     pub(crate) origin: String,
-    pub(crate) client_ip_header: Option<HeaderName>,
+    pub(crate) client_ip: ClientIp,
     pub(crate) capacity: usize,
     pub(crate) failures: FailureLimiter,
     pub(crate) continue_tokens: TokenBook<()>,
@@ -66,10 +70,17 @@ impl DeviceState {
                     .map_err(|_| ControlError::InvalidClientIpHeader)
             })
             .transpose()?;
+        let proxies = TrustedProxies::new(settings.client_ip_trusted_proxies)
+            .map_err(ControlError::UnusableTrustedProxy)?;
+        match (client_ip_header.is_some(), proxies.is_empty()) {
+            (true, true) => return Err(ControlError::ClientIpHeaderWithoutTrustedProxies),
+            (false, false) => return Err(ControlError::TrustedProxiesWithoutClientIpHeader),
+            (true, false) | (false, true) => {}
+        }
         Ok(DeviceState {
             enabled: settings.enabled,
             origin: settings.public_origin,
-            client_ip_header,
+            client_ip: ClientIp::new(client_ip_header, proxies),
             capacity,
             failures: FailureLimiter::new(Limits::STANDARD),
             continue_tokens: TokenBook::new(capacity),
@@ -82,8 +93,8 @@ impl DeviceState {
         format!("{}{VERIFICATION_PATH}", self.origin)
     }
 
-    pub(crate) fn sweep(&self, now: i64) {
-        self.failures.sweep(now);
+    pub(crate) fn sweep(&self, now: i64, tick_secs: i64) {
+        self.failures.sweep(tick_secs);
         self.continue_tokens.sweep(now);
         self.approvals.sweep(now);
         self.polls.sweep(now);

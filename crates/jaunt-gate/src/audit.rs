@@ -1,7 +1,28 @@
 use std::net::SocketAddr;
 
+use jaunt_limits::{ClientKey, Refused};
 use jaunt_ssh::OuterEvent;
 use jaunt_tunnel::{DisconnectReason, NodeId, RejectReason, Rejection};
+
+pub(crate) fn ssh_limited(client: ClientKey, refused: Refused, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.ssh.limited",
+        client = %client,
+        reason = refused.reason(),
+        suppressed
+    );
+}
+
+pub(crate) fn agent_limited(client: ClientKey, refused: Refused, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "agent.limited",
+        client = %client,
+        reason = refused.reason(),
+        suppressed
+    );
+}
 
 pub(crate) fn ssh_connected(client_addr: SocketAddr, peer_addr: SocketAddr, proxied: bool) {
     tracing::info!(

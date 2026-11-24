@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jaunt_gate::{AgentHub, AgentHubConfig, DisconnectReason, HubError};
+use jaunt_limits::{AddressLimits, Rate};
 use jaunt_tunnel::agent_server_config;
 use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, RejectReason};
 use rustls::pki_types::ServerName;
@@ -284,6 +285,34 @@ async fn api_sessions_are_capped_per_node_and_in_total_without_touching_other_no
         .unwrap();
     assert_eq!(session.node, node("node-a"));
     assert_eq!(test.hub.hub_stats().api_sessions_open, 3);
+    test.hub.shutdown(GRACE).await;
+}
+
+#[tokio::test]
+async fn the_configured_per_address_limits_reach_the_agents_listener() {
+    let pki = Pki::new("ca");
+    let test = start_hub(
+        &pki,
+        Arc::new(Verdicts::default()),
+        HubOptions {
+            client_limits: AddressLimits {
+                rate: Rate::new(10, 1).unwrap(),
+                concurrent: 1,
+                tracked: 16,
+            },
+            ..HubOptions::default()
+        },
+    )
+    .await;
+    let _first = TcpStream::connect(test.addr).await.unwrap();
+    let _second = TcpStream::connect(test.addr).await.unwrap();
+    eventually("one of the two silent connections to be refused", || {
+        test.hub.stats().snapshot().refused_per_address == 1
+    })
+    .await;
+    let limited = audited("agent.limited", |event| is_event(event, "agent.limited")).await;
+    assert_eq!(field(&limited, "client"), "127.0.0.1");
+    assert_eq!(field(&limited, "reason"), "concurrent");
     test.hub.shutdown(GRACE).await;
 }
 

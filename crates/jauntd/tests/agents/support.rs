@@ -140,6 +140,7 @@ impl Harness {
                 enabled: false,
                 public_origin: "https://jaunt.example.test".to_owned(),
                 client_ip_header: None,
+                client_ip_trusted_proxies: Vec::new(),
             },
             policy: PolicyHandle::empty(),
             web_enabled: false,

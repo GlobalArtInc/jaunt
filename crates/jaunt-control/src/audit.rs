@@ -1,5 +1,7 @@
 use std::net::IpAddr;
 
+use jaunt_limits::ClientKey;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DenyReason {
     MalformedQuery,
@@ -114,6 +116,16 @@ pub(crate) fn device_locked_out(ip: IpAddr) {
 
 pub(crate) fn device_continued(login_id: &str) {
     tracing::info!(target: "jaunt::audit", event = "login.device.continued", login_id);
+}
+
+pub(crate) fn callback_refused(reason: DenyReason, client: ClientKey, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "login.callback_refused",
+        reason = reason.code(),
+        client = %client,
+        suppressed
+    );
 }
 
 pub(crate) fn login_denied(login_id: Option<&str>, reason: DenyReason) {

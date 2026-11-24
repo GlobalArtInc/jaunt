@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use jaunt_limits::{
+    AddressLimits, AddressLimitsError, ClientKey, DEFAULT_CAPACITY, LogThrottle, Rate, Refused,
+};
 use jaunt_tunnel::{
     ALPN_AGENT_API, ALPN_TUNNEL, AcceptorConfig, AgentApiConnection, AgentRegistry, BoxFuture,
     ConnectionId, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_HANDSHAKING, DisconnectReason, Gate,
@@ -27,8 +30,14 @@ use crate::audit;
 
 pub const DEFAULT_MAX_API_SESSIONS_PER_NODE: usize = 4;
 pub const DEFAULT_MAX_API_SESSIONS: usize = 1024;
+pub const DEFAULT_AGENT_CLIENT_LIMITS: AddressLimits = AddressLimits {
+    rate: Rate::clamped(128, 1200),
+    concurrent: 64,
+    tracked: DEFAULT_CAPACITY,
+};
 const API_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
 const API_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 pub trait AgentApiHandler: Send + Sync {
     fn serve(
@@ -45,6 +54,7 @@ pub struct AgentHubConfig {
     pub tunnel: TunnelOptions,
     pub handshake_timeout: Duration,
     pub max_handshaking: usize,
+    pub client_limits: AddressLimits,
     pub max_api_sessions_per_node: usize,
     pub max_api_sessions: usize,
 }
@@ -57,6 +67,7 @@ impl AgentHubConfig {
             tunnel: TunnelOptions::default(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             max_handshaking: DEFAULT_MAX_HANDSHAKING,
+            client_limits: DEFAULT_AGENT_CLIENT_LIMITS,
             max_api_sessions_per_node: DEFAULT_MAX_API_SESSIONS_PER_NODE,
             max_api_sessions: DEFAULT_MAX_API_SESSIONS,
         }
@@ -75,6 +86,8 @@ pub enum HubError {
     Options(#[from] OptionsError),
     #[error("the agent api session limits must be at least one")]
     SessionLimits,
+    #[error("the agents' per address limits are invalid: {0}")]
+    ClientLimits(#[from] AddressLimitsError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +283,8 @@ struct Glue {
     book: Arc<SessionBook>,
     counters: Counters,
     shutdown: CancellationToken,
+    refusals: LogThrottle,
+    started: std::time::Instant,
 }
 
 impl Handover for Glue {
@@ -318,6 +333,12 @@ impl GateObserver for Glue {
             self.counters.no_certificate.fetch_add(1, Ordering::Relaxed);
         }
         audit::rejected(peer_addr, rejection);
+    }
+
+    fn peer_limited(&self, peer_addr: SocketAddr, refused: Refused) {
+        if let Some(suppressed) = self.refusals.admit(self.started.elapsed()) {
+            audit::agent_limited(ClientKey::of(peer_addr.ip()), refused, suppressed);
+        }
     }
 }
 
@@ -383,6 +404,8 @@ impl AgentHub {
             book: book.clone(),
             counters: Counters::default(),
             shutdown,
+            refusals: LogThrottle::new(REFUSAL_LOG_INTERVAL),
+            started: std::time::Instant::now(),
         });
         let gate = Gate::new(
             acceptor,
@@ -391,7 +414,8 @@ impl AgentHub {
             glue.clone(),
             config.tunnel,
         )?
-        .with_observer(glue.clone());
+        .with_observer(glue.clone())
+        .with_client_limits(config.client_limits)?;
         let token = connections.clone();
         let accept = tokio::spawn(async move { gate.serve(listener, token).await });
         Ok(Self {

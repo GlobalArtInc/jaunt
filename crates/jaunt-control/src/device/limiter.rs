@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use jaunt_limits::ClientKey;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {
@@ -38,7 +40,7 @@ struct Window {
 
 #[derive(Default)]
 struct State {
-    per_ip: HashMap<IpAddr, Window>,
+    per_ip: HashMap<ClientKey, Window>,
     global: VecDeque<i64>,
 }
 
@@ -47,15 +49,8 @@ pub(crate) struct FailureLimiter {
     state: Mutex<State>,
 }
 
-fn tracked_key(ip: IpAddr) -> IpAddr {
-    match ip.to_canonical() {
-        IpAddr::V6(v6) => {
-            let mut octets = v6.octets();
-            octets[8..].fill(0);
-            IpAddr::V6(Ipv6Addr::from(octets))
-        }
-        v4 => v4,
-    }
+fn tracked_key(ip: IpAddr) -> ClientKey {
+    ClientKey::of(ip)
 }
 
 fn expire(queue: &mut VecDeque<i64>, now: i64, window_secs: i64) {
@@ -102,16 +97,17 @@ impl FailureLimiter {
                 };
             }
             window.lockout_reported = false;
-        } else if state.per_ip.len() >= limits.max_tracked_ips {
-            prune(&mut state.per_ip, now, limits.per_ip_window_secs);
-            if state.per_ip.len() >= limits.max_tracked_ips {
-                return Verdict::Limited {
-                    retry_after_secs: limits.per_ip_window_secs,
-                    newly_locked: false,
-                };
-            }
         }
         expire(&mut state.global, now, limits.global_window_secs);
+        if state.global.len() < limits.global
+            && !state.per_ip.contains_key(&key)
+            && state.per_ip.len() >= limits.max_tracked_ips
+        {
+            prune(&mut state.per_ip, now, limits.per_ip_window_secs);
+            while state.per_ip.len() >= limits.max_tracked_ips.max(1) {
+                evict_quietest(&mut state.per_ip);
+            }
+        }
         if state.global.len() >= limits.global {
             return Verdict::Limited {
                 retry_after_secs: wait_for(state.global.front(), now, limits.global_window_secs),
@@ -154,7 +150,20 @@ impl FailureLimiter {
     }
 }
 
-fn prune(per_ip: &mut HashMap<IpAddr, Window>, now: i64, window_secs: i64) {
+fn evict_quietest(per_ip: &mut HashMap<ClientKey, Window>) {
+    let quietest = per_ip
+        .iter()
+        .min_by_key(|(_, window)| window.attempts.back().copied().unwrap_or(i64::MIN))
+        .map(|(key, _)| *key);
+    match quietest {
+        Some(key) => {
+            per_ip.remove(&key);
+        }
+        None => per_ip.clear(),
+    }
+}
+
+fn prune(per_ip: &mut HashMap<ClientKey, Window>, now: i64, window_secs: i64) {
     per_ip.retain(|_, window| {
         expire(&mut window.attempts, now, window_secs);
         !window.attempts.is_empty()
@@ -314,24 +323,31 @@ mod tests {
     }
 
     #[test]
-    fn a_full_table_forgets_stale_addresses_before_it_refuses_new_ones() {
+    fn a_full_table_forgets_its_quietest_address_instead_of_refusing_newcomers() {
         let limiter = FailureLimiter::new(Limits {
             max_tracked_ips: 2,
             ..Limits::STANDARD
         });
         assert_eq!(limiter.admit(ip("192.0.2.1"), 100), Verdict::Allowed);
         assert_eq!(limiter.admit(ip("192.0.2.2"), 200), Verdict::Allowed);
+        assert_eq!(limiter.admit(ip("192.0.2.1"), 210), Verdict::Allowed);
 
-        assert_eq!(
-            limiter.admit(ip("192.0.2.3"), 250),
-            Verdict::Limited {
-                retry_after_secs: 300,
-                newly_locked: false
-            }
-        );
-        assert_eq!(limiter.admit(ip("192.0.2.1"), 250), Verdict::Allowed);
-        assert_eq!(limiter.admit(ip("192.0.2.3"), 500), Verdict::Allowed);
+        assert_eq!(limiter.admit(ip("192.0.2.3"), 250), Verdict::Allowed);
         assert_eq!(limiter.tracked(), 2);
+        for second in 251..259 {
+            assert_eq!(limiter.admit(ip("192.0.2.1"), second), Verdict::Allowed);
+        }
+        assert!(matches!(
+            limiter.admit(ip("192.0.2.1"), 260),
+            Verdict::Limited { .. }
+        ));
+        for index in 4..100 {
+            assert_eq!(
+                limiter.admit(ip(&format!("192.0.2.{index}")), 270),
+                Verdict::Allowed
+            );
+            assert_eq!(limiter.tracked(), 2);
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@ use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
 use jaunt_control::{
-    AgentEndpoint, Clock, Control, ControlError, ControlParts, DeviceSettings, SshSuffix,
+    AgentEndpoint, Clock, Control, ControlError, ControlParts, DeviceSettings, RequestLimits,
+    SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -30,6 +31,7 @@ pub const DEFAULT_CERT_TTL_SECS: u64 = 8 * 60 * 60;
 pub const LOGIN_TTL_SECS: u64 = 300;
 pub const PUBLIC_ORIGIN: &str = "https://jaunt.example";
 pub const DEFAULT_PEER: &str = "198.51.100.7:50000";
+pub const DEFAULT_PROXY_NETWORKS: &[&str] = &["198.51.100.0/24"];
 pub const UNISSUED_CODE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const POLICY_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\nspec:\n  members: { groups: [ops] }\n  ssh: { nodes: { env: [prod] }, logins: [\"{username}\"] }\n";
 
@@ -65,6 +67,10 @@ impl TestClock {
         self.offset_secs.fetch_add(secs, Ordering::SeqCst);
     }
 
+    pub fn rewind(&self, secs: u64) {
+        self.offset_secs.fetch_sub(secs, Ordering::SeqCst);
+    }
+
     pub fn now_secs(&self) -> i64 {
         let now = self.base + Duration::from_secs(self.offset_secs.load(Ordering::SeqCst));
         i64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap()
@@ -74,6 +80,11 @@ impl TestClock {
         let clock = self.clone();
         Arc::new(move || clock.base + Duration::from_secs(clock.offset_secs.load(Ordering::SeqCst)))
     }
+
+    fn ticker(&self) -> Ticker {
+        let offset = Arc::clone(&self.offset_secs);
+        Arc::new(move || Duration::from_secs(offset.load(Ordering::SeqCst)))
+    }
 }
 
 pub struct Options {
@@ -82,9 +93,12 @@ pub struct Options {
     pub authority: CaKind,
     pub device_login: bool,
     pub client_ip_header: Option<&'static str>,
+    pub trusted_proxies: Option<&'static [&'static str]>,
+    pub ticker: Option<Ticker>,
     pub public_origin: &'static str,
     pub web: bool,
     pub extra_web_routes: Option<Router<Control>>,
+    pub request_limits: RequestLimits,
 }
 
 impl Default for Options {
@@ -95,9 +109,12 @@ impl Default for Options {
             authority: CaKind::User,
             device_login: true,
             client_ip_header: None,
+            trusted_proxies: None,
+            ticker: None,
             public_origin: PUBLIC_ORIGIN,
             web: false,
             extra_web_routes: None,
+            request_limits: RequestLimits::default(),
         }
     }
 }
@@ -266,28 +283,41 @@ impl Harness {
         let clock = TestClock::new();
         let policy = loaded_policy(dir.path());
         let policy_dir = dir.path().join("policy");
-        let control = Control::new(ControlParts {
-            store: store.clone(),
-            oidc: provider.oidc_client().await,
-            user_authority: authority,
-            user_trust,
-            host_trust,
-            host_authority: Arc::new(host_signer),
-            internal_ca,
-            ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
-            gate_endpoint: None,
-            agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
-            cert_ttl: Duration::from_secs(options.cert_ttl_secs),
-            pending_capacity: options.pending_capacity,
-            device: DeviceSettings {
-                enabled: options.device_login,
-                public_origin: options.public_origin.to_owned(),
-                client_ip_header: options.client_ip_header.map(str::to_owned),
+        let trusted_proxies = match (options.trusted_proxies, options.client_ip_header) {
+            (Some(given), _) => given,
+            (None, Some(_)) => DEFAULT_PROXY_NETWORKS,
+            (None, None) => &[],
+        };
+        let control = Control::with_limits_and_ticker(
+            ControlParts {
+                store: store.clone(),
+                oidc: provider.oidc_client().await,
+                user_authority: authority,
+                user_trust,
+                host_trust,
+                host_authority: Arc::new(host_signer),
+                internal_ca,
+                ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
+                gate_endpoint: None,
+                agent_endpoint: AgentEndpoint::parse("agents.example.com:443").unwrap(),
+                cert_ttl: Duration::from_secs(options.cert_ttl_secs),
+                pending_capacity: options.pending_capacity,
+                device: DeviceSettings {
+                    enabled: options.device_login,
+                    public_origin: options.public_origin.to_owned(),
+                    client_ip_header: options.client_ip_header.map(str::to_owned),
+                    client_ip_trusted_proxies: trusted_proxies
+                        .iter()
+                        .map(|network| network.parse().unwrap())
+                        .collect(),
+                },
+                policy: policy.clone(),
+                web_enabled: options.web,
+                clock: clock.clock(),
             },
-            policy: policy.clone(),
-            web_enabled: options.web,
-            clock: clock.clock(),
-        })?;
+            options.request_limits,
+            options.ticker.unwrap_or_else(|| clock.ticker()),
+        )?;
         let router = match options.extra_web_routes {
             Some(extra) => control.router_with_extra_web_routes(extra),
             None => control.router(),

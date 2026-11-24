@@ -1,0 +1,1 @@
+{"nodes": [{"name": "web-01", "labels": {"env": "prod"}, "hostname": "web-01.local", "connected": true}], "truncated": false}

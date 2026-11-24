@@ -190,6 +190,40 @@ async fn silent_partial_and_idle_api_connections_are_closed() {
 }
 
 #[tokio::test]
+async fn the_api_advertises_its_stream_limit_and_refuses_an_oversized_header_list() {
+    let harness = harness_with(patient()).await;
+    let agent = harness.enroll("web-01").await;
+    let dialed = dial(&harness, agent.chain.clone(), agent.key(), ALPN_AGENT_API).await;
+    let (mut sender, mut connection) = h2::client::handshake(dialed.stream.unwrap()).await.unwrap();
+    let reply = tokio::select! {
+        reply = api_request(&mut sender, Method::GET, "/healthz", &[], None) => reply,
+        ended = &mut connection => panic!("the connection ended: {ended:?}"),
+    };
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(connection.max_concurrent_send_streams(), 32);
+
+    let filler = "a".repeat(20 * 1024);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{AGENTS_NAME}/healthz"))
+        .header("x-filler", filler)
+        .body(())
+        .unwrap();
+    let mut ready = sender.clone().ready().await.unwrap();
+    let (response, _) = ready.send_request(request, true).unwrap();
+    let answered = tokio::select! {
+        answered = response => answered,
+        ended = &mut connection => panic!("the connection ended: {ended:?}"),
+    };
+    assert!(
+        answered.as_ref().map_or(true, |response| response.status()
+            == StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+        "{answered:?}"
+    );
+    harness.server.shutdown(GRACE).await;
+}
+
+#[tokio::test]
 async fn a_client_that_ignores_pings_is_dropped() {
     let harness = harness_with(ApiLimits {
         keepalive_interval: Duration::from_millis(200),

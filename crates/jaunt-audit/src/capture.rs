@@ -452,4 +452,70 @@ mod tests {
         assert_eq!(events[8].int("not_after"), Some(1_800_000_000));
         assert_eq!(stand.tap.snapshot().fields_dropped, 0);
     }
+
+    #[tokio::test]
+    async fn the_flood_refusals_map_to_noisy_types_and_keep_every_field() {
+        let stand = stand();
+        let subscriber = Registry::default().with(stand.tap.layer());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "jaunt::audit", event = "http.rate_limited", endpoint = "enroll",
+                client = %"2001:db8:1:2::/64", retry_after = 10_u64, suppressed = 3_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "http.connection_limited",
+                peer_addr = %"192.0.2.1", reason = "per_address", suppressed = 0_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "http.client_ip_header_ignored",
+                peer_addr = %"192.0.2.2", total = 4_u64, suppressed = 1_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "gate.ssh.limited", client = %"203.0.113.9",
+                reason = "rate", suppressed = 0_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "agent.limited", client = %"10.0.0.7",
+                reason = "concurrent", suppressed = 2_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "login.callback_refused", reason = "unknown_state",
+                client = %"198.51.100.7", suppressed = 0_u64
+            );
+        });
+
+        let events = drained(&stand).await;
+        let names: Vec<&str> = events.iter().map(|event| event.kind.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "http.rate_limited",
+                "http.connection_limited",
+                "http.client_ip_header_ignored",
+                "gate.limited",
+                "agent.limited",
+                "login.callback_refused"
+            ]
+        );
+        for event in &events {
+            assert_eq!(
+                event.kind.class(),
+                crate::spec::Class::Noisy,
+                "{}",
+                event.kind.name()
+            );
+            assert_eq!(event.actor.as_wire(), "anonymous");
+        }
+        assert_eq!(events[0].text("endpoint"), Some("enroll"));
+        assert_eq!(events[0].text("client"), Some("2001:db8:1:2::/64"));
+        assert_eq!(events[0].int("retry_after"), Some(10));
+        assert_eq!(events[0].int("suppressed"), Some(3));
+        assert_eq!(events[1].text("reason"), Some("per_address"));
+        assert_eq!(events[2].int("total"), Some(4));
+        assert_eq!(events[3].text("client"), Some("203.0.113.9"));
+        assert_eq!(events[4].text("reason"), Some("concurrent"));
+        assert_eq!(events[5].text("reason"), Some("unknown_state"));
+        assert_eq!(stand.tap.snapshot().fields_dropped, 0);
+    }
 }

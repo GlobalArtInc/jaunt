@@ -192,6 +192,7 @@ pub struct GateOptions {
     pub tunnel: TunnelOptions,
     pub handshake_timeout: Duration,
     pub max_handshaking: usize,
+    pub client_limits: Option<jaunt_limits::AddressLimits>,
 }
 
 impl Default for GateOptions {
@@ -200,6 +201,7 @@ impl Default for GateOptions {
             tunnel: TunnelOptions::default(),
             handshake_timeout: Duration::from_secs(10),
             max_handshaking: 1024,
+            client_limits: None,
         }
     }
 }
@@ -251,6 +253,10 @@ impl TestGate {
             options.tunnel,
         )
         .unwrap();
+        let gate = match options.client_limits {
+            Some(limits) => gate.with_client_limits(limits).unwrap(),
+            None => gate,
+        };
         let listener = TcpListener::bind(addr).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();

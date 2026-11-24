@@ -1,0 +1,1 @@
+{"ssh_suffix": "jaunt.test", "gate": {"host": "gate.jaunt.test", "port": 22}, "host_ca_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAaXY+9iERFJaC924oDq5cMwzwvat4VmDdi/vHWOdndN"]}

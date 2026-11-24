@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use jaunt_limits::Decision;
 use jaunt_proto::{EnrollmentApproved, NodeCertificates, PollRequest, PollResponse};
 use jaunt_store::{Enrollment, EnrollmentState};
 
@@ -13,6 +14,7 @@ use crate::control::Control;
 use crate::enroll_secrets;
 use crate::http::{error_response, json_body, json_response, server_error};
 use crate::issuance::{self, Bundle};
+use crate::limits;
 use crate::node_audit::{self, Delivered};
 use crate::node_keys;
 
@@ -74,8 +76,10 @@ pub(crate) async fn handle(
             return server_error();
         }
     };
-    if !control.poll_limiter.allow(&handle_hash, now.secs) {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, "too_many_requests");
+    if let Decision::Limited { retry_after } =
+        control.poll_limiter.check(&handle_hash, control.tick())
+    {
+        return limits::too_many_requests(retry_after);
     }
 
     let expired = enrollment.expires_at <= now.secs;

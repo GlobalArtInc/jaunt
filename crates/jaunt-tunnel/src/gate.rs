@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jaunt_limits::{AddressGate, AddressLimits, AddressLimitsError, Refused};
 use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -49,6 +50,7 @@ pub trait Handover: Send + Sync {
 pub trait GateObserver: Send + Sync {
     fn tunnel_registered(&self, node: &NodeId, peer_addr: SocketAddr, replaced: bool);
     fn peer_rejected(&self, peer_addr: SocketAddr, rejection: &Rejection);
+    fn peer_limited(&self, _peer_addr: SocketAddr, _refused: Refused) {}
 }
 
 #[derive(Clone)]
@@ -59,6 +61,8 @@ pub struct Gate {
     handover: Arc<dyn Handover>,
     observer: Option<Arc<dyn GateObserver>>,
     options: Arc<TunnelOptions>,
+    clients: Option<Arc<AddressGate>>,
+    started: Instant,
 }
 
 impl Gate {
@@ -77,12 +81,20 @@ impl Gate {
             handover,
             observer: None,
             options: Arc::new(options),
+            clients: None,
+            started: Instant::now(),
         })
     }
 
     pub fn with_observer(mut self, observer: Arc<dyn GateObserver>) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    pub fn with_client_limits(mut self, limits: AddressLimits) -> Result<Self, AddressLimitsError> {
+        limits.validate()?;
+        self.clients = Some(Arc::new(AddressGate::new(limits)));
+        Ok(self)
     }
 
     pub fn registry(&self) -> &AgentRegistry {
@@ -138,6 +150,19 @@ impl Gate {
             self.stats().record_accept_error();
             return;
         }
+        let client = match &self.clients {
+            Some(clients) => match clients.admit(peer_addr.ip(), self.started.elapsed()) {
+                Ok(guard) => Some(guard),
+                Err(refused) => {
+                    self.stats().record_refused_per_address();
+                    if let Some(observer) = &self.observer {
+                        observer.peer_limited(peer_addr, refused);
+                    }
+                    return;
+                }
+            },
+            None => None,
+        };
         let (accepted, permit) = match self.acceptor.accept(tcp).await {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -186,6 +211,7 @@ impl Gate {
             }
         }
         drop(permit);
+        drop(client);
     }
 
     fn observe_rejection(&self, peer_addr: SocketAddr, rejection: &Rejection) {
