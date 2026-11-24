@@ -15,7 +15,7 @@ use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
-    NodeAdmin, SshSuffix,
+    DeviceSettings, NodeAdmin, SshSuffix,
 };
 use jaunt_store::Store;
 use rustls::crypto::ring::default_provider;
@@ -327,6 +327,11 @@ impl Harness {
             agent_endpoint: AgentEndpoint::parse(AGENT_ENDPOINT).unwrap(),
             cert_ttl: Duration::from_secs(8 * 60 * 60),
             pending_capacity: 100,
+            device: DeviceSettings {
+                enabled: false,
+                public_origin: "https://jaunt.example.test".to_owned(),
+                client_ip_header: None,
+            },
             clock: clock.clock(),
         })?;
         Ok(Harness {
