@@ -10,14 +10,9 @@ mod host;
     )
 )]
 mod inner_ca;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the outer hop and the terminator drive the intake from S16a and S17a on"
-    )
-)]
 mod intake;
+mod limits;
+mod outer;
 mod proxy;
 mod target;
 #[cfg(test)]
@@ -28,5 +23,10 @@ pub use config::{ServerConfigCell, ServerProfile};
 pub use error::{HostCertProblem, SshError};
 pub use host::{HostIdentity, HostKey};
 pub use inner_ca::InnerCa;
+pub use limits::OuterLimits;
+pub use outer::{
+    AuthDenial, ForwardRefusal, OuterEnd, OuterEndReason, OuterEvent, OuterHop, RouteBackend,
+    RouteFuture, RouteRefusal, RouteTarget, RoutedStream, StreamEnd, TunnelStream,
+};
 pub use proxy::{MAX_PROXY_PAYLOAD, ProxiedAddr, ProxyError, decode_proxy_v2, read_proxy_v2};
 pub use target::parse_node_target;
