@@ -3,6 +3,9 @@ mod policy;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use jaunt::commands::{
+    Environment, LoginArgs, LogoutArgs, StatusArgs, run_login, run_logout, run_status,
+};
 
 use crate::policy::PolicyCommand;
 
@@ -16,16 +19,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     #[command(about = "Sign in through single sign-on")]
-    Login {
-        #[arg(long)]
-        device: bool,
-        #[arg(long, value_name = "NAME")]
-        profile: Option<String>,
-    },
+    Login(LoginArgs),
     #[command(about = "Sign out")]
-    Logout,
+    Logout(LogoutArgs),
     #[command(about = "Show session status")]
-    Status,
+    Status(StatusArgs),
     #[command(about = "List available hosts")]
     Ls,
     #[command(about = "Policy commands")]
@@ -41,9 +39,9 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = match cli.command {
         Command::Policy { command } => return policy::run(&command),
-        Command::Login { .. } => "login",
-        Command::Logout => "logout",
-        Command::Status => "status",
+        Command::Login(args) => return run_login(&args, &Environment::from_process()),
+        Command::Logout(args) => return run_logout(&args, &Environment::from_process()),
+        Command::Status(args) => return run_status(&args, &Environment::from_process()),
         Command::Ls => "ls",
         Command::Ensure => "ensure",
     };

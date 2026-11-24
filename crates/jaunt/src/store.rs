@@ -1,0 +1,1148 @@
+use std::ffi::OsStr;
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::profile::{ProfileName, profile_dir};
+use crate::secret::Secret;
+use crate::server_url::ServerUrl;
+
+const SERVER_FILE: &str = "server";
+const PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
+const CERTIFICATE_FILE: &str = "id_ed25519-cert.pub";
+const TOKEN_FILE: &str = "token";
+const META_FILE: &str = "meta.json";
+const PRIVATE_KEY_FILE: &str = "id_ed25519";
+const OWNED_FILES: [&str; 6] = [
+    PRIVATE_KEY_FILE,
+    CERTIFICATE_FILE,
+    PUBLIC_KEY_FILE,
+    TOKEN_FILE,
+    META_FILE,
+    SERVER_FILE,
+];
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+const MAX_READ_BYTES: u64 = 1024 * 1024;
+const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+
+static SIBLING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileMeta {
+    pub user_id: String,
+    pub email: String,
+    pub serial: i64,
+    pub key_id: String,
+    pub valid_after: i64,
+    pub valid_before: i64,
+    pub token_expires_at: i64,
+    pub host_ca_keys: Vec<String>,
+}
+
+pub struct LoginFiles<'a> {
+    pub server: &'a ServerUrl,
+    pub public_key_line: &'a str,
+    pub certificate_line: &'a str,
+    pub token: &'a Secret,
+    pub meta: &'a ProfileMeta,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("cannot {action} {path}: {source}")]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    #[error("{path} is not a plain directory")]
+    NotADirectory { path: PathBuf },
+    #[error("{path} is not a regular file")]
+    NotARegularFile { path: PathBuf },
+    #[error("{path} is too large")]
+    TooLarge { path: PathBuf },
+    #[error("{path} is damaged; run `jaunt logout` and sign in again")]
+    Corrupt { path: PathBuf },
+    #[error("{path} still contains other files and was kept")]
+    NotEmpty { path: PathBuf },
+    #[error(
+        "the previous profile was left in {path}: move it back to {profile} or run `jaunt logout`"
+    )]
+    Stranded { path: PathBuf, profile: PathBuf },
+}
+
+fn io_error(action: &'static str, path: &Path, source: io::Error) -> StoreError {
+    StoreError::Io {
+        action,
+        path: path.to_owned(),
+        source,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cleared {
+    pub removed_any: bool,
+    pub directory_kept: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileStore {
+    home: PathBuf,
+    name: String,
+    dir: PathBuf,
+}
+
+impl ProfileStore {
+    pub fn new(home: &Path, name: &ProfileName) -> ProfileStore {
+        ProfileStore {
+            home: home.to_owned(),
+            name: name.as_str().to_owned(),
+            dir: profile_dir(home, name),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn public_key_path(&self) -> PathBuf {
+        self.dir.join(PUBLIC_KEY_FILE)
+    }
+
+    pub fn certificate_path(&self) -> PathBuf {
+        self.dir.join(CERTIFICATE_FILE)
+    }
+
+    pub fn private_key_path(&self) -> PathBuf {
+        self.dir.join(PRIVATE_KEY_FILE)
+    }
+
+    pub fn read_server(&self) -> Result<Option<ServerUrl>, StoreError> {
+        let path = self.dir.join(SERVER_FILE);
+        let Some(text) = self.read_text(&path)? else {
+            return Ok(None);
+        };
+        ServerUrl::parse(text.trim())
+            .map(Some)
+            .map_err(|_| StoreError::Corrupt { path })
+    }
+
+    pub fn read_meta(&self) -> Result<Option<ProfileMeta>, StoreError> {
+        let path = self.dir.join(META_FILE);
+        let Some(bytes) = self.read_bytes(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| StoreError::Corrupt { path })
+    }
+
+    pub fn read_token(&self) -> Result<Option<Secret>, StoreError> {
+        let path = self.dir.join(TOKEN_FILE);
+        let Some(mut text) = self.read_text(&path)? else {
+            return Ok(None);
+        };
+        let trimmed = text.trim_end().len();
+        text.truncate(trimmed);
+        if text.is_empty() {
+            return Err(StoreError::Corrupt { path });
+        }
+        Ok(Some(Secret::new(text)))
+    }
+
+    pub fn read_public_key_line(&self) -> Result<Option<String>, StoreError> {
+        let path = self.public_key_path();
+        Ok(self.read_text(&path)?.map(|text| text.trim().to_owned()))
+    }
+
+    pub fn begin(
+        &self,
+        files: &LoginFiles<'_>,
+        now: SystemTime,
+    ) -> Result<Transaction, StoreError> {
+        self.dir_exists()?;
+        let meta = serde_json::to_vec_pretty(files.meta).map_err(|_| StoreError::Corrupt {
+            path: self.dir.join(META_FILE),
+        })?;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(&self.home)
+            .map_err(|err| io_error("create", &self.home, err))?;
+        let sweep_warning = match now.checked_sub(STALE_AFTER) {
+            Some(limit) => self.sweep_siblings(Some(limit)).err(),
+            None => None,
+        };
+        let staging = self.sibling("new");
+        DirBuilder::new()
+            .mode(DIR_MODE)
+            .create(&staging)
+            .map_err(|err| io_error("create", &staging, err))?;
+        let transaction = Transaction {
+            home: self.home.clone(),
+            profile: self.dir.clone(),
+            name: self.name.clone(),
+            staging,
+            server_line: line_bytes(files.server.as_str()),
+            now,
+            sweep_warning,
+            committed: false,
+        };
+        transaction.write(PUBLIC_KEY_FILE, &line_bytes(files.public_key_line))?;
+        transaction.write(CERTIFICATE_FILE, &line_bytes(files.certificate_line))?;
+        transaction.write(TOKEN_FILE, files.token.expose().as_bytes())?;
+        transaction.write(META_FILE, &meta)?;
+        Ok(transaction)
+    }
+
+    pub fn clear(&self) -> Result<Cleared, StoreError> {
+        let mut removed_any = false;
+        let mut directory_kept = false;
+        let mut failure: Option<StoreError> = None;
+        match self.sweep_siblings(None) {
+            Ok(swept) => removed_any |= swept,
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
+        }
+        match self.dir_exists() {
+            Ok(false) => {}
+            Ok(true) => {
+                let (removed, first_error) = remove_owned(&self.dir);
+                removed_any |= removed;
+                match (first_error, fs::remove_dir(&self.dir)) {
+                    (Some(err), _) => {
+                        failure.get_or_insert(err);
+                    }
+                    (None, Ok(())) => {}
+                    (None, Err(err)) if err.kind() == io::ErrorKind::NotFound => {}
+                    (None, Err(err)) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                        directory_kept = true;
+                    }
+                    (None, Err(err)) => {
+                        failure.get_or_insert(io_error("remove", &self.dir, err));
+                    }
+                }
+            }
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
+        }
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(Cleared {
+                removed_any,
+                directory_kept,
+            }),
+        }
+    }
+
+    fn sibling(&self, kind: &str) -> PathBuf {
+        let serial = SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.home.join(format!(
+            ".{}.{kind}.{}.{serial}",
+            self.name,
+            std::process::id()
+        ))
+    }
+
+    fn sweep_siblings(&self, older_than: Option<SystemTime>) -> Result<bool, StoreError> {
+        let entries = match fs::read_dir(&self.home) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(io_error("list", &self.home, err)),
+        };
+        let new_prefix = format!(".{}.new.", self.name);
+        let old_prefix = format!(".{}.old.", self.name);
+        let mut swept = false;
+        let mut failure: Option<StoreError> = None;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    failure.get_or_insert(io_error("list", &self.home, err));
+                    continue;
+                }
+            };
+            let file_name = entry.file_name();
+            let Some(text) = file_name.to_str() else {
+                continue;
+            };
+            if !(text.starts_with(&new_prefix) || text.starts_with(&old_prefix)) {
+                continue;
+            }
+            let path = entry.path();
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => {
+                    if let Some(limit) = older_than {
+                        match meta.modified() {
+                            Ok(modified) if modified < limit => {}
+                            Ok(_) => continue,
+                            Err(err) => {
+                                failure.get_or_insert(io_error("inspect", &path, err));
+                                continue;
+                            }
+                        }
+                    }
+                    let (_, first_error) = remove_owned(&path);
+                    let removed = fs::remove_dir_all(&path);
+                    match (first_error, removed) {
+                        (Some(err), _) => {
+                            failure.get_or_insert(err);
+                        }
+                        (None, Ok(())) => swept = true,
+                        (None, Err(err)) => {
+                            failure.get_or_insert(io_error("remove", &path, err));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    failure.get_or_insert(io_error("inspect", &path, err));
+                }
+            }
+        }
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(swept),
+        }
+    }
+
+    pub fn stranded_dirs(&self) -> Result<Vec<PathBuf>, StoreError> {
+        let entries = match fs::read_dir(&self.home) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(io_error("list", &self.home, err)),
+        };
+        let prefix = format!(".{}.old.", self.name);
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| io_error("list", &self.home, err))?;
+            let matches_prefix = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|text| text.starts_with(&prefix));
+            if matches_prefix && fs::symlink_metadata(entry.path()).is_ok_and(|meta| meta.is_dir())
+            {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    fn dir_exists(&self) -> Result<bool, StoreError> {
+        match fs::symlink_metadata(&self.dir) {
+            Ok(meta) if meta.is_dir() => Ok(true),
+            Ok(_) => Err(StoreError::NotADirectory {
+                path: self.dir.clone(),
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(io_error("inspect", &self.dir, err)),
+        }
+    }
+
+    fn read_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
+        if !self.dir_exists()? {
+            return Ok(None);
+        }
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error("inspect", path, err)),
+        };
+        if !meta.is_file() {
+            return Err(StoreError::NotARegularFile {
+                path: path.to_owned(),
+            });
+        }
+        if meta.len() > MAX_READ_BYTES {
+            return Err(StoreError::TooLarge {
+                path: path.to_owned(),
+            });
+        }
+        fs::read(path)
+            .map(Some)
+            .map_err(|err| io_error("read", path, err))
+    }
+
+    fn read_text(&self, path: &Path) -> Result<Option<String>, StoreError> {
+        match self.read_bytes(path)? {
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| StoreError::Corrupt {
+                    path: path.to_owned(),
+                }),
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Transaction {
+    home: PathBuf,
+    profile: PathBuf,
+    name: String,
+    staging: PathBuf,
+    server_line: Vec<u8>,
+    now: SystemTime,
+    sweep_warning: Option<StoreError>,
+    committed: bool,
+}
+
+impl Transaction {
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging
+    }
+
+    pub fn sweep_warning(&self) -> Option<&StoreError> {
+        self.sweep_warning.as_ref()
+    }
+
+    pub fn public_key_path(&self) -> PathBuf {
+        self.staging.join(PUBLIC_KEY_FILE)
+    }
+
+    pub fn write_private_key(&self, pem: &Secret) -> Result<(), StoreError> {
+        self.write(PRIVATE_KEY_FILE, pem.expose().as_bytes())
+    }
+
+    pub fn commit(&mut self) -> Result<Option<Retired>, StoreError> {
+        self.commit_with(&|from, to| fs::rename(from, to))
+    }
+
+    fn commit_with(
+        &mut self,
+        rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    ) -> Result<Option<Retired>, StoreError> {
+        self.write(SERVER_FILE, &self.server_line)?;
+        sync_dir(&self.staging)?;
+        let retired = match fs::symlink_metadata(&self.profile) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                rename(&self.staging, &self.profile)
+                    .map_err(|err| io_error("install", &self.profile, err))?;
+                None
+            }
+            Ok(meta) if meta.is_dir() => Some(self.replace_profile(rename)?),
+            Ok(_) => {
+                return Err(StoreError::NotADirectory {
+                    path: self.profile.clone(),
+                });
+            }
+            Err(err) => return Err(io_error("inspect", &self.profile, err)),
+        };
+        self.committed = true;
+        drop(sync_dir(&self.home));
+        Ok(retired)
+    }
+
+    fn replace_profile(
+        &self,
+        rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    ) -> Result<Retired, StoreError> {
+        let serial = SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let retired = self.home.join(format!(
+            ".{}.old.{}.{serial}",
+            self.name,
+            std::process::id()
+        ));
+        File::open(&self.profile)
+            .and_then(|dir| dir.set_modified(self.now))
+            .map_err(|err| io_error("mark", &self.profile, err))?;
+        rename(&self.profile, &retired).map_err(|err| io_error("retire", &self.profile, err))?;
+        if let Err(err) = rename(&self.staging, &self.profile) {
+            return Err(match rename(&retired, &self.profile) {
+                Ok(()) => io_error("install", &self.profile, err),
+                Err(_) => StoreError::Stranded {
+                    path: retired,
+                    profile: self.profile.clone(),
+                },
+            });
+        }
+        let carry_error = carry_foreign_entries(&retired, &self.profile);
+        Ok(Retired {
+            dir: retired,
+            carry_error,
+        })
+    }
+
+    fn write(&self, name: &str, contents: &[u8]) -> Result<(), StoreError> {
+        let path = self.staging.join(name);
+        write_new_file(&path, contents).map_err(|err| io_error("write", &path, err))
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            drop(shred(&self.staging.join(PRIVATE_KEY_FILE)));
+            drop(fs::remove_dir_all(&self.staging));
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Retired {
+    dir: PathBuf,
+    carry_error: Option<StoreError>,
+}
+
+impl Retired {
+    pub fn public_key_path(&self) -> PathBuf {
+        self.dir.join(PUBLIC_KEY_FILE)
+    }
+
+    pub fn discard(self) -> Result<(), StoreError> {
+        let (_, first_error) = remove_owned(&self.dir);
+        let removal = fs::remove_dir(&self.dir);
+        if let Some(err) = self.carry_error.or(first_error) {
+            return Err(err);
+        }
+        match removal {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                Err(StoreError::NotEmpty { path: self.dir })
+            }
+            Err(err) => Err(io_error("remove", &self.dir, err)),
+        }
+    }
+}
+
+fn is_owned_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|text| {
+        OWNED_FILES.contains(&text)
+            || (text.starts_with('.')
+                && text.ends_with(".tmp")
+                && OWNED_FILES
+                    .iter()
+                    .any(|owned| text.starts_with(&format!(".{owned}."))))
+    })
+}
+
+fn carry_foreign_entries(from: &Path, to: &Path) -> Option<StoreError> {
+    let entries = match fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(err) => return Some(io_error("list", from, err)),
+    };
+    let mut failure: Option<StoreError> = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                failure.get_or_insert(io_error("list", from, err));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if is_owned_name(&name) {
+            continue;
+        }
+        if let Err(err) = fs::rename(entry.path(), to.join(&name)) {
+            failure.get_or_insert(io_error("keep", &entry.path(), err));
+        }
+    }
+    failure
+}
+
+fn remove_owned(dir: &Path) -> (bool, Option<StoreError>) {
+    let mut removed = false;
+    let mut failure: Option<StoreError> = None;
+    let mut record = |result: Result<bool, StoreError>| match result {
+        Ok(did_remove) => removed |= did_remove,
+        Err(err) => {
+            failure.get_or_insert(err);
+        }
+    };
+    record(shred(&dir.join(PRIVATE_KEY_FILE)));
+    for name in OWNED_FILES {
+        if name != PRIVATE_KEY_FILE {
+            record(remove_if_present(&dir.join(name)));
+        }
+    }
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) if is_owned_name(&entry.file_name()) => {
+                        record(shred(&entry.path()));
+                    }
+                    Ok(_) => {}
+                    Err(err) => record(Err(io_error("list", dir, err))),
+                }
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => record(Err(io_error("list", dir, err))),
+    }
+    (removed, failure)
+}
+
+fn line_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(FILE_MODE)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|err| io_error("flush", dir, err))
+}
+
+fn remove_if_present(path: &Path) -> Result<bool, StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(io_error("remove", path, err)),
+    }
+}
+
+fn shred(path: &Path) -> Result<bool, StoreError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_error("inspect", path, err)),
+    };
+    let overwritten = if meta.is_file() {
+        overwrite_with_zeros(path, meta.len()).map_err(|err| io_error("overwrite", path, err))
+    } else {
+        Ok(())
+    };
+    let removed = remove_if_present(path);
+    overwritten?;
+    removed
+}
+
+fn overwrite_with_zeros(path: &Path, length: u64) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    io::copy(&mut io::repeat(0).take(length), &mut file)?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fs::{self, File};
+    use std::io;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, SystemTime};
+
+    use tempfile::TempDir;
+
+    use super::{
+        Cleared, LoginFiles, ProfileMeta, ProfileStore, Retired, SIBLING_COUNTER, StoreError,
+        Transaction,
+    };
+    use crate::profile::ProfileName;
+    use crate::secret::Secret;
+    use crate::server_url::ServerUrl;
+
+    fn meta() -> ProfileMeta {
+        ProfileMeta {
+            user_id: "u-1".to_owned(),
+            email: "a@example.com".to_owned(),
+            serial: 7,
+            key_id: "jaunt:a@example.com:7".to_owned(),
+            valid_after: 100,
+            valid_before: 900,
+            token_expires_at: 900,
+            host_ca_keys: vec!["ssh-ed25519 AAAA".to_owned()],
+        }
+    }
+
+    fn store() -> (TempDir, ProfileStore) {
+        let root = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(&root.path().join("state"), &ProfileName::default_name());
+        (root, store)
+    }
+
+    fn try_begin(store: &ProfileStore, token: &str) -> Result<Transaction, StoreError> {
+        let server = ServerUrl::parse("https://jaunt.example.com").unwrap();
+        let token = Secret::new(token.to_owned());
+        store.begin(
+            &LoginFiles {
+                server: &server,
+                public_key_line: &format!("ssh-ed25519 PUB-{}", token.expose()),
+                certificate_line: "ssh-ed25519-cert-v01@openssh.com CERT",
+                token: &token,
+                meta: &meta(),
+            },
+            SystemTime::now(),
+        )
+    }
+
+    fn begin(store: &ProfileStore, token: &str) -> Transaction {
+        try_begin(store, token).unwrap()
+    }
+
+    fn save(store: &ProfileStore, token: &str) -> Option<Retired> {
+        begin(store, token).commit().unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn snapshot(dir: &Path) -> Vec<(String, u32, Vec<u8>)> {
+        names(dir)
+            .into_iter()
+            .map(|name| {
+                let path = dir.join(&name);
+                (name, mode(&path), fs::read(&path).unwrap())
+            })
+            .collect()
+    }
+
+    fn running_as_root(dir: &Path) -> bool {
+        fs::metadata(dir).unwrap().uid() == 0
+    }
+
+    fn age(dir: &Path, secs: u64) {
+        File::open(dir)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn leftover_session(home: &Path, name: &str) -> PathBuf {
+        let dir = home.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("token"), "jt_leftover").unwrap();
+        fs::write(dir.join("id_ed25519"), "LEFTOVER-KEY\n").unwrap();
+        dir
+    }
+
+    fn assert_zeroed(path: &Path, length: usize) {
+        let content = fs::read(path).unwrap();
+        assert_eq!(content.len(), length);
+        assert!(content.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_transaction_stages_privately_writes_the_marker_last_and_installs_atomically() {
+        let (root, store) = store();
+        let mut transaction = begin(&store, "jt_first");
+        assert!(!store.dir().exists());
+        assert_eq!(mode(transaction.staging_dir()), 0o700);
+        assert_eq!(
+            names(transaction.staging_dir()),
+            [
+                "id_ed25519-cert.pub",
+                "id_ed25519.pub",
+                "meta.json",
+                "token"
+            ]
+        );
+        assert!(transaction.commit().unwrap().is_none());
+
+        assert_eq!(mode(&root.path().join("state")), 0o700);
+        assert_eq!(mode(store.dir()), 0o700);
+        assert_eq!(
+            names(store.dir()),
+            [
+                "id_ed25519-cert.pub",
+                "id_ed25519.pub",
+                "meta.json",
+                "server",
+                "token"
+            ]
+        );
+        for name in names(store.dir()) {
+            assert_eq!(mode(&store.dir().join(&name)), 0o600, "{name}");
+        }
+        assert_eq!(names(&root.path().join("state")), ["default"]);
+        assert_eq!(store.read_token().unwrap().unwrap().expose(), "jt_first");
+        assert_eq!(store.read_meta().unwrap(), Some(meta()));
+        assert_eq!(
+            store.read_server().unwrap().unwrap().as_str(),
+            "https://jaunt.example.com"
+        );
+        assert_eq!(
+            store.read_public_key_line().unwrap().as_deref(),
+            Some("ssh-ed25519 PUB-jt_first")
+        );
+    }
+
+    #[test]
+    fn replacing_a_profile_retires_the_old_files_keeps_foreign_ones_and_tightens_the_mode() {
+        let (root, store) = store();
+        save(&store, "jt_first");
+        fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(store.dir().join("ssh_config"), "Host x\n").unwrap();
+        fs::write(store.dir().join(".token.keep"), "keep-me\n").unwrap();
+        fs::write(store.dir().join("id_ed25519"), "OLD-KEY\n").unwrap();
+
+        let retired = save(&store, "jt_second").unwrap();
+        assert_eq!(
+            fs::read_to_string(retired.public_key_path())
+                .unwrap()
+                .trim(),
+            "ssh-ed25519 PUB-jt_first"
+        );
+        assert_eq!(mode(store.dir()), 0o700);
+        assert_eq!(store.read_token().unwrap().unwrap().expose(), "jt_second");
+        assert!(!store.private_key_path().exists());
+        assert_eq!(
+            fs::read_to_string(store.dir().join("ssh_config")).unwrap(),
+            "Host x\n"
+        );
+        assert_eq!(
+            fs::read_to_string(store.dir().join(".token.keep")).unwrap(),
+            "keep-me\n"
+        );
+
+        retired.discard().unwrap();
+        assert_eq!(names(&root.path().join("state")), ["default"]);
+    }
+
+    #[test]
+    fn an_abandoned_transaction_removes_its_staging_and_leaves_the_profile_untouched() {
+        let (root, store) = store();
+        save(&store, "jt_first");
+        let before = snapshot(store.dir());
+
+        let transaction = begin(&store, "jt_second");
+        transaction
+            .write_private_key(&Secret::new("NEW-KEY\n".to_owned()))
+            .unwrap();
+        let staging = transaction.staging_dir().to_owned();
+        assert!(staging.exists());
+        drop(transaction);
+
+        assert!(!staging.exists());
+        assert_eq!(snapshot(store.dir()), before);
+        assert_eq!(names(&root.path().join("state")), ["default"]);
+    }
+
+    #[test]
+    fn an_abandoned_transaction_wipes_a_staged_private_key_before_unlinking_it() {
+        let (root, store) = store();
+        let transaction = begin(&store, "jt_first");
+        transaction
+            .write_private_key(&Secret::new("STAGED-KEY\n".to_owned()))
+            .unwrap();
+        let alias = root.path().join("alias");
+        fs::hard_link(transaction.staging_dir().join("id_ed25519"), &alias).unwrap();
+        drop(transaction);
+        assert_zeroed(&alias, "STAGED-KEY\n".len());
+    }
+
+    #[test]
+    fn a_symlinked_profile_directory_is_refused_and_its_target_untouched() {
+        let (root, store) = store();
+        let target = tempfile::tempdir().unwrap();
+        fs::write(target.path().join("token"), "victim").unwrap();
+        fs::create_dir_all(root.path().join("state")).unwrap();
+        symlink(target.path(), store.dir()).unwrap();
+
+        assert!(matches!(
+            try_begin(&store, "jt_token"),
+            Err(StoreError::NotADirectory { .. })
+        ));
+        assert!(matches!(
+            store.clear(),
+            Err(StoreError::NotADirectory { .. })
+        ));
+        assert!(matches!(
+            store.read_token(),
+            Err(StoreError::NotADirectory { .. })
+        ));
+        assert_eq!(names(target.path()), ["token"]);
+        assert_eq!(
+            fs::read_to_string(target.path().join("token")).unwrap(),
+            "victim"
+        );
+        assert_eq!(names(&root.path().join("state")), ["default"]);
+    }
+
+    #[test]
+    fn a_symlink_in_place_of_a_profile_file_is_refused_on_read_and_never_written_through() {
+        let (_root, store) = store();
+        save(&store, "jt_first");
+        let foreign = tempfile::tempdir().unwrap();
+        let victim = foreign.path().join("victim");
+        fs::write(&victim, "foreign-content").unwrap();
+        fs::remove_file(store.dir().join("token")).unwrap();
+        symlink(&victim, store.dir().join("token")).unwrap();
+
+        assert!(matches!(
+            store.read_token(),
+            Err(StoreError::NotARegularFile { .. })
+        ));
+
+        let retired = save(&store, "jt_second").unwrap();
+        retired.discard().unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "foreign-content");
+        assert!(
+            fs::symlink_metadata(store.dir().join("token"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(store.read_token().unwrap().unwrap().expose(), "jt_second");
+    }
+
+    #[test]
+    fn clear_shreds_the_key_removes_leftovers_and_stale_staging_keeps_foreign_files() {
+        let (root, store) = store();
+        assert_eq!(
+            store.clear().unwrap(),
+            Cleared {
+                removed_any: false,
+                directory_kept: false
+            }
+        );
+        save(&store, "jt_token");
+        fs::write(store.dir().join("id_ed25519"), "KEY-MATERIAL\n").unwrap();
+        fs::write(store.dir().join(".id_ed25519.1.2.tmp"), "LEFTOVER-KEY\n").unwrap();
+        fs::write(store.dir().join("ssh_config"), "Host x\n").unwrap();
+        fs::write(store.dir().join(".token.keep"), "keep-me\n").unwrap();
+        let alias = root.path().join("alias");
+        fs::hard_link(store.private_key_path(), &alias).unwrap();
+        let home = root.path().join("state");
+        let stale_new = leftover_session(&home, ".default.new.1.1");
+        let stale_old = leftover_session(&home, ".default.old.1.2");
+        let other_profile = leftover_session(&home, ".other.new.1.1");
+        let lookalike = leftover_session(&home, ".default.keep");
+
+        let cleared = store.clear().unwrap();
+        assert_eq!(
+            cleared,
+            Cleared {
+                removed_any: true,
+                directory_kept: true
+            }
+        );
+        assert_eq!(names(store.dir()), [".token.keep", "ssh_config"]);
+        assert!(!stale_new.exists() && !stale_old.exists());
+        assert_zeroed(&alias, "KEY-MATERIAL\n".len());
+        for untouched in [&other_profile, &lookalike] {
+            assert_eq!(names(untouched), ["id_ed25519", "token"]);
+            assert_eq!(
+                fs::read_to_string(untouched.join("id_ed25519")).unwrap(),
+                "LEFTOVER-KEY\n"
+            );
+        }
+
+        fs::remove_file(store.dir().join("ssh_config")).unwrap();
+        fs::remove_file(store.dir().join(".token.keep")).unwrap();
+        assert_eq!(
+            store.clear().unwrap(),
+            Cleared {
+                removed_any: false,
+                directory_kept: false
+            }
+        );
+        assert!(!store.dir().exists());
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_overwritten_is_still_unlinked_and_the_failure_is_reported() {
+        let (root, store) = store();
+        save(&store, "jt_token");
+        fs::write(store.dir().join("id_ed25519"), "KEY\n").unwrap();
+        fs::set_permissions(store.private_key_path(), fs::Permissions::from_mode(0o400)).unwrap();
+
+        let outcome = store.clear();
+        assert!(!store.private_key_path().exists());
+        assert!(!store.dir().exists());
+        if running_as_root(root.path()) {
+            assert!(outcome.is_ok());
+        } else {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(StoreError::Io {
+                        action: "overwrite",
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn damaged_files_are_reported_instead_of_ignored() {
+        let (_root, store) = store();
+        save(&store, "jt_token");
+        fs::write(store.dir().join("meta.json"), "{not json").unwrap();
+        fs::write(store.dir().join("server"), "http://evil.example.com\n").unwrap();
+        assert!(matches!(store.read_meta(), Err(StoreError::Corrupt { .. })));
+        assert!(matches!(
+            store.read_server(),
+            Err(StoreError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn begin_sweeps_only_stale_staging_and_retired_directories_of_its_own_profile() {
+        let (root, store) = store();
+        let home = root.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        let stale_new = leftover_session(&home, ".default.new.1.1");
+        let stale_old = leftover_session(&home, ".default.old.1.2");
+        let recent = leftover_session(&home, ".default.new.2.1");
+        let fresh = leftover_session(&home, ".default.new.3.1");
+        let other_profile = leftover_session(&home, ".other.new.1.1");
+        let lookalike = leftover_session(&home, ".default.keep");
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("token"), "outside").unwrap();
+        symlink(outside.path(), home.join(".default.new.4.1")).unwrap();
+        let alias = root.path().join("alias");
+        fs::hard_link(stale_new.join("id_ed25519"), &alias).unwrap();
+        for dir in [&stale_new, &stale_old, &other_profile, &lookalike] {
+            age(dir, 16 * 60);
+        }
+        age(&recent, 14 * 60);
+
+        let transaction = begin(&store, "jt_token");
+        assert!(transaction.sweep_warning().is_none());
+        assert!(!stale_new.exists() && !stale_old.exists());
+        assert_zeroed(&alias, "LEFTOVER-KEY\n".len());
+        for kept in [&recent, &fresh, &other_profile, &lookalike] {
+            assert_eq!(names(kept), ["id_ed25519", "token"], "{}", kept.display());
+        }
+        assert_eq!(names(outside.path()), ["token"]);
+        assert!(
+            fs::symlink_metadata(home.join(".default.new.4.1"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_failed_second_rename_restores_the_previous_profile_byte_for_byte() {
+        let (root, store) = store();
+        save(&store, "jt_first");
+        fs::write(store.dir().join("ssh_config"), "Host x\n").unwrap();
+        let before = snapshot(store.dir());
+
+        let calls = Cell::new(0_usize);
+        let second_fails = |from: &Path, to: &Path| -> io::Result<()> {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(io::Error::other("injected"))
+            } else {
+                fs::rename(from, to)
+            }
+        };
+        let mut transaction = begin(&store, "jt_second");
+        let outcome = transaction.commit_with(&second_fails);
+        assert!(
+            matches!(
+                outcome,
+                Err(StoreError::Io {
+                    action: "install",
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(calls.get(), 3);
+        drop(transaction);
+
+        assert_eq!(snapshot(store.dir()), before);
+        assert_eq!(names(&root.path().join("state")), ["default"]);
+        assert!(store.stranded_dirs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn when_the_rollback_fails_too_the_error_says_where_the_old_session_is() {
+        let (root, store) = store();
+        save(&store, "jt_first");
+
+        let calls = Cell::new(0_usize);
+        let from_second_on = |from: &Path, to: &Path| -> io::Result<()> {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 {
+                Err(io::Error::other("injected"))
+            } else {
+                fs::rename(from, to)
+            }
+        };
+        let mut transaction = begin(&store, "jt_second");
+        let Err(StoreError::Stranded { path, profile }) = transaction.commit_with(&from_second_on)
+        else {
+            panic!("expected a stranded profile");
+        };
+        drop(transaction);
+
+        assert_eq!(profile, store.dir());
+        assert!(!store.dir().exists());
+        assert_eq!(store.stranded_dirs().unwrap(), std::slice::from_ref(&path));
+        assert_eq!(fs::read_to_string(path.join("token")).unwrap(), "jt_first");
+        let message = StoreError::Stranded {
+            path: path.clone(),
+            profile: profile.clone(),
+        }
+        .to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains(&profile.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("`jaunt logout`"), "{message}");
+        assert_eq!(names(&root.path().join("state")).len(), 1);
+    }
+
+    #[test]
+    fn stranded_directories_are_only_retired_sessions_of_this_profile() {
+        let (root, store) = store();
+        assert!(store.stranded_dirs().unwrap().is_empty());
+        let home = root.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        let retired = leftover_session(&home, ".default.old.5.5");
+        leftover_session(&home, ".default.new.5.6");
+        leftover_session(&home, ".other.old.5.7");
+        fs::write(home.join(".default.old.5.8"), "not a directory").unwrap();
+        assert_eq!(store.stranded_dirs().unwrap(), [retired]);
+    }
+
+    #[test]
+    fn staging_creation_does_not_tolerate_an_existing_directory() {
+        let (root, store) = store();
+        let home = root.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        let next = SIBLING_COUNTER.load(Ordering::Relaxed);
+        for serial in next..next + 512 {
+            fs::create_dir(home.join(format!(".default.new.{}.{serial}", std::process::id())))
+                .unwrap();
+        }
+        assert!(matches!(
+            try_begin(&store, "jt_token"),
+            Err(StoreError::Io {
+                action: "create",
+                ..
+            })
+        ));
+    }
+}
