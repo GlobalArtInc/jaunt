@@ -30,6 +30,41 @@ impl SessionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndReason {
+    Closed,
+    Revoked,
+    Expired,
+    AgentRestarted,
+    AgentGone,
+    NodeRemoved,
+}
+
+impl SessionEndReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionEndReason::Closed => "closed",
+            SessionEndReason::Revoked => "revoked",
+            SessionEndReason::Expired => "expired",
+            SessionEndReason::AgentRestarted => "agent_restarted",
+            SessionEndReason::AgentGone => "agent_gone",
+            SessionEndReason::NodeRemoved => "node_removed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<SessionEndReason, StoreError> {
+        match value {
+            "closed" => Ok(SessionEndReason::Closed),
+            "revoked" => Ok(SessionEndReason::Revoked),
+            "expired" => Ok(SessionEndReason::Expired),
+            "agent_restarted" => Ok(SessionEndReason::AgentRestarted),
+            "agent_gone" => Ok(SessionEndReason::AgentGone),
+            "node_removed" => Ok(SessionEndReason::NodeRemoved),
+            other => Err(StoreError::Corrupt(format!("sessions.end_reason: {other}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSession {
     pub user_id: String,
@@ -54,6 +89,8 @@ pub struct Session {
     pub bytes_in: Option<i64>,
     pub bytes_out: Option<i64>,
     pub recording_incomplete: Option<bool>,
+    pub end_reason: Option<SessionEndReason>,
+    pub max_duration_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +100,7 @@ pub struct ActivateSession<'a> {
     pub user_id: &'a str,
     pub serial: i64,
     pub login: &'a str,
+    pub max_duration_secs: i64,
     pub now: i64,
 }
 
@@ -83,11 +121,32 @@ pub enum EndRejection {
     WrongNode,
     NotActive,
     ConflictingEnd,
+    ClosedByControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenSessions<'a> {
+    OfUser(&'a str),
+    OfSerial(i64),
+    OfNode(&'a str),
+    OfNodeCreatedBefore {
+        node_id: &'a str,
+        before: i64,
+    },
+    RoutedCreatedBefore(i64),
+    CreatedBefore(i64),
+    ActivePastDeadline {
+        default_max_secs: i64,
+        margin_secs: i64,
+    },
+    OfRevokedSubjects,
+    OfInactiveNodes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndOutcome {
     Ended(Box<Session>),
+    Late(Box<Session>),
     Repeated,
     Rejected(EndRejection),
 }
@@ -95,7 +154,20 @@ pub enum EndOutcome {
 macro_rules! session_columns {
     () => {
         "id, user_id, serial, node_id, state, created_at, expires_at, authorized_at, ended_at, \
-         login, exit_status, bytes_in, bytes_out, recording_incomplete"
+         login, exit_status, bytes_in, bytes_out, recording_incomplete, end_reason, \
+         max_duration_secs"
+    };
+}
+
+macro_rules! close_open {
+    ($($filter:tt)+) => {
+        concat!(
+            "UPDATE sessions SET state = 'ended', ended_at = ?, end_reason = ? \
+             WHERE state IN ('routed', 'active') AND ",
+            $($filter)+,
+            " RETURNING ",
+            session_columns!()
+        )
     };
 }
 
@@ -108,7 +180,7 @@ const CREATE: &str = concat!(
 const GET: &str = concat!("SELECT ", session_columns!(), " FROM sessions WHERE id = ?");
 
 const ACTIVATE: &str = concat!(
-    "UPDATE sessions SET state = 'active', authorized_at = ?, login = ? \
+    "UPDATE sessions SET state = 'active', authorized_at = ?, login = ?, max_duration_secs = ? \
      WHERE id = ? AND node_id = ? AND user_id = ? AND serial = ? \
      AND state = 'routed' AND expires_at > ? \
      AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') RETURNING ",
@@ -117,8 +189,52 @@ const ACTIVATE: &str = concat!(
 
 const END: &str = concat!(
     "UPDATE sessions SET state = 'ended', ended_at = ?, exit_status = ?, bytes_in = ?, \
-     bytes_out = ?, recording_incomplete = ? \
+     bytes_out = ?, recording_incomplete = ?, end_reason = 'closed' \
      WHERE id = ? AND node_id = ? AND state = 'active' RETURNING ",
+    session_columns!()
+);
+
+const CLOSE_OF_USER: &str = close_open!("user_id = ?");
+
+const CLOSE_OF_SERIAL: &str = close_open!("serial = ?");
+
+const CLOSE_OF_NODE: &str = close_open!("node_id = ?");
+
+const CLOSE_OF_NODE_CREATED_BEFORE: &str = close_open!("node_id = ? AND created_at < ?");
+
+const CLOSE_ROUTED_CREATED_BEFORE: &str = close_open!("state = 'routed' AND created_at < ?");
+
+const CLOSE_CREATED_BEFORE: &str = close_open!("created_at < ?");
+
+const CLOSE_ACTIVE_PAST_DEADLINE: &str =
+    close_open!("state = 'active' AND authorized_at + COALESCE(max_duration_secs, ?) + ? < ?");
+
+macro_rules! revoked_subject {
+    () => {
+        "EXISTS (SELECT 1 FROM revocations r WHERE \
+         (r.kind = 'user' AND r.subject = sessions.user_id) \
+         OR (r.kind = 'serial' AND r.subject = CAST(sessions.serial AS TEXT)) \
+         OR (r.kind = 'node' AND r.subject = sessions.node_id))"
+    };
+}
+
+const CLOSE_OF_REVOKED_SUBJECTS: &str = close_open!(revoked_subject!());
+
+const CLOSE_OF_INACTIVE_NODES: &str =
+    close_open!("node_id IN (SELECT id FROM nodes WHERE state <> 'active')");
+
+const ANY_OPEN_OF_REVOKED_SUBJECTS: &str = concat!(
+    "SELECT 1 FROM sessions WHERE state IN ('routed', 'active') AND ",
+    revoked_subject!(),
+    " LIMIT 1"
+);
+
+const LATE_END: &str = concat!(
+    "UPDATE sessions SET exit_status = ?, bytes_in = ?, bytes_out = ?, \
+     recording_incomplete = CASE WHEN ? OR recording_incomplete = 1 THEN 1 ELSE 0 END \
+     WHERE id = ? AND node_id = ? AND state = 'ended' AND end_reason IS NOT NULL \
+     AND end_reason <> 'closed' AND authorized_at IS NOT NULL \
+     AND bytes_in IS NULL AND bytes_out IS NULL RETURNING ",
     session_columns!()
 );
 
@@ -165,6 +281,7 @@ impl Sessions {
         let row = sqlx::query(ACTIVATE)
             .bind(activation.now)
             .bind(activation.login)
+            .bind(activation.max_duration_secs)
             .bind(activation.id)
             .bind(activation.node_id)
             .bind(activation.user_id)
@@ -199,6 +316,24 @@ impl Sessions {
         if stored.state != SessionState::Ended {
             return Ok(EndOutcome::Rejected(EndRejection::NotActive));
         }
+        if stored
+            .end_reason
+            .is_some_and(|reason| reason != SessionEndReason::Closed)
+        {
+            let filled = sqlx::query(LATE_END)
+                .bind(end.exit_status)
+                .bind(end.bytes_in)
+                .bind(end.bytes_out)
+                .bind(end.recording_incomplete)
+                .bind(end.id)
+                .bind(end.node_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            return Ok(match filled {
+                Some(row) => EndOutcome::Late(Box::new(session_from_row(&row)?)),
+                None => EndOutcome::Rejected(EndRejection::ClosedByControl),
+            });
+        }
         let identical = stored.exit_status == end.exit_status
             && stored.bytes_in == Some(end.bytes_in)
             && stored.bytes_out == Some(end.bytes_out)
@@ -208,6 +343,47 @@ impl Sessions {
         } else {
             EndOutcome::Rejected(EndRejection::ConflictingEnd)
         })
+    }
+
+    pub async fn close(
+        &self,
+        which: OpenSessions<'_>,
+        reason: SessionEndReason,
+        now: i64,
+    ) -> Result<Vec<Session>, StoreError> {
+        let closing = |sql| sqlx::query(sql).bind(now).bind(reason.as_str());
+        let query = match which {
+            OpenSessions::OfUser(user_id) => closing(CLOSE_OF_USER).bind(user_id),
+            OpenSessions::OfSerial(serial) => closing(CLOSE_OF_SERIAL).bind(serial),
+            OpenSessions::OfNode(node_id) => closing(CLOSE_OF_NODE).bind(node_id),
+            OpenSessions::OfNodeCreatedBefore { node_id, before } => {
+                closing(CLOSE_OF_NODE_CREATED_BEFORE)
+                    .bind(node_id)
+                    .bind(before)
+            }
+            OpenSessions::RoutedCreatedBefore(before) => {
+                closing(CLOSE_ROUTED_CREATED_BEFORE).bind(before)
+            }
+            OpenSessions::CreatedBefore(before) => closing(CLOSE_CREATED_BEFORE).bind(before),
+            OpenSessions::ActivePastDeadline {
+                default_max_secs,
+                margin_secs,
+            } => closing(CLOSE_ACTIVE_PAST_DEADLINE)
+                .bind(default_max_secs)
+                .bind(margin_secs)
+                .bind(now),
+            OpenSessions::OfRevokedSubjects => closing(CLOSE_OF_REVOKED_SUBJECTS),
+            OpenSessions::OfInactiveNodes => closing(CLOSE_OF_INACTIVE_NODES),
+        };
+        let rows = query.fetch_all(&self.pool).await?;
+        rows.iter().map(session_from_row).collect()
+    }
+
+    pub async fn any_open_of_revoked_subjects(&self) -> Result<bool, StoreError> {
+        let row = sqlx::query(ANY_OPEN_OF_REVOKED_SUBJECTS)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn purge_expired_routed(&self, cutoff: i64) -> Result<u64, StoreError> {
@@ -221,6 +397,7 @@ impl Sessions {
 
 fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
     let state: String = row.try_get("state")?;
+    let end_reason: Option<String> = row.try_get("end_reason")?;
     Ok(Session {
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
@@ -236,5 +413,10 @@ fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
         bytes_in: row.try_get("bytes_in")?,
         bytes_out: row.try_get("bytes_out")?,
         recording_incomplete: row.try_get("recording_incomplete")?,
+        end_reason: end_reason
+            .as_deref()
+            .map(SessionEndReason::parse)
+            .transpose()?,
+        max_duration_secs: row.try_get("max_duration_secs")?,
     })
 }

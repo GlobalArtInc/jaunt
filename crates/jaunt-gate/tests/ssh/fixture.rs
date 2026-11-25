@@ -42,6 +42,10 @@ pub fn unix(time: SystemTime) -> u64 {
 }
 
 pub fn user_certificate(ca: &PrivateKey, subject: &PrivateKey) -> Certificate {
+    serial_certificate(ca, subject, 42)
+}
+
+pub fn serial_certificate(ca: &PrivateKey, subject: &PrivateKey, serial: u64) -> Certificate {
     let now = unix(SystemTime::now());
     let mut builder = Builder::new_with_random_nonce(
         &mut safe_rng(),
@@ -50,9 +54,11 @@ pub fn user_certificate(ca: &PrivateKey, subject: &PrivateKey) -> Certificate {
         now + 3600,
     )
     .unwrap();
-    builder.serial(42).unwrap();
+    builder.serial(serial).unwrap();
     builder.cert_type(CertType::User).unwrap();
-    builder.key_id("jaunt:alice@example.com:42").unwrap();
+    builder
+        .key_id(format!("jaunt:alice@example.com:{serial}"))
+        .unwrap();
     builder.valid_principal(USER_ID).unwrap();
     builder.sign(ca).unwrap()
 }
@@ -300,6 +306,21 @@ impl Fixture {
     pub async fn login(&self) -> Client {
         let mut client = self.connect().await;
         assert!(client.login(&self.user_ca).await);
+        client
+    }
+
+    pub async fn login_with_serial(&self, serial: u64) -> Client {
+        let mut client = self.connect().await;
+        let subject = key();
+        let certificate = serial_certificate(&self.user_ca, &subject, serial);
+        assert!(
+            client
+                .handle
+                .authenticate_openssh_cert("jaunt", Arc::new(subject), certificate)
+                .await
+                .unwrap()
+                .success()
+        );
         client
     }
 

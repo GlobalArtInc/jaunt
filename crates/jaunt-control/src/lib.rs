@@ -18,6 +18,7 @@ mod holder;
 mod http;
 mod identity;
 mod issuance;
+mod killer;
 mod labels;
 mod limits;
 mod naming;
@@ -28,13 +29,17 @@ mod pending;
 mod pkce;
 mod plane;
 mod poll;
+mod principal;
 mod rate_limit;
 mod renew;
+mod revocation;
+mod revocation_audit;
 mod route;
 mod serve;
 mod session_audit;
 mod session_end;
 mod session_http;
+mod session_sweep;
 mod source_ip;
 mod start;
 mod token;
@@ -52,9 +57,18 @@ pub use clock::{Clock, system_clock};
 pub use control::{Control, ControlParts, PENDING_CAPACITY};
 pub use device::DeviceSettings;
 pub use error::ControlError;
+pub use killer::{KillOrder, KillReason, KillScope, KilledSession, SessionKiller};
 pub use labels::{LabelError, Labels, MAX_LABELS};
 pub use limits::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, MAX_CONNECTIONS_LIMIT,
     RequestLimits,
 };
 pub use naming::{AgentEndpoint, GateEndpoint, NamingError, SshSuffix};
+pub use revocation::{
+    ListRevocationsError, MAX_LIST_PAGE, MAX_REASON_CHARS, RevocationAdmin, RevokeError,
+    RevokeRequest, Revoked, SESSION_CLOSE_BUDGET, SLOW_REVOCATION_WRITE, UnrevokeError,
+};
+pub use session_sweep::{
+    OVERDUE_MARGIN_SECS, REVOCATION_PRUNE_AFTER_EXPIRY_SECS, REVOCATION_WATCH_INTERVAL,
+    ROUTED_GRACE_SECS, SESSION_SWEEP_INTERVAL, SessionSweep,
+};

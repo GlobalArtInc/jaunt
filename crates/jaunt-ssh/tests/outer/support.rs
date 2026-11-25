@@ -672,4 +672,23 @@ impl Gate {
         client.authenticate().await;
         client
     }
+
+    pub async fn login_terminable(&self) -> (Client, CancellationToken) {
+        let (client_io, server_io) = tokio::io::duplex(TRANSPORT);
+        let permit = Arc::clone(&self.permits).try_acquire_owned().unwrap();
+        let hop = Arc::clone(&self.hop);
+        let shutdown = CancellationToken::new();
+        let terminate = CancellationToken::new();
+        let (stop, cut) = (shutdown.clone(), terminate.clone());
+        let client_addr = SocketAddr::from(([192, 0, 2, 8], 40_023));
+        let serve = tokio::spawn(async move {
+            hop.serve_with_termination(server_io, client_addr, permit, stop, cut)
+                .await
+        });
+        let mut client = self
+            .connect_over(client_io, serve, shutdown, client::Config::default())
+            .await;
+        client.authenticate().await;
+        (client, terminate)
+    }
 }

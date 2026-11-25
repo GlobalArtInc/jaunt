@@ -7,6 +7,7 @@ mod client_api;
 mod enroll;
 mod flow;
 mod renew;
+mod revoke;
 mod route;
 mod serve;
 mod session_http;

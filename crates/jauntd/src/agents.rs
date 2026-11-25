@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod certificate;
 mod reconcile;
+mod sessions;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,10 +10,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use jaunt_ca::CaError;
-use jaunt_control::{Clock, Control};
+use jaunt_control::{Clock, Control, REVOCATION_WATCH_INTERVAL, SESSION_SWEEP_INTERVAL};
 use jaunt_gate::{
-    AgentHub, AgentHubConfig, DEFAULT_AGENT_CLIENT_LIMITS, HubError, HubStatsSnapshot,
-    ShutdownReport,
+    AgentHub, AgentHubConfig, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS, HubError,
+    HubStatsSnapshot, ShutdownReport,
 };
 use jaunt_limits::AddressLimits;
 use jaunt_store::Store;
@@ -31,6 +32,7 @@ use api::AgentApi;
 use auth::NodeAuthenticator;
 use certificate::ServerCertificate;
 use reconcile::StoreNodes;
+use sessions::{Presence, Registrations, SweepPlan};
 
 pub const DEFAULT_AGENTS_LISTEN: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8444);
@@ -39,6 +41,7 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 pub const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const SSH_STREAM_WINDOW: u32 = 1024 * 1024;
 pub const SSH_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+pub const AGENT_GONE_AFTER: Duration = Duration::from_secs(120);
 
 const _: () = assert!(RECONCILE_INTERVAL.as_secs() <= 5);
 
@@ -55,6 +58,9 @@ pub struct AgentServerParts {
     pub clock: Clock,
     pub reconcile_interval: Duration,
     pub certificate_check_interval: Duration,
+    pub session_sweep_interval: Duration,
+    pub revocation_watch_interval: Duration,
+    pub agent_gone_after: Duration,
     pub api_limits: ApiLimits,
     pub tunnel: TunnelOptions,
     pub client_limits: AddressLimits,
@@ -77,6 +83,9 @@ impl AgentServerParts {
             clock,
             reconcile_interval: RECONCILE_INTERVAL,
             certificate_check_interval: CERTIFICATE_CHECK_INTERVAL,
+            session_sweep_interval: SESSION_SWEEP_INTERVAL,
+            revocation_watch_interval: REVOCATION_WATCH_INTERVAL,
+            agent_gone_after: AGENT_GONE_AFTER,
             api_limits: ApiLimits::default(),
             tunnel: ssh_tunnel_options(),
             client_limits: DEFAULT_AGENT_CLIENT_LIMITS,
@@ -120,10 +129,32 @@ impl AgentServer {
             clock,
             reconcile_interval,
             certificate_check_interval,
+            session_sweep_interval,
+            revocation_watch_interval,
+            agent_gone_after,
             api_limits,
             tunnel,
             client_limits,
         } = parts;
+        tracing::info!(
+            target: "jaunt::daemon",
+            "single-process assumption: this jauntd is the only one using its database, so open \
+             sessions of earlier runs are closed at start and agent presence is kept in this \
+             process memory; running several jauntd processes on one database is not supported"
+        );
+        match control.close_sessions_of_earlier_runs().await {
+            Ok(0) => {}
+            Ok(closed) => tracing::info!(
+                target: "jaunt::daemon",
+                closed,
+                "sessions left open by an earlier run were closed"
+            ),
+            Err(error) => tracing::warn!(
+                target: "jaunt::daemon",
+                error = %error,
+                "closing the sessions left open by an earlier run failed"
+            ),
+        }
         let certificate = Arc::new(ServerCertificate::issue(
             control.clone(),
             settings.server_name.clone(),
@@ -150,8 +181,34 @@ impl AgentServer {
             Arc::new(NodeAuthenticator::new(store.nodes())),
             Arc::new(AgentApi::new(control.agent_router(), api_limits)),
         )?;
+        let events = hub.registry().subscribe();
+        let presence = Arc::new(Presence::default());
         let stop = CancellationToken::new();
         let tasks = vec![
+            tokio::spawn(sessions::follow_registrations(
+                Registrations {
+                    closer: control.clone(),
+                    agents: hub.agents(),
+                    nodes: StoreNodes::new(store.nodes()),
+                    presence: Arc::clone(&presence),
+                },
+                events,
+                stop.clone(),
+            )),
+            tokio::spawn(sessions::sweep_forever(
+                control.clone(),
+                presence,
+                SweepPlan {
+                    every: session_sweep_interval,
+                    agent_gone_after,
+                },
+                stop.clone(),
+            )),
+            tokio::spawn(sessions::watch_revocations(
+                control.clone(),
+                revocation_watch_interval,
+                stop.clone(),
+            )),
             tokio::spawn(reconcile::run(
                 StoreNodes::new(store.nodes()),
                 hub.agents(),
@@ -178,6 +235,10 @@ impl AgentServer {
 
     pub fn registry(&self) -> &AgentRegistry {
         self.hub.registry()
+    }
+
+    pub fn agents(&self) -> ConnectedAgents {
+        self.hub.agents()
     }
 
     pub fn stats(&self) -> &Arc<GateStats> {

@@ -6,6 +6,7 @@ use jaunt_store::ValidApiToken;
 
 use crate::control::Control;
 use crate::http::{empty_response, json_response, server_error};
+use crate::principal::{self, Channel, Refusal};
 use crate::token;
 
 fn unauthorized() -> Response {
@@ -57,7 +58,16 @@ pub(crate) async fn authenticate(
         .find_valid(&token_hash, now.secs)
         .await
     {
-        Ok(Some(valid)) => Ok(valid),
+        Ok(Some(valid)) => {
+            let serial = Some(valid.token.cert_serial);
+            match principal::refuse_revoked(control, &valid.user.id, serial, Channel::ApiToken)
+                .await
+            {
+                Ok(()) => Ok(valid),
+                Err(Refusal::Revoked) => Err(AuthFailure::Rejected),
+                Err(Refusal::Unavailable) => Err(AuthFailure::Unavailable),
+            }
+        }
         Ok(None) => Err(AuthFailure::Rejected),
         Err(err) => {
             tracing::error!(target: "jaunt::control", error = %err, "looking up the api token failed");

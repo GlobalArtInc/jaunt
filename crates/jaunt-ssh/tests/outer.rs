@@ -656,6 +656,40 @@ async fn a_shutdown_ends_the_connection_and_every_forward() {
     assert_eq!(gate.events().last(), Some(&disconnected));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminated_connection_hears_only_the_refusal_text_and_loses_every_forward() {
+    let gate = Gate::new(OuterLimits::default(), Mode::Echo);
+    let (client, terminate) = gate.login_terminable().await;
+    let (bystander, _keep) = gate.login_terminable().await;
+    let _first = client.open_node().await;
+    let _second = client.open_node().await;
+    let started = Instant::now();
+
+    terminate.cancel();
+
+    assert_eq!(
+        client.disconnect_notice().await,
+        ("ByApplication".to_owned(), DENIED_TEXT.to_owned())
+    );
+    let end = finished(client.serve).await;
+    assert!(started.elapsed() < GRACE + Duration::from_secs(1));
+    assert_eq!(end.reason, OuterEndReason::Terminated);
+    assert_eq!(end.reason.reason(), "terminated");
+    assert_eq!(
+        end.identity.map(|identity| identity.user_id).as_deref(),
+        Some(USER_ID)
+    );
+    assert_eq!(
+        gate.closed_reasons(2).await,
+        [StreamEnd::Shutdown, StreamEnd::Shutdown]
+    );
+    assert!(gate.events().contains(&OuterEvent::Disconnected {
+        reason: OuterEndReason::Terminated
+    }));
+    let _alive = bystander.open_node().await;
+    assert_eq!(bystander.ended().await.reason, OuterEndReason::ClientGone);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_client_that_disconnects_but_keeps_the_transport_open_is_let_go() {
     let gate = Gate::new(OuterLimits::default(), Mode::Echo);

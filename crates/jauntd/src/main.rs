@@ -7,7 +7,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jaunt_ca::CaKind;
-use jauntd::{ca, ca_rotation, node};
+use jaunt_store::RevocationKind;
+use jauntd::{ca, ca_rotation, node, revoke};
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt control daemon")]
@@ -43,6 +44,91 @@ enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+    #[command(about = "Revoke a user, one certificate or a node")]
+    Revoke {
+        #[command(subcommand)]
+        command: RevokeCommand,
+    },
+    #[command(about = "List and remove revocations")]
+    Revocations {
+        #[command(subcommand)]
+        command: RevocationsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RevokeCommand {
+    #[command(about = "Revoke every certificate of a user, by user id")]
+    User {
+        #[arg(
+            value_name = "SUBJECT",
+            help = "The user id, as shown in the audit log and the admin API"
+        )]
+        subject: String,
+        #[arg(long, help = "Why the access is revoked")]
+        reason: String,
+    },
+    #[command(about = "Revoke one certificate, by serial")]
+    Serial {
+        #[arg(value_name = "SUBJECT", help = "The serial number of the certificate")]
+        subject: String,
+        #[arg(long, help = "Why the access is revoked")]
+        reason: String,
+    },
+    #[command(about = "Revoke a node, by id or by the name of an active node")]
+    Node {
+        #[arg(
+            value_name = "SUBJECT",
+            help = "The node id, or the name of an active node"
+        )]
+        subject: String,
+        #[arg(long, help = "Why the access is revoked")]
+        reason: String,
+    },
+}
+
+impl From<RevokeCommand> for revoke::RevokeAction {
+    fn from(command: RevokeCommand) -> revoke::RevokeAction {
+        let (kind, subject, reason) = match command {
+            RevokeCommand::User { subject, reason } => (RevocationKind::User, subject, reason),
+            RevokeCommand::Serial { subject, reason } => (RevocationKind::Serial, subject, reason),
+            RevokeCommand::Node { subject, reason } => (RevocationKind::Node, subject, reason),
+        };
+        revoke::RevokeAction::Revoke {
+            kind,
+            subject,
+            reason,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum RevocationsCommand {
+    #[command(about = "List revocations, newest first")]
+    List,
+    #[command(
+        about = "Remove a revocation by its id",
+        long_about = "Remove a revocation by its id. Removing a user revocation also deletes the \
+                      web sessions and API tokens of that user: the user signs in again to get \
+                      new ones. Removing a node revocation leaves the node removed: its agent \
+                      must enrol again."
+    )]
+    Rm {
+        #[arg(
+            value_name = "ID",
+            help = "The revocation id, as shown by `jauntd revocations list`"
+        )]
+        id: String,
+    },
+}
+
+impl From<RevocationsCommand> for revoke::RevokeAction {
+    fn from(command: RevocationsCommand) -> revoke::RevokeAction {
+        match command {
+            RevocationsCommand::List => revoke::RevokeAction::List,
+            RevocationsCommand::Rm { id } => revoke::RevokeAction::Remove { id },
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -147,6 +233,8 @@ fn main() -> ExitCode {
         Command::Db {
             command: DbCommand::Copy,
         } => not_implemented("db copy"),
+        Command::Revoke { command } => revoke::run(&cli.config, command.into()),
+        Command::Revocations { command } => revoke::run(&cli.config, command.into()),
     }
 }
 

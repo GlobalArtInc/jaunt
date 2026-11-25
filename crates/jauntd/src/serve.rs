@@ -17,6 +17,7 @@ use jauntd::agents::{AgentServer, AgentServerParts, AgentsError, AgentsSettings,
 use jauntd::gate_ssh::{
     GateSshError, GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer,
 };
+use jauntd::killer::InProcessKiller;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -154,6 +155,7 @@ async fn serve(
             return Err(err);
         }
     };
+    install_killer(&control, agents.as_ref(), gate.as_ref());
 
     let (deadline_tx, mut deadline_rx) = watch::channel(None);
     let shutdown = async move {
@@ -248,6 +250,20 @@ async fn start_gate(
         "serving ssh"
     );
     Ok(Some(server))
+}
+
+fn install_killer(control: &Control, agents: Option<&AgentServer>, gate: Option<&GateSshServer>) {
+    let Some(agents) = agents else {
+        return;
+    };
+    let gate = gate.map(|server| Arc::clone(server.gate()));
+    let closes_outer = gate.is_some();
+    control.install_session_killer(Arc::new(InProcessKiller::new(agents.agents(), gate)));
+    tracing::info!(
+        target: "jaunt::daemon",
+        closes_outer,
+        "revocations tear down live sessions in this process, where the gate and control run together"
+    );
 }
 
 fn gate_plan(

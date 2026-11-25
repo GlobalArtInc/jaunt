@@ -21,12 +21,15 @@ use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
 use crate::http;
+use crate::killer::{KillerSlot, SessionKiller};
 use crate::limits::{NoiseLog, RequestLimiters, RequestLimits};
 use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
 use crate::rate_limit;
+use crate::revocation::RevocationAdmin;
 use crate::serve;
+use crate::session_sweep::RevocationWatch;
 use crate::web::WebState;
 
 pub const PENDING_CAPACITY: usize = 10_000;
@@ -77,6 +80,8 @@ pub struct Inner {
     pub(crate) web: WebState,
     clock: Clock,
     ticker: Ticker,
+    pub(crate) killer: Arc<KillerSlot>,
+    pub(crate) watched: Arc<RevocationWatch>,
 }
 
 #[derive(Clone)]
@@ -143,6 +148,7 @@ impl Control {
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
             Duration::from_secs(parts.cert_ttl.as_secs().min(MAX_USER_VALIDITY.as_secs()));
+        let watched = RevocationWatch::starting_at(Moment::read(&parts.clock).map(|now| now.secs));
         Ok(Control {
             inner: Arc::new(Inner {
                 store: parts.store,
@@ -165,6 +171,8 @@ impl Control {
                 web,
                 clock: parts.clock,
                 ticker,
+                killer: Arc::default(),
+                watched: Arc::new(watched),
             }),
         })
     }
@@ -192,6 +200,19 @@ impl Control {
 
     pub fn node_admin(&self) -> NodeAdmin {
         NodeAdmin::new(self.store.clone(), self.clock.clone())
+    }
+
+    pub fn revocations(&self) -> RevocationAdmin {
+        RevocationAdmin::shared(
+            self.store.clone(),
+            self.clock.clone(),
+            Arc::clone(&self.inner.killer),
+            Arc::clone(&self.inner.watched),
+        )
+    }
+
+    pub fn install_session_killer(&self, killer: Arc<dyn SessionKiller>) {
+        self.inner.killer.install(killer);
     }
 
     pub fn issue_server_certificate(

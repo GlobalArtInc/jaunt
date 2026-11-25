@@ -44,8 +44,23 @@ pub(crate) async fn session_end(
             });
             Ok(SessionEndOutcome::Recorded)
         }
+        EndOutcome::Late(session) => {
+            session_audit::late_end(&session);
+            Ok(SessionEndOutcome::Recorded)
+        }
         EndOutcome::Repeated => Ok(SessionEndOutcome::Recorded),
         EndOutcome::Rejected(rejection) => {
+            if rejection == EndRejection::ClosedByControl {
+                tracing::warn!(
+                    target: "jaunt::control",
+                    node_id = %node_id,
+                    session_id = %request.session_id,
+                    exit_status = request.exit_status,
+                    bytes_in,
+                    bytes_out,
+                    "an agent reported the end of a session that control had already closed and counted"
+                );
+            }
             session_audit::end_rejected(&node_id, &request.session_id, rejection_code(rejection));
             Ok(SessionEndOutcome::Rejected)
         }
@@ -58,5 +73,6 @@ const fn rejection_code(rejection: EndRejection) -> &'static str {
         EndRejection::WrongNode => "wrong_node",
         EndRejection::NotActive => "session_not_active",
         EndRejection::ConflictingEnd => "conflicting_end",
+        EndRejection::ClosedByControl => "session_closed",
     }
 }

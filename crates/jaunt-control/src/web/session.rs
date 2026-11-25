@@ -13,6 +13,7 @@ use crate::completion;
 use crate::control::Control;
 use crate::http::{empty_response, error_response, server_error};
 use crate::identity::policy_identity;
+use crate::principal;
 use crate::token;
 
 use super::cookies::{self, SESSION_COOKIE};
@@ -100,6 +101,18 @@ async fn authenticate(
         end_if_expired(&sessions, &id_hash, now.secs).await;
         return Err(Failure::Unauthenticated);
     };
+    match principal::refuse_revoked(
+        control,
+        &valid.user.id,
+        None,
+        principal::Channel::WebSession,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(principal::Refusal::Revoked) => return Err(Failure::Unauthenticated),
+        Err(principal::Refusal::Unavailable) => return Err(Failure::Server),
+    }
     if csrf::is_state_changing(method)
         && let Err(refusal) = csrf::verify(
             headers,
@@ -201,6 +214,18 @@ pub(crate) struct AuditRead;
 
 impl Permission for AuditRead {
     const REQUIRED: AdminPermission = AdminPermission::AuditRead;
+}
+
+pub(crate) struct RevocationsWrite;
+
+impl Permission for RevocationsWrite {
+    const REQUIRED: AdminPermission = AdminPermission::RevocationsWrite;
+}
+
+pub(crate) struct SessionsRead;
+
+impl Permission for SessionsRead {
+    const REQUIRED: AdminPermission = AdminPermission::SessionsRead;
 }
 
 pub(crate) struct RequireAdmin<P: Permission> {

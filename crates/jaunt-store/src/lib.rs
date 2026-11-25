@@ -6,6 +6,7 @@ mod enrollments;
 mod error;
 mod login_requests;
 mod nodes;
+mod revocations;
 mod sessions;
 mod users;
 mod web_sessions;
@@ -35,9 +36,13 @@ pub use nodes::{
     CertificateState, Labels, NewNodeCertificate, Node, NodeCertificate, NodeCertificateKind,
     NodeKeys, NodeState, Nodes,
 };
+pub use revocations::{
+    MAX_REVOCATION_PAGE, NewRevocation, Revocation, RevocationCursor, RevocationKind,
+    RevocationPage, Revocations, RevokeOutcome, Subjects,
+};
 pub use sessions::{
-    ActivateSession, EndOutcome, EndRejection, EndSession, NewSession, Session, SessionState,
-    Sessions,
+    ActivateSession, EndOutcome, EndRejection, EndSession, NewSession, OpenSessions, Session,
+    SessionEndReason, SessionState, Sessions,
 };
 pub use users::{NewUser, User, Users};
 pub use web_sessions::{NewWebSession, ValidWebSession, WebSession, WebSessions};
@@ -107,6 +112,10 @@ impl Store {
 
     pub fn sessions(&self) -> Sessions {
         Sessions::new(self.pool.clone())
+    }
+
+    pub fn revocations(&self) -> Revocations {
+        Revocations::new(self.pool.clone())
     }
 
     pub fn web_sessions(&self) -> WebSessions {

@@ -1,6 +1,7 @@
 use jaunt_store::{
-    ActivateSession, EndOutcome, EndRejection, EndSession, NewCertificate, NewSession, NewUser,
-    Session, SessionState, Store, StoreError,
+    ActivateSession, EndOutcome, EndRejection, EndSession, NewCertificate, NewRevocation,
+    NewSession, NewUser, OpenSessions, RevocationKind, Session, SessionEndReason, SessionState,
+    Store, StoreError,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -8,6 +9,7 @@ use tempfile::TempDir;
 
 const NOW: i64 = 1_000;
 const TTL: i64 = 60;
+const MAX_DURATION: i64 = 3600;
 const NODE: &str = "node-a";
 const OTHER_NODE: &str = "node-b";
 
@@ -105,6 +107,7 @@ impl Fixture {
             user_id: &self.user_id,
             serial: self.serial,
             login: "deploy",
+            max_duration_secs: MAX_DURATION,
             now,
         }
     }
@@ -182,6 +185,7 @@ async fn exactly_one_of_sixteen_concurrent_activations_wins() {
                     user_id: &user_id,
                     serial,
                     login: "deploy",
+                    max_duration_secs: MAX_DURATION,
                     now: NOW + 1,
                 })
                 .await
@@ -353,4 +357,347 @@ async fn purge_removes_only_routed_sessions_that_expired_before_the_cutoff() {
     assert_eq!(sessions.get(&stale.id).await.unwrap(), None);
     assert!(sessions.get(&active.id).await.unwrap().is_some());
     assert!(sessions.get(&ended.id).await.unwrap().is_some());
+}
+
+fn ids(sessions: &[Session]) -> Vec<String> {
+    let mut ids: Vec<String> = sessions.iter().map(|session| session.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn open_sessions_close_by_user_serial_or_node_and_record_the_reason() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let other_serial = fixture.serial + 1_000;
+    let finished = fixture.active().await;
+    assert!(matches!(
+        sessions.end(end_of(&finished, NODE, 1)).await.unwrap(),
+        EndOutcome::Ended(_)
+    ));
+    let cases = [
+        (OpenSessions::OfUser("someone-else"), false),
+        (OpenSessions::OfSerial(other_serial), false),
+        (OpenSessions::OfNode(OTHER_NODE), false),
+        (OpenSessions::OfUser(&fixture.user_id), true),
+        (OpenSessions::OfSerial(fixture.serial), true),
+        (OpenSessions::OfNode(NODE), true),
+    ];
+    for (which, matches) in cases {
+        let routed = fixture.routed().await;
+        let active = fixture.active().await;
+
+        let closed = sessions
+            .close(which, SessionEndReason::Revoked, NOW + 9)
+            .await
+            .unwrap();
+
+        if !matches {
+            assert!(closed.is_empty(), "{which:?}");
+            sessions
+                .close(OpenSessions::OfNode(NODE), SessionEndReason::Expired, NOW)
+                .await
+                .unwrap();
+            continue;
+        }
+        assert_eq!(ids(&closed), ids(&[routed, active]), "{which:?}");
+        for session in &closed {
+            assert_eq!(session.state, SessionState::Ended);
+            assert_eq!(session.end_reason, Some(SessionEndReason::Revoked));
+            assert_eq!(session.ended_at, Some(NOW + 9));
+            assert_eq!(session.bytes_in, None);
+        }
+    }
+    let untouched = sessions.get(&finished.id).await.unwrap().unwrap();
+    assert_eq!(untouched.end_reason, Some(SessionEndReason::Closed));
+    assert_eq!(untouched.ended_at, Some(NOW + 5));
+}
+
+#[tokio::test]
+async fn the_sweep_filters_take_only_stale_routed_and_overdue_active_sessions() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let routed = fixture.routed().await;
+    let active = fixture.active().await;
+    let legacy = fixture.active().await;
+    sqlx::query("UPDATE sessions SET max_duration_secs = NULL WHERE id = ?")
+        .bind(&legacy.id)
+        .execute(&fixture.raw)
+        .await
+        .unwrap();
+    assert_eq!(active.max_duration_secs, Some(MAX_DURATION));
+    let deadline = OpenSessions::ActivePastDeadline {
+        default_max_secs: 2 * MAX_DURATION,
+        margin_secs: 300,
+    };
+    let authorized = NOW + 1;
+    let reason = SessionEndReason::Expired;
+
+    assert!(
+        sessions
+            .close(OpenSessions::RoutedCreatedBefore(NOW), reason, NOW)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        sessions
+            .close(deadline, reason, authorized + MAX_DURATION + 300)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let overdue = sessions
+        .close(deadline, reason, authorized + MAX_DURATION + 301)
+        .await
+        .unwrap();
+    assert_eq!(ids(&overdue), ids(std::slice::from_ref(&active)));
+    let stale = sessions
+        .close(
+            OpenSessions::RoutedCreatedBefore(NOW + 1),
+            reason,
+            NOW + 500,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&stale), ids(std::slice::from_ref(&routed)));
+    assert!(
+        sessions
+            .close(deadline, reason, authorized + 2 * MAX_DURATION + 300)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let defaulted = sessions
+        .close(deadline, reason, authorized + 2 * MAX_DURATION + 301)
+        .await
+        .unwrap();
+    assert_eq!(ids(&defaulted), ids(std::slice::from_ref(&legacy)));
+    assert!(
+        overdue
+            .iter()
+            .chain(&stale)
+            .chain(&defaulted)
+            .all(|session| session.end_reason == Some(SessionEndReason::Expired))
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_node_closes_only_sessions_created_before_it_registered() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let before = fixture.active().await;
+    let elsewhere = sessions
+        .create(
+            &NewSession {
+                user_id: fixture.user_id.clone(),
+                serial: fixture.serial,
+                node_id: OTHER_NODE.to_owned(),
+                ttl_secs: TTL,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    let registered_at = |before| OpenSessions::OfNodeCreatedBefore {
+        node_id: NODE,
+        before,
+    };
+
+    let same_second = sessions
+        .close(registered_at(NOW), SessionEndReason::AgentRestarted, NOW)
+        .await
+        .unwrap();
+    let later = sessions
+        .close(
+            registered_at(NOW + 1),
+            SessionEndReason::AgentRestarted,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+    assert!(same_second.is_empty());
+    assert_eq!(ids(&later), ids(&[before]));
+    assert_eq!(later[0].end_reason, Some(SessionEndReason::AgentRestarted));
+    let other = sessions.get(&elsewhere.id).await.unwrap().unwrap();
+    assert_eq!(other.state, SessionState::Routed);
+}
+
+#[tokio::test]
+async fn sessions_of_revoked_subjects_close_and_others_stay_open() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let first = fixture.active().await;
+    let routed = fixture.routed().await;
+    let sweep = || {
+        sessions.close(
+            OpenSessions::OfRevokedSubjects,
+            SessionEndReason::Revoked,
+            NOW + 2,
+        )
+    };
+    assert!(sweep().await.unwrap().is_empty());
+    for (kind, subject) in [
+        (RevocationKind::User, "someone-else".to_owned()),
+        (RevocationKind::Node, OTHER_NODE.to_owned()),
+        (RevocationKind::Serial, (fixture.serial + 1).to_string()),
+    ] {
+        fixture
+            .store
+            .revocations()
+            .insert(
+                &NewRevocation {
+                    kind,
+                    subject,
+                    reason: "test".to_owned(),
+                    created_by: "cli:root".to_owned(),
+                },
+                NOW,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(sweep().await.unwrap().is_empty());
+    assert!(!sessions.any_open_of_revoked_subjects().await.unwrap());
+    fixture
+        .store
+        .revocations()
+        .insert(
+            &NewRevocation {
+                kind: RevocationKind::Serial,
+                subject: fixture.serial.to_string(),
+                reason: "test".to_owned(),
+                created_by: "cli:root".to_owned(),
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert!(sessions.any_open_of_revoked_subjects().await.unwrap());
+
+    let closed = sweep().await.unwrap();
+
+    assert_eq!(ids(&closed), ids(&[first, routed]));
+    assert!(!sessions.any_open_of_revoked_subjects().await.unwrap());
+}
+
+#[tokio::test]
+async fn sessions_of_removed_nodes_and_sessions_older_than_a_start_close_on_their_own() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let here = fixture.active().await;
+    let there = sessions
+        .create(
+            &NewSession {
+                user_id: fixture.user_id.clone(),
+                serial: fixture.serial,
+                node_id: OTHER_NODE.to_owned(),
+                ttl_secs: TTL,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE nodes SET state = 'removed', removed_at = ? WHERE id = ?")
+        .bind(NOW)
+        .bind(OTHER_NODE)
+        .execute(&fixture.raw)
+        .await
+        .unwrap();
+
+    let removed = sessions
+        .close(
+            OpenSessions::OfInactiveNodes,
+            SessionEndReason::NodeRemoved,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&removed), ids(&[there]));
+    assert_eq!(removed[0].end_reason, Some(SessionEndReason::NodeRemoved));
+
+    let restart = |before| {
+        sessions.close(
+            OpenSessions::CreatedBefore(before),
+            SessionEndReason::AgentGone,
+            NOW + 2,
+        )
+    };
+    assert!(restart(NOW).await.unwrap().is_empty());
+    let left_over = restart(NOW + 1).await.unwrap();
+    assert_eq!(ids(&left_over), ids(&[here]));
+    assert_eq!(left_over[0].end_reason, Some(SessionEndReason::AgentGone));
+}
+
+#[tokio::test]
+async fn a_late_report_for_a_session_control_closed_fills_the_counts_once() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let active = fixture.active().await;
+    let flagged = fixture.active().await;
+    let never_authorized = fixture.routed().await;
+    for reason in [SessionEndReason::Revoked, SessionEndReason::AgentGone] {
+        let which = if reason == SessionEndReason::Revoked {
+            OpenSessions::OfUser(&fixture.user_id)
+        } else {
+            OpenSessions::OfNode(NODE)
+        };
+        sessions.close(which, reason, NOW + 3).await.unwrap();
+    }
+    sqlx::query("UPDATE sessions SET recording_incomplete = 1 WHERE id = ?")
+        .bind(&flagged.id)
+        .execute(&fixture.raw)
+        .await
+        .unwrap();
+    let closed = sessions.get(&active.id).await.unwrap().unwrap();
+
+    assert_eq!(
+        sessions.end(end_of(&active, OTHER_NODE, 20)).await.unwrap(),
+        EndOutcome::Rejected(EndRejection::WrongNode)
+    );
+    let EndOutcome::Late(filled) = sessions
+        .end(EndSession {
+            recording_incomplete: true,
+            ..end_of(&active, NODE, 20)
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the first late report must be accepted");
+    };
+    assert_eq!(
+        (
+            filled.exit_status,
+            filled.bytes_in,
+            filled.bytes_out,
+            filled.recording_incomplete
+        ),
+        (Some(0), Some(10), Some(20), Some(true))
+    );
+    assert_eq!(
+        (filled.state, filled.end_reason, filled.ended_at),
+        (closed.state, closed.end_reason, closed.ended_at)
+    );
+    assert_eq!(
+        sessions.end(end_of(&active, NODE, 20)).await.unwrap(),
+        EndOutcome::Rejected(EndRejection::ClosedByControl)
+    );
+    assert_eq!(sessions.get(&active.id).await.unwrap().unwrap(), *filled);
+
+    let EndOutcome::Late(kept) = sessions.end(end_of(&flagged, NODE, 5)).await.unwrap() else {
+        panic!("the first late report must be accepted");
+    };
+    assert_eq!(kept.recording_incomplete, Some(true));
+    assert_eq!(kept.end_reason, Some(SessionEndReason::Revoked));
+
+    assert_eq!(
+        sessions
+            .end(end_of(&never_authorized, NODE, 5))
+            .await
+            .unwrap(),
+        EndOutcome::Rejected(EndRejection::ClosedByControl)
+    );
+    let untouched = sessions.get(&never_authorized.id).await.unwrap().unwrap();
+    assert_eq!((untouched.bytes_in, untouched.authorized_at), (None, None));
 }

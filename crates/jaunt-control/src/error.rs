@@ -49,4 +49,6 @@ pub enum ControlError {
     PurgeSessions(#[source] StoreError),
     #[error("purging expired web sessions failed: {0}")]
     PurgeWebSessions(#[source] StoreError),
+    #[error("closing ended sessions failed: {0}")]
+    Sessions(#[source] StoreError),
 }

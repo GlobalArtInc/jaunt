@@ -3,15 +3,21 @@ use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, ControlError as PlaneError, DenyReason, NodeCaller,
     SessionPermissions,
 };
-use jaunt_store::{ActivateSession, SessionState};
+use jaunt_store::{ActivateSession, SessionState, Subjects};
 
 use crate::control::Control;
 use crate::holder::{self, Presented};
 use crate::identity::policy_identity;
 use crate::plane::{check_fields, clock_failure, node_info, store_failure};
+use crate::revocation::revoked;
 use crate::session_audit::{self, Denied, Phase, Started};
 
 pub(crate) const DEFAULT_MAX_SESSION_SECS: u64 = 12 * 60 * 60;
+pub(crate) const MAX_RECORDED_DURATION_SECS: u64 = 366 * 24 * 60 * 60;
+
+pub(crate) fn recorded_duration(max_duration_secs: u64) -> i64 {
+    i64::try_from(max_duration_secs.min(MAX_RECORDED_DURATION_SECS)).unwrap_or(0)
+}
 
 pub(crate) async fn authorize(
     control: &Control,
@@ -72,6 +78,14 @@ pub(crate) async fn authorize(
         Ok(holder) => holder,
         Err(reason) => return Ok(deny(reason)),
     };
+    let subjects = Subjects {
+        user_id: &holder.user.id,
+        serial: Some(holder.serial),
+        node_id: Some(&node_id),
+    };
+    if revoked(control, subjects).await? {
+        return Ok(deny(DenyReason::Revoked));
+    }
     let decision = policy.authorize_ssh(
         &policy_identity(&holder.user),
         &node_info(&node),
@@ -89,6 +103,7 @@ pub(crate) async fn authorize(
             user_id: &holder.user.id,
             serial: holder.serial,
             login: &request.login,
+            max_duration_secs: recorded_duration(permissions.max_duration_secs),
             now: now.secs,
         })
         .await
@@ -138,4 +153,18 @@ fn denied(
         client_addr: &request.client_addr,
     });
     AuthorizeDecision::Deny { reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RECORDED_DURATION_SECS, recorded_duration};
+
+    #[test]
+    fn the_recorded_duration_is_clamped_so_the_deadline_sum_cannot_overflow() {
+        let ceiling = i64::try_from(MAX_RECORDED_DURATION_SECS).unwrap();
+        assert_eq!(recorded_duration(43_200), 43_200);
+        assert_eq!(recorded_duration(u64::MAX), ceiling);
+        assert_eq!(recorded_duration(MAX_RECORDED_DURATION_SECS + 1), ceiling);
+        assert!(i64::from(u32::MAX).checked_add(ceiling + 300).is_some());
+    }
 }

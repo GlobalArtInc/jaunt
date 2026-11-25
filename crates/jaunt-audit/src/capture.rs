@@ -518,4 +518,77 @@ mod tests {
         assert_eq!(events[5].text("reason"), Some("unknown_state"));
         assert_eq!(stand.tap.snapshot().fields_dropped, 0);
     }
+
+    #[tokio::test]
+    async fn the_shapes_emitted_for_revocations_and_closed_sessions_map_without_loss() {
+        let stand = stand();
+        let subscriber = Registry::default().with(stand.tap.layer());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "jaunt::audit", event = "revoke.created", revocation_id = "r-1",
+                kind = "user", subject = "u-1", reason = "lost laptop", created_by = "web:u-9",
+                web_sessions_ended = 2_u64, api_access_removed = 1_u64
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "revoke.removed", revocation_id = "r-1",
+                kind = "user", subject = "u-1", removed_by = "cli:root"
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "session.terminated", session_id = "s-1",
+                user_id = "u-1", serial = 7_i64, node_id = "n-1", reason = "revoked"
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "gate.ssh.terminated", user_id = "u-1",
+                serial = Some(7_u64), reason = "revoked", connections = 1_usize
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "session.end", outcome = "revoked",
+                session_id = "s-1", user_id = "u-1", serial = 7_i64, node_id = "n-1",
+                login = Some("deploy"), state_before = "active"
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "session.end", late = true, outcome = Some("revoked"),
+                session_id = "s-1", user_id = "u-1", serial = 7_i64, node_id = "n-1",
+                login = Some("deploy"), exit_status = Some(0_i32), bytes_in = Some(10_i64),
+                bytes_out = Some(20_i64), recording_incomplete = Some(false)
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "session.end.rejected", node_id = "n-1",
+                session_id = "s-1", reason = "session_closed"
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "authz.deny", phase = "web_login",
+                reason = "revoked", user_id = "u-1"
+            );
+        });
+
+        let events = drained(&stand).await;
+        let shown: Vec<(&str, String)> = events
+            .iter()
+            .map(|event| (event.kind.name(), event.actor.as_wire()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("revoke.created", "web:u-9".to_owned()),
+                ("revoke.removed", "cli:root".to_owned()),
+                ("session.terminated", "u-1".to_owned()),
+                ("gate.terminated", "u-1".to_owned()),
+                ("session.end", "u-1".to_owned()),
+                ("session.end", "u-1".to_owned()),
+                ("session.end_rejected", "node:n-1".to_owned()),
+                ("authz.deny", "u-1".to_owned()),
+            ]
+        );
+        assert_eq!(stand.tap.snapshot().fields_dropped, 0);
+        assert_eq!(events[0].text("reason"), Some("lost laptop"));
+        assert_eq!(events[0].int("api_access_removed"), Some(1));
+        assert_eq!(events[2].node.as_deref(), Some("n-1"));
+        assert_eq!(events[3].int("connections"), Some(1));
+        assert_eq!(events[4].text("state_before"), Some("active"));
+        assert_eq!(events[5].flag("late"), Some(true));
+        assert_eq!(events[5].int("bytes_out"), Some(20));
+        assert_eq!(events[6].text("reason"), Some("session_closed"));
+    }
 }

@@ -153,6 +153,7 @@ pub enum OuterEndReason {
     CertificateExpired,
     ProtocolViolation,
     Shutdown,
+    Terminated,
 }
 
 impl OuterEndReason {
@@ -166,6 +167,7 @@ impl OuterEndReason {
             Self::CertificateExpired => "certificate_expired",
             Self::ProtocolViolation => "protocol_violation",
             Self::Shutdown => "shutdown",
+            Self::Terminated => "terminated",
         }
     }
 }
@@ -301,6 +303,35 @@ impl OuterHop {
         pre_auth: OwnedSemaphorePermit,
         shutdown: CancellationToken,
     ) -> OuterEnd {
+        let stops = Stops {
+            shutdown,
+            terminate: CancellationToken::new(),
+        };
+        self.serve_until(stream, client_addr, pre_auth, stops).await
+    }
+
+    pub async fn serve_with_termination<S: TunnelStream>(
+        &self,
+        stream: S,
+        client_addr: SocketAddr,
+        pre_auth: OwnedSemaphorePermit,
+        shutdown: CancellationToken,
+        terminate: CancellationToken,
+    ) -> OuterEnd {
+        let stops = Stops {
+            shutdown,
+            terminate,
+        };
+        self.serve_until(stream, client_addr, pre_auth, stops).await
+    }
+
+    async fn serve_until<S: TunnelStream>(
+        &self,
+        stream: S,
+        client_addr: SocketAddr,
+        pre_auth: OwnedSemaphorePermit,
+        stops: Stops,
+    ) -> OuterEnd {
         let deadline = later(self.hop.limits.auth_deadline);
         self.hop.emit(OuterEvent::Connected { client_addr });
         let config = Arc::new(connection_config(
@@ -319,19 +350,19 @@ impl OuterHop {
         let stream = Severable::new(stream, &connection.token);
         let started = tokio::select! {
             biased;
-            () = shutdown.cancelled() => None,
+            ending = stops.stopped() => Err(ending),
             started = tokio::time::timeout_at(deadline, server::run_stream(config, stream, handler)) => {
-                Some(started)
+                Ok(started)
             }
         };
         let reason = match started {
-            None => {
+            Err(ending) => {
                 connection.end.get_or_init(|| StreamEnd::Shutdown);
-                OuterEndReason::Shutdown
+                ending.reason()
             }
-            Some(Err(_)) => OuterEndReason::AuthTimeout,
-            Some(Ok(Err(_))) => OuterEndReason::HandshakeFailed,
-            Some(Ok(Ok(running))) => supervise(&connection, running, deadline, &shutdown).await,
+            Ok(Err(_)) => OuterEndReason::AuthTimeout,
+            Ok(Ok(Err(_))) => OuterEndReason::HandshakeFailed,
+            Ok(Ok(Ok(running))) => supervise(&connection, running, deadline, &stops).await,
         };
         connection.end.get_or_init(|| StreamEnd::ClientGone);
         drop(sever);
@@ -443,6 +474,7 @@ enum Ending {
     AuthAttempts,
     Expired,
     Shutdown,
+    Terminated,
 }
 
 impl Ending {
@@ -452,6 +484,7 @@ impl Ending {
             Self::AuthAttempts => OuterEndReason::AuthAttempts,
             Self::Expired => OuterEndReason::CertificateExpired,
             Self::Shutdown => OuterEndReason::Shutdown,
+            Self::Terminated => OuterEndReason::Terminated,
         }
     }
 
@@ -461,6 +494,22 @@ impl Ending {
             Self::AuthAttempts => (Disconnect::NoMoreAuthMethodsAvailable, AUTH_ATTEMPTS_TEXT),
             Self::Expired => (Disconnect::ByApplication, EXPIRED_TEXT),
             Self::Shutdown => (Disconnect::ByApplication, SHUTDOWN_TEXT),
+            Self::Terminated => (Disconnect::ByApplication, DENIED_TEXT),
+        }
+    }
+}
+
+struct Stops {
+    shutdown: CancellationToken,
+    terminate: CancellationToken,
+}
+
+impl Stops {
+    async fn stopped(&self) -> Ending {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Ending::Shutdown,
+            () = self.terminate.cancelled() => Ending::Terminated,
         }
     }
 }
@@ -469,7 +518,7 @@ async fn supervise(
     connection: &Connection,
     mut running: RunningSession<OuterHandler>,
     deadline: Instant,
-    shutdown: &CancellationToken,
+    stops: &Stops,
 ) -> OuterEndReason {
     let handle = running.handle();
     let mut alarm = (deadline, Ending::AuthTimeout);
@@ -477,7 +526,7 @@ async fn supervise(
         tokio::select! {
             biased;
             _ = &mut running => return connection.settled(),
-            () = shutdown.cancelled() => break Ending::Shutdown,
+            ending = stops.stopped() => break ending,
             () = connection.phase_changed.notified() => {
                 match connection.phase() {
                     Phase::PreAuth => {}

@@ -14,6 +14,7 @@ use crate::completion;
 use crate::control::Control;
 use crate::http::{BodyFailure, error_response, json_body, json_response, server_error};
 use crate::pkce;
+use crate::principal::{self, Channel, Refusal};
 use crate::start::LOGIN_KIND;
 use crate::token;
 
@@ -251,6 +252,11 @@ pub(crate) async fn redeem_and_issue(
             tracing::error!(target: "jaunt::control", "an approved login request names a missing user");
             failed(Failure::internal(FinishReason::CorruptRecord))
         })?;
+    match principal::refuse_revoked(control, &user.id, None, Channel::Certificate).await {
+        Ok(()) => {}
+        Err(Refusal::Revoked) => return Err(failed(Failure::grant(FinishReason::Revoked))),
+        Err(Refusal::Unavailable) => return Err(failed(Failure::internal(FinishReason::Store))),
+    }
     let user_uuid = Uuid::parse_str(&user.id).map_err(|_| {
         tracing::error!(target: "jaunt::control", "a stored user id is not a uuid");
         failed(Failure::internal(FinishReason::CorruptRecord))

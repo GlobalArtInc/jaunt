@@ -80,6 +80,14 @@ pub struct Options {
     pub clock_days_behind: u64,
     pub api_limits: Option<ApiLimits>,
     pub reconcile_interval: Option<Duration>,
+    pub session_sweep_interval: Option<Duration>,
+    pub agent_gone_after: Option<Duration>,
+}
+
+pub struct Authorities {
+    pub user: Arc<dyn Signer>,
+    pub host: Arc<dyn Signer>,
+    pub user_lines: Vec<String>,
 }
 
 pub struct Harness {
@@ -88,8 +96,9 @@ pub struct Harness {
     pub store: Store,
     pub server: AgentServer,
     pub clock: TestClock,
+    pub authorities: Authorities,
+    pub db_path: PathBuf,
     issuer: InternalCa,
-    db_path: PathBuf,
     _discovery: FakeDiscovery,
     _dir: TempDir,
 }
@@ -119,6 +128,19 @@ impl Harness {
         let (user_trust, user) = FileBackend::load(&ca_root, CaKind::User, &identity).unwrap();
         let (host_trust, host) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (internal_ca, issuer) = internal_cas(&ca_root, &identity);
+        let authorities = Authorities {
+            user: Arc::new(
+                FileBackend::load(&ca_root, CaKind::User, &identity)
+                    .unwrap()
+                    .1,
+            ),
+            host: Arc::new(
+                FileBackend::load(&ca_root, CaKind::Host, &identity)
+                    .unwrap()
+                    .1,
+            ),
+            user_lines: user_trust.to_authorized_lines().unwrap(),
+        };
         let db_path = dir.path().join("jaunt.db");
         let store = Store::open(&db_path).await.unwrap();
         store.migrate().await.unwrap();
@@ -164,6 +186,12 @@ impl Harness {
         if let Some(limits) = options.api_limits {
             parts.api_limits = limits;
         }
+        if let Some(every) = options.session_sweep_interval {
+            parts.session_sweep_interval = every;
+        }
+        if let Some(after) = options.agent_gone_after {
+            parts.agent_gone_after = after;
+        }
         let server = AgentServer::start(parts).await.unwrap();
         Harness {
             admin: control.node_admin(),
@@ -171,6 +199,7 @@ impl Harness {
             store,
             server,
             clock,
+            authorities,
             issuer,
             db_path,
             _discovery: discovery,
@@ -323,6 +352,14 @@ impl TestAgent {
 }
 
 pub fn spawn_agent(harness: &Harness, agent: &EnrolledAgent) -> TestAgent {
+    spawn_agent_with(harness, agent, Arc::new(Idle))
+}
+
+pub fn spawn_agent_with(
+    harness: &Harness,
+    agent: &EnrolledAgent,
+    handler: Arc<dyn StreamHandler>,
+) -> TestAgent {
     let tls = agent_client_config(harness.roots(), agent.chain.clone(), agent.key()).unwrap();
     let mut config = TunnelClientConfig::new(
         Arc::new(tls),
@@ -338,9 +375,7 @@ pub fn spawn_agent(harness: &Harness, agent: &EnrolledAgent) -> TestAgent {
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
     let join = tokio::spawn(async move {
-        TunnelClient::run(config, Arc::new(Idle), token)
-            .await
-            .unwrap();
+        TunnelClient::run(config, handler, token).await.unwrap();
     });
     TestAgent { shutdown, join }
 }

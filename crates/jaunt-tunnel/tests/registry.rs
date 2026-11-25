@@ -171,14 +171,20 @@ async fn subscribers_see_replacements_and_endings_in_a_consistent_per_node_order
             sink.lock().unwrap().push(event);
         }
     });
+    let mut seen_at = Vec::new();
     let (first, a) = registered_fake(&mut gate, &pki, &leaf).await;
+    seen_at.push(gate.registry.registered_at(&node("node-a")).unwrap());
     let (second, b) = registered_fake(&mut gate, &pki, &leaf).await;
+    seen_at.push(gate.registry.registered_at(&node("node-a")).unwrap());
     let (third, c) = registered_fake(&mut gate, &pki, &leaf).await;
+    seen_at.push(gate.registry.registered_at(&node("node-a")).unwrap());
+    assert!(seen_at.is_sorted());
     eventually("the replaced connections to close", || {
         first.closed.load(Ordering::SeqCst) && second.closed.load(Ordering::SeqCst)
     })
     .await;
     assert!(gate.registry.disconnect(&node("node-a")));
+    assert_eq!(gate.registry.registered_at(&node("node-a")), None);
     eventually("the last event", || log.lock().unwrap().len() == 4).await;
     eventually("the last connection to close", || {
         third.closed.load(Ordering::SeqCst)
@@ -192,17 +198,20 @@ async fn subscribers_see_replacements_and_endings_in_a_consistent_per_node_order
         [
             RegistryEvent::Connected {
                 node: node_a.clone(),
-                connection: a
+                connection: a,
+                registered_at: seen_at[0],
             },
             RegistryEvent::Replaced {
                 node: node_a.clone(),
                 previous: a,
-                connection: b
+                connection: b,
+                registered_at: seen_at[1],
             },
             RegistryEvent::Replaced {
                 node: node_a.clone(),
                 previous: b,
-                connection: c
+                connection: c,
+                registered_at: seen_at[2],
             },
             RegistryEvent::Disconnected {
                 node: node_a,
@@ -214,13 +223,16 @@ async fn subscribers_see_replacements_and_endings_in_a_consistent_per_node_order
     let mut tracked: HashMap<NodeId, ConnectionId> = HashMap::new();
     for event in events {
         match event {
-            RegistryEvent::Connected { node, connection } => {
+            RegistryEvent::Connected {
+                node, connection, ..
+            } => {
                 assert_eq!(tracked.insert(node, connection), None);
             }
             RegistryEvent::Replaced {
                 node,
                 previous,
                 connection,
+                ..
             } => assert_eq!(tracked.insert(node, connection), Some(previous)),
             RegistryEvent::Disconnected { node, connection } => {
                 assert_eq!(tracked.remove(&node), Some(connection));

@@ -16,6 +16,7 @@ use crate::device;
 use crate::device::net::ClientAddress;
 use crate::http::server_error;
 use crate::pending::{PendingKind, PendingLogin};
+use crate::principal::{self, Channel};
 use crate::start::LOGIN_KIND;
 use crate::web;
 
@@ -250,6 +251,14 @@ async fn complete_web(
     .await;
     match signed_in {
         Ok((user, now)) => {
+            match principal::refuse_revoked(control, &user.id, None, Channel::WebLogin).await {
+                Ok(()) => {}
+                Err(principal::Refusal::Revoked) => {
+                    audit::login_denied(Some(&login_id), DenyReason::Revoked);
+                    return web::pages::sign_in_failed();
+                }
+                Err(principal::Refusal::Unavailable) => return web::pages::server_error(),
+            }
             web::establish(
                 control,
                 &login_id,

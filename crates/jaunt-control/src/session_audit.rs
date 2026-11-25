@@ -1,4 +1,5 @@
 use jaunt_proto::{DenyReason, SessionPermissions};
+use jaunt_store::{Session, SessionEndReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -117,6 +118,7 @@ pub(crate) fn ended(event: &Ended<'_>) {
     tracing::info!(
         target: "jaunt::audit",
         event = "session.end",
+        outcome = SessionEndReason::Closed.as_str(),
         session_id = event.session_id,
         user_id = event.user_id,
         serial = event.serial,
@@ -126,6 +128,38 @@ pub(crate) fn ended(event: &Ended<'_>) {
         bytes_in = event.bytes_in,
         bytes_out = event.bytes_out,
         recording_incomplete = event.recording_incomplete
+    );
+}
+
+pub(crate) fn closed(session: &Session, outcome: SessionEndReason) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "session.end",
+        outcome = outcome.as_str(),
+        session_id = session.id.as_str(),
+        user_id = session.user_id.as_str(),
+        serial = session.serial,
+        node_id = session.node_id.as_str(),
+        login = session.login.as_deref(),
+        state_before = if session.authorized_at.is_some() { "active" } else { "routed" }
+    );
+}
+
+pub(crate) fn late_end(session: &Session) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "session.end",
+        late = true,
+        outcome = session.end_reason.map(SessionEndReason::as_str),
+        session_id = session.id.as_str(),
+        user_id = session.user_id.as_str(),
+        serial = session.serial,
+        node_id = session.node_id.as_str(),
+        login = session.login.as_deref(),
+        exit_status = session.exit_status,
+        bytes_in = session.bytes_in,
+        bytes_out = session.bytes_out,
+        recording_incomplete = session.recording_incomplete
     );
 }
 

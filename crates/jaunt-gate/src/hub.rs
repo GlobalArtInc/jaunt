@@ -3,7 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use jaunt_limits::{
     AddressLimits, AddressLimitsError, ClientKey, DEFAULT_CAPACITY, LogThrottle, Rate, Refused,
@@ -260,6 +260,10 @@ pub struct ConnectedAgents {
 impl ConnectedAgents {
     pub fn registry(&self) -> &AgentRegistry {
         &self.registry
+    }
+
+    pub fn registered_at(&self, node: &NodeId) -> Option<SystemTime> {
+        self.registry.registered_at(node)
     }
 
     pub fn connected_nodes(&self) -> Vec<NodeId> {

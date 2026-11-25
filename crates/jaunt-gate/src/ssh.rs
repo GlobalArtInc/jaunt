@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit;
 use crate::host_cert::{Clock, HostCertError, HostCertIssuer, HostCertificate};
+use crate::live::{LiveConnections, TerminationReason};
 use crate::route::{ControlRoute, DEFAULT_MAX_STREAMS_PER_USER_NODE, StreamBook};
 
 pub const DEFAULT_MAX_UNAUTHENTICATED: usize = 512;
@@ -186,6 +187,7 @@ struct Shared {
     clients: AddressGate,
     refusals: LogThrottle,
     started: Instant,
+    live: Arc<LiveConnections>,
 }
 
 pub struct SshGate {
@@ -261,6 +263,7 @@ impl SshGate {
                 clients: AddressGate::new(config.client_limits),
                 refusals: LogThrottle::new(REFUSAL_LOG_INTERVAL),
                 started: Instant::now(),
+                live: Arc::new(LiveConnections::default()),
             }),
         })
     }
@@ -292,6 +295,21 @@ impl SshGate {
         self.shared
             .max_unauthenticated
             .saturating_sub(self.shared.pre_auth.available_permits())
+    }
+
+    pub fn authenticated(&self) -> usize {
+        self.shared.live.authenticated()
+    }
+
+    pub fn terminate(
+        &self,
+        user_id: &str,
+        serial: Option<u64>,
+        reason: TerminationReason,
+    ) -> usize {
+        let connections = self.shared.live.terminate(user_id, serial);
+        audit::ssh_terminated(user_id, serial, reason, connections);
+        connections
     }
 }
 
@@ -417,6 +435,8 @@ impl Shared {
         audit::ssh_connected(client, peer, proxied);
         let slot = Arc::new(Mutex::new(slot));
         let release = Arc::clone(&slot);
+        let live = self.live.register();
+        let identify = live.identify();
         let backend: Arc<dyn RouteBackend> = self.backend.clone();
         let hop = OuterHop::new(
             self.host.cell(),
@@ -426,13 +446,19 @@ impl Shared {
             backend,
         )
         .with_events(move |event| {
-            if matches!(event, OuterEvent::AuthAccepted { .. }) {
+            if let OuterEvent::AuthAccepted {
+                user_id, serial, ..
+            } = &event
+            {
                 take_slot(&release);
+                identify.holder(user_id, *serial);
             }
             audit::ssh_event(client, event);
         });
-        hop.serve(tcp, client, permit, token).await;
+        hop.serve_with_termination(tcp, client, permit, token, live.token())
+            .await;
         take_slot(&slot);
+        drop(live);
     }
 }
 

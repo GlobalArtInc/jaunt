@@ -18,6 +18,7 @@ pub(crate) enum DenyReason {
     UserDenied,
     ApprovalRejected,
     BrowserMismatch,
+    Revoked,
     Internal,
 }
 
@@ -38,6 +39,7 @@ impl DenyReason {
             DenyReason::UserDenied => "user_denied",
             DenyReason::ApprovalRejected => "approval_rejected",
             DenyReason::BrowserMismatch => "browser_mismatch",
+            DenyReason::Revoked => "revoked",
             DenyReason::Internal => "internal",
         }
     }
@@ -60,6 +62,7 @@ pub(crate) enum FinishReason {
     Entropy,
     Signing,
     CorruptRecord,
+    Revoked,
 }
 
 impl FinishReason {
@@ -80,6 +83,7 @@ impl FinishReason {
             FinishReason::Entropy => "entropy",
             FinishReason::Signing => "signing",
             FinishReason::CorruptRecord => "corrupt_record",
+            FinishReason::Revoked => "revoked",
         }
     }
 }

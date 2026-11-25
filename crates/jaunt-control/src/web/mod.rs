@@ -6,11 +6,12 @@ mod csrf;
 mod headers;
 mod login;
 pub(crate) mod pages;
+mod revocations;
 mod session;
 
 use axum::Router;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 
 use crate::control::Control;
 
@@ -49,6 +50,11 @@ pub(crate) fn mount(
         .route("/v1/web/logout", post(api::logout))
         .route("/v1/admin/whoami", get(api::whoami))
         .route("/v1/admin/audit", get(audit_log::list))
+        .route(
+            "/v1/admin/revocations",
+            get(revocations::list).post(revocations::create),
+        )
+        .route("/v1/admin/revocations/{id}", delete(revocations::remove))
         .merge(extra)
         .fallback(assets::serve)
         .layer(middleware::from_fn_with_state(

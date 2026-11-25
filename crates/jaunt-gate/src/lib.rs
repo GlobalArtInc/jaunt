@@ -1,6 +1,7 @@
 mod audit;
 mod host_cert;
 mod hub;
+mod live;
 mod route;
 mod ssh;
 
@@ -12,6 +13,7 @@ pub use hub::{
 };
 pub use jaunt_limits::{TrustedProxyProblem, trusted_proxy_problem};
 pub use jaunt_tunnel::DisconnectReason;
+pub use live::TerminationReason;
 pub use route::DEFAULT_MAX_STREAMS_PER_USER_NODE;
 pub use ssh::{
     DEFAULT_MAX_UNAUTHENTICATED, DEFAULT_PROXY_HEADER_TIMEOUT, DEFAULT_RENEWAL_CHECK,

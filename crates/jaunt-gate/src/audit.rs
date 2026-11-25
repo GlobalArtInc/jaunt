@@ -4,6 +4,8 @@ use jaunt_limits::{ClientKey, Refused};
 use jaunt_ssh::OuterEvent;
 use jaunt_tunnel::{DisconnectReason, NodeId, RejectReason, Rejection};
 
+use crate::live::TerminationReason;
+
 pub(crate) fn ssh_limited(client: ClientKey, refused: Refused, suppressed: u64) {
     tracing::info!(
         target: "jaunt::audit",
@@ -31,6 +33,22 @@ pub(crate) fn ssh_connected(client_addr: SocketAddr, peer_addr: SocketAddr, prox
         client_addr = %client_addr,
         peer_addr = %peer_addr,
         proxied
+    );
+}
+
+pub(crate) fn ssh_terminated(
+    user_id: &str,
+    serial: Option<u64>,
+    reason: TerminationReason,
+    connections: usize,
+) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.ssh.terminated",
+        user_id,
+        serial,
+        reason = reason.as_str(),
+        connections
     );
 }
 

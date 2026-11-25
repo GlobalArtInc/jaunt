@@ -7,6 +7,7 @@ use jaunt_store::{LoginRequest, User};
 
 use crate::audit::{self, DenyReason};
 use crate::control::Control;
+use crate::principal::{self, Channel};
 
 use super::browser;
 use super::forms::{Form, FormFailure};
@@ -127,6 +128,21 @@ pub(super) async fn approve(
         approval,
         now,
     } = redeemed;
+    match principal::refuse_revoked(&control, &approval.user_id, None, Channel::DeviceApproval)
+        .await
+    {
+        Ok(()) => {}
+        Err(principal::Refusal::Revoked) => {
+            audit::login_denied(Some(&login_id), DenyReason::Revoked);
+            if let Err(err) = control.store.login_requests().deny(&login_id, now).await {
+                tracing::error!(target: "jaunt::control", error = %err, "closing the device request of a revoked user failed");
+            }
+            let mut response = page::invalid_request(StatusCode::FORBIDDEN);
+            browser::clear(&mut response);
+            return response;
+        }
+        Err(principal::Refusal::Unavailable) => return page::server_error(),
+    }
     let outcome = control
         .store
         .login_requests()

@@ -4,6 +4,8 @@ pub mod ca;
 pub mod ca_rotation;
 pub mod config;
 pub mod gate_ssh;
+pub mod killer;
 mod limits;
 pub mod logging;
 pub mod node;
+pub mod revoke;

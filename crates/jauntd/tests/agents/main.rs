@@ -1,8 +1,10 @@
 mod client;
 mod frames;
+mod kill;
 mod limits;
 mod oidc;
 mod recorder;
+mod stand;
 mod support;
 
 use std::time::Duration;

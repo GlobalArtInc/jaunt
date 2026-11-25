@@ -6,7 +6,7 @@ use std::time::Duration;
 use jaunt_gate::{AgentHub, AgentHubConfig, DisconnectReason, HubError};
 use jaunt_limits::{AddressLimits, Rate};
 use jaunt_tunnel::agent_server_config;
-use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, RejectReason};
+use jaunt_tunnel::{ALPN_AGENT_API, ALPN_TUNNEL, RegistryEvent, RejectReason};
 use rustls::pki_types::ServerName;
 use support::*;
 use tokio::net::{TcpListener, TcpStream};
@@ -50,8 +50,12 @@ async fn an_accepted_agent_gets_a_tunnel_and_a_planned_disconnect_keeps_its_reas
     assert!(field(&connected, "remote_addr").starts_with("127.0.0.1:"));
 
     let agents = test.hub.agents();
+    let registered = agents.registered_at(&node("node-a")).unwrap();
+    assert!(registered <= std::time::SystemTime::now());
+    assert_eq!(agents.registered_at(&node("node-b")), None);
     assert!(agents.disconnect(&node("node-a"), DisconnectReason::Removed));
     assert!(!agents.disconnect(&node("node-b"), DisconnectReason::Removed));
+    assert_eq!(agents.registered_at(&node("node-a")), None);
     let disconnected = audit_events()
         .into_iter()
         .find(|event| is_event(event, "agent.disconnected"))
@@ -68,13 +72,36 @@ async fn a_second_tunnel_of_the_same_node_is_audited_as_a_replacement() {
     let pki = Pki::new("ca");
     let (verdicts, leaves) = allowing(&pki, &["node-a"]);
     let test = start_hub(&pki, verdicts, HubOptions::default()).await;
+    let mut events = test.hub.registry().subscribe();
     let _first = connect_fake_agent(test.addr, &pki, &leaves[0]).await;
+    let first_registered = match within("the first registration", events.recv())
+        .await
+        .unwrap()
+    {
+        RegistryEvent::Connected { registered_at, .. } => registered_at,
+        other => panic!("expected a connection, got {other:?}"),
+    };
+    assert_eq!(
+        test.hub.agents().registered_at(&node("node-a")),
+        Some(first_registered)
+    );
     audited("the first tunnel", |event| {
         is_event(event, "agent.connected") && field(event, "replaced") == "false"
     })
     .await;
 
     let _second = connect_fake_agent(test.addr, &pki, &leaves[0]).await;
+    let second_registered = match within("the replacing registration", events.recv())
+        .await
+        .unwrap()
+    {
+        RegistryEvent::Replaced { registered_at, .. } => registered_at,
+        other => panic!("expected a replacement, got {other:?}"),
+    };
+    assert_eq!(
+        test.hub.agents().registered_at(&node("node-a")),
+        Some(second_registered)
+    );
 
     let connected = audited("the replacing tunnel", |event| {
         is_event(event, "agent.connected") && field(event, "replaced") == "true"
@@ -88,6 +115,7 @@ async fn a_second_tunnel_of_the_same_node_is_audited_as_a_replacement() {
     assert_eq!(field(&ended, "node_id"), "node-a");
     assert_eq!(field(&ended, "reason"), "replaced");
     assert_eq!(test.hub.registry().connected_nodes(), [node("node-a")]);
+    assert!(second_registered >= first_registered);
     test.hub.shutdown(GRACE).await;
 }
 

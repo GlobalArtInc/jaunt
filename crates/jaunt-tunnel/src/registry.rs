@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::SystemTime;
 
 use thiserror::Error;
 use tokio::runtime::Handle;
@@ -18,11 +19,13 @@ pub enum RegistryEvent {
     Connected {
         node: NodeId,
         connection: ConnectionId,
+        registered_at: SystemTime,
     },
     Replaced {
         node: NodeId,
         previous: ConnectionId,
         connection: ConnectionId,
+        registered_at: SystemTime,
     },
     Disconnected {
         node: NodeId,
@@ -61,14 +64,19 @@ pub trait RegistryObserver: Send + Sync {
     fn connection_ended(&self, node: &NodeId, connection: ConnectionId, reason: DisconnectReason);
 }
 
+struct Registered {
+    connection: TunnelConnection,
+    at: SystemTime,
+}
+
 struct RegistryInner {
-    connections: Mutex<HashMap<NodeId, TunnelConnection>>,
+    connections: Mutex<HashMap<NodeId, Registered>>,
     events: broadcast::Sender<RegistryEvent>,
     observer: Option<Arc<dyn RegistryObserver>>,
 }
 
 impl RegistryInner {
-    fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, TunnelConnection>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<NodeId, Registered>> {
         self.connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -88,7 +96,7 @@ impl RegistryInner {
         let removed = {
             let mut connections = self.lock();
             match connections.get(node) {
-                Some(current) if current.id() == connection => {
+                Some(current) if current.connection.id() == connection => {
                     let removed = connections.remove(node);
                     self.publish(RegistryEvent::Disconnected {
                         node: node.clone(),
@@ -155,16 +163,27 @@ impl AgentRegistry {
         let closed = connection.closed_token();
         let replaced = {
             let mut connections = self.inner.lock();
-            let previous = connections.insert(node.clone(), connection);
+            let registered_at = SystemTime::now();
+            let previous = connections
+                .insert(
+                    node.clone(),
+                    Registered {
+                        connection,
+                        at: registered_at,
+                    },
+                )
+                .map(|old| old.connection);
             self.inner.publish(match &previous {
                 Some(old) => RegistryEvent::Replaced {
                     node: node.clone(),
                     previous: old.id(),
                     connection: id,
+                    registered_at,
                 },
                 None => RegistryEvent::Connected {
                     node: node.clone(),
                     connection: id,
+                    registered_at,
                 },
             });
             previous
@@ -209,7 +228,7 @@ impl AgentRegistry {
     pub fn disconnect_because(&self, node: &NodeId, reason: DisconnectReason) -> bool {
         let removed = {
             let mut connections = self.inner.lock();
-            let removed = connections.remove(node);
+            let removed = connections.remove(node).map(|old| old.connection);
             if let Some(connection) = &removed {
                 self.inner.publish(RegistryEvent::Disconnected {
                     node: node.clone(),
@@ -231,6 +250,7 @@ impl AgentRegistry {
             let mut connections = self.inner.lock();
             connections
                 .drain()
+                .map(|(node, registered)| (node, registered.connection))
                 .inspect(|(node, connection)| {
                     self.inner.publish(RegistryEvent::Disconnected {
                         node: node.clone(),
@@ -259,6 +279,10 @@ impl AgentRegistry {
         self.inner.lock().contains_key(node)
     }
 
+    pub fn registered_at(&self, node: &NodeId) -> Option<SystemTime> {
+        self.inner.lock().get(node).map(|registered| registered.at)
+    }
+
     pub fn connected_nodes(&self) -> Vec<NodeId> {
         let mut nodes: Vec<NodeId> = self.inner.lock().keys().cloned().collect();
         nodes.sort();
@@ -270,12 +294,15 @@ impl AgentRegistry {
     }
 
     fn opener(&self, node: &NodeId) -> Option<StreamOpener> {
-        self.inner.lock().get(node).map(TunnelConnection::opener)
+        self.inner
+            .lock()
+            .get(node)
+            .map(|registered| registered.connection.opener())
     }
 
     fn send_control(&self, node: &NodeId, message: ServerMessage) -> Result<(), SendError> {
         let connections = self.inner.lock();
-        let connection = connections.get(node).ok_or(SendError::NotConnected)?;
-        connection.queue_control(message)
+        let registered = connections.get(node).ok_or(SendError::NotConnected)?;
+        registered.connection.queue_control(message)
     }
 }

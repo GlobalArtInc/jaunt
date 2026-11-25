@@ -348,6 +348,12 @@ mod tests {
             (Method::GET, "/v1/web/session", Some(Endpoint::Other)),
             (Method::POST, "/v1/web/logout", Some(Endpoint::Other)),
             (Method::GET, "/v1/admin/whoami", Some(Endpoint::Other)),
+            (Method::POST, "/v1/admin/revocations", Some(Endpoint::Other)),
+            (
+                Method::DELETE,
+                "/v1/admin/revocations/r-1",
+                Some(Endpoint::Other),
+            ),
             (Method::POST, "/login/device", Some(Endpoint::Other)),
             (Method::GET, "/", Some(Endpoint::Other)),
             (Method::GET, "/healthz", None),

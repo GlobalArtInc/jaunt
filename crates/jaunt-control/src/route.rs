@@ -1,10 +1,11 @@
 use jaunt_proto::{ControlError as PlaneError, DenyReason, RouteDecision, RouteRequest};
-use jaunt_store::NewSession;
+use jaunt_store::{NewSession, Subjects};
 
 use crate::control::Control;
 use crate::holder::{self, Presented};
 use crate::identity::policy_identity;
 use crate::plane::{check_fields, clock_failure, node_info, store_failure};
+use crate::revocation::revoked;
 use crate::session_audit::{self, Denied, Phase, Routed};
 
 pub(crate) const ROUTED_SESSION_TTL_SECS: i64 = 60;
@@ -44,6 +45,19 @@ pub(crate) async fn route(
             None,
         ));
     };
+    let subjects = Subjects {
+        user_id: &holder.user.id,
+        serial: Some(holder.serial),
+        node_id: Some(&node.id),
+    };
+    if revoked(control, subjects).await? {
+        return Ok(denied(
+            &request,
+            policy.hash(),
+            DenyReason::Revoked,
+            Some(&node.id),
+        ));
+    }
     if !policy.route(&policy_identity(&holder.user), &node_info(&node)) {
         return Ok(denied(
             &request,

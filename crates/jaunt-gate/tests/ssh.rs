@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fixture::{
-    Client, DENIED_TEXT, FakeControl, Fixture, GATE_NAME, LIMIT_TEXT, STEP, TestClock, Verdict,
-    echo_once, key,
+    Client, DENIED_TEXT, FakeControl, Fixture, GATE_NAME, LIMIT_TEXT, STEP, TestClock, USER_ID,
+    Verdict, echo_once, key,
 };
 use jaunt_gate::{
     HostCertError, HostCertIssuer, IssueError, SshGate, SshGateConfig, SshGateError,
-    TrustedProxyProblem,
+    TerminationReason, TrustedProxyProblem,
 };
 use jaunt_proto::BoxFuture;
 use jaunt_ssh::{UserCaKeys, UserCaSource};
@@ -366,6 +366,65 @@ async fn shutdown_closes_live_connections_within_the_grace() {
     eventually("the client to see the end", || client.handle.is_closed()).await;
     assert!(closed_without_a_word(idle).await);
     assert!(TcpStream::connect(addr).await.is_err());
+}
+
+#[tokio::test]
+async fn terminate_closes_only_the_matching_connections_and_their_forwards() {
+    let fixture = Fixture::start(|_| {}).await;
+    let first = fixture.login_with_serial(42).await;
+    let mut channel = first.open_node().await.unwrap();
+    echo_once(&mut channel, b"before").await;
+    let second = fixture.login_with_serial(43).await;
+    let gate = Arc::clone(&fixture.gate);
+    eventually("both connections to be indexed", || {
+        gate.authenticated() == 2
+    })
+    .await;
+    assert_eq!(gate.open_streams(), 1);
+
+    assert_eq!(
+        gate.terminate("someone-else", None, TerminationReason::Revoked),
+        0
+    );
+    assert_eq!(
+        gate.terminate(USER_ID, Some(7), TerminationReason::Revoked),
+        0
+    );
+    let started = Instant::now();
+    assert_eq!(
+        gate.terminate(USER_ID, Some(42), TerminationReason::Revoked),
+        1
+    );
+
+    eventually("the terminated client to see the end", || {
+        first.handle.is_closed()
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    eventually("the forward to be released", || gate.open_streams() == 0).await;
+    assert!(!second.handle.is_closed());
+    let terminated = audited("the termination", |event| {
+        field(event, "event") == "gate.ssh.terminated" && field(event, "serial") == "42"
+    })
+    .await;
+    assert_eq!(field(&terminated, "reason"), "revoked");
+    assert_eq!(field(&terminated, "connections"), "1");
+    audited("the terminated disconnect", |event| {
+        field(event, "event") == "gate.ssh.disconnect" && field(event, "reason") == "terminated"
+    })
+    .await;
+
+    assert_eq!(gate.terminate(USER_ID, None, TerminationReason::Revoked), 1);
+    eventually("the second client to see the end", || {
+        second.handle.is_closed()
+    })
+    .await;
+    eventually("the index to empty", || gate.authenticated() == 0).await;
+    fixture.stop().await;
 }
 
 struct Refusing;
