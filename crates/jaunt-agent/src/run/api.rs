@@ -6,11 +6,12 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use h2::client::SendRequest;
 use h2::{Ping, PingPong};
-use http::header::{ACCEPT, CONTENT_TYPE, DATE};
+use http::header::{ACCEPT, CONTENT_TYPE, DATE, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
-    AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody, RenewRequest,
-    RenewResponse, SessionEnd, SessionEndOutcome,
+    AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody, RecordingAck,
+    RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse, SessionEnd,
+    SessionEndOutcome, recording_chunks_path, recording_complete_path,
 };
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
@@ -64,7 +65,11 @@ pub enum ApiError {
     #[error("the server did not accept this node's certificate")]
     Unauthorized,
     #[error("the agent API answered HTTP {status} ({code})")]
-    Status { status: u16, code: String },
+    Status {
+        status: u16,
+        code: String,
+        retry_after: Option<Duration>,
+    },
     #[error("the agent API response is too large")]
     BodyTooLarge,
     #[error("the agent API sent a response that cannot be understood")]
@@ -82,6 +87,7 @@ enum Exchange {
 struct Answer {
     status: StatusCode,
     server_time: Option<SystemTime>,
+    retry_after: Option<Duration>,
     body: Vec<u8>,
 }
 
@@ -200,6 +206,28 @@ impl AgentApi {
             .await
     }
 
+    pub async fn recording_chunk(
+        &self,
+        session_id: &str,
+        chunk: &RecordingChunk,
+    ) -> Result<RecordingAck, ApiError> {
+        self.post_json(&recording_chunks_path(session_id), chunk, Retry::Idempotent)
+            .await
+    }
+
+    pub async fn recording_complete(
+        &self,
+        session_id: &str,
+        complete: &RecordingComplete,
+    ) -> Result<RecordingReceipt, ApiError> {
+        self.post_json(
+            &recording_complete_path(session_id),
+            complete,
+            Retry::Idempotent,
+        )
+        .await
+    }
+
     pub async fn trust(&self) -> Result<Dated<ServedTrust>, ApiError> {
         if !self.first_trust_version_only.load(Ordering::Acquire) {
             match self
@@ -275,10 +303,12 @@ impl AgentApi {
             };
             let error = match outcome {
                 Ok(Ok(answer)) => {
-                    return interpret(answer.status, &answer.body).map(|value| Dated {
-                        value,
-                        server_time: answer.server_time,
-                    });
+                    return interpret(answer.status, &answer.body)
+                        .map(|value| Dated {
+                            value,
+                            server_time: answer.server_time,
+                        })
+                        .map_err(|error| with_retry_after(error, answer.retry_after));
                 }
                 Ok(Err(exchange)) => exchange,
                 Err(_) => Exchange::Failed(ApiError::CallTimeout),
@@ -433,6 +463,7 @@ async fn exchange(
     let response = response.await.map_err(Exchange::NoResponse)?;
     let status = response.status();
     let server_time = server_time(response.headers());
+    let retry_after = retry_after(response.headers());
     let failed = |error| Exchange::Failed(ApiError::Http2(error));
     let mut body = response.into_body();
     let mut reply = Vec::new();
@@ -449,6 +480,7 @@ async fn exchange(
     Ok(Answer {
         status,
         server_time,
+        retry_after,
         body: reply,
     })
 }
@@ -456,6 +488,25 @@ async fn exchange(
 fn server_time(headers: &HeaderMap) -> Option<SystemTime> {
     let value = headers.get(DATE)?.to_str().ok()?;
     httpdate::parse_http_date(value).ok()
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn with_retry_after(error: ApiError, after: Option<Duration>) -> ApiError {
+    match error {
+        ApiError::Status { status, code, .. } => ApiError::Status {
+            status,
+            code,
+            retry_after: after,
+        },
+        other => other,
+    }
 }
 
 fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, ApiError> {
@@ -478,6 +529,7 @@ fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, 
         _ => ApiError::Status {
             status: status.as_u16(),
             code,
+            retry_after: None,
         },
     })
 }
@@ -496,7 +548,10 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{API_KEEPALIVE, AgentApi, ApiError, ServedTrust, forget, interpret};
+    use super::{
+        API_KEEPALIVE, AgentApi, ApiError, ServedTrust, forget, interpret, retry_after,
+        with_retry_after,
+    };
     use crate::keys::HostKey;
     use crate::testkit::{
         AGENT_HOST, AUTHORIZE_PATH, ApiStep, FakeGate, NodeIdentity, RawTlsServer, RenewStep,
@@ -971,5 +1026,37 @@ mod tests {
             panic!("expected a status error");
         };
         assert_eq!(code, "bad31mcode");
+    }
+
+    #[test]
+    fn a_refusal_carries_retry_after_only_as_plain_seconds() {
+        let cases = [
+            ("60", Some(Duration::from_secs(60))),
+            ("0", Some(Duration::ZERO)),
+            ("-5", None),
+            ("1.5", None),
+            ("Wed, 21 Oct 2026 07:28:00 GMT", None),
+            ("", None),
+            ("99999999999999999999999", None),
+        ];
+        for (value, expected) in cases {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::RETRY_AFTER, value.parse().unwrap());
+            assert_eq!(retry_after(&headers), expected, "{value:?}");
+        }
+        assert_eq!(retry_after(&http::HeaderMap::new()), None);
+        let refused = interpret::<RenewResponse>(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":"too_many_recordings"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            with_retry_after(refused, Some(Duration::from_secs(60))),
+            ApiError::Status { status: 429, retry_after: Some(after), .. } if after == Duration::from_secs(60)
+        ));
+        assert!(matches!(
+            with_retry_after(ApiError::CallTimeout, Some(Duration::from_secs(60))),
+            ApiError::CallTimeout
+        ));
     }
 }

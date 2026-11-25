@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, UserCaKeys};
+use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, NoObserver, UserCaKeys};
 use jaunt_tunnel::{BackoffPolicy, ClientEvent, StreamHandler};
 use serde_json::json;
 use ssh_key::public::KeyData;
@@ -74,6 +74,7 @@ async fn loading_with(
         },
         Arc::new(ControlAuthority::new(api.clone())),
         AgentLimits::default(),
+        Arc::new(NoObserver),
     ));
     let shutdown = CancellationToken::new();
     let (events, receiver) = broadcast::channel(options.capacity);

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1329,5 +1330,169 @@ async fn a_closed_trust_loader_does_not_spin_the_renewal_loop() {
     assert!(clock.slept().len() < 10, "{}", clock.slept().len());
     assert_eq!(gate.requests(TRUST_V2_PATH).len(), 1);
     agent.stop().await;
+    gate.stop().await;
+}
+
+struct AcceptingSshd {
+    started: Arc<tokio::sync::Notify>,
+    channels: Vec<russh::Channel<russh::server::Msg>>,
+}
+
+impl russh::server::Handler for AcceptingSshd {
+    type Error = russh::Error;
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        _user: &str,
+        _certificate: &Certificate,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        Ok(russh::server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.push(channel);
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_success(channel)?;
+        self.started.notify_one();
+        Ok(())
+    }
+}
+
+async fn accepting_sshd(dir: &Path) -> (SocketAddr, PathBuf, Arc<tokio::sync::Notify>) {
+    let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+    let host_key = dir.join("inner_host_key.pub");
+    fs::write(
+        &host_key,
+        format!("{}\n", key.public_key().to_openssh().unwrap()),
+    )
+    .unwrap();
+    let config = Arc::new(russh::server::Config {
+        keys: vec![key],
+        ..russh::server::Config::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&started);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let handler = AcceptingSshd {
+                started: Arc::clone(&notify),
+                channels: Vec::new(),
+            };
+            let config = Arc::clone(&config);
+            tokio::spawn(async move {
+                if let Ok(running) = russh::server::run_stream(config, tcp, handler).await {
+                    drop(running.await);
+                }
+            });
+        }
+    });
+    (addr, host_key, started)
+}
+
+#[tokio::test]
+async fn stopping_the_agent_lets_a_pending_recording_upload_finish() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let user = user();
+    gate.set_standing(TRUST_PATH, trust_reply(std::slice::from_ref(&user.ca_line)));
+    gate.script(
+        AUTHORIZE_PATH,
+        vec![ApiStep::Json(
+            200,
+            json!({"decision": "allow", "permissions": {
+                "pty": true, "port_forwarding": false, "record_input": false,
+                "max_duration_secs": 3600,
+            }}),
+        )],
+    );
+    gate.set_standing(
+        SESSION_END_PATH,
+        ApiStep::Json(200, json!({"outcome": "recorded"})),
+    );
+    let complete_path = jaunt_proto::recording_complete_path("live");
+    let release = Arc::new(tokio::sync::Notify::new());
+    gate.script(
+        &complete_path,
+        vec![ApiStep::Held(
+            Arc::clone(&release),
+            Box::new(ApiStep::Json(
+                200,
+                json!({"state": "complete", "chunks": 0}),
+            )),
+        )],
+    );
+    let inner = tempfile::tempdir().unwrap();
+    let (sshd_addr, sshd_host_key, exec_started) = accepting_sshd(inner.path()).await;
+    let agent = Agent::start_with(
+        &node.path(),
+        ManualClock::new(SystemTime::now()),
+        1.0,
+        |settings| {
+            settings.inner.sshd_addr = sshd_addr;
+            settings.inner.sshd_host_key = sshd_host_key;
+        },
+    );
+    gate.wait_connected().await;
+    eventually("the trust set to load", || {
+        !gate.requests(TRUST_PATH).is_empty()
+    })
+    .await;
+    let stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta("live"))
+        .await
+        .unwrap();
+    let mut handle = soon(
+        "the SSH handshake",
+        client::connect_stream(
+            Arc::new(client::Config::default()),
+            stream,
+            HostCertificates(Arc::default()),
+        ),
+    )
+    .await
+    .unwrap();
+    let authenticated = soon(
+        "the login",
+        handle.authenticate_openssh_cert("deploy", user.key, user.certificate),
+    )
+    .await
+    .unwrap();
+    assert!(authenticated.success());
+    let channel = soon("a session channel", handle.channel_open_session())
+        .await
+        .unwrap();
+    channel.exec(true, "sleep 300").await.unwrap();
+    soon("the inner exec", exec_started.notified()).await;
+
+    let stopping = tokio::spawn(agent.stop());
+    eventually("the recording manifest to reach the server", || {
+        !gate.requests(&complete_path).is_empty()
+    })
+    .await;
+    release.notify_one();
+    soon("the agent to stop", stopping).await.unwrap();
+    let text = logs.text();
+    assert!(text.contains("agent.ssh.recording_stored"), "{text}");
+    assert!(!text.contains("agent.ssh.recording_dropped"), "{text}");
+    drop(handle);
     gate.stop().await;
 }

@@ -1065,7 +1065,7 @@ mod tests {
     };
     use crate::intake::{ChannelIntake, SessionGone, WindowGrant};
     use crate::observer::{
-        ChannelProgram, ChannelStart, ObserverCell, ObserverFactory, SessionObserver,
+        ChannelProgram, ChannelStart, ObserverCell, ObserverFactory, SessionInfo, SessionObserver,
     };
 
     struct NoGrants;
@@ -1158,7 +1158,7 @@ mod tests {
     struct Probes(Answer, Arc<Mutex<Vec<bool>>>);
 
     impl ObserverFactory for Probes {
-        fn create(&self, _: &str, _: &SessionPermissions) -> Box<dyn SessionObserver> {
+        fn create(&self, _: &SessionInfo, _: &SessionPermissions) -> Box<dyn SessionObserver> {
             Box::new(StartProbe {
                 answer: Arc::clone(&self.0),
                 undelivered_at_start: Arc::clone(&self.1),
@@ -1188,7 +1188,12 @@ mod tests {
         observer
             .create(
                 &Probes(Arc::clone(&answer), Arc::clone(&starts)),
-                "s",
+                &SessionInfo {
+                    session_id: "s".to_owned(),
+                    user_id: "u".to_owned(),
+                    login: "deploy".to_owned(),
+                    client_addr: "203.0.113.5:40000".to_owned(),
+                },
                 &permissions,
             )
             .unwrap();

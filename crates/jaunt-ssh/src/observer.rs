@@ -65,6 +65,14 @@ pub enum ChannelExit {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub user_id: String,
+    pub login: String,
+    pub client_addr: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recording {
     Complete,
@@ -94,7 +102,7 @@ pub trait SessionObserver: Send {
 pub trait ObserverFactory: Send + Sync + 'static {
     fn create(
         &self,
-        session_id: &str,
+        session: &SessionInfo,
         permissions: &SessionPermissions,
     ) -> Box<dyn SessionObserver>;
 }
@@ -107,7 +115,7 @@ impl SessionObserver for NoObserver {}
 impl ObserverFactory for NoObserver {
     fn create(
         &self,
-        _session_id: &str,
+        _session: &SessionInfo,
         _permissions: &SessionPermissions,
     ) -> Box<dyn SessionObserver> {
         Box::new(NoObserver)
@@ -132,10 +140,10 @@ impl ObserverCell {
     pub(crate) fn create(
         &self,
         factory: &dyn ObserverFactory,
-        session_id: &str,
+        session: &SessionInfo,
         permissions: &SessionPermissions,
     ) -> Result<(), ObserverFailed> {
-        match catch_unwind(AssertUnwindSafe(|| factory.create(session_id, permissions))) {
+        match catch_unwind(AssertUnwindSafe(|| factory.create(session, permissions))) {
             Ok(observer) => {
                 *self.slot() = Some(observer);
                 Ok(())
@@ -221,7 +229,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ChannelProgram, ObserverCell, ObserverFactory, OutputStream, Recording, SessionObserver,
+        ChannelProgram, ObserverCell, ObserverFactory, OutputStream, Recording, SessionInfo,
+        SessionObserver,
     };
 
     struct Scripted {
@@ -254,12 +263,21 @@ mod tests {
     struct Factory(Arc<Mutex<Vec<String>>>, bool, Recording);
 
     impl ObserverFactory for Factory {
-        fn create(&self, _: &str, _: &SessionPermissions) -> Box<dyn SessionObserver> {
+        fn create(&self, _: &SessionInfo, _: &SessionPermissions) -> Box<dyn SessionObserver> {
             Box::new(Scripted {
                 seen: Arc::clone(&self.0),
                 panic_on_output: self.1,
                 finish: self.2,
             })
+        }
+    }
+
+    fn info() -> SessionInfo {
+        SessionInfo {
+            session_id: "s".to_owned(),
+            user_id: "u".to_owned(),
+            login: "deploy".to_owned(),
+            client_addr: "203.0.113.5:40000".to_owned(),
         }
     }
 
@@ -277,7 +295,7 @@ mod tests {
         let cell = ObserverCell::new(stop.clone());
         cell.create(
             &Factory(Arc::clone(&seen), true, Recording::Complete),
-            "s",
+            &info(),
             &PERMISSIONS,
         )
         .unwrap();
@@ -296,8 +314,12 @@ mod tests {
         for expected in [Recording::Complete, Recording::Incomplete] {
             let stop = CancellationToken::new();
             let cell = ObserverCell::new(stop.clone());
-            cell.create(&Factory(Arc::default(), false, expected), "s", &PERMISSIONS)
-                .unwrap();
+            cell.create(
+                &Factory(Arc::default(), false, expected),
+                &info(),
+                &PERMISSIONS,
+            )
+            .unwrap();
             assert_eq!(cell.finish(), expected);
             assert!(!stop.is_cancelled());
         }

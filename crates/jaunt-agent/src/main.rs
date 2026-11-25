@@ -6,6 +6,7 @@ mod installer;
 mod keys;
 mod paths;
 mod pin;
+mod recording;
 mod run;
 mod ssh;
 mod state;

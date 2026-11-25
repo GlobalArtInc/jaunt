@@ -34,7 +34,7 @@ pub use target::parse_node_target;
 pub use inner::{InnerTarget, OUTPUT_WINDOW};
 pub use observer::{
     ChannelExit, ChannelProgram, ChannelStart, ForwardTarget, NoObserver, ObserverFactory,
-    OutputStream, Recording, SessionObserver, Terminal, TerminalSize,
+    OutputStream, Recording, SessionInfo, SessionObserver, Terminal, TerminalSize,
 };
 pub use terminate::{
     AgentLimits, AuthorityError, EndReason, SessionAuthority, SessionOutcome, StreamContext,

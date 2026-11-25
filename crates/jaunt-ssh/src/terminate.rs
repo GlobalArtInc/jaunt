@@ -27,7 +27,7 @@ use crate::inner::{self, InnerClient, InnerSession, InnerTarget};
 use crate::inner_ca::{InnerCa, InnerCertRequest, is_portable_login};
 use crate::intake::IntakeError;
 use crate::observer::{
-    ChannelProgram, ObserverCell, ObserverFactory, Recording, Terminal, TerminalSize,
+    ChannelProgram, ObserverCell, ObserverFactory, Recording, SessionInfo, Terminal, TerminalSize,
 };
 use crate::outer::TunnelStream;
 
@@ -729,14 +729,16 @@ impl server::Handler for Gatekeeper {
                 return Ok(self.refuse(reason, Some(&identity), login));
             }
         };
+        let session = SessionInfo {
+            session_id: self.shared.session_id.clone(),
+            user_id: identity.user_id.clone(),
+            login: login.to_owned(),
+            client_addr: self.shared.client_addr.clone(),
+        };
         if self
             .shared
             .observer
-            .create(
-                self.observers.as_ref(),
-                &self.shared.session_id,
-                &permissions,
-            )
+            .create(self.observers.as_ref(), &session, &permissions)
             .is_err()
         {
             self.shared.end_with(EndReason::ObserverFailed);

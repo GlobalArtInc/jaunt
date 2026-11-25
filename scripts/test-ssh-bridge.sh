@@ -185,6 +185,74 @@ test_sessions() {
   check "sshd: one inner login per session" same "$(accepted_logins)" "$((logins + 4))"
 }
 
+last_session_end() { tail -n 1 "$STAND_DIR/session-end.log" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p'; }
+
+cast_check() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+cast_path, manifest_path, expected_output, expected_marker = sys.argv[1:5]
+raw = open(cast_path, "rb").read()
+text = raw.decode("utf-8")
+assert text.endswith("\n"), "the cast does not end with a newline"
+lines = text.split("\n")[:-1]
+header = json.loads(lines[0])
+assert sorted(header) == ["env", "height", "timestamp", "version", "width"], header
+assert header["version"] == 2
+for key in ("width", "height", "timestamp"):
+    assert isinstance(header[key], int) and not isinstance(header[key], bool), key
+assert sorted(header["env"]) == ["SHELL", "TERM"]
+assert all(isinstance(value, str) for value in header["env"].values())
+previous, output, markers, inputs = 0.0, "", [], 0
+for line in lines[1:]:
+    event = json.loads(line)
+    assert isinstance(event, list) and len(event) == 3, line
+    time, kind, data = event
+    assert isinstance(time, (int, float)) and time >= previous, line
+    assert kind in ("o", "i", "r", "m") and isinstance(data, str), line
+    previous = time
+    if kind == "o":
+        output += data
+    elif kind == "m":
+        markers.append(data)
+    elif kind == "i":
+        inputs += 1
+manifest = json.load(open(manifest_path))
+assert manifest["kind"] == "shell", manifest["kind"]
+assert manifest["incomplete"] is False and manifest["dropped_chunks"] == 0
+assert manifest["input_recorded"] is False and inputs == 0
+assert manifest["raw_bytes"] == len(raw) and manifest["chunks"] >= 1
+assert expected_output in output, "the typed command output is missing"
+assert any(marker.endswith(expected_marker) for marker in markers), markers
+PY
+}
+
+exec_manifest() { grep -q '"kind":"exec"' "$1" && grep -q '"command":"exit 7"' "$1" && grep -q '"chunks":0' "$1" && grep -q '"exit_status":7' "$1"; }
+
+test_recording() {
+  local ends session
+  ends=$(lines "$STAND_DIR/session-end.log")
+  ssh_run 'echo rec-$((6*7))\nexit\n' -tt "$TARGET"
+  check "recording: the pty session ran" out_has rec-42
+  wait_for "the recorded session to end" grew_by "$STAND_DIR/session-end.log" "$ends" 1
+  session=$(last_session_end)
+  check "recording: the session end does not claim an incomplete recording" grep -q "\"session_id\":\"$session\",.*\"recording_incomplete\":false" "$STAND_DIR/session-end.log"
+  wait_for "the stand to store the recording" test -f "$STAND_DIR/recordings/$session.manifest.json"
+  check "recording: the stored cast and manifest pass the reference check" cast_check "$STAND_DIR/recordings/$session.cast" "$STAND_DIR/recordings/$session.manifest.json" rec-42 " shell start"
+  ends=$(lines "$STAND_DIR/session-end.log")
+  ssh_run 'echo ptyexec-$((6*7))\nexit\n' -tt "$TARGET" bash
+  check "recording: the pty exec session ran" out_has ptyexec-42
+  wait_for "the pty exec session to end" grew_by "$STAND_DIR/session-end.log" "$ends" 1
+  session=$(last_session_end)
+  wait_for "the stand to store the pty exec recording" test -f "$STAND_DIR/recordings/$session.manifest.json"
+  check "recording: 'ssh -tt host bash' is stored as a cast with the command marker" cast_check "$STAND_DIR/recordings/$session.cast" "$STAND_DIR/recordings/$session.manifest.json" ptyexec-42 " exec bash"
+  ends=$(lines "$STAND_DIR/session-end.log")
+  ssh_run '' "$TARGET" 'exit 7'
+  wait_for "the exec session to end" grew_by "$STAND_DIR/session-end.log" "$ends" 1
+  session=$(last_session_end)
+  wait_for "the stand to store the exec manifest" test -f "$STAND_DIR/recordings/$session.manifest.json"
+  check "recording: an exec session stores a metadata-only manifest" exec_manifest "$STAND_DIR/recordings/$session.manifest.json"
+}
+
 test_denial() {
   local logins authorized
   logins=$(accepted_logins)
@@ -492,6 +560,7 @@ inside() {
   prepare_image
   set_up_node
   test_sessions
+  test_recording
   test_denial
   test_extra_identity_file
   report_environment

@@ -11,8 +11,8 @@ use jaunt_proto::{
 use jaunt_ssh::{
     AgentLimits, AuthorityError, ChannelExit, ChannelStart, ForwardTarget, HostKey, InnerCa,
     InnerTarget, ObserverFactory, OutputStream, Recording, ServerConfigCell, ServerProfile,
-    SessionAuthority, SessionObserver, SessionOutcome, StreamContext, TerminalSize, Terminator,
-    TunnelStream, UserCaKeys, UserCaSource,
+    SessionAuthority, SessionInfo, SessionObserver, SessionOutcome, StreamContext, TerminalSize,
+    Terminator, TunnelStream, UserCaKeys, UserCaSource,
 };
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::{Builder, CertType};
@@ -166,10 +166,18 @@ struct Recorder {
 impl ObserverFactory for Recorder {
     fn create(
         &self,
-        session_id: &str,
+        session: &SessionInfo,
         permissions: &SessionPermissions,
     ) -> Box<dyn SessionObserver> {
-        assert_eq!(session_id, SESSION_ID);
+        assert_eq!(
+            *session,
+            SessionInfo {
+                session_id: SESSION_ID.to_owned(),
+                user_id: USER_ID.to_owned(),
+                login: LOGIN.to_owned(),
+                client_addr: CLIENT_ADDR.to_owned(),
+            }
+        );
         assert!(permissions.record_input);
         Box::new(Recorder {
             events: Arc::clone(&self.events),

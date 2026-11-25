@@ -8,9 +8,9 @@ use jaunt_proto::{
     SessionEndOutcome,
 };
 use jaunt_ssh::{
-    AgentLimits, AuthorityError, HostIdentity, InnerCa, InnerTarget, NoObserver, ServerConfigCell,
-    ServerProfile, SessionAuthority, SshError, StreamContext, Terminator, UserCaKeys, UserCaSource,
-    read_pinned_host_key,
+    AgentLimits, AuthorityError, HostIdentity, InnerCa, InnerTarget, ObserverFactory,
+    ServerConfigCell, ServerProfile, SessionAuthority, SshError, StreamContext, Terminator,
+    UserCaKeys, UserCaSource, read_pinned_host_key,
 };
 use jaunt_tunnel::{BoxFuture, H2Io, IncomingStream, StreamHandler, StreamMeta};
 use tokio::io::AsyncWriteExt;
@@ -152,6 +152,7 @@ pub struct SshService {
     target: InnerTarget,
     authority: Arc<dyn SessionAuthority>,
     limits: AgentLimits,
+    observers: Arc<dyn ObserverFactory>,
     trust_changed: Arc<Notify>,
     untrusted: Arc<UntrustedRefusals>,
     refused: AtomicU64,
@@ -163,6 +164,7 @@ impl SshService {
         target: InnerTarget,
         authority: Arc<dyn SessionAuthority>,
         limits: AgentLimits,
+        observers: Arc<dyn ObserverFactory>,
     ) -> Self {
         Self {
             ready: OnceLock::new(),
@@ -171,6 +173,7 @@ impl SshService {
             target,
             authority,
             limits,
+            observers,
             trust_changed: Arc::new(Notify::new()),
             untrusted: Arc::new(UntrustedRefusals::default()),
             refused: AtomicU64::new(0),
@@ -253,7 +256,7 @@ impl SshService {
             self.target.clone(),
             Arc::clone(&self.authority),
             self.limits,
-            Arc::new(NoObserver),
+            Arc::clone(&self.observers),
         )
         .on_untrusted_ca(move || untrusted.record());
         if self.ready.set(Arc::new(terminator)).is_ok() {

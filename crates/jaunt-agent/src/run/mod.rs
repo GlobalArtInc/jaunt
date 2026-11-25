@@ -27,12 +27,13 @@ use crate::AGENT_VERSION;
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
+use crate::recording::{RecordingParts, Recordings};
 use crate::ssh::{self, ControlAuthority, InnerTargetError, SshService};
 use crate::state::{DEFAULT_STATE_DIR, StateDir, StateError};
 use crate::trust::{TRUST_TIMING, TrustLoader, TrustTiming, random_sampler};
 use crate::verify::{self, VerifyError};
 use api::{API_KEEPALIVE, AgentApi, ApiError};
-use config::{ConfigError, InnerConfig};
+use config::{ConfigError, InnerConfig, RecordingConfig};
 use logging::LoggingError;
 use renew::{HOST_CA_RENEWAL_SPREAD, RENEWAL_BACKOFF, Renewer};
 
@@ -93,6 +94,7 @@ pub struct RunSettings {
     pub state_dir: PathBuf,
     pub inner: InnerConfig,
     pub ssh_limits: AgentLimits,
+    pub recording: RecordingConfig,
     pub tunnel_backoff: BackoffPolicy,
     pub renewal_backoff: BackoffPolicy,
     pub host_ca_spread: Duration,
@@ -107,6 +109,7 @@ impl RunSettings {
             state_dir,
             inner: InnerConfig::default(),
             ssh_limits: AgentLimits::default(),
+            recording: RecordingConfig::default(),
             tunnel_backoff: BackoffPolicy::default(),
             renewal_backoff: RENEWAL_BACKOFF,
             host_ca_spread: HOST_CA_RENEWAL_SPREAD,
@@ -168,6 +171,7 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
         };
         let settings = RunSettings {
             inner: config.inner,
+            recording: config.recording,
             ..RunSettings::new(state_dir)
         };
         run(settings, env, shutdown).await
@@ -220,11 +224,23 @@ pub async fn run(
         AgentApi::new(&tls, &endpoint, settings.api_keepalive, api_stop.clone())
             .map_err(RunError::Api)?,
     );
+    let tunnel_config = tunnel_config(tls, &endpoint, settings.tunnel_backoff);
+    let max_uploads =
+        usize::try_from(tunnel_config.options.max_concurrent_streams).unwrap_or(usize::MAX);
+    let recordings = Recordings::new(RecordingParts {
+        node_id: record.node_id.clone(),
+        limits: settings.recording.limits(max_uploads),
+        transport: api.clone(),
+        clock: env.clock.clone(),
+        jitter: Arc::new(|| rand::random_range(0.0..=1.0)),
+        cast_clocks: RecordingParts::system_cast_clocks(),
+    });
     let service = Arc::new(SshService::new(
         Arc::new(inner_ca),
         target,
         Arc::new(ControlAuthority::new(api.clone())),
         settings.ssh_limits,
+        Arc::new(recordings.clone()),
     ));
     match ssh::load_host_identity(&state, now_unix(env.clock.as_ref())) {
         Ok(host) => service.install_host_identity(host),
@@ -234,7 +250,6 @@ pub async fn run(
             "cannot load the SSH host certificate; SSH sessions are refused until a renewal succeeds"
         ),
     }
-    let tunnel_config = tunnel_config(tls, &endpoint, settings.tunnel_backoff);
     let events = tunnel_config.subscribe();
     let trust_events = tunnel_config.subscribe();
     tracing::info!(
@@ -291,11 +306,13 @@ pub async fn run(
         () = shutdown.cancelled() => None,
         joined = &mut tunnel => Some(joined),
     };
+    recordings.begin_shutdown();
     stop.cancel();
     let tunnel_result = match outcome {
         Some(joined) => joined,
         None => tunnel.await,
     };
+    recordings.drain().await;
     api_stop.cancel();
     match renewal.await {
         Ok(end) => {

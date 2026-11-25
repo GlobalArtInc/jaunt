@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -20,9 +21,10 @@ use jaunt_gate::{AgentApiHandler, AgentHub, AgentHubConfig, HostCertIssuer, Issu
 use jaunt_gate::{SshGate, SshGateConfig};
 use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, ControlError, ControlPlane, EnrollRequest, EnrollResponse,
-    EnrollmentApproved, NodeCaller, NodeCertificates, PollResponse, RouteDecision, RouteRequest,
-    SessionEnd, SessionEndOutcome,
+    EnrollmentApproved, NodeCaller, NodeCertificates, PollResponse, RECORDINGS_PATH_PREFIX,
+    RecordingChunk, RecordingComplete, RouteDecision, RouteRequest, SessionEnd, SessionEndOutcome,
 };
+use jaunt_record::{Assembler, Chunk, Limits, SessionKind, SessionManifest, Sink, SinkError};
 use jaunt_ssh::{UserCaKeys, UserCaSource};
 use jaunt_tunnel::{
     BoxFuture, NodeId, PeerAuthenticator, RejectReason, Rejection, TunnelOptions,
@@ -56,6 +58,8 @@ const GATE_ADDR: &str = "127.0.0.1:2222";
 const HANDLE: &str = "stand-handle";
 const WEEK: u64 = 7 * 24 * 3600;
 const MAX_BODY: usize = 64 * 1024;
+const MAX_RECORDING_BODY: usize = 2 * 1024 * 1024;
+const RECORDINGS_DIR: &str = "recordings";
 
 type Failure = Box<dyn Error + Send + Sync>;
 
@@ -76,6 +80,31 @@ struct Stand {
     user_ca_line: String,
     enrolled: Mutex<Option<EnrollRequest>>,
     sessions: AtomicU64,
+    uploads: Mutex<HashMap<String, Upload>>,
+}
+
+#[derive(Default)]
+struct CastBytes(Vec<u8>);
+
+impl Sink for CastBytes {
+    fn write(&mut self, _seq: u64, raw: &[u8]) -> Result<(), SinkError> {
+        self.0.extend_from_slice(raw);
+        Ok(())
+    }
+}
+
+struct Upload {
+    assembler: Assembler,
+    cast: CastBytes,
+    stored: Option<serde_json::Value>,
+}
+
+fn stand_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 impl Stand {
@@ -95,6 +124,80 @@ impl Stand {
         if let Err(error) = appended {
             tracing::error!(error = %error, file = name, "cannot record a request");
         }
+    }
+
+    fn recording(&self, path: &str, body: &[u8]) -> (StatusCode, serde_json::Value) {
+        let refused = |status, code: &str| (status, serde_json::json!({ "error": code }));
+        let Some((session_id, action)) = path
+            .strip_prefix(RECORDINGS_PATH_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return refused(StatusCode::NOT_FOUND, "not_found");
+        };
+        if !stand_session_id(session_id) {
+            return refused(StatusCode::NOT_FOUND, "session_unknown");
+        }
+        let mut uploads = self.uploads.lock().unwrap_or_else(PoisonError::into_inner);
+        let upload = uploads
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Upload {
+                assembler: Assembler::new(session_id, Limits::default()),
+                cast: CastBytes::default(),
+                stored: None,
+            });
+        let outcome = match action {
+            "chunks" => accept_chunk(session_id, upload, body),
+            "complete" => self.accept_complete(session_id, upload, body),
+            _ => return refused(StatusCode::NOT_FOUND, "not_found"),
+        };
+        outcome.unwrap_or_else(|(status, code)| {
+            tracing::warn!(session_id, code, "refused a recording upload");
+            refused(status, code)
+        })
+    }
+
+    fn accept_complete(
+        &self,
+        session_id: &str,
+        upload: &mut Upload,
+        body: &[u8],
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, &'static str)> {
+        let request: RecordingComplete = serde_json::from_slice(body)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_request"))?;
+        let wire = serde_json::to_value(&request.manifest)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_request"))?;
+        if let Some(stored) = &upload.stored {
+            return if *stored == wire {
+                Ok(receipt(&request))
+            } else {
+                Err((StatusCode::CONFLICT, "conflict"))
+            };
+        }
+        let manifest: SessionManifest = serde_json::from_value(wire.clone())
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid_request"))?;
+        upload
+            .assembler
+            .complete(
+                &manifest,
+                manifest.kind == SessionKind::Shell,
+                &mut upload.cast,
+            )
+            .map_err(|_| (StatusCode::CONFLICT, "conflict"))?;
+        let dir = self.dir.join(RECORDINGS_DIR);
+        let written = fs::create_dir_all(&dir)
+            .and_then(|()| fs::write(dir.join(format!("{session_id}.cast")), &upload.cast.0))
+            .and_then(|()| {
+                fs::write(
+                    dir.join(format!("{session_id}.manifest.json")),
+                    wire.to_string(),
+                )
+            });
+        if let Err(error) = written {
+            tracing::error!(error = %error, "cannot store a recording");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+        }
+        upload.stored = Some(wire);
+        Ok(receipt(&request))
     }
 
     fn host_certificate(
@@ -152,6 +255,45 @@ impl Stand {
             agent_endpoint: format!("{AGENTS_NAME}:{}", port(HUB_ADDR)?),
         })
     }
+}
+
+fn accept_chunk(
+    session_id: &str,
+    upload: &mut Upload,
+    body: &[u8],
+) -> Result<(StatusCode, serde_json::Value), (StatusCode, &'static str)> {
+    let request: RecordingChunk =
+        serde_json::from_slice(body).map_err(|_| (StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let chunk = Chunk {
+        session_id: session_id.to_owned(),
+        seq: request.seq,
+        raw_len: request.raw_len,
+        compressed: STANDARD
+            .decode(request.data.as_bytes())
+            .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "bad_chunk"))?,
+        sha256: request.sha256,
+        is_last: request.is_last,
+    };
+    upload
+        .assembler
+        .accept(&chunk, &mut upload.cast)
+        .map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, "bad_chunk"))?;
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "acked_through": request.seq }),
+    ))
+}
+
+fn receipt(request: &RecordingComplete) -> (StatusCode, serde_json::Value) {
+    let state = if request.manifest.incomplete {
+        "incomplete"
+    } else {
+        "complete"
+    };
+    (
+        StatusCode::OK,
+        serde_json::json!({ "state": state, "chunks": request.manifest.chunks }),
+    )
 }
 
 fn offset(seconds: u64) -> Result<time::OffsetDateTime, Failure> {
@@ -275,13 +417,18 @@ async fn answer(
     mut respond: h2::server::SendResponse<Bytes>,
 ) {
     let (parts, mut body) = request.into_parts();
+    let limit = if parts.uri.path().starts_with(RECORDINGS_PATH_PREFIX) {
+        MAX_RECORDING_BODY
+    } else {
+        MAX_BODY
+    };
     let mut received = Vec::new();
     while let Some(chunk) = body.data().await {
         let Ok(chunk) = chunk else {
             return;
         };
         if body.flow_control().release_capacity(chunk.len()).is_err()
-            || received.len() + chunk.len() > MAX_BODY
+            || received.len() + chunk.len() > limit
         {
             return;
         }
@@ -314,6 +461,7 @@ async fn answer(
             stand.record("session-end.log", &received);
             (StatusCode::OK, serde_json::json!({"outcome": "recorded"}))
         }
+        path if path.starts_with(RECORDINGS_PATH_PREFIX) => stand.recording(path, &received),
         _ => (
             StatusCode::NOT_FOUND,
             serde_json::json!({"error": "not_found"}),
@@ -475,6 +623,7 @@ async fn serve(dir: PathBuf) -> Result<(), Failure> {
         user_ca_line: user_ca.public_key().to_openssh()?,
         enrolled: Mutex::new(None),
         sessions: AtomicU64::new(0),
+        uploads: Mutex::new(HashMap::new()),
     });
     write_client(&stand, &user_ca)?;
 

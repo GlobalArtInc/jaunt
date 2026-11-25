@@ -8,7 +8,8 @@ use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, DenyReason, SessionEnd, SessionPermissions,
 };
 use jaunt_ssh::{
-    AgentLimits, AuthorityError, InnerCa, InnerTarget, SessionAuthority, SshError, UserCaKeys,
+    AgentLimits, AuthorityError, InnerCa, InnerTarget, NoObserver, SessionAuthority, SshError,
+    UserCaKeys,
 };
 use jaunt_tunnel::{H2Io, IncomingStream, SessionId, StreamHandler, StreamKind, StreamMeta};
 use serde_json::json;
@@ -44,6 +45,7 @@ fn service(authority: Arc<dyn SessionAuthority>) -> SshService {
         target(Path::new("/nonexistent")),
         authority,
         AgentLimits::default(),
+        Arc::new(NoObserver),
     )
 }
 
