@@ -89,3 +89,41 @@ jobs:
         with:
           name: e2e-logs
           path: target/e2e/logs
+  e2e-rotation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CONTAINER_ENGINE: docker
+      E2E_PROJECT: jaunt-e2e-rotation-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/cargo-home
+            target/installer-linux
+          key: e2e-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: e2e-linux-
+      - id: old-agent
+        uses: actions/cache/restore@v4
+        with:
+          path: target/e2e/old-agent
+          key: e2e-old-agent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('e2e/build-old-agent.sh') }}
+      - run: just e2e-rotation
+      - uses: actions/cache/save@v4
+        if: always() && steps.old-agent.outputs.cache-hit != 'true' && hashFiles('target/e2e/old-agent/*/jaunt-agent') != ''
+        with:
+          path: target/e2e/old-agent
+          key: e2e-old-agent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('e2e/build-old-agent.sh') }}
+      - run: just e2e-down
+        if: always()
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-rotation-logs
+          path: target/e2e/logs

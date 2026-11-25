@@ -13,7 +13,8 @@ case "${1:-}" in
     name=$2
     labels=$3
     pin=$4
-    run_as_agent sh -c "exec '$AGENT' enroll --server http://127.0.0.1:7001 --name '$name' --labels '$labels' --ca-pin '$pin' --state-dir '$STATE' >/tmp/enroll.log 2>&1" &
+    extra=${5:-}
+    run_as_agent sh -c "exec '$AGENT' enroll --server http://127.0.0.1:7001 --name '$name' --labels '$labels' --ca-pin '$pin' --state-dir '$STATE' $extra >/tmp/enroll.log 2>&1" &
     echo $! >/tmp/enroll.pid
     ;;
   start)
@@ -34,7 +35,7 @@ case "${1:-}" in
     if [ -f "$EXIT" ]; then cat "$EXIT"; else echo timeout; exit 1; fi
     ;;
   *)
-    echo "usage: agentctl.sh enroll NAME LABELS PIN | start | stop" >&2
+    echo "usage: agentctl.sh enroll NAME LABELS PIN [--replace] | start | stop" >&2
     exit 2
     ;;
 esac

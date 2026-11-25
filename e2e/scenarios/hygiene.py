@@ -3,11 +3,11 @@ import os
 import re
 
 from stand import engine
-from stand.layout import FIXTURES, NODES, container
+from stand.layout import FIXTURES, container
 from stand.stand import SECRET_PATTERNS
 
 ALLOWED_ERRORS_FILE = "allowed-errors.txt"
-STOP_ORDER = ("client", "node-a", "node-b", "jauntd", "edge-web", "edge-idp", "idp")
+STOP_ORDER = ("client", "node-a", "node-b", "node-c", "jauntd", "edge-web", "edge-idp", "idp")
 
 
 def allowed_errors():
@@ -59,7 +59,7 @@ def mode_problems(stand):
         problems.append("the recordings directory is {}".format(lines[2] if len(lines) > 2 else "unreadable"))
     for extra in lines[3:]:
         problems.append("{} is open beyond its documented mode".format(extra))
-    for node in NODES:
+    for node in stand.nodes:
         state = stand.on_node(node, ["sh", "-c",
             "stat -c '%a %U' /var/lib/jaunt; find /var/lib/jaunt -type f \\( -name '*key*' -o -name 'state.json' \\) -perm /077 -print"])
         rows = state.out.splitlines()
@@ -73,7 +73,7 @@ def mode_problems(stand):
 def finish(stand, report):
     secrets = list(stand.secrets) + (profile_secrets(stand) if stand.admin is not None else [])
     with report.step("hygiene: every agent runs as an unprivileged user") as step:
-        for node in NODES:
+        for node in stand.nodes:
             shown = stand.on_node(node, ["ps", "-o", "user=,pid=,args=", "-C", "jaunt-agent"])
             users = [line.split()[0] for line in shown.out.splitlines() if line.strip()]
             step.expect(users and all(user != "root" for user in users), "{}: ps shows {!r}".format(node, shown.out))
@@ -83,14 +83,14 @@ def finish(stand, report):
         step.expect(not problems, "; ".join(problems))
 
     with report.step("hygiene: the agents stop cleanly on SIGTERM with exit status 0") as step:
-        for node in NODES:
+        for node in stand.nodes:
             status = stand.agent_stop(node)
             step.expect(status == "0", "the agent on {} exited with {}".format(node, status))
 
     logs = stand.collect_logs()
 
     with report.step("hygiene: every container stops with exit status 0") as step:
-        for role in STOP_ORDER:
+        for role in [role for role in STOP_ORDER if not role.startswith("node-") or role in stand.nodes]:
             stopped = engine.engine("stop", "-t", "30", container(role), timeout=90)
             code = engine.engine("inspect", "-f", "{{.State.ExitCode}}", container(role)).out.strip()
             step.expect(stopped.ok and code == "0", "{} exited with {} ({})".format(role, code, stopped.text()))
@@ -100,7 +100,7 @@ def finish(stand, report):
     with report.step("hygiene: no ERROR lines in the jauntd and agent logs") as step:
         allowed = allowed_errors()
         found = []
-        for name in ("jauntd", "node-a-agent", "node-b-agent", "idp", "edge-web", "edge-idp"):
+        for name in ["jauntd", "idp", "edge-web", "edge-idp"] + ["{}-agent".format(node) for node in stand.nodes]:
             for line in error_lines(logs.get(name, ""), allowed):
                 found.append("{}: {}".format(name, line))
         step.expect(not found, "\n".join(found[:10]))

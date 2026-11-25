@@ -10,7 +10,7 @@ from .engine import Streaming, exec_detached, exec_in
 from .layout import (
     AGENTS_HOST, AGENTS_PORT, ALL_ROLES, BINARIES, CA_PEM, CLI_SERVER, CLIENT_FORWARD_PORT, CLIENT_USERS,
     CONTAINER_DIR, CONTROL_PORT, DATA_VOLUME, FIXTURES, GATE_HOST, GATE_PORT, IDP_CLIENT_ID,
-    IDP_HOST, NETWORK, NODES, OUT, PROJECT, RUN_DIR, SUFFIX, WEB_HOST, WEB_ORIGIN, container, node_host,
+    IDP_HOST, NETWORK, NODES, OLD_AGENT_DIR, OUT, PROJECT, RUN_DIR, SUFFIX, WEB_HOST, WEB_ORIGIN, container, node_host,
 )
 from .report import StepFailed
 
@@ -21,6 +21,7 @@ SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}"),
     re.compile(r"Bearer [A-Za-z0-9._~+/=-]{16,}"),
+    re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{20,}"),
 ]
 
 
@@ -66,7 +67,9 @@ def jauntd_config(cert_ttl_secs):
 
 
 class Stand:
-    def __init__(self, base_image, transfer_mib=256, keep=False):
+    def __init__(self, base_image, transfer_mib=256, keep=False, nodes=None, agent_env=None):
+        self.nodes = nodes or NODES
+        self.agent_env = agent_env or {}
         self.base_image = qualify(base_image)
         self.label = base_image
         self.transfer_mib = transfer_mib
@@ -119,9 +122,11 @@ class Stand:
             argv += ["-v", "{}:{}".format(source, target)]
         return argv
 
-    def create(self, role, image, aliases, mounts, command, user=None, env=None, publish=None):
+    def create(self, role, image, aliases, mounts, command, user=None, env=None, publish=None, caps=()):
         argv = ["run", "-d", "--security-opt", "label=disable", "--name", container(role), "--network", NETWORK,
                 "--hostname", role]
+        for cap in caps:
+            argv += ["--cap-add", cap]
         for alias in aliases:
             argv += ["--network-alias", alias]
         if user:
@@ -219,13 +224,16 @@ class Stand:
             (self.binary("jaunt"), "/usr/local/bin/jaunt:ro"), certs_ro, e2e,
             (os.path.join(CONTAINER_DIR, "xdg-open"), "/usr/local/bin/xdg-open:ro"),
         ], ["/e2e/idle.sh"])
-        for node, spec in NODES.items():
+        for node, spec in self.nodes.items():
+            agent = os.path.join(OLD_AGENT_DIR, "jaunt-agent") if spec.get("old_agent") else self.binary("jaunt-agent")
+            if not os.path.exists(agent):
+                raise RuntimeError("{} is missing: run e2e/build-old-agent.sh".format(agent))
             self.create(node, self.node_image, [node], [
-                (self.binary("jaunt-agent"), "/usr/local/bin/jaunt-agent:ro"), e2e,
-            ], ["/e2e/node.sh"])
+                (agent, "/usr/local/bin/jaunt-agent:ro"), e2e,
+            ], ["/e2e/node.sh"], caps=["NET_ADMIN"] if spec.get("net_admin") else ())
         self.prepare_client()
         self.wait_until("jauntd answers health checks", self.control_healthy, 60)
-        for node in NODES:
+        for node in self.nodes:
             self.wait_until("{} is ready".format(node), lambda node=node: self.node_ready(node), 90)
 
     def prepare_client(self):
@@ -426,11 +434,13 @@ class Stand:
         os.makedirs(self.log_dir, exist_ok=True)
         gathered = {}
         for role in ALL_ROLES:
+            if role.startswith("node-") and role not in self.nodes:
+                continue
             logged = engine.engine("logs", container(role))
             text = logged.out + logged.err
             write_file(os.path.join(self.log_dir, "{}.log".format(role)), text)
             gathered[role] = text
-        for node in NODES if include_files else ():
+        for node in self.nodes if include_files else ():
             for name, path in (("sshd", "/var/log/sshd.log"), ("agent", "/tmp/agent.log"), ("enroll", "/tmp/enroll.log"),
                                ("install", "/run/e2e/install.log")):
                 fetched = self.on_node(node, ["cat", path])
@@ -438,9 +448,11 @@ class Stand:
                 gathered["{}-{}".format(node, name)] = fetched.out
         return gathered
 
-    def enrol_start(self, node):
-        spec = NODES[node]
-        started = exec_detached(container(node), ["/e2e/agentctl.sh", "enroll", node, spec["labels"], self.ca_pin])
+    def enrol_start(self, node, replace=False):
+        spec = self.nodes[node]
+        started = exec_detached(container(node), [
+            "/e2e/agentctl.sh", "enroll", node, spec["labels"], self.ca_pin, "--replace" if replace else "",
+        ])
         if not started.ok:
             raise StepFailed("cannot start the enrolment on {}: {}".format(node, started.text()))
         holder = {}
@@ -469,7 +481,7 @@ class Stand:
         return holder["id"]
 
     def agent_start(self, node):
-        started = self.on_node(node, ["/e2e/agentctl.sh", "start"])
+        started = exec_in(container(node), ["/e2e/agentctl.sh", "start"], env=self.agent_env)
         if not started.ok:
             raise StepFailed("cannot start the agent on {}: {}".format(node, started.text()))
 

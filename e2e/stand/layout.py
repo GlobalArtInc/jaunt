@@ -5,6 +5,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 E2E = os.path.join(ROOT, "e2e")
 OUT = os.path.join(ROOT, "target", "e2e")
 BINARIES = os.path.join(ROOT, "target", "installer-linux", "release")
+OLD_AGENT_COMMIT = "22aea3856164f60901c68ce5572e912b95fa0cdc"
+OLD_AGENT_DIR = os.path.join(OUT, "old-agent", OLD_AGENT_COMMIT)
 CONTAINER_DIR = os.path.join(E2E, "container")
 FIXTURES = os.path.join(E2E, "fixtures")
 
@@ -17,7 +19,7 @@ NETWORK = PROJECT
 PREFIX = PROJECT + "-"
 DATA_VOLUME = PROJECT + "-data"
 RUN_DIR = os.path.join(OUT, "run", PROJECT)
-ALL_ROLES = ("client", "node-a", "node-b", "jauntd", "edge-web", "edge-idp", "idp")
+ALL_ROLES = ("client", "node-a", "node-b", "node-c", "jauntd", "edge-web", "edge-idp", "idp")
 
 WEB_HOST = "jaunt.{}".format(SUFFIX)
 IDP_HOST = "idp.{}".format(SUFFIX)
@@ -37,6 +39,12 @@ IDP_CLIENT_ID = "jaunt-e2e"
 NODES = {
     "node-a": {"labels": "env=test"},
     "node-b": {"labels": "env=prod"},
+}
+
+ROTATION_NODES = {
+    "node-a": {"labels": "env=test"},
+    "node-b": {"labels": "env=prod", "net_admin": True},
+    "node-c": {"labels": "env=test", "old_agent": True},
 }
 
 
