@@ -20,7 +20,7 @@ use crate::bridge::{
     BridgeContext, InnerOpen, LiveChannels, SessionBridge, StartReply, Traffic, Verdict,
     audit_forward,
 };
-use crate::cert::{UserCaSource, UserIdentity, verify_user_certificate};
+use crate::cert::{CertRejection, UserCaSource, UserIdentity, verify_user_certificate};
 use crate::config::ServerConfigCell;
 use crate::forward::{ForwardBridge, ForwardOpen, Originator, loopback_destination};
 use crate::inner::{self, InnerClient, InnerSession, InnerTarget};
@@ -42,6 +42,8 @@ const NODE_CLOSED_TEXT: &str = "jaunt: the node closed the session";
 const FORWARDING_REFUSED: &str = "jaunt: port forwarding is not allowed by your roles";
 const LOOPBACK_ONLY: &str = "jaunt: forwarding is limited to localhost on the node";
 const TOO_MANY_FORWARDS: &str = "jaunt: too many open sessions";
+
+type RefusalHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorityError {
@@ -142,6 +144,7 @@ pub struct Terminator {
     limits: AgentLimits,
     observers: Arc<dyn ObserverFactory>,
     inner_config: Arc<client::Config>,
+    untrusted_ca: Option<RefusalHook>,
 }
 
 impl Terminator {
@@ -163,7 +166,13 @@ impl Terminator {
             limits,
             observers,
             inner_config: Arc::new(inner::client_config()),
+            untrusted_ca: None,
         }
+    }
+
+    pub fn on_untrusted_ca(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.untrusted_ca = Some(Arc::new(hook));
+        self
     }
 
     pub async fn serve<S: TunnelStream>(
@@ -206,6 +215,7 @@ impl Terminator {
             authority: Arc::clone(&self.authority),
             observers: Arc::clone(&self.observers),
             inner_config: Arc::clone(&self.inner_config),
+            untrusted_ca: self.untrusted_ca.clone(),
             limits: self.limits,
             window: config.window_size,
             attempted: false,
@@ -512,6 +522,7 @@ struct Gatekeeper {
     authority: Arc<dyn SessionAuthority>,
     observers: Arc<dyn ObserverFactory>,
     inner_config: Arc<client::Config>,
+    untrusted_ca: Option<RefusalHook>,
     limits: AgentLimits,
     window: u32,
     attempted: bool,
@@ -690,7 +701,14 @@ impl server::Handler for Gatekeeper {
         }
         let identity = match verify_user_certificate(certificate, &self.cas.current(), unix_now()) {
             Ok(identity) => identity,
-            Err(rejection) => return Ok(self.refuse(rejection.reason(), None, login)),
+            Err(rejection) => {
+                if rejection == CertRejection::UntrustedCa
+                    && let Some(hook) = &self.untrusted_ca
+                {
+                    hook();
+                }
+                return Ok(self.refuse(rejection.reason(), None, login));
+            }
         };
         if !is_portable_login(login) {
             return Ok(self.refuse("login", Some(&identity), login));

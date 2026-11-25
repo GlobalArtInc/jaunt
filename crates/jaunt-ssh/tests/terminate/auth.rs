@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use jaunt_proto::{AuthorizeRequest, SessionEnd};
@@ -94,6 +95,31 @@ async fn unverifiable_certificates_bad_logins_and_passwords_never_reach_authoriz
     }
     assert!(fixture.authority.requests().is_empty());
     assert_eq!(SshdStats::count(&fixture.sshd.stats.connections), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_certificate_from_an_unknown_ca_signals_an_untrusted_ca_refusal() {
+    let fixture = Fixture::new(Options::default()).await;
+    let user = &fixture.user_key;
+    let issued = now();
+    let mut client = fixture.connect().await;
+    let host = certify(
+        &fixture.user_ca,
+        user,
+        CertType::Host,
+        issued - 120,
+        issued + 3600,
+    );
+    assert!(!client.authenticate(LOGIN, host).await);
+    assert_eq!(fixture.untrusted_ca.load(Ordering::SeqCst), 0);
+    let foreign = certify(&key(), user, CertType::User, issued - 120, issued + 3600);
+    assert!(!client.authenticate(LOGIN, foreign).await);
+    assert_eq!(fixture.untrusted_ca.load(Ordering::SeqCst), 1);
+    assert!(fixture.authority.requests().is_empty());
+    assert!(client.authenticate(LOGIN, fixture.cert.clone()).await);
+    assert_eq!(fixture.untrusted_ca.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.authority.requests().len(), 1);
+    client.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

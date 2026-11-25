@@ -10,6 +10,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Args;
 use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, SshError};
@@ -19,7 +20,7 @@ use jaunt_tunnel::{
 };
 use rustls::pki_types::CertificateDer;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::AGENT_VERSION;
@@ -33,7 +34,7 @@ use crate::verify::{self, VerifyError};
 use api::{API_KEEPALIVE, AgentApi, ApiError};
 use config::{ConfigError, InnerConfig};
 use logging::LoggingError;
-use renew::{RENEWAL_BACKOFF, Renewer};
+use renew::{HOST_CA_RENEWAL_SPREAD, RENEWAL_BACKOFF, Renewer};
 
 const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 const FILTER_VAR: &str = "RUST_LOG";
@@ -94,6 +95,7 @@ pub struct RunSettings {
     pub ssh_limits: AgentLimits,
     pub tunnel_backoff: BackoffPolicy,
     pub renewal_backoff: BackoffPolicy,
+    pub host_ca_spread: Duration,
     pub trust: TrustTiming,
     pub api_keepalive: Keepalive,
     pub privileged: bool,
@@ -107,6 +109,7 @@ impl RunSettings {
             ssh_limits: AgentLimits::default(),
             tunnel_backoff: BackoffPolicy::default(),
             renewal_backoff: RENEWAL_BACKOFF,
+            host_ca_spread: HOST_CA_RENEWAL_SPREAD,
             trust: TRUST_TIMING,
             api_keepalive: API_KEEPALIVE,
             privileged: running_as_root(),
@@ -249,6 +252,7 @@ pub async fn run(
             service.reload_host_identity(state, now_unix(clock.as_ref()));
         })
     };
+    let (host_ca, host_ca_changes) = watch::channel(None);
     let loader = TrustLoader {
         api: api.clone(),
         ssh: service.clone(),
@@ -256,6 +260,7 @@ pub async fn run(
         timing: settings.trust,
         events: Some(trust_events),
         sample: random_sampler(),
+        host_ca,
     };
     let renewer = Renewer {
         api,
@@ -270,6 +275,8 @@ pub async fn run(
         jitter: env.jitter,
         backoff: settings.renewal_backoff,
         after_renewal: reload,
+        host_ca: host_ca_changes,
+        host_ca_spread: settings.host_ca_spread,
     };
     let trust = tokio::spawn(loader.run(stop.child_token()));
     let mut tunnel = tokio::spawn(TunnelClient::run(

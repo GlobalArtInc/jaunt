@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::config::InnerConfig;
+use super::renew::host_signer;
 use super::{
     RunEnv, RunError, RunSettings, SSH_CONNECTION_WINDOW, SSH_STREAM_WINDOW, run, tunnel_config,
 };
@@ -36,7 +37,7 @@ use crate::testkit::{
     AUTHORIZE_PATH, ApiStep, Approval, ControlScript, FakeControl, FakeGate, LogCapture,
     ManualClock, NODE_ID, NODE_NAME, NodeIdentity, PollStep, RenewStep, SESSION_END_PATH,
     TRUST_PATH, TRUST_V2_PATH, TestPki, eventually, soon, sshd_host_key_file, trust_reply,
-    unix_now, user_ca_line,
+    trust_v2_reply, unix_now, user_ca_line,
 };
 use crate::trust::TrustTiming;
 
@@ -66,6 +67,7 @@ fn settings(dir: &Path, sshd_host_key: PathBuf) -> RunSettings {
             refresh_min: Duration::from_secs(3600),
             refresh_max: Duration::from_secs(3600),
             wake_jitter: Duration::from_millis(1),
+            refusal_interval: Duration::from_secs(60),
         },
         ..RunSettings::new(dir.to_path_buf())
     }
@@ -987,5 +989,345 @@ async fn stopping_the_agent_still_reports_the_end_of_a_live_session() {
     let end: jaunt_proto::SessionEnd = serde_json::from_slice(&ends[0].body).unwrap();
     assert_eq!(end.session_id, "live");
     login.abort();
+    gate.stop().await;
+}
+
+fn host_ca_key(line: &str) -> ssh_key::public::KeyData {
+    ssh_key::PublicKey::from_openssh(line)
+        .unwrap()
+        .key_data()
+        .clone()
+}
+
+fn stored_signer(node: &Enrolled) -> Option<ssh_key::public::KeyData> {
+    host_signer(&certificate_file(node))
+}
+
+#[tokio::test]
+async fn an_old_server_without_the_second_trust_version_keeps_the_half_life_schedule() {
+    let t0 = unix_now();
+    let (pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    pki.rotate_host_ca();
+    let clock = ManualClock::new(at_unix_secs(t0 - 600));
+    let agent = Agent::start(&node.path(), clock.clone());
+    gate.wait_connected().await;
+    eventually("the first trust version to be read", || {
+        !gate.requests(TRUST_PATH).is_empty()
+    })
+    .await;
+    gate.registry.send_trust_update(&node_id()).unwrap();
+    eventually("the announced set to be read", || {
+        gate.requests(TRUST_PATH).len() == 2
+    })
+    .await;
+    clock.wait_for_sleeper(at_unix_secs(t0)).await;
+    assert_eq!(clock.sleepers(), [at_unix_secs(t0)]);
+    assert_eq!(gate.requests(TRUST_V2_PATH).len(), 1);
+    assert!(gate.renewals().is_empty());
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn a_new_active_host_ca_key_renews_the_host_certificate_once_within_the_spread() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (pki, mut gate, node) = gate_and_node(
+        &[RenewStep::Issue {
+            not_before: t0 - 60,
+            not_after: t0 + 4 * HOUR,
+        }],
+        t0 - HOUR,
+        t0 + 3 * HOUR,
+    )
+    .await;
+    let previous = host_ca_key(&pki.host_ca_line());
+    let active = pki.rotate_host_ca();
+    gate.set_standing(TRUST_V2_PATH, trust_v2_reply(&[user_ca_line()], &active));
+    let clock = ManualClock::new(at_unix_secs(t0));
+    let agent = Agent::start_with_jitter(&node.path(), clock.clone(), 0.5);
+    gate.wait_connected().await;
+    assert_eq!(stored_signer(&node), Some(previous));
+    clock.wait_for_sleeper(at_unix_secs(t0 + 150)).await;
+    assert!(gate.renewals().is_empty());
+
+    clock.set(at_unix_secs(t0 + 150));
+    eventually("the host certificate to be signed by the new key", || {
+        stored_signer(&node) == Some(host_ca_key(&active))
+    })
+    .await;
+    let half_life = at_unix_secs((t0 - 60 + t0 + 4 * HOUR) / 2);
+    clock.wait_for_sleeper(half_life).await;
+    gate.registry.send_trust_update(&node_id()).unwrap();
+    eventually("the announced set to be read", || {
+        gate.requests(TRUST_V2_PATH).len() == 2
+    })
+    .await;
+    clock.wait_for_sleeper(half_life).await;
+    assert_eq!(gate.renewals().len(), 1);
+    assert_eq!(clock.sleepers(), [half_life]);
+    assert!(gate.requests(TRUST_PATH).is_empty());
+    agent.stop().await;
+    gate.stop().await;
+    assert!(
+        logs.text()
+            .contains("the host certificate is renewed early")
+    );
+    assert_no_key_material(&logs.text(), node.dir.path());
+}
+
+#[tokio::test]
+async fn a_failed_early_renewal_retries_with_the_renewal_backoff() {
+    let t0 = unix_now();
+    let (pki, mut gate, node) = gate_and_node(
+        &[
+            RenewStep::Status(500, "server_error"),
+            RenewStep::Issue {
+                not_before: t0 - 60,
+                not_after: t0 + 4 * HOUR,
+            },
+        ],
+        t0 - HOUR,
+        t0 + 3 * HOUR,
+    )
+    .await;
+    let active = pki.rotate_host_ca();
+    gate.set_standing(TRUST_V2_PATH, trust_v2_reply(&[user_ca_line()], &active));
+    let clock = ManualClock::new(at_unix_secs(t0));
+    let agent = Agent::start_with_jitter(&node.path(), clock.clone(), 0.5);
+    gate.wait_connected().await;
+    clock.wait_for_sleeper(at_unix_secs(t0 + 150)).await;
+    clock.set(at_unix_secs(t0 + 150));
+    eventually("the first attempt", || gate.renewals().len() == 1).await;
+    clock.wait_for_sleeper(at_unix_secs(t0 + 180)).await;
+    assert_ne!(stored_signer(&node), Some(host_ca_key(&active)));
+
+    clock.set(at_unix_secs(t0 + 180));
+    eventually("the retry to store the new host certificate", || {
+        stored_signer(&node) == Some(host_ca_key(&active))
+    })
+    .await;
+    assert_eq!(gate.renewals().len(), 2);
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn a_refused_certificate_rereads_the_trust_set_and_is_accepted_next_time() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let user = user();
+    let previous = user_ca_line();
+    gate.set_standing(TRUST_PATH, trust_reply(std::slice::from_ref(&previous)));
+    gate.script(
+        AUTHORIZE_PATH,
+        vec![ApiStep::Json(
+            200,
+            json!({"decision": "allow", "permissions": {
+                "pty": false, "port_forwarding": false, "record_input": false,
+                "max_duration_secs": 3600,
+            }}),
+        )],
+    );
+    gate.set_standing(
+        SESSION_END_PATH,
+        ApiStep::Json(200, json!({"outcome": "recorded"})),
+    );
+    let silent_sshd = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sshd_addr = silent_sshd.local_addr().unwrap();
+    let agent = Agent::start_with(
+        &node.path(),
+        ManualClock::new(SystemTime::now()),
+        1.0,
+        |settings| settings.inner.sshd_addr = sshd_addr,
+    );
+    gate.wait_connected().await;
+    eventually("the agent to accept SSH sessions", || {
+        logs.text().contains("the agent now accepts SSH sessions")
+    })
+    .await;
+    gate.set_standing(TRUST_PATH, trust_reply(&[previous, user.ca_line.clone()]));
+
+    let mut refused = connect_user(&gate, "refused").await;
+    let outcome = refused
+        .authenticate_openssh_cert("deploy", user.key.clone(), user.certificate.clone())
+        .await
+        .unwrap();
+    assert!(!outcome.success());
+    eventually("the refusal to reread the trust set", || {
+        logs.text().contains("\"wake\":\"untrusted_ca\"") && gate.requests(TRUST_PATH).len() == 2
+    })
+    .await;
+    assert!(gate.requests(AUTHORIZE_PATH).is_empty());
+    eventually("the reread set to be installed", || {
+        logs.text().matches("loaded the user CA trust set").count() == 2
+    })
+    .await;
+
+    let mut accepted = connect_user(&gate, "accepted").await;
+    let login = tokio::spawn(async move {
+        let outcome = accepted
+            .authenticate_openssh_cert("deploy", user.key, user.certificate)
+            .await;
+        (accepted, outcome)
+    });
+    let (_inner, _) = soon("the inner login to reach sshd", silent_sshd.accept())
+        .await
+        .unwrap();
+    assert_eq!(gate.requests(AUTHORIZE_PATH).len(), 1);
+    agent.stop().await;
+    login.abort();
+    gate.stop().await;
+}
+
+async fn connect_user(gate: &FakeGate, session: &str) -> client::Handle<HostCertificates> {
+    let stream = gate
+        .registry
+        .open_stream(&node_id(), &stream_meta(session))
+        .await
+        .unwrap();
+    soon(
+        "the SSH handshake",
+        client::connect_stream(
+            Arc::new(client::Config::default()),
+            stream,
+            HostCertificates(Arc::new(Mutex::new(Vec::new()))),
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_announced_key_matching_the_stored_certificate_keeps_the_half_life_schedule() {
+    let t0 = unix_now();
+    let (pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let reply = trust_v2_reply(&[user_ca_line()], &pki.host_ca_line());
+    gate.script(
+        TRUST_V2_PATH,
+        vec![ApiStep::Held(release.clone(), Box::new(reply.clone()))],
+    );
+    gate.set_standing(TRUST_V2_PATH, reply);
+    let clock = ManualClock::new(at_unix_secs(t0 - 600));
+    let agent = Agent::start(&node.path(), clock.clone());
+    gate.wait_connected().await;
+    clock.wait_for_sleeper(at_unix_secs(t0)).await;
+    assert_eq!(clock.slept().len(), 1);
+    release.notify_one();
+    eventually("the renewal loop to see the announced key", || {
+        clock.slept().len() >= 2
+    })
+    .await;
+    assert_eq!(clock.sleepers(), [at_unix_secs(t0)]);
+    assert!(gate.renewals().is_empty());
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn a_server_that_still_signs_with_the_old_key_gets_one_early_renewal() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(
+        &[RenewStep::Issue {
+            not_before: t0 - 60,
+            not_after: t0 + 4 * HOUR,
+        }],
+        t0 - HOUR,
+        t0 + 3 * HOUR,
+    )
+    .await;
+    let announced = user_ca_line();
+    gate.set_standing(TRUST_V2_PATH, trust_v2_reply(&[user_ca_line()], &announced));
+    let clock = ManualClock::new(at_unix_secs(t0));
+    let agent = Agent::start_with_jitter(&node.path(), clock.clone(), 0.5);
+    gate.wait_connected().await;
+    clock.wait_for_sleeper(at_unix_secs(t0 + 150)).await;
+    clock.set(at_unix_secs(t0 + 150));
+    eventually("the early renewal", || gate.renewals().len() == 1).await;
+    let half_life = at_unix_secs((t0 - 60 + t0 + 4 * HOUR) / 2);
+    clock.wait_for_sleeper(half_life).await;
+    assert_ne!(stored_signer(&node), Some(host_ca_key(&announced)));
+
+    clock.set(at_unix_secs(t0 + 750));
+    clock.wait_for_sleeper(half_life).await;
+    assert_eq!(clock.sleepers(), [half_life]);
+    assert_eq!(gate.renewals().len(), 1);
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_new_key_within_a_minute_waits_for_the_renewal_floor() {
+    let t0 = unix_now();
+    let issue = RenewStep::Issue {
+        not_before: t0 - 60,
+        not_after: t0 + 4 * HOUR,
+    };
+    let (pki, mut gate, node) =
+        gate_and_node(&[issue.clone(), issue], t0 - HOUR, t0 + 3 * HOUR).await;
+    let first = pki.rotate_host_ca();
+    gate.set_standing(TRUST_V2_PATH, trust_v2_reply(&[user_ca_line()], &first));
+    let clock = ManualClock::new(at_unix_secs(t0));
+    let agent = Agent::start_with_jitter(&node.path(), clock.clone(), 0.0);
+    gate.wait_connected().await;
+    eventually("the first early renewal", || {
+        stored_signer(&node) == Some(host_ca_key(&first))
+    })
+    .await;
+
+    let second = pki.rotate_host_ca();
+    gate.set_standing(TRUST_V2_PATH, trust_v2_reply(&[user_ca_line()], &second));
+    gate.registry.send_trust_update(&node_id()).unwrap();
+    clock.wait_for_sleeper(at_unix_secs(t0 + 60)).await;
+    assert_eq!(gate.renewals().len(), 1);
+
+    clock.set(at_unix_secs(t0 + 60));
+    eventually("the second early renewal", || {
+        stored_signer(&node) == Some(host_ca_key(&second))
+    })
+    .await;
+    assert_eq!(gate.renewals().len(), 2);
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_trust_loader_does_not_spin_the_renewal_loop() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(
+        &[RenewStep::Issue {
+            not_before: t0 - 60,
+            not_after: t0 + 4 * HOUR,
+        }],
+        t0 - HOUR,
+        t0 + HOUR,
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    gate.script(
+        TRUST_V2_PATH,
+        vec![ApiStep::Held(
+            release.clone(),
+            Box::new(ApiStep::Json(403, json!({"error": "node_removed"}))),
+        )],
+    );
+    let clock = ManualClock::new(at_unix_secs(t0 - 600));
+    let agent = Agent::start(&node.path(), clock.clone());
+    gate.wait_connected().await;
+    clock.wait_for_sleeper(at_unix_secs(t0)).await;
+    release.notify_one();
+    eventually("the renewal loop to see the loader stop", || {
+        clock.slept().len() >= 2
+    })
+    .await;
+    clock.set(at_unix_secs(t0));
+    eventually("the renewal at half-life", || gate.renewals().len() == 1).await;
+    assert!(clock.slept().len() < 10, "{}", clock.slept().len());
+    assert_eq!(gate.requests(TRUST_V2_PATH).len(), 1);
+    agent.stop().await;
     gate.stop().await;
 }

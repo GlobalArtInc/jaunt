@@ -81,7 +81,7 @@ fn offset(secs: i64) -> time::OffsetDateTime {
 
 pub struct TestPki {
     issuer: CertifiedIssuer<'static, KeyPair>,
-    host_ca: PrivateKey,
+    host_ca: Mutex<PrivateKey>,
 }
 
 impl TestPki {
@@ -95,8 +95,22 @@ impl TestPki {
         let key = KeyPair::generate().unwrap();
         Self {
             issuer: CertifiedIssuer::self_signed(params, key).unwrap(),
-            host_ca: PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            host_ca: Mutex::new(PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap()),
         }
+    }
+
+    pub fn host_ca_line(&self) -> String {
+        self.host_ca
+            .lock()
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap()
+    }
+
+    pub fn rotate_host_ca(&self) -> String {
+        *self.host_ca.lock().unwrap() = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        self.host_ca_line()
     }
 
     pub fn root_der(&self) -> &[u8] {
@@ -191,7 +205,11 @@ impl TestPki {
         for principal in principals {
             builder.valid_principal(*principal).unwrap();
         }
-        builder.sign(&self.host_ca).unwrap().to_openssh().unwrap()
+        builder
+            .sign(&*self.host_ca.lock().unwrap())
+            .unwrap()
+            .to_openssh()
+            .unwrap()
     }
 
     pub fn node_certificates(
@@ -627,6 +645,7 @@ pub enum ApiStep {
     Json(u16, serde_json::Value),
     Oversized,
     RefuseStream,
+    Held(Arc<tokio::sync::Notify>, Box<ApiStep>),
 }
 
 pub const RENEW_PATH: &str = "/v1/agent/renew";
@@ -645,6 +664,17 @@ pub fn user_ca_line() -> String {
 
 pub fn trust_reply(lines: &[String]) -> ApiStep {
     ApiStep::Json(200, serde_json::json!({ "user_ca_keys": lines }))
+}
+
+pub fn trust_v2_reply(lines: &[String], host_ca_active: &str) -> ApiStep {
+    ApiStep::Json(
+        200,
+        serde_json::json!({
+            "trust_id": "test-trust",
+            "user_ca_keys": lines,
+            "host_ca_active": host_ca_active,
+        }),
+    )
 }
 
 struct ApiInner {
@@ -775,7 +805,13 @@ async fn serve_api(api: Arc<ApiInner>, connection: AgentApiConnection, stop: Can
                 }
                 renew_reply(&api, step)
             } else {
-                match api.next_step(&path) {
+                let mut step = api.next_step(&path);
+                while let Some(ApiStep::Held(release, then)) = step {
+                    release.notified().await;
+                    step = Some(*then);
+                }
+                match step {
+                    Some(ApiStep::Held(..)) => unreachable!("held steps are released above"),
                     Some(ApiStep::Json(status, value)) => {
                         (status, serde_json::to_vec(&value).unwrap())
                     }

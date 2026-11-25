@@ -104,6 +104,13 @@ impl ServedTrust {
             ServedTrust::V2(trust) => trust.user_ca_keys,
         }
     }
+
+    pub fn host_ca_active(&self) -> Option<&str> {
+        match self {
+            ServedTrust::V1(_) => None,
+            ServedTrust::V2(trust) => Some(&trust.host_ca_active),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

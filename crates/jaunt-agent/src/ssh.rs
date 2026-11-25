@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 use crate::run::api::{AgentApi, ApiError};
 use crate::state::{StateDir, StateError};
+use crate::trust::UntrustedRefusals;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InnerTargetError {
@@ -152,6 +153,7 @@ pub struct SshService {
     authority: Arc<dyn SessionAuthority>,
     limits: AgentLimits,
     trust_changed: Arc<Notify>,
+    untrusted: Arc<UntrustedRefusals>,
     refused: AtomicU64,
 }
 
@@ -170,12 +172,17 @@ impl SshService {
             authority,
             limits,
             trust_changed: Arc::new(Notify::new()),
+            untrusted: Arc::new(UntrustedRefusals::default()),
             refused: AtomicU64::new(0),
         }
     }
 
     pub fn trust_changed(&self) -> Arc<Notify> {
         Arc::clone(&self.trust_changed)
+    }
+
+    pub fn untrusted_refusals(&self) -> Arc<UntrustedRefusals> {
+        Arc::clone(&self.untrusted)
     }
 
     fn parts(&self) -> MutexGuard<'_, Parts> {
@@ -238,6 +245,7 @@ impl SshService {
         let (Some(config), Some(cas)) = (&parts.config, &parts.cas) else {
             return;
         };
+        let untrusted = Arc::clone(&self.untrusted);
         let terminator = Terminator::new(
             Arc::clone(config),
             Arc::clone(cas),
@@ -246,7 +254,8 @@ impl SshService {
             Arc::clone(&self.authority),
             self.limits,
             Arc::new(NoObserver),
-        );
+        )
+        .on_untrusted_ca(move || untrusted.record());
         if self.ready.set(Arc::new(terminator)).is_ok() {
             tracing::info!(target: "jaunt::agent", "the agent now accepts SSH sessions");
         }

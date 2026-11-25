@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use jaunt_ssh::{SshError, UserCaKeys};
 use jaunt_tunnel::{Backoff, BackoffPolicy, ClientEvent, MAX_TIMER};
-use tokio::sync::{Notify, broadcast};
+use ssh_key::PublicKey;
+use ssh_key::public::KeyData;
+use tokio::sync::{Notify, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::clock::Clock;
@@ -18,6 +21,7 @@ pub struct TrustTiming {
     pub refresh_min: Duration,
     pub refresh_max: Duration,
     pub wake_jitter: Duration,
+    pub refusal_interval: Duration,
 }
 
 pub const TRUST_TIMING: TrustTiming = TrustTiming {
@@ -29,6 +33,7 @@ pub const TRUST_TIMING: TrustTiming = TrustTiming {
     refresh_min: Duration::from_secs(10 * 60),
     refresh_max: Duration::from_secs(15 * 60),
     wake_jitter: Duration::from_secs(5),
+    refusal_interval: Duration::from_secs(60),
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +47,7 @@ enum Wake {
     Announced,
     Reconnected,
     Periodic,
+    Refused,
     Shutdown,
 }
 
@@ -51,10 +57,38 @@ impl Wake {
             Self::Announced => "announced",
             Self::Reconnected => "reconnected",
             Self::Periodic => "periodic",
+            Self::Refused => "untrusted_ca",
             Self::Shutdown => "shutdown",
         }
     }
 }
+
+#[derive(Debug, Default)]
+pub struct UntrustedRefusals {
+    pending: AtomicBool,
+    wake: Notify,
+}
+
+impl UntrustedRefusals {
+    pub fn record(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    fn pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    fn clear(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
+    fn restore(&self) {
+        self.pending.store(true, Ordering::Release);
+    }
+}
+
+pub type HostCaActive = watch::Sender<Option<KeyData>>;
 
 #[derive(Debug, thiserror::Error)]
 enum TrustError {
@@ -116,20 +150,38 @@ pub struct TrustLoader {
     pub timing: TrustTiming,
     pub events: Option<broadcast::Receiver<ClientEvent>>,
     pub sample: Sampler,
+    pub host_ca: HostCaActive,
 }
 
 impl TrustLoader {
     pub async fn run(mut self, shutdown: CancellationToken) -> TrustEnd {
         let changed = self.ssh.trust_changed();
+        let refusals = self.ssh.untrusted_refusals();
         let mut reconnections = Reconnections::default();
         let mut first = true;
+        let mut last_refusal_read = None;
+        let mut wake = Wake::Periodic;
         loop {
             self.drain_events(&mut reconnections);
-            if let Err(end) = self.load_with_retries(&shutdown, first).await {
+            let loaded = if wake == Wake::Refused {
+                last_refusal_read = Some(self.clock.now());
+                self.load_after_refusal(&refusals).await
+            } else {
+                self.load_with_retries(&refusals, &shutdown, first).await
+            };
+            if let Err(end) = loaded {
                 return end;
             }
             first = false;
-            let wake = self.wait(&changed, &mut reconnections, &shutdown).await;
+            wake = self
+                .wait(
+                    &changed,
+                    &refusals,
+                    last_refusal_read,
+                    &mut reconnections,
+                    &shutdown,
+                )
+                .await;
             tracing::debug!(
                 target: "jaunt::agent",
                 wake = wake.as_str(),
@@ -137,7 +189,7 @@ impl TrustLoader {
             );
             let jitter = match wake {
                 Wake::Shutdown => return TrustEnd::Shutdown,
-                Wake::Periodic => Duration::ZERO,
+                Wake::Periodic | Wake::Refused => Duration::ZERO,
                 Wake::Announced | Wake::Reconnected => {
                     spread(Duration::ZERO, self.timing.wake_jitter, (self.sample)())
                 }
@@ -170,6 +222,8 @@ impl TrustLoader {
     async fn wait(
         &mut self,
         changed: &Notify,
+        refusals: &UntrustedRefusals,
+        last_refusal_read: Option<SystemTime>,
         reconnections: &mut Reconnections,
         shutdown: &CancellationToken,
     ) -> Wake {
@@ -178,21 +232,59 @@ impl TrustLoader {
             self.timing.refresh_max,
             (self.sample)(),
         );
-        tokio::select! {
-            () = shutdown.cancelled() => Wake::Shutdown,
-            () = changed.notified() => Wake::Announced,
-            () = next_reconnection(&mut self.events, reconnections) => Wake::Reconnected,
-            () = tokio::time::sleep(refresh) => Wake::Periodic,
+        let periodic = tokio::time::sleep(refresh);
+        tokio::pin!(periodic);
+        let clock = Arc::clone(&self.clock);
+        loop {
+            let due = refusals
+                .pending()
+                .then(|| refusal_due(last_refusal_read, self.timing.refusal_interval, clock.now()))
+                .flatten();
+            let refused = async {
+                match due {
+                    Some(deadline) => clock.sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                () = shutdown.cancelled() => return Wake::Shutdown,
+                () = changed.notified() => return Wake::Announced,
+                () = next_reconnection(&mut self.events, reconnections) => return Wake::Reconnected,
+                () = &mut periodic => return Wake::Periodic,
+                () = refused => return Wake::Refused,
+                () = refusals.wake.notified(), if due.is_none() => {}
+            }
+        }
+    }
+
+    async fn load_after_refusal(&self, refusals: &UntrustedRefusals) -> Result<(), TrustEnd> {
+        refusals.clear();
+        match self.load_once().await {
+            Ok(_) => Ok(()),
+            Err(TrustError::Api(ApiError::Shutdown)) => Err(TrustEnd::Shutdown),
+            Err(TrustError::Api(ApiError::NodeRemoved)) => Err(node_removed()),
+            Err(error) => {
+                refusals.restore();
+                tracing::warn!(
+                    target: "jaunt::agent",
+                    error = %error,
+                    retry_in_secs = self.timing.refusal_interval.as_secs(),
+                    "reloading the user CA trust set after a refused certificate failed; the previous set stays in use"
+                );
+                Ok(())
+            }
         }
     }
 
     async fn load_with_retries(
         &self,
+        refusals: &UntrustedRefusals,
         shutdown: &CancellationToken,
         check_clock: bool,
     ) -> Result<(), TrustEnd> {
         let mut backoff = Backoff::new(self.timing.backoff);
         loop {
+            refusals.clear();
             match self.load_once().await {
                 Ok(server_time) => {
                     if check_clock {
@@ -201,13 +293,7 @@ impl TrustLoader {
                     return Ok(());
                 }
                 Err(TrustError::Api(ApiError::Shutdown)) => return Err(TrustEnd::Shutdown),
-                Err(TrustError::Api(ApiError::NodeRemoved)) => {
-                    tracing::error!(
-                        target: "jaunt::agent",
-                        "the server no longer knows this node (node_removed); the user CA trust set is not refreshed any more"
-                    );
-                    return Err(TrustEnd::NodeRemoved);
-                }
+                Err(TrustError::Api(ApiError::NodeRemoved)) => return Err(node_removed()),
                 Err(error) => {
                     let delay = backoff.next_delay(Duration::ZERO, (self.sample)());
                     tracing::warn!(
@@ -227,6 +313,7 @@ impl TrustLoader {
 
     async fn load_once(&self) -> Result<Option<SystemTime>, TrustError> {
         let reply = self.api.trust().await.map_err(TrustError::Api)?;
+        let host_ca = reply.value.host_ca_active().map(str::to_owned);
         let lines = reply.value.into_user_ca_keys();
         let keys = UserCaKeys::from_openssh_lines(&lines).map_err(TrustError::Invalid)?;
         self.ssh.install_trust(keys);
@@ -235,8 +322,49 @@ impl TrustLoader {
             keys = lines.len(),
             "loaded the user CA trust set"
         );
+        self.publish_host_ca(host_ca.as_deref());
         Ok(reply.server_time)
     }
+
+    fn publish_host_ca(&self, line: Option<&str>) {
+        let active = match line.map(|line| PublicKey::from_openssh(line.trim())) {
+            None => None,
+            Some(Ok(key)) => Some(key.key_data().clone()),
+            Some(Err(_)) => {
+                tracing::warn!(
+                    target: "jaunt::agent",
+                    "the control plane sent an active host CA key that cannot be read; the host certificate is renewed on its usual schedule"
+                );
+                return;
+            }
+        };
+        self.host_ca.send_if_modified(|current| {
+            if *current == active {
+                return false;
+            }
+            *current = active;
+            true
+        });
+    }
+}
+
+fn node_removed() -> TrustEnd {
+    tracing::error!(
+        target: "jaunt::agent",
+        "the server no longer knows this node (node_removed); the user CA trust set is not refreshed any more"
+    );
+    TrustEnd::NodeRemoved
+}
+
+fn refusal_due(
+    last_read: Option<SystemTime>,
+    interval: Duration,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    let Some(at) = last_read else {
+        return Some(SystemTime::UNIX_EPOCH);
+    };
+    Some(at.checked_add(interval)?.min(now.checked_add(interval)?))
 }
 
 async fn next_reconnection(

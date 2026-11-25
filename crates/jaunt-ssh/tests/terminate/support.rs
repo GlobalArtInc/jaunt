@@ -267,6 +267,7 @@ pub struct Fixture {
     pub user_key: Arc<PrivateKey>,
     pub cert: Certificate,
     pub stalled: Arc<AtomicBool>,
+    pub untrusted_ca: Arc<AtomicUsize>,
     terminator: Arc<Terminator>,
     _dir: tempfile::TempDir,
 }
@@ -323,7 +324,7 @@ impl Fixture {
             stall: options.slow_observer.then(|| Arc::clone(&stalled)),
             skip: options.skip_outputs,
         });
-        let terminator = Arc::new(Terminator::new(
+        let terminator = Terminator::new(
             config,
             Arc::new(UserCaSource::new(cas)),
             Arc::new(inner_ca),
@@ -334,7 +335,12 @@ impl Fixture {
             Arc::clone(&authority) as Arc<dyn SessionAuthority>,
             options.limits,
             recorder,
-        ));
+        );
+        let untrusted_ca = Arc::new(AtomicUsize::new(0));
+        let refusals = Arc::clone(&untrusted_ca);
+        let terminator = Arc::new(terminator.on_untrusted_ca(move || {
+            refusals.fetch_add(1, Ordering::SeqCst);
+        }));
         let user_key = key();
         let cert = certify(
             &user_ca,
@@ -352,6 +358,7 @@ impl Fixture {
             user_key: Arc::new(user_key),
             cert,
             stalled,
+            untrusted_ca,
             terminator,
             _dir: dir,
         }

@@ -343,6 +343,13 @@ impl StateDir {
         })
     }
 
+    pub fn read_ssh_certificate(&self) -> Result<Vec<u8>, StateError> {
+        Ok(self
+            .dir
+            .read_at_most(SSH_CERTIFICATE_FILE, MAX_SSH_HOST_FILE_BYTES)?
+            .to_vec())
+    }
+
     pub fn store_inner_ca(&self, public_line: &str) -> Result<(), StateError> {
         self.dir.write_readable(
             INNER_CA_FILE,

@@ -4,7 +4,8 @@ use std::time::{Duration, SystemTime};
 use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, UserCaKeys};
 use jaunt_tunnel::{BackoffPolicy, ClientEvent, StreamHandler};
 use serde_json::json;
-use tokio::sync::broadcast;
+use ssh_key::public::KeyData;
+use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -13,8 +14,8 @@ use super::{
 };
 use crate::ssh::{ControlAuthority, SshService};
 use crate::testkit::{
-    ApiStep, FakeGate, LogCapture, ManualClock, TRUST_PATH, eventually, gate_and_api, soon,
-    trust_reply, user_ca_line,
+    ApiStep, FakeGate, LogCapture, ManualClock, TRUST_PATH, TRUST_V2_PATH, eventually,
+    gate_and_api, soon, trust_reply, trust_v2_reply, user_ca_line,
 };
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -28,7 +29,10 @@ const FAST: TrustTiming = TrustTiming {
     refresh_min: HOUR,
     refresh_max: HOUR,
     wake_jitter: Duration::from_millis(1),
+    refusal_interval: MINUTE,
 };
+
+const MINUTE: Duration = Duration::from_secs(60);
 
 struct Loading {
     gate: FakeGate,
@@ -36,6 +40,7 @@ struct Loading {
     events: broadcast::Sender<ClientEvent>,
     shutdown: CancellationToken,
     task: JoinHandle<TrustEnd>,
+    host_ca: watch::Receiver<Option<KeyData>>,
 }
 
 struct Options {
@@ -80,7 +85,9 @@ async fn loading_with(
         timing: options.timing,
         events: Some(receiver),
         sample: Arc::new(move || sample),
+        host_ca: watch::Sender::new(None),
     };
+    let host_ca = loader.host_ca.subscribe();
     let task = tokio::spawn(loader.run(shutdown.clone()));
     Loading {
         gate,
@@ -88,6 +95,7 @@ async fn loading_with(
         events,
         shutdown,
         task,
+        host_ca,
     }
 }
 
@@ -121,6 +129,7 @@ fn delays_spread_between_their_bounds() {
     assert_eq!(TRUST_TIMING.refresh_min, Duration::from_secs(600));
     assert_eq!(TRUST_TIMING.refresh_max, Duration::from_secs(900));
     assert_eq!(TRUST_TIMING.wake_jitter, Duration::from_secs(5));
+    assert_eq!(TRUST_TIMING.refusal_interval, MINUTE);
 }
 
 #[tokio::test]
@@ -415,4 +424,201 @@ async fn a_removed_node_stops_loading() {
     assert!(loading.trust().is_none());
     assert_eq!(loading.gate.requests(TRUST_PATH).len(), 1);
     assert_eq!(loading.stop().await, TrustEnd::NodeRemoved);
+}
+
+#[tokio::test]
+async fn a_flood_of_refusals_reads_the_trust_set_at_most_once_a_minute() {
+    let t0 = SystemTime::now();
+    let clock = ManualClock::new(t0);
+    let loading = loading(clock.clone(), |_| {}).await;
+    eventually("the trust set to load", || loading.trust().is_some()).await;
+    let refusals = loading.service.untrusted_refusals();
+    let reads = || loading.gate.requests(TRUST_PATH).len();
+    for _ in 0..1000 {
+        refusals.record();
+    }
+    eventually("one read for the burst", || reads() == 2).await;
+
+    for _ in 0..1000 {
+        refusals.record();
+    }
+    clock.wait_for_sleeper(t0 + MINUTE).await;
+    clock.advance(Duration::from_secs(30));
+    for _ in 0..1000 {
+        refusals.record();
+    }
+    clock.wait_for_sleeper(t0 + MINUTE).await;
+    assert_eq!(reads(), 2);
+
+    clock.set(t0 + MINUTE);
+    eventually("the second read a minute later", || reads() == 3).await;
+    for _ in 0..1000 {
+        refusals.record();
+    }
+    clock.set(t0 + Duration::from_secs(90));
+    clock.wait_for_sleeper(t0 + 2 * MINUTE).await;
+    assert_eq!(reads(), 3);
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_read_after_a_refusal_is_retried_a_minute_later() {
+    let t0 = SystemTime::now();
+    let clock = ManualClock::new(t0);
+    let loading = loading(clock.clone(), |_| {}).await;
+    eventually("the trust set to load", || loading.trust().is_some()).await;
+    let lines = vec![user_ca_line()];
+    loading.gate.script(
+        TRUST_PATH,
+        vec![ApiStep::Json(503, json!({"error": "unavailable"}))],
+    );
+    loading.gate.set_standing(TRUST_PATH, trust_reply(&lines));
+    loading.service.untrusted_refusals().record();
+    clock.wait_for_sleeper(t0 + MINUTE).await;
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 2);
+    assert_ne!(*loading.trust().unwrap(), keys(&lines));
+
+    clock.set(t0 + MINUTE);
+    eventually("the retried read to install the set", || {
+        loading
+            .trust()
+            .is_some_and(|current| *current == keys(&lines))
+    })
+    .await;
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 3);
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn an_announcement_during_a_stalled_refusal_read_is_applied_after_it() {
+    let clock = ManualClock::new(SystemTime::now());
+    let loading = loading(clock.clone(), |_| {}).await;
+    eventually("the trust set to load", || loading.trust().is_some()).await;
+    let (stalled, newest) = (vec![user_ca_line()], vec![user_ca_line()]);
+    let release = Arc::new(Notify::new());
+    loading.gate.script(
+        TRUST_PATH,
+        vec![ApiStep::Held(
+            release.clone(),
+            Box::new(trust_reply(&stalled)),
+        )],
+    );
+    loading.gate.set_standing(TRUST_PATH, trust_reply(&newest));
+    let refusals = loading.service.untrusted_refusals();
+    refusals.record();
+    eventually("the refusal read to stall", || {
+        loading.gate.requests(TRUST_PATH).len() == 2
+    })
+    .await;
+    loading.service.trust_update();
+    let started = std::time::Instant::now();
+    for _ in 0..10_000 {
+        refusals.record();
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+    tokio::task::yield_now().await;
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 2);
+
+    release.notify_one();
+    eventually("the announced set to replace the stalled one", || {
+        loading
+            .trust()
+            .is_some_and(|current| *current == keys(&newest))
+    })
+    .await;
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 3);
+    assert!(clock.sleepers().is_empty());
+    loading.stop().await;
+}
+
+fn loaded(logs: &LogCapture) -> usize {
+    logs.text().matches("loaded the user CA trust set").count()
+}
+
+#[tokio::test]
+async fn a_served_refusal_does_not_keep_reading_once_a_minute() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = SystemTime::now();
+    let clock = ManualClock::new(t0);
+    let loading = loading(clock.clone(), |_| {}).await;
+    eventually("the trust set to load", || loaded(&logs) == 1).await;
+    loading.service.untrusted_refusals().record();
+    eventually("the refusal read", || loaded(&logs) == 2).await;
+    assert!(clock.sleepers().is_empty());
+    for minute in 1..=5 {
+        clock.set(t0 + minute * MINUTE);
+        tokio::task::yield_now().await;
+    }
+    assert!(clock.sleepers().is_empty());
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 2);
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn a_clock_set_back_does_not_freeze_the_read_after_a_refusal() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let t0 = SystemTime::now();
+    let clock = ManualClock::new(t0);
+    let loading = loading(clock.clone(), |_| {}).await;
+    eventually("the trust set to load", || loaded(&logs) == 1).await;
+    let refusals = loading.service.untrusted_refusals();
+    refusals.record();
+    eventually("the refusal read", || loaded(&logs) == 2).await;
+
+    let back = t0 - HOUR;
+    clock.set(back);
+    refusals.record();
+    clock.wait_for_sleeper(back + MINUTE).await;
+    assert_eq!(loading.gate.requests(TRUST_PATH).len(), 2);
+    clock.set(back + MINUTE);
+    eventually("the read a minute after the clock was set back", || {
+        loaded(&logs) == 3
+    })
+    .await;
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_active_host_key_still_installs_the_user_keys_and_publishes_nothing() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let first = vec![user_ca_line()];
+    let reply = trust_v2_reply(&first, "ssh-ed25519 not-base64");
+    let mut loading = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.set_standing(TRUST_V2_PATH, reply);
+    })
+    .await;
+    eventually("the first set to load", || {
+        loading
+            .trust()
+            .is_some_and(|current| *current == keys(&first))
+    })
+    .await;
+    assert!(
+        logs.text()
+            .contains("active host CA key that cannot be read")
+    );
+    assert_eq!(*loading.host_ca.borrow_and_update(), None);
+
+    let (second, host_ca) = (vec![user_ca_line()], user_ca_line());
+    loading
+        .gate
+        .set_standing(TRUST_V2_PATH, trust_v2_reply(&second, &host_ca));
+    loading.service.trust_update();
+    soon(
+        "the readable key to be published",
+        loading.host_ca.changed(),
+    )
+    .await
+    .unwrap();
+    let expected = ssh_key::PublicKey::from_openssh(&host_ca)
+        .unwrap()
+        .key_data()
+        .clone();
+    assert_eq!(*loading.host_ca.borrow(), Some(expected));
+    assert_eq!(*loading.trust().unwrap(), keys(&second));
+    assert!(loading.gate.requests(TRUST_PATH).is_empty());
+    loading.stop().await;
 }
