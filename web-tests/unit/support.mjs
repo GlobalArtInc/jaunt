@@ -82,8 +82,11 @@ export async function until(condition, description) {
   throw new Error("timed out waiting for " + description);
 }
 
-export async function mount(routes, hash = "") {
+export async function mount(routes, hash = "", options = {}) {
   const dom = installDom();
+  if (options.before) {
+    options.before(dom.window);
+  }
   const server = createServer(routes);
   globalThis.fetch = server.fetch;
   if (hash) {

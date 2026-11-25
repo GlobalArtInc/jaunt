@@ -56,7 +56,6 @@ export async function auditView(ctx) {
     from: ctx.query.get("from") || "",
     to: ctx.query.get("to") || "",
   };
-  const typeInput = textInput({ value: values.type, maxlength: 64, placeholder: "login." });
   const actorInput = textInput({ value: values.actor, maxlength: 128 });
   const nodeInput = textInput({ value: values.node, maxlength: 128 });
   const sessionInput = textInput({ value: values.session, maxlength: 128 });
@@ -72,7 +71,7 @@ export async function auditView(ctx) {
       return;
     }
     filterError.replaceChildren();
-    ctx.navigate("/audit", { type: typeInput.value.trim(), actor: actorInput.value.trim(), node: nodeInput.value.trim(), session: sessionInput.value.trim(), from, to });
+    ctx.navigate("/audit", { type: search.input.value.trim(), actor: actorInput.value.trim(), node: nodeInput.value.trim(), session: sessionInput.value.trim(), from, to });
   }
 
   const table = pagedTable({
@@ -93,7 +92,7 @@ export async function auditView(ctx) {
       event.session_id ? el("span", { class: "mono", text: clean(event.session_id) }) : S.none,
       button(S.audit.details, { small: true, onClick: () => openEventDrawer(event) }),
     ],
-    empty: () => emptyState(S.audit.empty),
+    empty: () => emptyState(S.audit.empty, null, null, "audit"),
     fetchPage: async (cursor) => {
       const from = parseUtcInput(values.from);
       const to = parseUtcInput(values.to);
@@ -111,19 +110,16 @@ export async function auditView(ctx) {
     },
   });
 
-  const filters = filterBar(
-    [
-      field({ label: S.audit.filterType, control: typeInput }),
-      field({ label: S.audit.filterActor, control: actorInput }),
-      field({ label: S.audit.filterNode, control: nodeInput }),
-      field({ label: S.audit.filterSession, control: sessionInput }),
-      fromField,
-      toField,
-      filterError,
-    ],
-    { onSubmit: apply, onReset: () => ctx.navigate("/audit", {}) },
-  );
-  replace(ctx.main, pageHead(S.audit.heading), el("section", { class: "panel", "aria-label": S.audit.heading }, filters, table.element));
+  const search = filterBar({
+    label: S.audit.searchLabel,
+    placeholder: S.audit.search,
+    value: values.type,
+    advancedOpen: values.actor !== "" || values.node !== "" || values.session !== "" || values.from !== "" || values.to !== "",
+    advanced: [field({ label: S.audit.filterActor, control: actorInput }), field({ label: S.audit.filterNode, control: nodeInput }), field({ label: S.audit.filterSession, control: sessionInput }), fromField, toField],
+    onSubmit: apply,
+    onReset: () => ctx.navigate("/audit", {}),
+  });
+  replace(ctx.main, pageHead(S.audit.heading), search.element, filterError, el("section", { class: "results", "aria-label": S.audit.heading }, table.element));
   try {
     await table.load();
   } catch (error) {

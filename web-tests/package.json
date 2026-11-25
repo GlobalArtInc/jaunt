@@ -11,7 +11,8 @@
     "test": "node --test \"unit/*.test.mjs\"",
     "smoke": "node smoke/run.mjs",
     "smoke:recording": "node smoke/recording.mjs",
-    "smoke:csi": "node smoke/csi-sweep.mjs"
+    "smoke:csi": "node smoke/csi-sweep.mjs",
+    "smoke:before": "node smoke/before.mjs"
   },
   "devDependencies": {
     "jsdom": "31.0.1",

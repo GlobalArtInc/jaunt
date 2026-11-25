@@ -14,7 +14,7 @@ afterEach(() => {
 
 const nodesPage = (nodes, extra = {}) => json(200, { nodes, next: null, pending_enrolments: 0, ...extra });
 
-test("the nodes screen renders rows, label chips, state markers, the pending banner and the nav count", async () => {
+test("the nodes screen renders cards with label chips, state markers, the pending banner and the nav count", async () => {
   ui = await mount(
     {
       ...signedIn(),
@@ -22,15 +22,17 @@ test("the nodes screen renders rows, label chips, state markers, the pending ban
     },
     "#/nodes",
   );
-  const rows = ui.root.querySelectorAll("tbody tr");
-  assert.equal(rows.length, 2);
-  assert.match(rows[0].textContent, /web-01/);
-  assert.deepEqual(Array.from(rows[0].querySelectorAll(".chip")).map((chip) => chip.textContent), ["env=prod", "team=web"]);
-  assert.match(rows[0].textContent, /Online/);
-  assert.match(rows[1].textContent, /Offline/);
-  assert.match(rows[1].textContent, /Revoked/);
+  const cards = ui.root.querySelectorAll(".node-card");
+  assert.equal(cards.length, 2);
+  assert.match(cards[1].textContent, /web-01/);
+  assert.deepEqual(Array.from(cards[1].querySelectorAll(".chip")).map((chip) => chip.textContent), ["env: prod", "team: web"]);
+  assert.match(cards[1].textContent, /SSH node/);
+  assert.match(cards[1].textContent, /Online/);
+  assert.match(cards[0].textContent, /Offline/);
+  assert.match(cards[0].textContent, /Revoked/);
   assert.match(ui.root.querySelector(".banner").textContent, /2 enrolment requests are waiting/);
-  assert.match(ui.root.querySelector(".mainnav").textContent, /2 pending/);
+  assert.equal(ui.root.querySelector(".subnav-item .nav-count").textContent, "2");
+  assert.equal(ui.root.querySelector(".bell-count").textContent, "2");
   assert.equal(document.title, "Nodes · Jaunt");
   assert.equal(ui.root.querySelector("a.btn-primary").getAttribute("href"), "#/approve");
 });
@@ -51,7 +53,7 @@ test("the nodes screen sends its filters, appends the next page and shows the em
   click(byText(ui.root, "button", "Load more"));
   await settle();
   assert.equal(pages[1], "state=removed&q=web&label=env%3Aprod&label=team%3Aweb&limit=50&cursor=cursor-1");
-  assert.equal(ui.root.querySelectorAll("tbody tr").length, 2);
+  assert.equal(ui.root.querySelectorAll(".node-card").length, 2);
   assert.equal(byText(ui.root, "button", "Load more").hidden, true);
 });
 
@@ -66,7 +68,7 @@ test("an empty registry explains how to enrol a node and a filtered miss says so
 
 test("an invalid filter code from the server becomes a message next to the filters", async () => {
   ui = await mount({ ...signedIn(), "GET /v1/admin/nodes": json(422, { error: "invalid_label" }) }, "#/nodes?label=bad");
-  assert.match(ui.root.querySelector(".filters").textContent, /A label must look like key:value/);
+  assert.match(ui.main().textContent, /A label must look like key:value/);
 });
 
 test("the node detail shows facts, keys, session counts and who can reach the node", async () => {
@@ -166,7 +168,7 @@ test("the audit screen sends RFC 3339 range filters and the drawer shows typed f
 
 test("a bad audit filter code is explained and the cursor is passed on load more", async () => {
   ui = await mount({ ...signedIn(), "GET /v1/admin/audit": json(400, { error: "invalid_range" }) }, "#/audit");
-  assert.match(ui.root.querySelector(".filters").textContent, /start must be before the end/);
+  assert.match(ui.main().textContent, /start must be before the end/);
 });
 
 test("without a session the sign-in page shows one clear button that leaves for the login route", async () => {
@@ -174,7 +176,7 @@ test("without a session the sign-in page shows one clear button that leaves for 
   const link = ui.root.querySelector("a.btn-primary");
   assert.match(link.getAttribute("href"), /^\/v1\/web\/login\?return_to=/);
   assert.match(ui.text(), /Welcome back/);
-  assert.equal(ui.root.querySelector(".mainnav"), null);
+  assert.equal(ui.root.querySelector(".sidebar"), null);
 });
 
 test("an unreachable server offers a retry instead of the sign-in button", async () => {
@@ -184,16 +186,16 @@ test("an unreachable server offers a retry instead of the sign-in button", async
   assert.ok(byText(ui.root, "button", "Try again"));
 });
 
-test("a signed-in user without any admin permission gets the not allowed page and an empty nav", async () => {
+test("a signed-in user without any admin permission gets the not allowed page and only the terminal in the nav", async () => {
   ui = await mount({ ...signedIn([]) });
   assert.match(ui.text(), /Not allowed/);
   assert.match(ui.text(), /none of your roles grants an administration permission/);
-  assert.equal(ui.root.querySelectorAll(".mainnav a").length, 0);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail a")).map((link) => link.getAttribute("href")), ["#/terminal"]);
 });
 
 test("navigation hides what the session cannot use and routes to it are refused without any request", async () => {
   ui = await mount({ ...signedIn(["sessions.read"]), "GET /v1/admin/sessions": json(200, { sessions: [], next: null }) }, "#/nodes");
-  assert.deepEqual(Array.from(ui.root.querySelectorAll(".mainnav a")).map((link) => link.getAttribute("href")), ["#/sessions", "#/revocations"]);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail a")).map((link) => link.getAttribute("href")), ["#/sessions", "#/terminal", "#/revocations"]);
   assert.match(ui.text(), /needs the permission nodes\.approve/);
   assert.equal(ui.server.count("GET", "/v1/admin/nodes"), 0);
   window.location.hash = "#/audit";
@@ -218,7 +220,8 @@ test("the start route goes to the first screen the session may open, unknown rou
 
 test("signing out posts with the token and returns to the sign-in page", async () => {
   ui = await mount({ ...signedIn(), "GET /v1/admin/nodes": nodesPage([]), "POST /v1/web/logout": json(204, undefined) }, "#/nodes");
-  click(byText(ui.root, "button", "Sign out"));
+  click(ui.root.querySelector(".account-btn"));
+  click(byText(ui.root, '[role="menuitem"]', "Sign out"));
   await settle();
   const call = ui.server.calls.find((entry) => entry.path === "/v1/web/logout");
   assert.equal(call.headers["x-jaunt-csrf"], "csrf-token-one");

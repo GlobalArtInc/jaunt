@@ -5,18 +5,20 @@ import { chromium } from "playwright";
 
 import { startStub } from "./stub.mjs";
 
-const OUT = fileURLToPath(new URL("../screenshots-out/", import.meta.url));
+const OUT = (process.env.SCREENSHOT_DIR || fileURLToPath(new URL("../screenshots-out/after/", import.meta.url))).replace(/\/?$/, "/");
 const ALL = ["nodes.approve", "sessions.read", "recordings.read", "revocations.write", "audit.read"];
-const WIDTHS = [380, 1440];
-const THEMES = ["light", "dark"];
+const WIDTHS = process.env.SMOKE_WIDTHS ? process.env.SMOKE_WIDTHS.split(",").map(Number) : [380, 900, 1440];
+const THEMES = process.env.SMOKE_THEMES ? process.env.SMOKE_THEMES.split(",") : ["light", "dark"];
 
 const TEXT_PAIRS = [
-  ["--text", "--bg"], ["--text", "--surface"], ["--text", "--surface-2"], ["--text-muted", "--bg"], ["--text-muted", "--surface"], ["--text-muted", "--surface-2"],
-  ["--accent", "--bg"], ["--accent", "--surface"], ["--accent", "--accent-weak"], ["--on-accent", "--accent"], ["--text", "--accent-weak"],
-  ["--ok", "--ok-weak"], ["--warn", "--warn-weak"], ["--danger", "--danger-weak"], ["--ok", "--bg"], ["--warn", "--bg"], ["--danger", "--bg"], ["--danger", "--surface"],
+  ["--text", "--bg"], ["--text", "--canvas"], ["--text", "--surface"], ["--text", "--surface-2"], ["--text", "--surface-3"], ["--text", "--hover"],
+  ["--text-muted", "--bg"], ["--text-muted", "--canvas"], ["--text-muted", "--surface"], ["--text-muted", "--surface-2"], ["--text-muted", "--surface-3"], ["--text-muted", "--hover"],
+  ["--accent", "--bg"], ["--accent", "--canvas"], ["--accent", "--surface"], ["--accent", "--accent-weak"], ["--on-accent", "--accent"], ["--text", "--accent-weak"], ["--text-muted", "--accent-weak"],
+  ["--info", "--info-weak"], ["--text", "--info-weak"], ["--ok", "--ok-weak"], ["--warn", "--warn-weak"], ["--danger", "--danger-weak"], ["--ok", "--bg"], ["--warn", "--bg"], ["--danger", "--bg"], ["--danger", "--canvas"], ["--danger", "--surface"],
   ["--text", "--warn-weak"], ["--text", "--danger-weak"], ["--text", "--ok-weak"], ["--on-danger", "--danger-fill"],
 ];
-const NON_TEXT_PAIRS = [["--border-strong", "--bg"], ["--border-strong", "--surface"], ["--focus", "--bg"], ["--focus", "--surface"]];
+const NON_TEXT_PAIRS = [["--border-strong", "--bg"], ["--border-strong", "--canvas"], ["--border-strong", "--surface"], ["--border-strong", "--surface-3"], ["--focus", "--bg"], ["--focus", "--canvas"], ["--focus", "--surface"], ["--focus", "--accent-weak"]];
+const TOKENS = Array.from(new Set([...TEXT_PAIRS, ...NON_TEXT_PAIRS].flat()));
 
 let touchChecked = 0;
 const failures = [];
@@ -38,10 +40,10 @@ function ratio(first, second) {
 }
 
 async function tokenContrast(page, context) {
-  const tokens = await page.evaluate(() => {
+  const tokens = await page.evaluate((names) => {
     const style = getComputedStyle(document.documentElement);
-    return Object.fromEntries(Array.from(new Set(["--text", "--bg", "--surface", "--surface-2", "--text-muted", "--accent", "--accent-weak", "--on-accent", "--ok", "--ok-weak", "--warn", "--warn-weak", "--danger", "--danger-weak", "--danger-fill", "--on-danger", "--border-strong", "--focus"])).map((name) => [name, style.getPropertyValue(name)]));
-  });
+    return Object.fromEntries(names.map((name) => [name, style.getPropertyValue(name)]));
+  }, TOKENS);
   for (const [foreground, background] of TEXT_PAIRS) {
     const value = ratio(tokens[foreground], tokens[background]);
     if (value < 4.5) fail(context, `${foreground} on ${background} is ${value.toFixed(2)}`);
@@ -54,7 +56,7 @@ async function tokenContrast(page, context) {
 
 async function layoutChecks(page, context) {
   const result = await page.evaluate(() => {
-    const secondary = ".small, .muted, .badge, .chip, th, dt, label, legend, .field-hint, .sub, .crumbs, .nav-count, .who, .server, .num, .steps, .code, caption, .step-list li, .nav-group";
+    const secondary = ".small, .muted, .badge, .chip, th, dt, label, legend, .field-hint, .sub, .crumbs, .nav-count, .num, .steps, .code, caption, .step-list li, .rail-label, .menu-hint, .menu-heading, .bell-count, .avatar, .subnav-foot, .link-btn, .node-type, .node-warning, .node-meta, .sort-note, .node-host";
     const small = [];
     const lowContrast = [];
     const parse = (value) => {
@@ -102,11 +104,12 @@ async function layoutChecks(page, context) {
     const touch = [];
     let checked = 0;
     if (window.innerWidth <= 520) {
-      const targets = document.querySelectorAll("button, a.btn, select, textarea, input:not([type=hidden]):not([type=checkbox]):not([type=radio]), .mainnav a, table.data a, .crumbs a, a.chip");
+      const targets = document.querySelectorAll("button, a.btn, select, textarea, input:not([type=hidden]):not([type=checkbox]):not([type=radio]), .rail a, .subnav a, .tab, .icon-btn, .menu-item, table.data a, .crumbs a, a.chip, .node-name, .switch-field");
       for (const target of targets) {
         const rect = target.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0 || rect.bottom <= 0 || rect.top < -50 || target.closest(".visually-hidden") || target.classList.contains("skip")) continue;
         if (target.closest("[inert]") && !target.closest(".scrim")) continue;
+        if (getComputedStyle(target).visibility === "hidden" || target.closest("[hidden]")) continue;
         checked += 1;
         if (rect.height < 43.5) touch.push(target.tagName.toLowerCase() + "." + target.className + " " + rect.height.toFixed(1) + "px");
       }
@@ -146,12 +149,127 @@ async function focusRing(page, context) {
   if (checked === 0) fail(context, "nothing took keyboard focus");
 }
 
+
+const FOCUS_KINDS = ["hamburger", "rail-item", "subnav-item", "btn-connect", "tab", "search-input", "switch-input", "icon-btn", "account-btn", "node-name", "link-btn", "menu-item", "brand"];
+
+async function activeRing(page) {
+  return page.evaluate((kinds) => {
+    const active = document.activeElement;
+    if (!active || active === document.body) return null;
+    const classes = (active.getAttribute("class") || "").split(/\s+/);
+    const kind = kinds.find((name) => classes.includes(name)) || active.localName;
+    const target = classes.includes("switch-input") ? active.nextElementSibling : active;
+    const style = getComputedStyle(target);
+    return {
+      kind,
+      index: Array.from(document.querySelectorAll("*")).indexOf(active),
+      style: style.outlineStyle,
+      width: parseFloat(style.outlineWidth),
+      color: style.outlineColor,
+      text: (active.textContent || active.getAttribute("aria-label") || "").trim().slice(0, 24),
+    };
+  }, FOCUS_KINDS);
+}
+
+function ringProblem(ring) {
+  return ring.style === "none" || ring.width < 2 || /rgba\(0, 0, 0, 0\)/.test(ring.color);
+}
+
+async function walkTabOrder(page, context, required) {
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.focus(".skip");
+  const seen = new Set();
+  const kinds = new Set();
+  for (let step = 0; step < 160; step += 1) {
+    await page.keyboard.press("Tab");
+    const ring = await activeRing(page);
+    if (!ring || seen.has(ring.index)) break;
+    seen.add(ring.index);
+    kinds.add(ring.kind);
+    if (ringProblem(ring)) fail(context, `no visible focus ring on ${ring.kind} "${ring.text}": ${ring.style} ${ring.width}px ${ring.color}`);
+  }
+  for (const kind of required) {
+    if (!kinds.has(kind)) fail(context, `the tab order never reached a ${kind}`);
+  }
+  report.push(`${context} tab order ${seen.size} stops`);
+}
+
+async function walkMenu(page, context) {
+  await page.focus(".btn-connect");
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(".menu");
+  let items = 0;
+  for (let step = 0; step < 4; step += 1) {
+    const ring = await activeRing(page);
+    if (ring && ring.kind === "menu-item") {
+      items += 1;
+      if (ringProblem(ring)) fail(context, `no visible focus ring on a menu item "${ring.text}": ${ring.style} ${ring.width}px ${ring.color}`);
+    }
+    await page.keyboard.press("ArrowDown");
+  }
+  if (items < 2) fail(context, "the menu walk reached fewer than two items");
+  await page.keyboard.press("Escape");
+}
+
+async function switchTarget(page, context, width) {
+  const box = await page.evaluate(() => {
+    const field = document.querySelector(".switch-field");
+    const rect = field ? field.getBoundingClientRect() : null;
+    return rect ? { width: rect.width, height: rect.height } : null;
+  });
+  if (!box) return fail(context, "the Advanced switch is missing");
+  if (width <= 520 && box.height < 43.5) fail(context, `the Advanced switch is ${box.height.toFixed(1)}px tall`);
+  if (width <= 520 && box.width < 43.5) fail(context, `the Advanced switch is ${box.width.toFixed(1)}px wide`);
+}
+
 async function shot(page, name, context, checks = {}) {
   await page.waitForTimeout(50);
-  await page.screenshot({ path: `${OUT}${context}-${name}.png`, fullPage: true });
+  await page.screenshot({ path: `${OUT}${context}-${name}.png`, fullPage: checks.fullPage !== false });
   await layoutChecks(page, `${context} ${name}`);
   if (checks.focus !== false) await focusRing(page, `${context} ${name}`);
   report.push(`${context} ${name}`);
+}
+
+
+async function navigationChecks(page, context, width) {
+  const drawer = width <= 900;
+  const state = await page.evaluate(() => {
+    const visible = (node) => node && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== "hidden";
+    const rail = document.querySelector(".rail");
+    const subnav = document.querySelector(".subnav");
+    return {
+      hamburger: visible(document.querySelector(".hamburger")),
+      rail: visible(rail),
+      railWidth: rail ? rail.getBoundingClientRect().width : 0,
+      subnav: visible(subnav),
+      subnavWidth: subnav ? subnav.getBoundingClientRect().width : 0,
+      bell: visible(document.querySelector(".bell")),
+      account: visible(document.querySelector(".account-btn")),
+      mainLeft: document.querySelector("main").getBoundingClientRect().left,
+    };
+  });
+  if (!state.bell || !state.account) fail(context, "the bell or the account menu is not visible");
+  if (drawer) {
+    if (!state.hamburger) fail(context, "no hamburger in the drawer layout");
+    if (state.rail || state.subnav) fail(context, "the navigation is visible while the drawer is closed");
+    await page.click(".hamburger");
+    await page.waitForSelector(".drawer-open .sidebar");
+    const inside = await page.evaluate(() => document.querySelector("#sidebar").contains(document.activeElement));
+    if (!inside) fail(context, "focus did not move into the open drawer");
+    await shot(page, "drawer", context, { focus: false, fullPage: false });
+    for (let step = 0; step < 14; step += 1) await page.keyboard.press("Tab");
+    const trapped = await page.evaluate(() => document.querySelector("#sidebar").contains(document.activeElement));
+    if (!trapped) fail(context, "focus left the open drawer");
+    await page.keyboard.press("Escape");
+    const returned = await page.evaluate(() => document.activeElement === document.querySelector(".hamburger"));
+    if (!returned) fail(context, "focus did not return to the hamburger");
+    const closed = await page.evaluate(() => document.querySelector(".sidebar").getClientRects().length === 0);
+    if (!closed) fail(context, "the drawer did not close on Escape");
+  } else {
+    if (state.hamburger) fail(context, "the hamburger shows on a wide screen");
+    if (!state.rail || !state.subnav) fail(context, "the rail and the secondary panel are not both visible");
+    if (Math.abs(state.railWidth - 84) > 1 || Math.abs(state.subnavWidth - 220) > 1) fail(context, `rail ${state.railWidth}px and panel ${state.subnavWidth}px, expected 84 and 220`);
+  }
 }
 
 async function runMatrix(browser, stub, width, theme) {
@@ -160,7 +278,8 @@ async function runMatrix(browser, stub, width, theme) {
   const page = await browserContext.newPage();
   const problems = [];
   page.on("console", (message) => {
-    if (message.type() === "error" && !/status of (401|429)/.test(message.text())) problems.push("console: " + message.text());
+    const optional = /\/v1\/(web\/terminal\/targets|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
+    if (message.type() === "error" && !optional && !/status of (401|429)/.test(message.text())) problems.push("console: " + message.text());
   });
   page.on("pageerror", (error) => problems.push("pageerror: " + error.message));
   await page.addInitScript(() => {
@@ -175,10 +294,55 @@ async function runMatrix(browser, stub, width, theme) {
   await shot(page, "signin", context);
 
   await page.click("a.btn-primary");
-  await page.waitForSelector(".mainnav a");
-  await page.waitForSelector("tbody tr");
+  await page.waitForSelector(".rail a", { state: "attached" });
+  await page.waitForSelector(".node-card");
   if (!page.url().endsWith("#/nodes")) fail(context, "sign-in did not land on the nodes screen: " + page.url());
   await shot(page, "nodes", context);
+  await navigationChecks(page, context, width);
+  await switchTarget(page, context, width);
+  const wide = width > 900;
+  await walkTabOrder(page, context + " nodes", ["search-input", "switch-input", "tab", "btn-connect", "node-name", "icon-btn", "account-btn", ...(wide ? ["rail-item", "subnav-item"] : ["hamburger"])]);
+  await walkMenu(page, context + " connect menu");
+
+  await page.click("button[aria-label='List view']");
+  await page.waitForSelector(".node-row");
+  await shot(page, "nodes-list", context);
+  await page.click("button[aria-label='Grid view']");
+  await page.waitForSelector(".node-card");
+
+  await page.click(".node-card .link-btn");
+  await page.click(".node-card button[aria-label^='Connect to']");
+  await page.waitForSelector(".menu");
+  await shot(page, "nodes-connect-menu", context, { focus: false, fullPage: false });
+  await page.keyboard.press("Escape");
+  stub.setTargets([{ node: "web-01", labels: {}, connected: true, logins: ["deploy", "root"] }]);
+  await page.goto(stub.origin + "/#/nodes?sort=recent");
+  await page.reload();
+  await page.waitForSelector(".node-card");
+  await page.waitForTimeout(150);
+  await page.click(".node-card:has(a.node-name:text-is('web-01')) button[aria-label^='Connect to']");
+  await page.waitForSelector(".menu a[role=menuitem]:has-text('Open terminal as deploy')");
+  await shot(page, "nodes-connect-targets", context, { focus: false, fullPage: false });
+  await page.keyboard.press("Escape");
+  stub.setTargets(null);
+
+  await page.goto(stub.origin + "/#/nodes?q=web");
+  await page.waitForSelector(".node-card");
+  await page.click(".switch-field");
+  await page.waitForSelector(".advanced:not([hidden])");
+  await shot(page, "nodes-advanced", context);
+  await page.goto(stub.origin + "/#/nodes?tab=pending");
+  await page.waitForSelector(".empty");
+  await shot(page, "nodes-pending", context);
+  await page.goto(stub.origin + "/#/terminal");
+  await page.waitForSelector(".empty");
+  await shot(page, "terminal", context);
+  await page.click(".account-btn");
+  await page.waitForSelector(".menu");
+  await shot(page, "account-menu", context, { focus: false, fullPage: false });
+  await page.keyboard.press("Escape");
+  await page.goto(stub.origin + "/#/nodes");
+  await page.waitForSelector(".node-card");
 
   await page.goto(stub.origin + "/#/nodes/n-1");
   await page.waitForSelector(".kv");
@@ -272,11 +436,11 @@ async function runForbidden(browser, width, theme) {
   const page = await browserContext.newPage();
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");
-  await page.waitForSelector(".mainnav a");
+  await page.waitForSelector(".rail a", { state: "attached" });
   await page.goto(stub.origin + "/#/nodes");
   await page.waitForSelector("text=Not allowed");
-  const links = await page.$$eval(".mainnav a", (nodes) => nodes.map((node) => node.getAttribute("href")));
-  if (links.join() !== "#/sessions,#/revocations") fail(context, "navigation shows " + links.join());
+  const links = await page.$$eval(".rail a", (nodes) => nodes.map((node) => node.getAttribute("href")));
+  if (links.join() !== "#/sessions,#/terminal,#/revocations") fail(context, "navigation shows " + links.join());
   await shot(page, "forbidden", context);
   await browserContext.close();
   await stub.close();

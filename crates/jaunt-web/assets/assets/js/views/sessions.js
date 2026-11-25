@@ -1,8 +1,9 @@
 import { el, replace, encodeSegment } from "../dom.js";
 import { bytes, clean, parseUtcInput, span, time } from "../format.js";
 import { S } from "../strings.js";
-import { badge, button, crumbs, errorLine, facts, field, pageHead, panel, selectInput, textInput } from "../ui.js";
-import { emptyState, filterBar, pagedTable, takeFlash, timeFilterField } from "./shared.js";
+import { badge, button, crumbs, errorLine, facts, field, pageHead, panel, textInput } from "../ui.js";
+import { icon } from "../icons.js";
+import { dropdown, emptyState, filterBar, pagedTable, radioItems, takeFlash, timeFilterField, toolbar } from "./shared.js";
 import { recordingPanel } from "./recording.js";
 import { openRevokeDialog } from "./revocations.js";
 
@@ -60,14 +61,18 @@ export async function sessionsView(ctx) {
   };
   const filtered = Object.values(values).some((value) => value !== "");
 
-  const stateSelect = selectInput([["", S.sessions.any], ["routed", S.sessions.stateRouted], ["active", S.sessions.stateActive], ["ended", S.sessions.stateEnded]], values.state);
-  const userInput = textInput({ value: values.user, maxlength: 128 });
   const nodeInput = textInput({ value: values.node, maxlength: 128 });
   const loginInput = textInput({ value: values.login, maxlength: 128 });
   const fromField = timeFilterField(S.sessions.filterFrom, "sessions-from", values.from);
   const toField = timeFilterField(S.sessions.filterTo, "sessions-to", values.to);
   const filterError = el("div", { role: "alert" });
   const status = el("div", {});
+  const stateNames = { "": S.sessions.any, routed: S.sessions.stateRouted, active: S.sessions.stateActive, ended: S.sessions.stateEnded };
+
+  function go(overrides) {
+    const next = { ...values, ...overrides };
+    ctx.navigate("/sessions", next);
+  }
 
   function apply() {
     const from = fromField.querySelector("input").value;
@@ -77,7 +82,7 @@ export async function sessionsView(ctx) {
       return;
     }
     filterError.replaceChildren();
-    ctx.navigate("/sessions", { state: stateSelect.value, user: userInput.value.trim(), node: nodeInput.value.trim(), login: loginInput.value.trim(), from, to });
+    go({ user: search.input.value.trim(), node: nodeInput.value.trim(), login: loginInput.value.trim(), from, to });
   }
 
   const table = pagedTable({
@@ -104,7 +109,7 @@ export async function sessionsView(ctx) {
       outcome(session),
       bytes(session.bytes_in) + " / " + bytes(session.bytes_out),
     ],
-    empty: () => emptyState(filtered ? S.sessions.empty : S.sessions.emptyAll),
+    empty: () => emptyState(filtered ? S.sessions.empty : S.sessions.emptyAll, null, null, "pulse"),
     fetchPage: async (cursor) => {
       const from = parseUtcInput(values.from);
       const to = parseUtcInput(values.to);
@@ -158,25 +163,30 @@ export async function sessionsView(ctx) {
     }
   });
 
-  const filters = filterBar(
-    [
-      field({ label: S.sessions.filterState, control: stateSelect }),
-      field({ label: S.sessions.filterUser, control: userInput }),
-      field({ label: S.sessions.filterNode, control: nodeInput }),
-      field({ label: S.sessions.filterLogin, control: loginInput }),
-      fromField,
-      toField,
-      filterError,
-    ],
-    { onSubmit: apply, onReset: () => ctx.navigate("/sessions", {}) },
+  const search = filterBar({
+    label: S.sessions.searchLabel,
+    placeholder: S.sessions.search,
+    value: values.user,
+    advancedOpen: values.node !== "" || values.login !== "" || values.from !== "" || values.to !== "",
+    advanced: [field({ label: S.sessions.filterNode, control: nodeInput }), field({ label: S.sessions.filterLogin, control: loginInput }), fromField, toField],
+    onSubmit: apply,
+    onReset: () => ctx.navigate("/sessions", {}),
+  });
+  const stateMenu = dropdown({
+    label: S.sessions.stateButton(stateNames[values.state]),
+    items: () => radioItems(Object.entries(stateNames), values.state, (value) => go({ state: value })),
+  });
+  const refreshButton = el("button", { type: "button", class: "btn btn-menu", on: { click: refresh } }, icon("refresh", { size: "sm" }), el("span", { class: "btn-text", text: S.sessions.refresh }));
+  const autoField = el("div", { class: "check" }, autoBox, el("label", { for: "sessions-auto", text: S.sessions.auto }));
+  replace(
+    ctx.main,
+    pageHead(S.sessions.heading),
+    search.element,
+    filterError,
+    toolbar([stateMenu.element, status], [refreshButton]),
+    autoField,
+    el("section", { class: "results", "aria-label": S.sessions.heading }, table.element),
   );
-  const controls = el(
-    "div",
-    { class: "load-more" },
-    button(S.sessions.refresh, { onClick: refresh }),
-    el("div", { class: "check" }, autoBox, el("label", { for: "sessions-auto", text: S.sessions.auto })),
-  );
-  replace(ctx.main, pageHead(S.sessions.heading, { sub: "" }), status, el("section", { class: "panel", "aria-label": S.sessions.heading }, filters, controls, table.element));
   try {
     await table.load();
   } catch (error) {

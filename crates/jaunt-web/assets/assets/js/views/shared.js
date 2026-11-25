@@ -1,24 +1,83 @@
-import { el } from "../dom.js";
+import { el, uniqueId } from "../dom.js";
+import { icon } from "../icons.js";
+import { menuButton } from "../menu.js";
 import { genericMessage } from "../errors.js";
 import { timeWithSeconds } from "../format.js";
 import { S } from "../strings.js";
 import { banner, button, dataTable, errorLine, loadMoreBar } from "../ui.js";
 
-export function filterBar(fields, { onSubmit, onReset }) {
+export function filterBar({ label, placeholder, value, advanced, advancedOpen, advancedLabel, onSubmit, onReset }) {
+  const input = el("input", {
+    type: "search",
+    class: "search-input",
+    value: value || "",
+    placeholder,
+    "aria-label": label,
+    autocomplete: "off",
+    spellcheck: "false",
+    maxlength: "128",
+  });
+  const advancedId = uniqueId("advanced");
+  const toggle = el("input", { type: "checkbox", role: "switch", class: "switch-input", checked: Boolean(advancedOpen), "aria-controls": advancedId });
+  const panel = el(
+    "div",
+    { class: "advanced", id: advancedId, hidden: !advancedOpen, role: "group", "aria-label": advancedLabel || S.advanced },
+    advanced,
+    el("div", { class: "actions" }, button(S.apply, { kind: "primary", type: "submit" }), button(S.reset, { onClick: onReset })),
+  );
   const form = el(
     "form",
     { class: "filters", role: "search", novalidate: true },
-    fields,
-    el("div", { class: "actions" }, button(S.apply, { kind: "primary", type: "submit" }), button(S.reset, { onClick: onReset })),
+    el(
+      "div",
+      { class: "searchbar" },
+      el("span", { class: "search-field" }, icon("search"), input),
+      el("label", { class: "switch-field" }, toggle, el("span", { class: "switch-track", "aria-hidden": "true" }), el("span", { class: "switch-text", text: S.advanced })),
+    ),
+    panel,
   );
+  toggle.addEventListener("change", () => {
+    panel.hidden = !toggle.checked;
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      onSubmit();
+    }
+  });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     onSubmit();
   });
-  return form;
+  return { element: form, input, toggle, panel };
 }
 
-export function pagedTable({ caption, columns, toRow, fetchPage, empty, onLoaded }) {
+export function toolbar(start, end) {
+  return el("div", { class: "toolbar" }, el("div", { class: "toolbar-group" }, ...start), el("div", { class: "toolbar-group toolbar-end" }, ...end));
+}
+
+export function iconButton({ name, label, onClick, pressed, id }) {
+  return el(
+    "button",
+    { type: "button", class: "icon-btn", "aria-label": label, "aria-pressed": pressed === undefined ? null : String(Boolean(pressed)), id, on: onClick ? { click: onClick } : {} },
+    icon(name),
+  );
+}
+
+export function dropdown({ label, items, align, className, icon: iconName }) {
+  return menuButton({
+    className: className || "btn btn-menu",
+    align,
+    content: [iconName ? icon(iconName, { size: "sm" }) : null, el("span", { class: "btn-text", text: label }), icon("chevronDown", { size: "sm" })],
+    items,
+  });
+}
+
+export function radioItems(options, current, onChoose) {
+  return options.map(([value, text]) => ({ text, role: "menuitemradio", checked: value === current, onSelect: () => onChoose(value) }));
+}
+
+export function pagedTable({ caption, columns, toRow, renderItems, fetchPage, empty, onLoaded }) {
   const host = el("div", {});
   const tableSlot = el("div", {});
   const errorSlot = el("div", {});
@@ -33,7 +92,7 @@ export function pagedTable({ caption, columns, toRow, fetchPage, empty, onLoaded
     if (items.length === 0) {
       tableSlot.replaceChildren(empty());
     } else {
-      tableSlot.replaceChildren(dataTable({ caption, columns, rows: items.map(toRow) }));
+      tableSlot.replaceChildren(renderItems ? renderItems(items, next !== null) : dataTable({ caption, columns, rows: items.map(toRow) }));
     }
     paintBar();
   }
@@ -73,7 +132,7 @@ export function pagedTable({ caption, columns, toRow, fetchPage, empty, onLoaded
     }
   }
 
-  return { element: host, load, items: () => items };
+  return { element: host, load, repaint: paint, items: () => items, hasMore: () => next !== null };
 }
 
 let flash = null;
@@ -88,8 +147,14 @@ export function takeFlash() {
   return current ? banner(current.kind, current.text) : null;
 }
 
-export function emptyState(heading, body, extra) {
-  return el("div", { class: "empty" }, el("h2", { text: heading }), body ? el("p", { text: body }) : null, extra || null);
+export function emptyState(heading, body, extra, iconName) {
+  return el(
+    "div",
+    { class: "empty" },
+    el("div", { class: "empty-head" }, icon(iconName || "database", { size: "lg" }), el("h2", { text: heading })),
+    body ? el("p", { text: body }) : null,
+    extra || null,
+  );
 }
 
 export function splitLabels(text) {

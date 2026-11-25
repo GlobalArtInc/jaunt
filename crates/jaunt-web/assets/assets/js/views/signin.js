@@ -1,5 +1,6 @@
 import { el, replace } from "../dom.js";
 import { S } from "../strings.js";
+import { wordmark } from "../shell.js";
 import { banner, button } from "../ui.js";
 
 const RETURN_PATH = /^#\/[A-Za-z0-9\/_\-.]*$/;
@@ -15,7 +16,7 @@ export function renderSignIn(root, { notice, expired, error, onRetry } = {}) {
   const card = el(
     "section",
     { class: "card", "aria-labelledby": "signin-title" },
-    el("div", { class: "brand-row" }, el("span", { class: "brand-mark", "aria-hidden": "true", text: "J" }), S.product),
+    el("div", { class: "brand-row" }, wordmark()),
     el("h1", { id: "signin-title", text: expired ? S.expired.heading : S.signIn.heading }),
   );
   if (expired) {

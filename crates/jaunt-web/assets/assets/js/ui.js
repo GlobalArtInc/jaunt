@@ -1,5 +1,6 @@
 import { el, uniqueId } from "./dom.js";
 import { clean } from "./format.js";
+import { icon } from "./icons.js";
 import { S } from "./strings.js";
 
 const BADGE_KINDS = new Set(["ok", "off", "warn", "danger", "info", "live", "plain"]);
@@ -36,7 +37,12 @@ export function banner(kind, title, body, ...actions) {
   if (actions.length > 0) {
     parts.push(el("div", { class: "actions" }, ...actions));
   }
-  return el("div", { class: "banner banner-" + kind, role: kind === "danger" || kind === "warn" ? "alert" : "status" }, ...parts);
+  return el(
+    "div",
+    { class: "banner banner-" + kind, role: kind === "danger" || kind === "warn" ? "alert" : "status" },
+    el("span", { class: "banner-icon" }, icon(kind === "info" ? "info" : "alert")),
+    el("div", { class: "banner-body" }, ...parts),
+  );
 }
 
 export function chips(labels, hrefFor) {
@@ -48,7 +54,7 @@ export function chips(labels, hrefFor) {
     "span",
     { class: "chips" },
     entries.map(([key, value]) => {
-      const inner = [el("span", { class: "k", text: clean(key) }), "=", clean(value)];
+      const inner = [el("span", { class: "k", text: clean(key) + ":" }), " ", clean(value)];
       if (hrefFor) {
         return el("a", { class: "chip chip-link", href: hrefFor(key, value) }, ...inner);
       }

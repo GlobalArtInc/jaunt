@@ -17,7 +17,19 @@ afterEach(() => {
 const hostileLabels = { [HOSTILE.tag]: HOSTILE.quote, rtl: HOSTILE.rtl, [HOSTILE.control]: HOSTILE.link };
 
 function assertInert(scope) {
-  assert.equal(scope.querySelectorAll("img, script, iframe, object, embed, svg, style, link, form[action]").length, 0, "no element may come from data");
+  assert.equal(scope.querySelectorAll("img, script, iframe, object, embed, style, link, form[action]").length, 0, "no element may come from data");
+  for (const drawing of scope.querySelectorAll("svg")) {
+    assert.equal(drawing.getAttribute("class").startsWith("icon"), true, "only the static icons are drawings");
+    for (const part of drawing.querySelectorAll("*")) {
+      assert.match(part.localName, /^(path|circle|rect|ellipse)$/, "icons hold plain shapes only");
+      for (const attribute of part.getAttributeNames()) {
+        assert.doesNotMatch(attribute, /href|^on|style/i, attribute);
+      }
+    }
+    for (const attribute of drawing.getAttributeNames()) {
+      assert.doesNotMatch(attribute, /href/i);
+    }
+  }
   for (const element of scope.querySelectorAll("*")) {
     for (const attribute of element.attributes) {
       assert.doesNotMatch(attribute.name, /^on/i, attribute.name);
@@ -128,11 +140,29 @@ test("the markup helper refuses event handler attributes, style attributes and u
 test("a hostile display name and hostile groups are shown as text in the header and on the not allowed page", async () => {
   ui = await mount({ ...signedIn(["audit.read"], { display_name: HOSTILE.tag }), "GET /v1/admin/audit": json(200, { events: [], next_cursor: null }) }, "#/audit");
   assertInert(ui.root);
-  assertShowsAsText(ui.root.querySelector(".who"), HOSTILE.tag);
+  assertShowsAsText(ui.root.querySelector(".account-btn"), HOSTILE.tag);
   ui.stop();
   ui = await mount({ "GET /v1/web/session": json(200, sessionFixture([], { groups: [HOSTILE.tag, HOSTILE.quote, HOSTILE.rtl], display_name: HOSTILE.quote })) });
   assertInert(ui.root);
   assertShowsAsText(ui.root, HOSTILE.tag, HOSTILE.quote);
+});
+
+test("hostile labels in the Labels menu and a hostile display name in the account menu are text and nothing else", async () => {
+  const bad = node({ name: HOSTILE.tag, labels: hostileLabels });
+  ui = await mount({ ...signedIn(["nodes.approve"], { display_name: HOSTILE.tag + HOSTILE.rtl }), "GET /v1/admin/nodes": json(200, { nodes: [bad], next: "more", pending_enrolments: 0 }) }, "#/nodes");
+  const labelsButton = Array.from(ui.root.querySelectorAll("button")).find((button) => button.textContent.trim() === "Labels");
+  click(labelsButton);
+  const menu = ui.root.querySelector(".menu");
+  assert.ok(menu.querySelectorAll('[role="menuitemcheckbox"]').length >= 3);
+  assertInert(ui.root);
+  assertShowsAsText(menu, HOSTILE.tag);
+  assert.match(menu.textContent, /loaded so far/);
+  click(labelsButton);
+  click(ui.root.querySelector(".account-btn"));
+  const account = ui.root.querySelector(".menu");
+  assertInert(ui.root);
+  assert.ok(account.querySelector(".menu-heading").textContent.includes(HOSTILE.tag));
+  assert.doesNotMatch(account.textContent, /[‪-‮⁦-⁩​-‏]/);
 });
 
 test("the removal note and the approval results show hostile names as text", async () => {

@@ -10,7 +10,9 @@ Dev-only. Nothing here is embedded in the binary or part of the Rust workspace.
 
 `npm test` runs the DOM tests (node:test and jsdom) against the real modules in `crates/jaunt-web/assets`.
 
-`npm run smoke` starts an API stub that serves the embedded assets with the daemon's CSP, then drives Chromium at 380 px and 1440 px in the light and dark themes. It checks horizontal overflow, minimum font sizes, rendered text contrast, token contrast, focus rings, dialog focus and CSP violations, and writes screenshots to `screenshots-out/` (git-ignored).
+`npm run smoke` starts an API stub that serves the embedded assets with the daemon's CSP, then drives Chromium at 380 px, 900 px and 1440 px in the light and dark themes. It covers every screen, the node cards and list, the Connect and account menus, the navigation drawer below 900 px (focus trap, Escape, focus return) and the three-column shell at wide widths. It checks horizontal overflow, minimum font sizes, rendered text contrast, token contrast, focus rings, touch targets, dialog focus and CSP violations, and writes screenshots to `screenshots-out/after/` (git-ignored). `SCREENSHOT_DIR` changes the output directory and `JAUNT_ASSETS` serves another copy of the assets.
+
+`npm run smoke:before` renders the same screens from an earlier commit into `screenshots-out/before/`, so the two sets can be compared side by side. It reads the assets and the smoke scripts of the commit named by `BEFORE_REF` (default `HEAD`, so run it before committing a redesign or pass the previous commit).
 
 `npm run smoke:recording` drives the recording player in Chromium against the same stub at 380 px and 1440 px in both themes: it plays a recorded cast and a hostile one, checks layout, keyboard control, minimum font sizes, contrast, the content security policy and the requests the page makes, and writes screenshots to `screenshots-out/`. The stub serves generated casts from `smoke/casts.mjs`; a recording from a real node is not used.
 

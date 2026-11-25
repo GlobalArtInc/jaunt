@@ -44,15 +44,15 @@ async function signIn(page, context) {
   await page.waitForSelector("a.btn-primary");
   await shot(page, context, "signin");
   await page.click("a.btn-primary");
-  await page.waitForSelector(".mainnav a");
+  await page.waitForSelector(".rail a", { state: "attached" });
   if (!page.url().endsWith("#/nodes")) {
     fail(context, `sign-in did not land on the nodes screen: ${page.url()}`);
   }
 }
 
 async function listNodes(page, context) {
-  await page.waitForSelector("tbody tr");
-  const text = await page.innerText("tbody");
+  await page.waitForSelector(".node-card");
+  const text = await page.innerText(".node-grid");
   for (const name of ["node-a", "node-b"]) {
     if (!text.includes(name)) {
       fail(context, `the node list does not show ${name}: ${text.slice(0, 200)}`);

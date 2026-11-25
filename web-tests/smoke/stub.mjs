@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ASSETS = resolve(fileURLToPath(new URL("../../crates/jaunt-web/assets", import.meta.url)));
+const ASSETS = resolve(process.env.JAUNT_ASSETS || fileURLToPath(new URL("../../crates/jaunt-web/assets", import.meta.url)));
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
 const COOKIE = "jaunt_stub";
@@ -42,6 +42,10 @@ function seedNodes() {
     make(6, "build-cache", { env: "dev", team: "platform" }, { connected: false, connected_since: null, revoked: true, certificates: { state: "delivered", x509_expires_at: t - 2 * 86400, ssh_host_expires_at: t - 2 * 86400 } }),
     make(7, "x".repeat(60) + "-very-long-node-name", { "a-very-long-label-key-for-testing": "value-" + "v".repeat(70) }, { hostname: "long-" + "h".repeat(70) + ".example.com" }),
     make(8, '<img src=x onerror="window.__pwned=1">', { '"><script>1</script>': "‮txt.exe" }),
+    make(9, "queue-01", { env: "prod", team: "platform", service: "queue", region: "eu", tier: "gold" }),
+    make(10, "cache-02", { env: "staging", team: "platform", service: "cache" }),
+    make(11, "mail-01", { env: "prod", team: "comms" }, { connected: false, connected_since: null, certificates: { state: "pending" } }),
+    make(12, "metrics-01", { env: "prod", team: "sre", service: "metrics", region: "us" }),
   ];
 }
 
@@ -75,6 +79,7 @@ export async function startStub({ permissions }) {
     enrolments: new Map(),
     sessionsTokens: new Map(),
     lookupLimited: false,
+    targets: null,
     recordings: new Map(),
     recordingRequests: [],
     log: [],
@@ -136,6 +141,10 @@ export async function startStub({ permissions }) {
       send(response, 200, { code });
       return;
     }
+    if (path === "/v1/client-config" && method === "GET") {
+      send(response, 200, { ssh_suffix: "jaunt.example.com", gate: { host: "gate.example.com", port: 22 }, host_ca_keys: [] });
+      return;
+    }
     const current = sessionOf(request);
     if (!current) {
       send(response, 401, { error: "unauthorized" });
@@ -151,6 +160,10 @@ export async function startStub({ permissions }) {
         send(response, 403, { error: "forbidden" });
         return;
       }
+    }
+    if (path === "/v1/web/terminal/targets" && method === "GET") {
+      if (state.targets === null) return send(response, 404, { error: "not_found" });
+      return send(response, 200, state.targets);
     }
     if (path === "/v1/web/logout" && method === "POST") {
       send(response, 204, undefined);
@@ -323,6 +336,9 @@ export async function startStub({ permissions }) {
     expireSessions: () => state.sessionsTokens.clear(),
     setRecording(id, manifest, cast) {
       state.recordings.set(id, { manifest, cast });
+    },
+    setTargets(targets) {
+      state.targets = targets;
     },
     setNodes(nodes) {
       state.nodes = nodes;

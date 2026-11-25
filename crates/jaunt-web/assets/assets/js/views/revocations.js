@@ -178,13 +178,13 @@ export async function revocationsView(ctx) {
       }
       return row;
     },
-    empty: () => emptyState(S.revocations.empty),
+    empty: () => emptyState(S.revocations.empty, null, null, "shield"),
     fetchPage: async (cursor) => {
       const page = await ctx.api.get(REVOCATIONS, { limit: 50, after: cursor });
       return { items: page.revocations, next: page.next };
     },
   });
   const actions = canWrite ? [button(S.revocations.create, { kind: "primary", onClick: () => openRevokeDialog(ctx, { onDone: () => ctx.navigate("/revocations", {}) }) })] : [];
-  replace(ctx.main, takeFlash(), pageHead(S.revocations.heading, { actions }), el("section", { class: "panel", "aria-label": S.revocations.heading }, table.element));
+  replace(ctx.main, takeFlash(), pageHead(S.revocations.heading, { actions }), el("section", { class: "results", "aria-label": S.revocations.heading }, table.element));
   await table.load();
 }

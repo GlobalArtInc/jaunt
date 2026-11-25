@@ -213,11 +213,12 @@ test("approving or rejecting refreshes the pending count in the navigation", asy
     [APPROVE]: approved(),
     "GET /v1/admin/nodes": json(200, { nodes: [], next: null, pending_enrolments: 3 }),
   }, "#/approve");
-  assert.doesNotMatch(ui.root.querySelector(".mainnav").textContent, /pending/);
+  assert.equal(ui.root.querySelector(".bell-count"), null);
   await enterCode();
   click(byText(ui.root, "button", "Approve web-03"));
   await settle();
-  assert.match(ui.root.querySelector(".mainnav").textContent, /3 pending/);
+  assert.equal(ui.root.querySelector(".bell-count").textContent, "3");
+  assert.equal(ui.root.querySelector(".bell").getAttribute("aria-label"), "3 pending enrolments");
   assert.equal(ui.server.calls.find((entry) => entry.path === "/v1/admin/nodes").query.get("limit"), "1");
 });
 
@@ -430,6 +431,7 @@ test("leaving the sessions screen stops its refresh timer", async () => {
 
 test("a node whose certificate is still pending renders a minimal row", async () => {
   ui = await mount({ ...signedIn(), "GET /v1/admin/nodes": json(200, { nodes: [node({ certificates: { state: "pending" }, connected_since: null, connected: false })], next: null, pending_enrolments: 0 }) }, "#/nodes");
+  click(ui.root.querySelector('button[aria-label="List view"]'));
   assert.match(ui.text(), /Certificate pending/);
 });
 

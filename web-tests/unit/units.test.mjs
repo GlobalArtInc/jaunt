@@ -21,18 +21,19 @@ test("query strings encode separators, fragments and unicode so every value roun
   assert.equal(queryString({}), "");
 });
 
-test("the theme toggle cycles auto, light and dark, persists the choice and the early script restores it", async () => {
+test("the theme setting takes auto, light and dark, persists the choice and the early script restores it", async () => {
   const dom = installDom();
-  const { cycleTheme, currentTheme } = await import(JS + "js/theme.js");
+  const { setTheme, currentTheme } = await import(JS + "js/theme.js");
   assert.equal(currentTheme(), "auto");
-  assert.equal(cycleTheme(), "light");
+  assert.equal(setTheme("light"), "light");
   assert.equal(window.localStorage.getItem("jaunt-theme"), "light");
-  assert.equal(cycleTheme(), "dark");
+  assert.equal(setTheme("dark"), "dark");
   assert.equal(window.localStorage.getItem("jaunt-theme"), "dark");
   document.documentElement.removeAttribute("data-theme");
   window.eval(await readFile(new URL(JS + "theme-init.js", import.meta.url), "utf8"));
   assert.equal(document.documentElement.getAttribute("data-theme"), "dark");
-  assert.equal(cycleTheme(), "auto");
+  assert.equal(setTheme("auto"), "auto");
+  assert.equal(setTheme("<bad>"), "auto");
   assert.equal(window.localStorage.getItem("jaunt-theme"), null);
   assert.equal(document.documentElement.hasAttribute("data-theme"), false);
   window.localStorage.setItem("jaunt-theme", "<script>");

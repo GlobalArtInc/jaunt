@@ -81,7 +81,8 @@ async function instrument(browserContext, origin, context) {
   const problems = [];
   const requests = [];
   page.on("console", (message) => {
-    if ((message.type() === "error" || message.type() === "warning") && !/status of 401/.test(message.text())) {
+    const optional = /\/v1\/(web\/terminal\/targets|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
+    if ((message.type() === "error" || message.type() === "warning") && !optional && !/status of 401/.test(message.text())) {
       problems.push("console " + message.type() + ": " + message.text().slice(0, 200));
     }
   });
@@ -93,7 +94,7 @@ async function instrument(browserContext, origin, context) {
   page.on("request", (request) => requests.push(request.url()));
   page.on("requestfailed", (request) => problems.push("request failed: " + request.url()));
   page.on("response", (response) => {
-    if (response.status() >= 400 && !/\/v1\/web\/session$/.test(response.url())) {
+    if (response.status() >= 400 && !/\/v1\/(web\/session|web\/terminal\/targets|client-config)$/.test(response.url())) {
       problems.push("http " + response.status() + ": " + response.url().replace(origin, ""));
     }
   });
@@ -193,7 +194,7 @@ async function runContext(browser, stub, width, theme) {
   const { page, problems, requests } = await instrument(browserContext, stub.origin, context);
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");
-  await page.waitForSelector(".mainnav a");
+  await page.waitForSelector(".rail a", { state: "attached" });
 
   stub.state.recordingRequests.length = 0;
   await page.goto(stub.origin + "/#/sessions/" + IDS.rich);
@@ -283,7 +284,7 @@ async function runContext(browser, stub, width, theme) {
     pwned: window.__pwned,
     longest: Math.max(0, ...window.__long),
     resizeListeners: window.__resizeListeners,
-    foreign: document.querySelectorAll(".recording img, .recording iframe, .recording object, .recording embed, .recording svg, .recording style, .recording script, .player-screen a").length,
+    foreign: document.querySelectorAll(".recording img, .recording iframe, .recording object, .recording embed, .recording svg:not(.icon), .recording style, .recording script, .player-screen a").length,
     scripts: document.querySelectorAll("script").length,
     skipped: document.querySelector(".recording [role=status]:not(.visually-hidden)")?.textContent || "",
     hash: location.hash,
@@ -338,7 +339,7 @@ async function runReader(browser, width) {
   const { page, problems, requests } = await instrument(browserContext, stub.origin, context);
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");
-  await page.waitForSelector(".mainnav a");
+  await page.waitForSelector(".rail a", { state: "attached" });
   await page.goto(stub.origin + "/#/sessions/" + IDS.rich);
   await page.waitForSelector("text=not its content");
   await shot(page, "no-permission", context);

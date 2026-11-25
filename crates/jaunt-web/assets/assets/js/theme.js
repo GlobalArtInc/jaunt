@@ -1,5 +1,3 @@
-import { S } from "./strings.js";
-
 const KEY = "jaunt-theme";
 const ORDER = ["auto", "light", "dark"];
 
@@ -16,13 +14,8 @@ function apply(theme) {
   }
 }
 
-export function themeLabel() {
-  const theme = currentTheme();
-  return S.themeLabel(theme.charAt(0).toUpperCase() + theme.slice(1));
-}
-
-export function cycleTheme() {
-  const next = ORDER[(ORDER.indexOf(currentTheme()) + 1) % ORDER.length];
+export function setTheme(requested) {
+  const next = ORDER.includes(requested) ? requested : "auto";
   apply(next);
   try {
     if (next === "auto") {

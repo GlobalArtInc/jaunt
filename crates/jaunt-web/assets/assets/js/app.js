@@ -3,35 +3,35 @@ import { el, replace } from "./dom.js";
 import { closeRouteDialogs, openDialog } from "./dialog.js";
 import { renderForbidden, renderNotFound, renderProblem } from "./errors.js";
 import { S } from "./strings.js";
-import { cycleTheme, themeLabel } from "./theme.js";
+import { closeOpenMenu } from "./menu.js";
+import { createConnectInfo } from "./connect.js";
+import { firstAllowedHref, hasPermission } from "./nav.js";
+import { createShell } from "./shell.js";
 import { button } from "./ui.js";
 import { auditView } from "./views/audit.js";
 import { approveView } from "./views/approve.js";
-import { nodeView, nodesView } from "./views/nodes.js";
+import { nodeView } from "./views/nodes.js";
+import { nodesView } from "./views/nodes-list.js";
 import { revocationsView } from "./views/revocations.js";
 import { renderSignIn, loginHref } from "./views/signin.js";
 import { sessionView, sessionsView } from "./views/sessions.js";
+import { terminalView } from "./views/terminal.js";
 
-const NAV = [
-  { id: "nodes", href: "#/nodes", label: S.nav.nodes, permission: "nodes.approve" },
-  { id: "sessions", href: "#/sessions", label: S.nav.sessions, permission: "sessions.read" },
-  { id: "audit", href: "#/audit", label: S.nav.audit, permission: "audit.read" },
-  { id: "revocations", href: "#/revocations", label: S.nav.revocations, permission: "sessions.read" },
-];
+const PENDING_MAX_AGE_MS = 60000;
+const NODES_PAGE = (query) => (query.get("tab") === "pending" ? "pending" : "nodes");
 
 const ROUTES = [
-  { pattern: /^\/nodes$/, view: nodesView, permission: "nodes.approve", nav: "nodes", title: S.titles.nodes },
-  { pattern: /^\/nodes\/([^/]+)$/, view: nodeView, permission: "nodes.approve", nav: "nodes", title: S.titles.nodes },
-  { pattern: /^\/approve$/, view: approveView, permission: "nodes.approve", nav: "nodes", title: S.titles.approve },
-  { pattern: /^\/sessions$/, view: sessionsView, permission: "sessions.read", nav: "sessions", title: S.titles.sessions },
-  { pattern: /^\/sessions\/([^/]+)$/, view: sessionView, permission: "sessions.read", nav: "sessions", title: S.titles.sessions },
-  { pattern: /^\/revocations$/, view: revocationsView, permission: "sessions.read", nav: "revocations", title: S.titles.revocations },
-  { pattern: /^\/audit$/, view: auditView, permission: "audit.read", nav: "audit", title: S.titles.audit },
+  { pattern: /^\/nodes$/, view: nodesView, permission: "nodes.approve", area: "nodes", page: NODES_PAGE, title: S.titles.nodes, reportsPending: true },
+  { pattern: /^\/nodes\/([^/]+)$/, view: nodeView, permission: "nodes.approve", area: "nodes", page: () => "nodes", title: S.titles.nodes },
+  { pattern: /^\/approve$/, view: approveView, permission: "nodes.approve", area: "nodes", page: () => "approve", title: S.titles.approve, reportsPending: true },
+  { pattern: /^\/sessions$/, view: sessionsView, permission: "sessions.read", area: "sessions", page: () => "sessions", title: S.titles.sessions },
+  { pattern: /^\/sessions\/([^/]+)$/, view: sessionView, permission: "sessions.read", area: "sessions", page: () => "sessions", title: S.titles.sessions },
+  { pattern: /^\/revocations$/, view: revocationsView, permission: "sessions.read", area: "access", page: () => "revocations", title: S.titles.revocations },
+  { pattern: /^\/audit$/, view: auditView, permission: "audit.read", area: "audit", page: () => "audit", title: S.titles.audit },
+  { pattern: /^\/terminal$/, view: terminalView, permission: null, area: "terminal", page: () => "terminal", title: S.titles.terminal },
 ];
 
-export function hasPermission(session, permission) {
-  return Boolean(session && Array.isArray(session.permissions) && session.permissions.includes(permission));
-}
+export { hasPermission };
 
 function parseHash() {
   const raw = location.hash.replace(/^#/, "");
@@ -69,15 +69,20 @@ function hashFor(path, query) {
 }
 
 export function start(root) {
-  const state = { session: null, wasSignedIn: false, token: 0, cleanups: [], expiredDialog: null, shell: null, active: true };
+  const state = { session: null, wasSignedIn: false, token: 0, cleanups: [], expiredDialog: null, shell: null, active: true, counts: {}, current: { area: null, page: null }, pendingAt: 0 };
 
   const api = createApi({
     onUnauthorized: () => showExpired(),
     onSession: (session) => {
+      if (state.session && state.session.user_id !== session.user_id) {
+        connect.reset();
+      }
       state.session = session;
       refreshNav();
     },
   });
+
+  const connect = createConnectInfo(api);
 
   function runCleanups() {
     const pending = state.cleanups;
@@ -129,45 +134,17 @@ export function start(root) {
     }
   }
 
+  function currentModel() {
+    return { session: state.session, current: state.current, counts: state.counts };
+  }
+
   function buildShell() {
-    const who = el("span", { class: "who" }, S.signedInAs + " ", el("strong", { text: state.session.display_name || state.session.email || "" }));
-    const theme = button(themeLabel(), {
-      small: true,
-      onClick: () => {
-        cycleTheme();
-        theme.textContent = themeLabel();
-      },
-    });
-    theme.classList.add("theme-toggle");
-    const signOut = button(S.signOut, { small: true, onClick: signOutNow });
-    const main = el("main", { id: "main", tabindex: "-1" });
-    const list = el("ul", {});
-    const skip = el("button", { type: "button", class: "skip", on: { click: () => main.focus() } }, S.skip);
-    const live = el("div", { class: "visually-hidden", role: "status", "aria-live": "polite" });
-    const app = el(
-      "div",
-      { class: "app" },
-      skip,
-      el(
-        "header",
-        { class: "topbar" },
-        el(
-          "div",
-          { class: "wrap" },
-          el("a", { class: "brand", href: "#/" }, el("span", { class: "brand-mark", "aria-hidden": "true", text: "J" }), S.product),
-          el("span", { class: "server", text: location.host }),
-          el("span", { class: "spacer" }),
-          who,
-          theme,
-          signOut,
-        ),
-      ),
-      el("nav", { class: "mainnav", "aria-label": S.navLabel }, el("div", { class: "wrap" }, list)),
-      main,
-      live,
-    );
-    replace(root, app);
-    state.shell = { main, list, live, counts: {}, current: null };
+    connect.reset();
+    const shell = createShell({ root, onSignOut: signOutNow });
+    state.shell = { main: shell.main, live: shell.live, handle: shell };
+    state.counts = {};
+    state.pendingAt = 0;
+    state.current = { area: null, page: null };
     refreshNav();
   }
 
@@ -175,20 +152,26 @@ export function start(root) {
     if (!state.shell) {
       return;
     }
-    const { list, counts, current } = state.shell;
-    const items = NAV.filter((item) => hasPermission(state.session, item.permission));
-    const children = [];
-    if (items.length > 0) {
-      children.push(el("li", { class: "nav-group", "aria-hidden": "true", text: S.navGroupAdmin }));
+    state.shell.handle.update(currentModel());
+  }
+
+  async function loadPending() {
+    if (!hasPermission(state.session, "nodes.approve") || !state.shell) {
+      return;
     }
-    for (const item of items) {
-      const link = el("a", { href: item.href, "aria-current": item.id === current ? "page" : null }, el("span", { text: item.label }));
-      if (counts[item.id] > 0) {
-        link.appendChild(el("span", { class: "nav-count", text: S.pendingCount(counts[item.id]) }));
+    state.pendingAt = Date.now();
+    try {
+      const page = await api.get("/v1/admin/nodes", { limit: 1 });
+      if (state.shell && Number.isInteger(page.pending_enrolments)) {
+        state.counts.nodes = page.pending_enrolments;
+        refreshNav();
       }
-      children.push(el("li", {}, link));
+    } catch (error) {
+      if (error.status === 401) {
+        return;
+      }
+      state.pendingAt = 0;
     }
-    replace(list, ...children);
   }
 
   async function signOutNow() {
@@ -204,13 +187,9 @@ export function start(root) {
     runCleanups();
     state.session = null;
     state.wasSignedIn = false;
+    state.shell.handle.destroy();
     state.shell = null;
     renderSignIn(root, { notice: S.signIn.signedOut });
-  }
-
-  function firstAllowed() {
-    const item = NAV.find((candidate) => hasPermission(state.session, candidate.permission));
-    return item ? item.href.slice(1) : null;
   }
 
   async function render() {
@@ -219,17 +198,19 @@ export function start(root) {
     }
     runCleanups();
     closeRouteDialogs();
+    closeOpenMenu();
+    state.shell.handle.closeDrawer();
     state.token += 1;
     const mine = state.token;
     const { main } = state.shell;
     const { path, query } = parseHash();
     if (path === "/") {
-      const target = firstAllowed();
+      const target = firstAllowedHref(state.session);
       if (target) {
         go(target, null, { replace: true });
         return;
       }
-      state.shell.current = null;
+      state.current = { area: null, page: null };
       refreshNav();
       document.title = S.titles.notAllowed + " · " + S.product;
       renderForbidden(main, { session: state.session, permission: null, path: null });
@@ -238,21 +219,21 @@ export function start(root) {
     const matched = matchRoute(path);
     main.replaceChildren();
     if (!matched) {
-      state.shell.current = null;
+      state.current = { area: null, page: null };
       refreshNav();
       document.title = S.titles.notFound + " · " + S.product;
       renderNotFound(main);
-      main.focus();
+      main.focus({ preventScroll: true });
       return;
     }
     const { route, params } = matched;
-    state.shell.current = route.nav;
+    state.current = { area: route.area, page: route.page(query) };
     refreshNav();
     document.title = route.title + " · " + S.product;
     if (!hasPermission(state.session, route.permission)) {
       document.title = S.titles.notAllowed + " · " + S.product;
       renderForbidden(main, { session: state.session, permission: route.permission, path: "#" + path });
-      main.focus();
+      main.focus({ preventScroll: true });
       return;
     }
     const ctx = {
@@ -270,12 +251,13 @@ export function start(root) {
       setTitle: (text) => {
         document.title = text + " · " + S.product;
       },
-      navCount: (id) => (state.shell ? state.shell.counts[id] : undefined),
+      navCount: (id) => state.counts[id],
+      connect,
       setNavCount: (id, count) => {
         if (!state.shell) {
           return;
         }
-        state.shell.counts[id] = count;
+        state.counts[id] = count;
         refreshNav();
       },
       onCleanup: (cleanup) => state.cleanups.push(cleanup),
@@ -284,6 +266,9 @@ export function start(root) {
       },
     };
     main.setAttribute("aria-busy", "true");
+    if (!route.reportsPending && Date.now() - state.pendingAt > PENDING_MAX_AGE_MS && !document.hidden) {
+      loadPending();
+    }
     try {
       await route.view(ctx);
     } catch (error) {
@@ -291,7 +276,7 @@ export function start(root) {
     } finally {
       if (ctx.isCurrent()) {
         main.removeAttribute("aria-busy");
-        main.focus();
+        main.focus({ preventScroll: true });
       }
     }
   }
@@ -328,6 +313,9 @@ export function start(root) {
       state.active = false;
       window.removeEventListener("hashchange", onHashChange);
       runCleanups();
+      if (state.shell) {
+        state.shell.handle.destroy();
+      }
     },
   };
 }
