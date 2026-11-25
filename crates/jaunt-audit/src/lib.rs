@@ -28,11 +28,14 @@ pub use query::{
     AuditFilter, AuditPage, DEFAULT_PAGE, FilterError, MAX_PAGE, QueryError, encode_cursor, query,
 };
 pub use recording::{
-    CAST_SUFFIX, Committed, DEFAULT_MIN_FREE_BYTES, DirectoryLimits, DirectorySink, FILE_MODE,
-    FreeSpace, Leftovers, MANIFEST_SUFFIX, MAX_MANIFEST_BYTES, PART_SUFFIX, ROOT_MODE,
-    RecordingKey, RecordingKeyError, RecordingSink, RecordingStoreError, StagedRecording,
-    StagedSink, StoredRecording, VerifiedRecording, VerifyFailure, cast_sha256, manifest_bytes,
-    manifest_sha256, store_error_of, verify_stored,
+    CAST_CONFLICT, CAST_SUFFIX, CastProof, Committed, DEFAULT_MIN_FREE_BYTES, DirectoryLimits,
+    DirectorySink, DirectoryStaged, FILE_MODE, FreeSpace, IDENTITY_CONFLICT, Identity,
+    LENGTH_CONFLICT, Leftovers, LocalProof, MANIFEST_CONFLICT, MANIFEST_SUFFIX, MAX_MANIFEST_BYTES,
+    PART_SUFFIX, PENDING_SUFFIX, PendingManifest, ROOT_MODE, RecordingKey, RecordingKeyError,
+    RecordingSink, RecordingStoreError, Resolution, STRUCTURE_CONFLICT, StagedRecording,
+    StagedSink, StoreProof, StoredRecording, UNREADABLE_CONFLICT, VerifiedRecording, VerifyFailure,
+    cast_sha256, manifest_bytes, manifest_sha256, read_store_proof, resolve_existing,
+    store_error_of, verify_stored,
 };
 pub use retention::{
     DEFAULT_RETENTION_DAYS, MASS_DELETE_MIN_ROWS, MAX_RETENTION_DAYS, PRUNE_INTERVAL, PruneOutcome,

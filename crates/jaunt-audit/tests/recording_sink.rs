@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use jaunt_audit::{
     DirectoryLimits, DirectorySink, FreeSpace, Leftovers, RecordingKey, RecordingSink,
-    RecordingStoreError, VerifyFailure, verify_stored,
+    RecordingStoreError, StagedRecording, VerifyFailure, verify_stored,
 };
 use jaunt_record::{MANIFEST_VERSION, SessionKind, SessionManifest};
 use jaunt_store::{Recording, RecordingState};
@@ -217,7 +217,11 @@ fn a_symlink_planted_at_either_target_is_refused_and_never_written_through() {
     assert_eq!(fs::read(&victim).unwrap(), b"untouched");
     assert_eq!(
         names(&month_dir(&dir)),
-        [format!("{OTHER}.cast"), format!("{ID}.cast.part")]
+        [
+            format!("{OTHER}.cast"),
+            format!("{OTHER}.cast.part"),
+            format!("{ID}.cast.part")
+        ]
     );
     assert!(matches!(
         sink.open(&key(OTHER)).map(|stored| stored.is_none()),
@@ -247,9 +251,76 @@ fn a_failed_manifest_write_leaves_no_recording_because_the_manifest_comes_last()
     ));
     assert_eq!(
         names(&month_dir(&dir)),
-        [format!("{ID}.manifest.json.part")]
+        [
+            format!("{ID}.cast.part"),
+            format!("{ID}.manifest.json.part")
+        ]
     );
     assert!(sink.open(&key(ID)).unwrap().is_none());
+    fs::remove_dir(&blocker).unwrap();
+    staged.commit(&manifest(ID, 1, 7)).unwrap();
+    assert_eq!(
+        names(&month_dir(&dir)),
+        [format!("{ID}.cast"), format!("{ID}.manifest.json")]
+    );
+}
+
+#[test]
+fn a_name_collision_at_commit_keeps_the_staged_part_until_the_owner_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin(&key(ID)).unwrap();
+    staged.write(0, b"payload").unwrap();
+    fs::write(month_dir(&dir).join(format!("{ID}.cast")), b"foreign").unwrap();
+    assert!(matches!(
+        staged.commit(&manifest(ID, 1, 7)),
+        Err(RecordingStoreError::Exists)
+    ));
+    assert_eq!(
+        names(&month_dir(&dir)),
+        [format!("{ID}.cast"), format!("{ID}.cast.part")]
+    );
+    assert_eq!(
+        fs::read(month_dir(&dir).join(format!("{ID}.cast"))).unwrap(),
+        b"foreign"
+    );
+    staged.keep_files();
+    drop(staged);
+    assert!(sink.holds_staged_part(&key(ID)));
+    assert_eq!(
+        names(&month_dir(&dir)),
+        [format!("{ID}.cast"), format!("{ID}.cast.part")]
+    );
+
+    let mut fresh = sink.begin_staged(&key(OTHER)).unwrap();
+    fresh.write(0, b"x").unwrap();
+    drop(fresh);
+    assert!(!sink.holds_staged_part(&key(OTHER)));
+}
+
+#[test]
+fn staged_files_move_to_the_quarantine_directory_and_nothing_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    staged.write(0, b"cast\n").unwrap();
+    staged.stash_manifest(b"damaged").unwrap();
+    staged.release();
+    drop(staged);
+    sink.quarantine_staged(&key(ID)).unwrap();
+    assert!(names(&month_dir(&dir)).is_empty());
+    let quarantine = dir.path().join("recordings").join("quarantine").join(ID);
+    assert_eq!(
+        names(&quarantine),
+        [format!("{ID}.cast.part"), format!("{ID}.manifest.pending")]
+    );
+    assert_eq!(
+        fs::read(quarantine.join(format!("{ID}.manifest.pending"))).unwrap(),
+        b"damaged"
+    );
+    assert!(sink.pending_manifests().unwrap().is_empty());
+    assert_eq!(sink.remove_leftovers().unwrap(), Leftovers::default());
+    assert_eq!(names(&quarantine).len(), 2);
 }
 
 #[test]
@@ -401,7 +472,7 @@ fn an_interrupted_part_resumes_cut_to_the_delivered_prefix() {
     std::mem::forget(staged);
 
     assert!(sink.resume(&key(ID), 100, &prefix).unwrap().is_none());
-    let resumed = sink.resume(&key(ID), 13, &prefix).unwrap().unwrap();
+    let mut resumed = sink.resume(&key(ID), 13, &prefix).unwrap().unwrap();
     assert_eq!(resumed.written(), 13);
     let mut salvaged = manifest(ID, 2, 13);
     salvaged.incomplete = true;
@@ -449,4 +520,170 @@ fn a_part_whose_delivered_prefix_changed_on_disk_is_not_resumed_and_is_removed()
         Err(RecordingStoreError::PrefixMismatch)
     ));
     assert!(names(&month_dir(&dir)).is_empty());
+}
+
+#[test]
+fn a_stashed_manifest_is_listed_replaced_and_protects_its_part_from_the_startup_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    staged.write(0, b"cast\n").unwrap();
+    assert!(sink.pending_manifests().unwrap().is_empty());
+    staged.stash_manifest(b"first").unwrap();
+    staged.stash_manifest(b"second").unwrap();
+    assert_eq!(
+        names(&month_dir(&dir)),
+        [format!("{ID}.cast.part"), format!("{ID}.manifest.pending")]
+    );
+    let pending = sink.pending_manifests().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, key(ID));
+    assert_eq!(pending[0].bytes, b"second");
+
+    let mut cast = String::new();
+    staged
+        .cast_for_upload()
+        .unwrap()
+        .unwrap()
+        .read_to_string(&mut cast)
+        .unwrap();
+    assert_eq!(cast, "cast\n");
+    staged.release();
+    drop(staged);
+    assert_eq!(
+        sink.remove_leftovers().unwrap(),
+        Leftovers {
+            parts: 0,
+            orphan_casts: 0
+        }
+    );
+    assert_eq!(names(&month_dir(&dir)).len(), 2);
+    assert!(sink.open_staged_cast(&key(ID)).unwrap().is_some());
+
+    sink.remove_staged(&key(ID)).unwrap();
+    assert!(names(&month_dir(&dir)).is_empty());
+    assert!(sink.open_staged_cast(&key(ID)).unwrap().is_none());
+}
+
+#[test]
+fn discarding_a_staged_recording_removes_its_stashed_manifest_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    staged.write(0, b"cast\n").unwrap();
+    staged.stash_manifest(b"pending").unwrap();
+    staged.discard().unwrap();
+    assert!(names(&month_dir(&dir)).is_empty());
+    assert!(matches!(
+        staged.stash_manifest(b"late"),
+        Err(RecordingStoreError::Finished)
+    ));
+}
+
+#[test]
+fn a_symlinked_pending_manifest_is_never_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    staged.write(0, b"cast\n").unwrap();
+    let victim = dir.path().join("victim");
+    fs::write(&victim, b"not a manifest").unwrap();
+    staged.stash_manifest(b"honest").unwrap();
+    symlink(
+        &victim,
+        month_dir(&dir).join(format!("{OTHER}.manifest.pending")),
+    )
+    .unwrap();
+    let listed = sink.pending_manifests().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, key(ID));
+    assert_eq!(fs::read(&victim).unwrap(), b"not a manifest");
+}
+
+#[test]
+fn an_unreadable_month_never_hides_the_pending_manifests_of_the_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let later = RecordingKey::new(OTHER, STARTED + 40 * 86_400).unwrap();
+    for staged_key in [key(ID), later.clone()] {
+        let mut staged = sink.begin_staged(&staged_key).unwrap();
+        staged.write(0, b"cast\n").unwrap();
+        staged.stash_manifest(b"manifest").unwrap();
+        staged.release();
+    }
+    let broken = month_dir(&dir);
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(&broken).is_ok();
+    let listed = sink.pending_manifests();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return;
+    }
+    let listed = listed.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, later);
+    assert_eq!(sink.pending_manifests().unwrap().len(), 2);
+}
+
+#[test]
+fn removing_the_staged_files_deletes_the_pending_manifest_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    staged.write(0, b"cast\n").unwrap();
+    staged.stash_manifest(b"manifest").unwrap();
+    staged.release();
+    let part = month_dir(&dir).join(format!("{ID}.cast.part"));
+    fs::remove_file(&part).unwrap();
+    fs::create_dir(&part).unwrap();
+    fs::write(part.join("inner"), b"x").unwrap();
+    assert!(sink.remove_staged(&key(ID)).is_err());
+    assert!(
+        !month_dir(&dir)
+            .join(format!("{ID}.manifest.pending"))
+            .exists()
+    );
+    assert!(part.exists());
+}
+
+#[test]
+fn leftovers_of_rows_that_are_still_receiving_are_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    for id in [ID, OTHER] {
+        let mut staged = sink.begin_staged(&key(id)).unwrap();
+        staged.write(0, b"delivered").unwrap();
+        staged.release();
+    }
+    fs::write(month_dir(&dir).join(format!("{ID}.cast")), b"orphan").unwrap();
+    let kept = vec![ID.to_owned()];
+    assert_eq!(
+        sink.remove_leftovers_except(&kept).unwrap(),
+        Leftovers {
+            parts: 1,
+            orphan_casts: 0
+        }
+    );
+    assert_eq!(
+        names(&month_dir(&dir)),
+        [format!("{ID}.cast"), format!("{ID}.cast.part")]
+    );
+    assert!(sink.open_staged_cast(&key(ID)).unwrap().is_some());
+    assert!(sink.open_staged_cast(&key(OTHER)).unwrap().is_none());
+}
+
+#[test]
+fn a_staged_cast_that_vanishes_before_the_upload_is_an_error_not_an_empty_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let mut staged = sink.begin_staged(&key(ID)).unwrap();
+    assert!(staged.cast_for_upload().unwrap().is_none());
+    staged.write(0, b"cast\n").unwrap();
+    assert!(staged.cast_for_upload().unwrap().is_some());
+    fs::remove_file(month_dir(&dir).join(format!("{ID}.cast.part"))).unwrap();
+    assert!(matches!(
+        staged.cast_for_upload(),
+        Err(RecordingStoreError::Io { .. })
+    ));
 }

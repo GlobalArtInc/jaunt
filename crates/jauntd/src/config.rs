@@ -276,7 +276,7 @@ impl Config {
             return Err(ConfigError::PolicyPollOutOfRange);
         }
         let audit = self.audit.into_settings()?;
-        let recordings = self.recordings.into_settings()?;
+        let recordings = self.recordings.into_settings(&self.data_dir)?;
         let client_ip_header = self
             .client_ip_header
             .map(|name| validate_header_name(&name))
@@ -570,6 +570,7 @@ mod tests {
 
     use crate::agents::AgentsSettings;
     use crate::gate_ssh::GateSshSettings;
+    use crate::recordings::StoreSettings;
     use jaunt_gate::TrustedProxyProblem;
 
     use super::{CLIENT_SECRET_VAR, Config, ConfigError, load};
@@ -612,8 +613,10 @@ mod tests {
             .into_run_settings(&secret_env)
             .unwrap();
         assert_eq!(
-            on.recordings.map(|recordings| recordings.dir),
-            Some(PathBuf::from("/var/lib/jaunt/recordings"))
+            on.recordings.map(|recordings| recordings.store),
+            Some(StoreSettings::Directory {
+                dir: PathBuf::from("/var/lib/jaunt/recordings")
+            })
         );
         let err = parse("recordings:\n  dir: relative\n")
             .into_run_settings(&secret_env)

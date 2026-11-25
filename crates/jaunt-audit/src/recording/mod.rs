@@ -1,10 +1,10 @@
 mod directory;
+mod resolve;
 mod verify;
 
 use std::error::Error as StdError;
 use std::fmt;
-use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 
 use jaunt_record::{SessionManifest, Sink, SinkError};
 use jaunt_store::is_session_id;
@@ -13,8 +13,13 @@ use sha2::{Digest, Sha256};
 use crate::time::{SECONDS_PER_DAY, civil_from_days};
 
 pub use directory::{
-    DEFAULT_MIN_FREE_BYTES, DirectoryLimits, DirectorySink, FILE_MODE, FreeSpace, Leftovers,
-    ROOT_MODE,
+    DEFAULT_MIN_FREE_BYTES, DirectoryLimits, DirectorySink, DirectoryStaged, FILE_MODE, FreeSpace,
+    Leftovers, PendingManifest, ROOT_MODE,
+};
+pub use resolve::{
+    CAST_CONFLICT, CastProof, IDENTITY_CONFLICT, Identity, LENGTH_CONFLICT, LocalProof,
+    MANIFEST_CONFLICT, Resolution, STRUCTURE_CONFLICT, StoreProof, UNREADABLE_CONFLICT,
+    read_store_proof, resolve_existing,
 };
 pub use verify::{VerifiedRecording, VerifyFailure, cast_sha256, verify_stored};
 
@@ -22,6 +27,7 @@ pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const CAST_SUFFIX: &str = ".cast";
 pub const MANIFEST_SUFFIX: &str = ".manifest.json";
 pub const PART_SUFFIX: &str = ".part";
+pub const PENDING_SUFFIX: &str = ".manifest.pending";
 
 const MAX_YEAR: i64 = 9999;
 
@@ -72,6 +78,39 @@ impl RecordingKey {
         )
     }
 
+    pub fn from_location(location: &str) -> Result<RecordingKey, RecordingKeyError> {
+        let mut parts = location.split('/');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(year), Some(month), Some(id), None) => {
+                RecordingKey::from_directories(id, year, month)
+            }
+            _ => Err(RecordingKeyError::Date),
+        }
+    }
+
+    pub(crate) fn from_directories(
+        session_id: &str,
+        year: &str,
+        month: &str,
+    ) -> Result<RecordingKey, RecordingKeyError> {
+        if !is_session_id(session_id) {
+            return Err(RecordingKeyError::SessionId);
+        }
+        let digits = |text: &str, len: usize| {
+            (text.len() == len && text.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| text.parse::<i64>().ok())
+                .flatten()
+        };
+        match (digits(year, 4), digits(month, 2)) {
+            (Some(year), Some(month)) if (1..=12).contains(&month) => Ok(RecordingKey {
+                session_id: session_id.to_owned(),
+                year,
+                month,
+            }),
+            _ => Err(RecordingKeyError::Date),
+        }
+    }
+
     pub(crate) fn year_dir(&self) -> String {
         format!("{:04}", self.year)
     }
@@ -101,6 +140,8 @@ pub enum RecordingStoreError {
     Exists,
     #[error("a path of the recording storage is a symbolic link or not a directory")]
     UnsafePath,
+    #[error("the recording object store is unavailable")]
+    Unavailable,
     #[error("the stored manifest is invalid")]
     InvalidManifest,
     #[error("the recording was already committed or aborted")]
@@ -118,6 +159,14 @@ pub enum RecordingStoreError {
 }
 
 impl RecordingStoreError {
+    pub fn is_local_fault(&self) -> bool {
+        match self {
+            RecordingStoreError::UnsafePath => true,
+            RecordingStoreError::Io { source, .. } => source.kind() != io::ErrorKind::NotFound,
+            _ => false,
+        }
+    }
+
     pub(crate) fn io(operation: &'static str) -> impl FnOnce(io::Error) -> RecordingStoreError {
         move |source| RecordingStoreError::Io { operation, source }
     }
@@ -144,7 +193,7 @@ impl fmt::Debug for Committed {
 pub struct StoredRecording {
     pub manifest: SessionManifest,
     pub manifest_sha256: String,
-    pub cast: Option<File>,
+    pub cast: Option<Box<dyn Read + Send>>,
 }
 
 impl fmt::Debug for StoredRecording {
@@ -168,6 +217,16 @@ pub trait RecordingSink: Send + Sync {
         raw_bytes: u64,
         prefix_sha256: &str,
     ) -> Result<Option<Box<dyn StagedRecording>>, RecordingStoreError>;
+
+    fn holds_staged_manifest(&self, key: &RecordingKey) -> bool {
+        let _ = key;
+        false
+    }
+
+    fn holds_staged_part(&self, key: &RecordingKey) -> bool {
+        let _ = key;
+        false
+    }
 }
 
 pub trait StagedRecording: Send {
@@ -177,12 +236,11 @@ pub trait StagedRecording: Send {
 
     fn prefix_sha256(&self) -> String;
 
-    fn commit(
-        self: Box<Self>,
-        manifest: &SessionManifest,
-    ) -> Result<Committed, RecordingStoreError>;
+    fn commit(&mut self, manifest: &SessionManifest) -> Result<Committed, RecordingStoreError>;
 
     fn abort(self: Box<Self>) -> Result<(), RecordingStoreError>;
+
+    fn keep_files(&mut self) {}
 }
 
 pub struct StagedSink<'a>(pub &'a mut dyn StagedRecording);
@@ -239,6 +297,18 @@ mod tests {
         for (secs, prefix) in cases {
             let key = RecordingKey::new(ID, secs).unwrap();
             assert_eq!(key.location(), format!("{prefix}/{ID}"));
+            assert_eq!(RecordingKey::from_location(&key.location()), Ok(key));
+        }
+        for bad in [
+            format!("2025/13/{ID}"),
+            format!("2025/00/{ID}"),
+            format!("25/11/{ID}"),
+            format!("2025/11/{ID}/x"),
+            format!("2025/11/../{ID}"),
+            "2025/11/id".to_owned(),
+            "2025/11".to_owned(),
+        ] {
+            assert!(RecordingKey::from_location(&bad).is_err(), "{bad}");
         }
         assert_eq!(
             RecordingKey::new(ID, 253_402_300_800),

@@ -232,6 +232,13 @@ impl Rec {
     }
 }
 
+pub fn files_in(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    walk(root, root, &mut found);
+    found.sort();
+    found
+}
+
 fn walk(root: &Path, dir: &Path, found: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -414,11 +421,36 @@ pub struct Gate {
     released: std::sync::Mutex<bool>,
     opened: std::sync::Condvar,
     fail_commit: std::sync::atomic::AtomicBool,
+    unavailable_commits: std::sync::atomic::AtomicU64,
+    commit_attempts: std::sync::atomic::AtomicU64,
+    unavailable_opens: std::sync::atomic::AtomicU64,
+    existing_commits: std::sync::atomic::AtomicU64,
+    on_commit: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Gate {
     pub fn fail_next_commit(&self) {
         self.fail_commit.store(true, Ordering::SeqCst);
+    }
+
+    pub fn unavailable_for(&self, attempts: u64) {
+        self.unavailable_commits.store(attempts, Ordering::SeqCst);
+    }
+
+    pub fn existing_for(&self, attempts: u64) {
+        self.existing_commits.store(attempts, Ordering::SeqCst);
+    }
+
+    pub fn on_commit(&self, action: Arc<dyn Fn() + Send + Sync>) {
+        *self.on_commit.lock().unwrap() = Some(action);
+    }
+
+    pub fn unavailable_opens_for(&self, attempts: u64) {
+        self.unavailable_opens.store(attempts, Ordering::SeqCst);
+    }
+
+    pub fn commit_attempts(&self) -> u64 {
+        self.commit_attempts.load(Ordering::SeqCst)
     }
 
     pub fn arm(&self, stage: Stage) {
@@ -483,7 +515,22 @@ impl RecordingSink for GatedSink {
         }))
     }
 
+    fn holds_staged_manifest(&self, key: &RecordingKey) -> bool {
+        self.inner.holds_staged_manifest(key)
+    }
+
+    fn holds_staged_part(&self, key: &RecordingKey) -> bool {
+        self.inner.holds_staged_part(key)
+    }
+
     fn open(&self, key: &RecordingKey) -> Result<Option<StoredRecording>, RecordingStoreError> {
+        let remaining = self.gate.unavailable_opens.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.gate
+                .unavailable_opens
+                .store(remaining - 1, Ordering::SeqCst);
+            return Err(RecordingStoreError::Unavailable);
+        }
         self.inner.open(key)
     }
 
@@ -511,11 +558,27 @@ impl StagedRecording for GatedStaged {
         self.inner.prefix_sha256()
     }
 
-    fn commit(
-        self: Box<Self>,
-        manifest: &SessionManifest,
-    ) -> Result<Committed, RecordingStoreError> {
+    fn commit(&mut self, manifest: &SessionManifest) -> Result<Committed, RecordingStoreError> {
         self.gate.pass(Stage::Commit);
+        self.gate.commit_attempts.fetch_add(1, Ordering::SeqCst);
+        let remaining = self.gate.unavailable_commits.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.gate
+                .unavailable_commits
+                .store(remaining - 1, Ordering::SeqCst);
+            return Err(RecordingStoreError::Unavailable);
+        }
+        let action = self.gate.on_commit.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
+        let existing = self.gate.existing_commits.load(Ordering::SeqCst);
+        if existing > 0 {
+            self.gate
+                .existing_commits
+                .store(existing - 1, Ordering::SeqCst);
+            return Err(RecordingStoreError::Exists);
+        }
         if self.gate.fail_commit.swap(false, Ordering::SeqCst) {
             return Err(RecordingStoreError::Io {
                 operation: "commit",
@@ -523,6 +586,10 @@ impl StagedRecording for GatedStaged {
             });
         }
         self.inner.commit(manifest)
+    }
+
+    fn keep_files(&mut self) {
+        self.inner.keep_files();
     }
 
     fn abort(self: Box<Self>) -> Result<(), RecordingStoreError> {

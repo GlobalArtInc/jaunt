@@ -3,8 +3,8 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_audit::{
-    Committed, RecordingKey, RecordingSink, RecordingStoreError, StagedRecording, cast_sha256,
-    manifest_sha256, store_error_of,
+    CastProof, Committed, Identity, LocalProof, RecordingKey, RecordingStoreError, Resolution,
+    StagedRecording, manifest_sha256, read_store_proof, resolve_existing, store_error_of,
 };
 use jaunt_proto::{
     RecordingAck, RecordingChunk, RecordingComplete, RecordingKind, RecordingManifest,
@@ -25,6 +25,7 @@ use super::uploads::{Admission, Created, Entry, FinishError, Slot, Upload, Uploa
 use crate::control::Control;
 
 const OPEN_ATTEMPTS: usize = 3;
+const WAIT_WARNING_SECS: i64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -32,6 +33,7 @@ pub(crate) enum Failure {
         refusal: RecordingRefusal,
         reason: Reason,
     },
+    Unavailable,
     Internal,
 }
 
@@ -68,8 +70,12 @@ pub(crate) fn report(
     session_id: Option<&str>,
     failure: &Failure,
 ) {
-    if let Failure::Refused { reason, .. } = failure {
-        reject(control, node_id, session_id, *reason);
+    match failure {
+        Failure::Refused { reason, .. } => reject(control, node_id, session_id, *reason),
+        Failure::Unavailable => {
+            tracing::warn!(target: "jaunt::control", session_id, "the recording storage is unavailable: the agent is asked to retry");
+        }
+        Failure::Internal => {}
     }
 }
 
@@ -202,12 +208,18 @@ async fn chunk_flow(
         uploads.remove(&entry, 0);
         return Err(Failure::Internal);
     };
+    let protected = is_protected(&entry, &upload);
     let reserved = upload.pending_cost(chunk.seq, chunk.compressed.len());
     let session_budget =
         u64::try_from(uploads.limits().chunk.max_pending_bytes).unwrap_or(u64::MAX);
     if upload.pending().saturating_add(reserved) > session_budget {
+        let failure = refused(RecordingRefusal::TooLarge, Reason::Limit);
+        if protected {
+            *guard = Slot::Open(upload);
+            return Err(failure);
+        }
         close_upload(control, uploads, &entry, guard, upload, now).await;
-        return Err(refused(RecordingRefusal::TooLarge, Reason::Limit));
+        return Err(failure);
     }
     if uploads.reserve(node_id, reserved) == Admission::TooMany {
         *guard = Slot::Open(upload);
@@ -232,6 +244,10 @@ async fn chunk_flow(
         Err(error) => {
             uploads.release(node_id, reserved);
             let failure = assemble_failure(&error);
+            if protected {
+                *guard = Slot::Open(upload);
+                return Err(failure);
+            }
             close_upload(control, uploads, &entry, guard, upload, now).await;
             return Err(failure);
         }
@@ -320,16 +336,22 @@ async fn complete_flow(
         return Err(Failure::Internal);
     };
     if !expects_cast && upload.received > 0 {
-        close_upload(control, uploads, &entry, guard, upload, now).await;
+        if is_protected(&entry, &upload) {
+            *guard = Slot::Open(upload);
+        } else {
+            close_upload(control, uploads, &entry, guard, upload, now).await;
+        }
         return Err(not_recordable());
     }
     let pending_before = upload.pending();
+    let permit = uploads.commit_permit().await;
     let joined = tokio::task::spawn_blocking(move || {
         let mut upload = upload;
         let result = upload.finish(&manifest, expects_cast);
         (upload, manifest, result)
     })
     .await;
+    drop(permit);
     let Ok((upload, manifest, result)) = joined else {
         lost_upload(control, uploads, &entry, guard, pending_before, now).await;
         return Err(Failure::Internal);
@@ -340,7 +362,30 @@ async fn complete_flow(
             let failure = match &error {
                 FinishError::Verify(error) => verify_failure(error),
                 FinishError::Commit(error) => storage_failure(error),
+                FinishError::ManifestChanged => conflict(),
             };
+            let keep_open = match &error {
+                FinishError::ManifestChanged
+                | FinishError::Commit(RecordingStoreError::Unavailable) => true,
+                FinishError::Verify(_) => is_protected(&entry, &upload),
+                FinishError::Commit(_) => false,
+            };
+            if keep_open {
+                entry.touch(now);
+                *guard = Slot::Open(upload);
+                return Err(failure);
+            }
+            if matches!(error, FinishError::Commit(RecordingStoreError::Exists)) {
+                return settle_existing(
+                    control,
+                    uploads,
+                    &target,
+                    &manifest,
+                    (entry, guard, upload),
+                    now,
+                )
+                .await;
+            }
             close_upload(control, uploads, &entry, guard, upload, now).await;
             return Err(failure);
         }
@@ -377,6 +422,124 @@ async fn complete_flow(
     Ok(RecordingReceipt {
         state,
         chunks: verified.received_chunks,
+    })
+}
+
+enum Settled {
+    Adopted,
+    Conflict(&'static str),
+    Retry,
+    RowMoved,
+}
+
+fn staged_proof(staged: &dyn StagedRecording) -> Option<CastProof> {
+    CastProof::of(staged.written(), staged.prefix_sha256())
+}
+
+async fn settle(
+    control: &Control,
+    uploads: &Uploads,
+    target: &UploadTarget,
+    cast: Option<CastProof>,
+    manifest: &SessionManifest,
+    now: i64,
+) -> Settled {
+    let local = LocalProof {
+        manifest: Some(manifest),
+        cast: cast.as_ref(),
+        chunks: None,
+    };
+    match adopt(control, uploads, target, now, Some(&local)).await {
+        Adoption::Adopted => Settled::Adopted,
+        Adoption::Mismatch(reason) => Settled::Conflict(reason),
+        Adoption::StoreFailed | Adoption::Absent => Settled::Retry,
+        Adoption::RowMoved => Settled::RowMoved,
+    }
+}
+
+fn record_conflict(uploads: &Uploads, session_id: &str, reason: &'static str) {
+    uploads.mark_conflicted(session_id);
+    let conflicts = uploads.note_conflict();
+    tracing::error!(target: "jaunt::control", session_id, reason, conflicts_total = conflicts, "a recording conflicts with what the recording storage holds: nothing in the storage is touched, the staged files stay on disk and the row stays receiving until an operator clears the conflict");
+}
+
+async fn settle_existing(
+    control: &Control,
+    uploads: &Uploads,
+    target: &UploadTarget,
+    manifest: &SessionManifest,
+    held: (Arc<Entry>, OwnedMutexGuard<Slot>, Box<Upload>),
+    now: i64,
+) -> Result<RecordingReceipt, Failure> {
+    let (entry, mut guard, upload) = held;
+    let cast = upload
+        .staged
+        .as_ref()
+        .map(|staged| staged_proof(staged.as_ref()));
+    let verdict = match cast {
+        Some(cast) => settle(control, uploads, target, cast, manifest, now).await,
+        None => Settled::Conflict("the staged recording is gone"),
+    };
+    match verdict {
+        Settled::Adopted => {
+            adopted_receipt(control, uploads, &entry, guard, upload, &target.session_id).await
+        }
+        Settled::Retry => {
+            *guard = Slot::Open(upload);
+            Err(Failure::Unavailable)
+        }
+        Settled::RowMoved => {
+            release_keeping_files(uploads, &entry, guard, upload);
+            Err(closed())
+        }
+        Settled::Conflict(reason) => {
+            record_conflict(uploads, &target.session_id, reason);
+            release_keeping_files(uploads, &entry, guard, upload);
+            Err(conflict())
+        }
+    }
+}
+
+fn release_keeping_files(
+    uploads: &Uploads,
+    entry: &Entry,
+    mut guard: OwnedMutexGuard<Slot>,
+    mut upload: Box<Upload>,
+) {
+    let pending = upload.pending();
+    if let Some(mut staged) = upload.staged.take() {
+        staged.keep_files();
+    }
+    drop(upload);
+    uploads.remove_and_hold(entry, pending);
+    *guard = Slot::Closed;
+}
+
+async fn adopted_receipt(
+    control: &Control,
+    uploads: &Uploads,
+    entry: &Entry,
+    mut guard: OwnedMutexGuard<Slot>,
+    mut upload: Box<Upload>,
+    session_id: &str,
+) -> Result<RecordingReceipt, Failure> {
+    *guard = Slot::Closed;
+    uploads.remove(entry, upload.pending());
+    if let Some(staged) = upload.staged.take() {
+        abort_staged(staged).await;
+    }
+    drop(guard);
+    drop(upload);
+    let row = control
+        .store
+        .recordings()
+        .get(session_id)
+        .await
+        .map_err(internal("loading an adopted recording"))?
+        .ok_or(Failure::Internal)?;
+    Ok(RecordingReceipt {
+        state: wire_state(row.state == RecordingState::Incomplete),
+        chunks: row.chunks,
     })
 }
 
@@ -536,8 +699,11 @@ async fn open_upload(
                 if uploads.find(&target.session_id).is_some() {
                     continue;
                 }
-                fail_or_adopt(control, uploads, target, now).await;
-                return Err(closed());
+                return match fail_or_adopt(control, uploads, target, now).await {
+                    Adoption::StoreFailed => Err(Failure::Unavailable),
+                    Adoption::Mismatch(_) => Err(conflict()),
+                    _ => Err(closed()),
+                };
             }
             Some(_) => return Err(closed()),
         }
@@ -659,7 +825,11 @@ async fn close_session(control: &Control, uploads: &Uploads, target: &UploadTarg
         let mut guard = entry.lock().await;
         match std::mem::replace(&mut *guard, Slot::Closed) {
             Slot::Open(upload) => {
-                close_upload(control, uploads, &entry, guard, upload, now).await;
+                if is_protected(&entry, &upload) {
+                    *guard = Slot::Open(upload);
+                } else {
+                    close_upload(control, uploads, &entry, guard, upload, now).await;
+                }
                 return;
             }
             other => *guard = other,
@@ -737,20 +907,65 @@ async fn expire(
     control: &Control,
     uploads: &Uploads,
     entry: &Entry,
-    guard: OwnedMutexGuard<Slot>,
+    mut guard: OwnedMutexGuard<Slot>,
     mut upload: Box<Upload>,
     target: Option<&UploadTarget>,
     now: i64,
 ) {
     let delivered = upload.delivered_chunks();
-    if let (Some(target), true) = (target, delivered > 0)
+    let real = upload.verified_manifest();
+    let since = entry.deferred_since();
+    let waited = if since > 0 {
+        now.saturating_sub(since)
+    } else {
+        0
+    };
+    let max_wait = i64::try_from(uploads.limits().max_wait.as_secs()).unwrap_or(i64::MAX);
+    let give_up = waited >= max_wait;
+    if waited >= WAIT_WARNING_SECS && !give_up {
+        tracing::warn!(target: "jaunt::control", session_id = %entry.session_id, waited_secs = waited, "a recording has waited for the object store for more than an hour");
+    }
+    if give_up && real.is_some() && upload.staged.is_some() {
+        let pending = upload.pending();
+        if let Some(mut staged) = upload.staged.take() {
+            staged.keep_files();
+        }
+        drop(upload);
+        uploads.remove_and_hold(entry, pending);
+        let given_up = uploads.note_given_up();
+        tracing::error!(target: "jaunt::control", session_id = %entry.session_id, waited_secs = waited, given_up_total = given_up, "a finished recording waited for the object store longer than the limit: it left memory but its staged files stay for the periodic retry");
+        drop(guard);
+        return;
+    }
+    if give_up {
+        tracing::error!(target: "jaunt::control", session_id = %entry.session_id, waited_secs = waited, "a recording with nothing verified waited for the object store longer than the limit: its staged files are removed and it is marked failed");
+    }
+    if !give_up
+        && let (Some(target), true) = (target, delivered > 0 || real.is_some())
         && let Some(staged) = upload.staged.take()
     {
-        let pending = upload.pending();
-        drop(upload);
-        salvage(control, target, staged, delivered, now).await;
-        uploads.remove(entry, pending);
-        drop(guard);
+        match salvage(control, uploads, target, staged, delivered, real, now).await {
+            Salvaged::Unavailable(staged) => {
+                upload.staged = Some(staged);
+                let wait =
+                    i64::try_from(uploads.limits().store_retry.as_secs()).unwrap_or(i64::MAX);
+                entry.defer_until(now.saturating_add(wait));
+                entry.note_deferred(now);
+                *guard = Slot::Open(upload);
+            }
+            Salvaged::Stored | Salvaged::Failed => {
+                let pending = upload.pending();
+                drop(upload);
+                uploads.remove(entry, pending);
+                drop(guard);
+            }
+            Salvaged::Conflict => {
+                let pending = upload.pending();
+                drop(upload);
+                uploads.remove_and_hold(entry, pending);
+                drop(guard);
+            }
+        }
         return;
     }
     close_upload(control, uploads, entry, guard, upload, now).await;
@@ -788,32 +1003,124 @@ fn salvaged_manifest(target: &UploadTarget, chunks: u64, raw_bytes: u64) -> Sess
     }
 }
 
+enum Salvaged {
+    Stored,
+    Failed,
+    Conflict,
+    Unavailable(Box<dyn StagedRecording>),
+}
+
+type CommitOutcome = (
+    SessionManifest,
+    Result<Committed, RecordingStoreError>,
+    Option<Box<dyn StagedRecording>>,
+);
+
 async fn salvage(
     control: &Control,
+    uploads: &Uploads,
     target: &UploadTarget,
     staged: Box<dyn StagedRecording>,
     chunks: u64,
+    real: Option<(SessionManifest, Verified)>,
     now: i64,
-) -> bool {
-    let manifest = salvaged_manifest(target, chunks, staged.written());
-    let joined = tokio::task::spawn_blocking(move || {
-        let committed = staged.commit(&manifest);
-        (manifest, committed)
+) -> Salvaged {
+    let manifest = match &real {
+        Some((manifest, _)) => manifest.clone(),
+        None => salvaged_manifest(target, chunks, staged.written()),
+    };
+    let permit = uploads.commit_permit().await;
+    let joined: Result<CommitOutcome, _> = tokio::task::spawn_blocking(move || {
+        let mut staged = staged;
+        match staged.commit(&manifest) {
+            Err(RecordingStoreError::Unavailable) => {
+                (manifest, Err(RecordingStoreError::Unavailable), Some(staged))
+            }
+            Err(RecordingStoreError::Exists) => {
+                (manifest, Err(RecordingStoreError::Exists), Some(staged))
+            }
+            Err(err) => {
+                if let Err(abort) = staged.abort() {
+                    tracing::warn!(target: "jaunt::control", error = %abort, "removing a staged recording after a failed store did not succeed");
+                }
+                (manifest, Err(err), None)
+            }
+            Ok(committed) => (manifest, Ok(committed), None),
+        }
     })
     .await;
+    drop(permit);
     let (manifest, committed) = match joined {
-        Ok((manifest, Ok(committed))) => (manifest, committed),
-        Ok((_, Err(err))) => {
+        Ok((manifest, Ok(committed), _)) => (manifest, committed),
+        Ok((_, Err(RecordingStoreError::Unavailable), Some(staged))) => {
+            tracing::warn!(target: "jaunt::control", session_id = %target.session_id, "the recording storage is unavailable: the recording stays receiving and is retried later");
+            return Salvaged::Unavailable(staged);
+        }
+        Ok((manifest, Err(RecordingStoreError::Exists), Some(mut staged))) => {
+            let cast = staged_proof(staged.as_ref());
+            match settle(control, uploads, target, cast, &manifest, now).await {
+                Settled::Adopted => {
+                    abort_staged(staged).await;
+                    return Salvaged::Stored;
+                }
+                Settled::Retry => return Salvaged::Unavailable(staged),
+                Settled::RowMoved => {
+                    staged.keep_files();
+                    drop(staged);
+                    uploads.hold(&target.session_id);
+                    return Salvaged::Failed;
+                }
+                Settled::Conflict(reason) => {
+                    staged.keep_files();
+                    drop(staged);
+                    record_conflict(uploads, &target.session_id, reason);
+                    return Salvaged::Conflict;
+                }
+            }
+        }
+        Ok((_, Err(err), _)) => {
             tracing::error!(target: "jaunt::control", error = %err, "storing the delivered part of a recording failed");
             mark_failed(control, &target.session_id, now).await;
-            return false;
+            return Salvaged::Failed;
         }
         Err(_) => {
             tracing::error!(target: "jaunt::control", "storing the delivered part of a recording panicked");
             mark_failed(control, &target.session_id, now).await;
-            return false;
+            return Salvaged::Failed;
         }
     };
+    if let Some((_, verified)) = &real {
+        let marked = mark_stored(
+            control,
+            &target.node_id,
+            &manifest,
+            verified,
+            &committed,
+            now,
+        )
+        .await;
+        match marked {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::error!(target: "jaunt::control", session_id = %target.session_id, "a stored recording found its table row no longer receiving");
+                return Salvaged::Failed;
+            }
+            Err(err) => {
+                tracing::error!(target: "jaunt::control", error = %err, "marking a stored recording failed");
+                return Salvaged::Failed;
+            }
+        }
+        audit::completed(&Completed {
+            session_id: &target.session_id,
+            node_id: &target.node_id,
+            chunks: verified.received_chunks,
+            raw_bytes: verified.raw_bytes,
+            incomplete: verified.incomplete,
+            input_recorded: manifest.input_recorded,
+        });
+        reconcile_with_session(control, &target.session_id, &target.node_id).await;
+        return Salvaged::Stored;
+    }
     let stored = StoredRecording {
         session_id: &target.session_id,
         node_id: &target.node_id,
@@ -831,11 +1138,11 @@ async fn salvage(
         Ok(true) => {}
         Ok(false) => {
             tracing::error!(target: "jaunt::control", session_id = %target.session_id, "a salvaged recording found its table row no longer receiving");
-            return false;
+            return Salvaged::Failed;
         }
         Err(err) => {
             tracing::error!(target: "jaunt::control", error = %err, "marking a salvaged recording failed");
-            return false;
+            return Salvaged::Failed;
         }
     }
     audit::completed(&Completed {
@@ -847,57 +1154,92 @@ async fn salvage(
         input_recorded: manifest.input_recorded,
     });
     reconcile_with_session(control, &target.session_id, &target.node_id).await;
-    true
+    Salvaged::Stored
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Adoption {
     Adopted,
+    Mismatch(&'static str),
     Absent,
-    Refused,
     RowMoved,
     StoreFailed,
 }
 
-async fn fail_or_adopt(control: &Control, uploads: &Uploads, target: &UploadTarget, now: i64) {
-    match adopt(control, uploads, target, now).await {
-        Adoption::Adopted | Adoption::RowMoved | Adoption::StoreFailed => {}
-        Adoption::Absent | Adoption::Refused => {
-            mark_failed(control, &target.session_id, now).await;
+async fn fail_or_adopt(
+    control: &Control,
+    uploads: &Uploads,
+    target: &UploadTarget,
+    now: i64,
+) -> Adoption {
+    if uploads.is_conflicted(&target.session_id) {
+        return Adoption::Mismatch("the conflict is held until an operator clears it");
+    }
+    if uploads.is_held(&target.session_id) {
+        return Adoption::StoreFailed;
+    }
+    let local = recovery_proof(uploads, target);
+    let adoption = adopt(
+        control,
+        uploads,
+        target,
+        now,
+        local.as_ref().map(RecoveryProof::local).as_ref(),
+    )
+    .await;
+    match adoption {
+        Adoption::Absent => mark_failed(control, &target.session_id, now).await,
+        Adoption::Mismatch(reason) => {
+            record_conflict(uploads, &target.session_id, reason);
+            uploads.hold(&target.session_id);
+        }
+        _ => {}
+    }
+    adoption
+}
+
+struct RecoveryProof {
+    cast: Option<CastProof>,
+    chunks: Option<u64>,
+}
+
+impl RecoveryProof {
+    fn local(&self) -> LocalProof<'_> {
+        LocalProof {
+            manifest: None,
+            cast: self.cast.as_ref(),
+            chunks: self.chunks,
         }
     }
 }
 
-struct Found {
-    manifest: SessionManifest,
-    manifest_sha256: String,
-    cast_bytes: u64,
-    cast_sha256: Option<String>,
+fn recovery_proof(uploads: &Uploads, target: &UploadTarget) -> Option<RecoveryProof> {
+    let key = target
+        .authorized_at
+        .and_then(|started| RecordingKey::new(&target.session_id, started).ok())?;
+    if !uploads.sink().holds_staged_part(&key) {
+        return None;
+    }
+    let cast = target.recording.as_ref().and_then(|row| {
+        row.progress_sha256
+            .as_ref()
+            .filter(|_| row.chunks > 0)
+            .and_then(|sha256| CastProof::of(row.raw_bytes, sha256.clone()))
+    });
+    let chunks = cast
+        .as_ref()
+        .and(target.recording.as_ref())
+        .map(|row| row.chunks);
+    Some(RecoveryProof { cast, chunks })
 }
 
-fn read_stored(
-    sink: &dyn RecordingSink,
-    key: &RecordingKey,
-) -> Result<Option<Found>, RecordingStoreError> {
-    let Some(mut stored) = sink.open(key)? else {
-        return Ok(None);
-    };
-    let (cast_bytes, cast_sha256) = match stored.cast.as_mut() {
-        Some(cast) => {
-            let (bytes, sha256) = cast_sha256(cast)?;
-            (bytes, Some(sha256))
-        }
-        None => (0, None),
-    };
-    Ok(Some(Found {
-        manifest: stored.manifest,
-        manifest_sha256: stored.manifest_sha256,
-        cast_bytes,
-        cast_sha256,
-    }))
-}
-
-async fn adopt(control: &Control, uploads: &Uploads, target: &UploadTarget, now: i64) -> Adoption {
+async fn adopt(
+    control: &Control,
+    uploads: &Uploads,
+    target: &UploadTarget,
+    now: i64,
+    local: Option<&LocalProof<'_>>,
+) -> Adoption {
     let Some(key) = target
         .authorized_at
         .and_then(|started| RecordingKey::new(&target.session_id, started).ok())
@@ -906,31 +1248,29 @@ async fn adopt(control: &Control, uploads: &Uploads, target: &UploadTarget, now:
     };
     let location = key.location();
     let sink = uploads.sink();
-    let found = match tokio::task::spawn_blocking(move || read_stored(sink.as_ref(), &key)).await {
-        Ok(Ok(Some(found))) => found,
-        Ok(Ok(None)) => return Adoption::Absent,
-        Ok(Err(err)) => {
-            tracing::error!(target: "jaunt::control", error = %err, "reading a stored recording to adopt it failed");
-            return Adoption::Refused;
+    let found =
+        match tokio::task::spawn_blocking(move || read_store_proof(sink.as_ref(), &key)).await {
+            Ok(found) => found,
+            Err(_) => Err(RecordingStoreError::Unavailable),
+        };
+    let identity = Identity {
+        session_id: target.session_id.clone(),
+        node: target.node_id.clone(),
+        user: target.user_id.clone(),
+        login: target.login.clone(),
+    };
+    let found = match (resolve_existing(&identity, local, &found), found) {
+        (Resolution::Nothing, _) => return Adoption::Absent,
+        (Resolution::Retry, _) => {
+            let retries = uploads.note_retry();
+            tracing::warn!(target: "jaunt::control", session_id = %target.session_id, retries_total = retries, "the recording storage could not be read completely: the recording stays receiving and is looked at again later");
+            return Adoption::StoreFailed;
         }
-        Err(_) => {
-            tracing::error!(target: "jaunt::control", "reading a stored recording to adopt it panicked");
-            return Adoption::Refused;
-        }
+        (Resolution::Conflict(reason), _) => return Adoption::Mismatch(reason),
+        (Resolution::Adopt, Ok(Some(found))) => found,
+        (Resolution::Adopt, _) => return Adoption::Absent,
     };
     let manifest = &found.manifest;
-    let belongs = manifest.node == target.node_id
-        && manifest.user == target.user_id
-        && target.login.as_deref() == Some(manifest.login.as_str())
-        && found.cast_bytes <= manifest.raw_bytes;
-    if !belongs {
-        tracing::error!(
-            target: "jaunt::control",
-            session_id = %target.session_id,
-            "a stored manifest does not match its session or its cast: the files are kept and the recording is marked failed"
-        );
-        return Adoption::Refused;
-    }
     let stored = StoredRecording {
         session_id: &target.session_id,
         node_id: &target.node_id,
@@ -973,11 +1313,12 @@ async fn adopt(control: &Control, uploads: &Uploads, target: &UploadTarget, now:
     Adoption::Adopted
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveredRecordings {
     pub adopted: u64,
     pub salvaged: u64,
     pub failed: u64,
+    pub left_receiving: Vec<String>,
 }
 
 pub(crate) async fn recover(control: &Control) -> Result<RecoveredRecordings, StoreError> {
@@ -989,24 +1330,38 @@ pub(crate) async fn recover(control: &Control) -> Result<RecoveredRecordings, St
         return Ok(recovered);
     };
     let recordings = control.store.recordings();
+    let pass_started = uploads.hold_seq();
     for row in recordings.list_receiving().await? {
-        if uploads.find(&row.session_id).is_some() {
+        if uploads.find(&row.session_id).is_some() || uploads.is_conflicted(&row.session_id) {
+            recovered.left_receiving.push(row.session_id.clone());
             continue;
         }
         let target = recordings.upload_target(&row.session_id).await?;
+        if let Some(target) = &target
+            && staged_manifest_waits(uploads, target)
+        {
+            if uploads.first_note(&row.session_id) {
+                tracing::warn!(target: "jaunt::control", session_id = %row.session_id, "a staged manifest waits to be published: the recording is left alone");
+            }
+            recovered.left_receiving.push(row.session_id.clone());
+            continue;
+        }
         if let Some(target) = &target {
-            match adopt(control, uploads, target, now).await {
+            let proof = recovery_proof(uploads, target);
+            let local = proof.as_ref().map(RecoveryProof::local);
+            match adopt(control, uploads, target, now, local.as_ref()).await {
                 Adoption::Adopted => {
                     recovered.adopted += 1;
                     continue;
                 }
-                Adoption::Refused => {
-                    mark_failed(control, &row.session_id, now).await;
-                    recovered.failed += 1;
+                Adoption::Mismatch(reason) => {
+                    record_conflict(uploads, &row.session_id, reason);
+                    recovered.left_receiving.push(row.session_id.clone());
                     continue;
                 }
                 Adoption::RowMoved | Adoption::StoreFailed => {
                     tracing::warn!(target: "jaunt::control", session_id = %row.session_id, "an interrupted recording could not be adopted now: it stays receiving");
+                    recovered.left_receiving.push(row.session_id.clone());
                     continue;
                 }
                 Adoption::Absent => {}
@@ -1016,24 +1371,46 @@ pub(crate) async fn recover(control: &Control) -> Result<RecoveredRecordings, St
             (Some(target), Some(prefix)) if row.chunks > 0 => {
                 resume(uploads, target, row.raw_bytes, prefix).await
             }
-            _ => None,
+            _ => Resumed::Nothing,
         };
+        if matches!(resumed, Resumed::Later) {
+            recovered.left_receiving.push(row.session_id.clone());
+            continue;
+        }
         let salvaged = match (target, resumed) {
-            (Some(target), Some(staged)) => {
-                salvage(control, &target, staged, row.chunks, now).await
+            (Some(target), Resumed::Staged(staged)) => {
+                salvage(control, uploads, &target, staged, row.chunks, None, now).await
             }
             _ => {
                 mark_failed(control, &row.session_id, now).await;
-                false
+                Salvaged::Failed
             }
         };
-        if salvaged {
-            recovered.salvaged += 1;
-        } else {
-            recovered.failed += 1;
+        match salvaged {
+            Salvaged::Stored => recovered.salvaged += 1,
+            Salvaged::Conflict => recovered.left_receiving.push(row.session_id.clone()),
+            Salvaged::Failed => recovered.failed += 1,
+            Salvaged::Unavailable(staged) => {
+                drop(staged);
+                recovered.left_receiving.push(row.session_id.clone());
+            }
         }
     }
+    uploads.refresh_held(&recovered.left_receiving, pass_started);
     Ok(recovered)
+}
+
+fn staged_manifest_waits(uploads: &Uploads, target: &UploadTarget) -> bool {
+    target
+        .authorized_at
+        .and_then(|started| RecordingKey::new(&target.session_id, started).ok())
+        .is_some_and(|key| uploads.sink().holds_staged_manifest(&key))
+}
+
+enum Resumed {
+    Staged(Box<dyn StagedRecording>),
+    Nothing,
+    Later,
 }
 
 async fn resume(
@@ -1041,21 +1418,35 @@ async fn resume(
     target: &UploadTarget,
     raw_bytes: u64,
     prefix_sha256: &str,
-) -> Option<Box<dyn StagedRecording>> {
-    let key = RecordingKey::new(&target.session_id, target.authorized_at?).ok()?;
+) -> Resumed {
+    let Some(authorized_at) = target.authorized_at else {
+        return Resumed::Nothing;
+    };
+    let Ok(key) = RecordingKey::new(&target.session_id, authorized_at) else {
+        return Resumed::Nothing;
+    };
     let sink = uploads.sink();
     let prefix_sha256 = prefix_sha256.to_owned();
     match tokio::task::spawn_blocking(move || sink.resume(&key, raw_bytes, &prefix_sha256)).await {
-        Ok(Ok(staged)) => staged,
+        Ok(Ok(Some(staged))) => Resumed::Staged(staged),
+        Ok(Ok(None)) => Resumed::Nothing,
+        Ok(Err(err)) if err.is_local_fault() => {
+            tracing::warn!(target: "jaunt::control", session_id = %target.session_id, error = %err, "the staged files of an interrupted recording cannot be read now: they are kept and the recording stays receiving");
+            Resumed::Later
+        }
         Ok(Err(err)) => {
             tracing::error!(target: "jaunt::control", error = %err, "resuming an interrupted recording failed");
-            None
+            Resumed::Nothing
         }
         Err(_) => {
             tracing::error!(target: "jaunt::control", "resuming an interrupted recording panicked");
-            None
+            Resumed::Nothing
         }
     }
+}
+
+fn is_protected(entry: &Entry, upload: &Upload) -> bool {
+    upload.awaiting_commit() || entry.retry_after() > 0
 }
 
 fn assemble_failure(error: &AssembleError) -> Failure {
@@ -1102,6 +1493,8 @@ fn storage_failure(error: &RecordingStoreError) -> Failure {
             refused(RecordingRefusal::InsufficientStorage, Reason::DiskFull)
         }
         RecordingStoreError::TooLarge => refused(RecordingRefusal::TooLarge, Reason::Limit),
+        RecordingStoreError::Unavailable => Failure::Unavailable,
+        RecordingStoreError::Finished => closed(),
         other => {
             tracing::error!(target: "jaunt::control", error = %other, "the recording storage failed");
             Failure::Internal

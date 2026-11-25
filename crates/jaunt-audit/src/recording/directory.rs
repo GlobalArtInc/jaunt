@@ -12,9 +12,9 @@ use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use super::{
-    CAST_SUFFIX, Committed, MANIFEST_SUFFIX, MAX_MANIFEST_BYTES, PART_SUFFIX, RecordingKey,
-    RecordingSink, RecordingStoreError, StagedRecording, StoredRecording, hex, manifest_bytes,
-    sha256_hex,
+    CAST_SUFFIX, Committed, MANIFEST_SUFFIX, MAX_MANIFEST_BYTES, PART_SUFFIX, PENDING_SUFFIX,
+    RecordingKey, RecordingSink, RecordingStoreError, StagedRecording, StoredRecording, hex,
+    manifest_bytes, sha256_hex,
 };
 
 pub const ROOT_MODE: u32 = 0o750;
@@ -36,6 +36,20 @@ impl Default for DirectoryLimits {
     }
 }
 
+pub struct PendingManifest {
+    pub key: RecordingKey,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for PendingManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingManifest")
+            .field("key", &self.key)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Leftovers {
     pub parts: u64,
@@ -44,6 +58,7 @@ pub struct Leftovers {
 
 pub type FreeSpace = Arc<dyn Fn(BorrowedFd<'_>) -> io::Result<u64> + Send + Sync>;
 
+pub const QUARANTINE_DIR: &str = "quarantine";
 const RENAME_PROBE: &str = ".rename-probe";
 const RENAME_PROBE_DONE: &str = ".rename-probe-done";
 
@@ -260,10 +275,17 @@ impl DirectorySink {
     }
 
     pub fn remove_leftovers(&self) -> Result<Leftovers, RecordingStoreError> {
+        self.remove_leftovers_except(&[])
+    }
+
+    pub fn remove_leftovers_except(
+        &self,
+        keep: &[String],
+    ) -> Result<Leftovers, RecordingStoreError> {
         let mut leftovers = Leftovers::default();
         for year in subdirectories(&self.root, 4)? {
             for month in subdirectories(&year, 2)? {
-                remove_leftovers_in(&month, &mut leftovers)?;
+                remove_leftovers_in(&month, keep, &mut leftovers)?;
             }
         }
         Ok(leftovers)
@@ -293,7 +315,7 @@ fn subdirectories(dir: &Path, digits: usize) -> Result<Vec<PathBuf>, RecordingSt
 }
 
 enum Leftover {
-    Part,
+    Part(String),
     Cast(String),
 }
 
@@ -302,13 +324,17 @@ fn leftover_kind(name: &str) -> Option<Leftover> {
         let id = stem
             .strip_suffix(CAST_SUFFIX)
             .or_else(|| stem.strip_suffix(MANIFEST_SUFFIX))?;
-        return is_session_id(id).then_some(Leftover::Part);
+        return is_session_id(id).then(|| Leftover::Part(id.to_owned()));
     }
     let id = name.strip_suffix(CAST_SUFFIX)?;
     is_session_id(id).then(|| Leftover::Cast(id.to_owned()))
 }
 
-fn remove_leftovers_in(dir: &Path, leftovers: &mut Leftovers) -> Result<(), RecordingStoreError> {
+fn remove_leftovers_in(
+    dir: &Path,
+    keep: &[String],
+    leftovers: &mut Leftovers,
+) -> Result<(), RecordingStoreError> {
     for entry in listing(dir)? {
         let entry = entry.map_err(RecordingStoreError::io("list a recording directory"))?;
         let kind = entry
@@ -323,11 +349,23 @@ fn remove_leftovers_in(dir: &Path, leftovers: &mut Leftovers) -> Result<(), Reco
         let remove =
             || fs::remove_file(entry.path()).map_err(RecordingStoreError::io("remove a leftover"));
         match leftover_kind(&name) {
-            Some(Leftover::Part) => {
+            Some(Leftover::Part(id)) => {
+                if keep.contains(&id) {
+                    continue;
+                }
+                let pending = name
+                    .strip_suffix(&format!("{CAST_SUFFIX}{PART_SUFFIX}"))
+                    .map(|id| dir.join(format!("{id}{PENDING_SUFFIX}")));
+                if pending.is_some_and(|path| path.symlink_metadata().is_ok()) {
+                    continue;
+                }
                 remove()?;
                 leftovers.parts += 1;
             }
             Some(Leftover::Cast(id)) => {
+                if keep.contains(&id) {
+                    continue;
+                }
                 let manifest = dir.join(format!("{id}{MANIFEST_SUFFIX}"));
                 match fs::symlink_metadata(&manifest) {
                     Ok(_) => {}
@@ -349,15 +387,15 @@ fn remove_leftovers_in(dir: &Path, leftovers: &mut Leftovers) -> Result<(), Reco
     Ok(())
 }
 
-impl RecordingSink for DirectorySink {
-    fn begin(&self, key: &RecordingKey) -> Result<Box<dyn StagedRecording>, RecordingStoreError> {
+impl DirectorySink {
+    pub fn begin_staged(&self, key: &RecordingKey) -> Result<DirectoryStaged, RecordingStoreError> {
         if free_bytes(&self.free_space, self.root_fd.as_fd())? < self.limits.min_free_bytes {
             return Err(RecordingStoreError::DiskFull);
         }
         let year = ensure_dir(&*self.root_fd, &key.year_dir())?;
         let month = ensure_dir(&year, &key.month_dir())?;
         refuse_stored(&month, key)?;
-        Ok(Box::new(DirectoryStaged {
+        Ok(DirectoryStaged {
             dir: month,
             key: key.clone(),
             limits: self.limits,
@@ -368,15 +406,15 @@ impl RecordingSink for DirectorySink {
             last_seq: None,
             files: Files::default(),
             finished: false,
-        }))
+        })
     }
 
-    fn resume(
+    pub fn resume_staged(
         &self,
         key: &RecordingKey,
         raw_bytes: u64,
         prefix_sha256: &str,
-    ) -> Result<Option<Box<dyn StagedRecording>>, RecordingStoreError> {
+    ) -> Result<Option<DirectoryStaged>, RecordingStoreError> {
         let Some(year) = open_dir(&*self.root_fd, &key.year_dir())? else {
             return Ok(None);
         };
@@ -425,7 +463,7 @@ impl RecordingSink for DirectorySink {
             unlink(&month, &part_name(&key.cast_name()))?;
             return Err(RecordingStoreError::PrefixMismatch);
         }
-        Ok(Some(Box::new(DirectoryStaged {
+        Ok(Some(DirectoryStaged {
             dir: month,
             key: key.clone(),
             limits: self.limits,
@@ -439,7 +477,188 @@ impl RecordingSink for DirectorySink {
                 ..Files::default()
             },
             finished: false,
-        })))
+        }))
+    }
+
+    pub fn pending_manifests(&self) -> Result<Vec<PendingManifest>, RecordingStoreError> {
+        let mut found = Vec::new();
+        let years = match subdirectories(&self.root, 4) {
+            Ok(years) => years,
+            Err(err) => {
+                tracing::warn!(target: "jaunt::recordings", error = %err, "the staging directory cannot be listed for pending manifests");
+                return Ok(found);
+            }
+        };
+        for year in years {
+            let Some(year_name) = year.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let year_fd = match open_dir(&*self.root_fd, year_name) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(target: "jaunt::recordings", directory = year_name, error = %err, "a staging directory is skipped");
+                    continue;
+                }
+            };
+            let months = match subdirectories(&year, 2) {
+                Ok(months) => months,
+                Err(err) => {
+                    tracing::warn!(target: "jaunt::recordings", directory = year_name, error = %err, "a staging directory is skipped");
+                    continue;
+                }
+            };
+            for month in months {
+                let Some(month_name) = month.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let month_fd = match open_dir(&year_fd, month_name) {
+                    Ok(Some(fd)) => fd,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        tracing::warn!(target: "jaunt::recordings", directory = month_name, error = %err, "a staging directory is skipped");
+                        continue;
+                    }
+                };
+                let entries = match listing(&month) {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        tracing::warn!(target: "jaunt::recordings", directory = month_name, error = %err, "a staging directory is skipped");
+                        continue;
+                    }
+                };
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    let Some(id) = name.strip_suffix(PENDING_SUFFIX) else {
+                        continue;
+                    };
+                    let Ok(key) = RecordingKey::from_directories(id, year_name, month_name) else {
+                        continue;
+                    };
+                    let read = open_file(&month_fd, &name).and_then(|opened| match opened {
+                        Some(file) => read_bounded(file).map(Some),
+                        None => Ok(None),
+                    });
+                    match read {
+                        Ok(Some(bytes)) => found.push(PendingManifest { key, bytes }),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(target: "jaunt::recordings", session_id = key.session_id(), error = %err, "a pending manifest cannot be read and is skipped");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    pub fn open_staged_cast(
+        &self,
+        key: &RecordingKey,
+    ) -> Result<Option<File>, RecordingStoreError> {
+        let Some(year) = open_dir(&*self.root_fd, &key.year_dir())? else {
+            return Ok(None);
+        };
+        let Some(month) = open_dir(&year, &key.month_dir())? else {
+            return Ok(None);
+        };
+        open_file(&month, &part_name(&key.cast_name()))
+    }
+
+    pub fn quarantine_staged(&self, key: &RecordingKey) -> Result<(), RecordingStoreError> {
+        let Some(year) = open_dir(&*self.root_fd, &key.year_dir())? else {
+            return Ok(());
+        };
+        let Some(month) = open_dir(&year, &key.month_dir())? else {
+            return Ok(());
+        };
+        let quarantine = ensure_dir(&*self.root_fd, QUARANTINE_DIR)?;
+        let target = ensure_dir(&quarantine, key.session_id())?;
+        let manifest_name = key.manifest_name();
+        for name in [
+            pending_name(key),
+            part_name(&manifest_name),
+            part_name(&key.cast_name()),
+        ] {
+            match rustix::fs::renameat_with(
+                &month,
+                name.as_str(),
+                &target,
+                name.as_str(),
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) | Err(Errno::NOENT) => {}
+                Err(other) => return Err(errno("quarantine a staged file")(other)),
+            }
+        }
+        rustix::fs::fsync(&target).map_err(errno("flush the quarantine directory"))
+    }
+
+    pub fn pending_exists(&self, key: &RecordingKey) -> Result<bool, RecordingStoreError> {
+        let Some(year) = open_dir(&*self.root_fd, &key.year_dir())? else {
+            return Ok(false);
+        };
+        let Some(month) = open_dir(&year, &key.month_dir())? else {
+            return Ok(false);
+        };
+        match rustix::fs::statat(
+            &month,
+            pending_name(key).as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(other) => Err(errno("inspect a pending manifest")(other)),
+        }
+    }
+
+    pub fn remove_staged(&self, key: &RecordingKey) -> Result<(), RecordingStoreError> {
+        let Some(year) = open_dir(&*self.root_fd, &key.year_dir())? else {
+            return Ok(());
+        };
+        let Some(month) = open_dir(&year, &key.month_dir())? else {
+            return Ok(());
+        };
+        let manifest_name = key.manifest_name();
+        for name in [
+            pending_name(key),
+            part_name(&manifest_name),
+            part_name(&key.cast_name()),
+        ] {
+            unlink(&month, &name)?;
+        }
+        Ok(())
+    }
+}
+
+impl RecordingSink for DirectorySink {
+    fn begin(&self, key: &RecordingKey) -> Result<Box<dyn StagedRecording>, RecordingStoreError> {
+        Ok(Box::new(self.begin_staged(key)?))
+    }
+
+    fn holds_staged_manifest(&self, key: &RecordingKey) -> bool {
+        self.pending_exists(key).unwrap_or(true)
+    }
+
+    fn holds_staged_part(&self, key: &RecordingKey) -> bool {
+        self.open_staged_cast(key)
+            .map_or(true, |opened| opened.is_some())
+    }
+
+    fn resume(
+        &self,
+        key: &RecordingKey,
+        raw_bytes: u64,
+        prefix_sha256: &str,
+    ) -> Result<Option<Box<dyn StagedRecording>>, RecordingStoreError> {
+        Ok(self
+            .resume_staged(key, raw_bytes, prefix_sha256)?
+            .map(|staged| Box::new(staged) as Box<dyn StagedRecording>))
     }
 
     fn open(&self, key: &RecordingKey) -> Result<Option<StoredRecording>, RecordingStoreError> {
@@ -452,21 +671,14 @@ impl RecordingSink for DirectorySink {
         let Some(manifest_file) = open_file(&month, &key.manifest_name())? else {
             return Ok(None);
         };
-        let mut bytes = Vec::new();
-        let limit = u64::try_from(MAX_MANIFEST_BYTES).unwrap_or(u64::MAX);
-        manifest_file
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(RecordingStoreError::io("read a stored manifest"))?;
-        if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(RecordingStoreError::InvalidManifest);
-        }
+        let bytes = read_bounded(manifest_file)?;
         let manifest: SessionManifest =
             serde_json::from_slice(&bytes).map_err(|_| RecordingStoreError::InvalidManifest)?;
         if manifest.session_id != key.session_id() {
             return Err(RecordingStoreError::InvalidManifest);
         }
-        let cast = open_file(&month, &key.cast_name())?;
+        let cast =
+            open_file(&month, &key.cast_name())?.map(|file| Box::new(file) as Box<dyn Read + Send>);
         Ok(Some(StoredRecording {
             manifest,
             manifest_sha256: sha256_hex(&bytes),
@@ -475,15 +687,32 @@ impl RecordingSink for DirectorySink {
     }
 }
 
+fn read_bounded(file: File) -> Result<Vec<u8>, RecordingStoreError> {
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_MANIFEST_BYTES).unwrap_or(u64::MAX);
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(RecordingStoreError::io("read a stored manifest"))?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(RecordingStoreError::InvalidManifest);
+    }
+    Ok(bytes)
+}
+
+fn pending_name(key: &RecordingKey) -> String {
+    format!("{}{PENDING_SUFFIX}", key.session_id())
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct Files {
     cast_part: bool,
     cast: bool,
     manifest_part: bool,
     manifest: bool,
+    pending: bool,
 }
 
-struct DirectoryStaged {
+pub struct DirectoryStaged {
     dir: OwnedFd,
     key: RecordingKey,
     limits: DirectoryLimits,
@@ -503,11 +732,10 @@ impl DirectoryStaged {
     ) -> Result<Committed, RecordingStoreError> {
         let bytes = manifest_bytes(manifest)?;
         let cast_name = self.key.cast_name();
-        let cast_sha256 = match self.cast.take() {
+        let cast_sha256 = match self.cast.as_ref() {
             Some(file) => {
                 file.sync_all()
                     .map_err(RecordingStoreError::io("flush the recording"))?;
-                drop(file);
                 store_name(&self.dir, &part_name(&cast_name), &cast_name)?;
                 self.files.cast_part = false;
                 self.files.cast = true;
@@ -536,7 +764,76 @@ impl DirectoryStaged {
         })
     }
 
-    fn discard(&mut self) -> Result<(), RecordingStoreError> {
+    pub fn cast_for_upload(&mut self) -> Result<Option<File>, RecordingStoreError> {
+        if self.finished {
+            return Err(RecordingStoreError::Finished);
+        }
+        let Some(writer) = self.cast.as_ref() else {
+            return Ok(None);
+        };
+        writer
+            .sync_all()
+            .map_err(RecordingStoreError::io("flush the recording"))?;
+        match open_file(&self.dir, &part_name(&self.key.cast_name()))? {
+            Some(file) => Ok(Some(file)),
+            None => Err(RecordingStoreError::Io {
+                operation: "open the staged recording",
+                source: io::Error::new(
+                    ErrorKind::NotFound,
+                    "the staged recording was removed while it was being stored",
+                ),
+            }),
+        }
+    }
+
+    pub fn stash_manifest(&mut self, bytes: &[u8]) -> Result<(), RecordingStoreError> {
+        if self.finished {
+            return Err(RecordingStoreError::Finished);
+        }
+        let temporary = part_name(&self.key.manifest_name());
+        unlink(&self.dir, &temporary)?;
+        let mut file = create_file(&self.dir, &temporary)?;
+        self.files.manifest_part = true;
+        file.write_all(bytes)
+            .map_err(RecordingStoreError::io("write the pending manifest"))?;
+        file.sync_all()
+            .map_err(RecordingStoreError::io("flush the pending manifest"))?;
+        drop(file);
+        rustix::fs::renameat(
+            &self.dir,
+            temporary.as_str(),
+            &self.dir,
+            pending_name(&self.key),
+        )
+        .map_err(errno("store the pending manifest"))?;
+        self.files.manifest_part = false;
+        self.files.pending = true;
+        rustix::fs::fsync(&self.dir).map_err(errno("flush the recording directory"))
+    }
+
+    fn restore_after_exists(&mut self) -> Result<(), RecordingStoreError> {
+        let manifest_name = self.key.manifest_name();
+        let cast_name = self.key.cast_name();
+        if self.files.manifest_part {
+            unlink(&self.dir, &part_name(&manifest_name))?;
+            self.files.manifest_part = false;
+        }
+        if self.files.cast {
+            store_name(&self.dir, &cast_name, &part_name(&cast_name))?;
+            self.files.cast = false;
+            self.files.cast_part = true;
+        }
+        Ok(())
+    }
+
+    pub fn release(&mut self) {
+        self.cast = None;
+        self.files = Files::default();
+        self.finished = true;
+    }
+
+    pub fn discard(&mut self) -> Result<(), RecordingStoreError> {
+        self.finished = true;
         self.cast = None;
         let files = std::mem::take(&mut self.files);
         let manifest_name = self.key.manifest_name();
@@ -544,6 +841,7 @@ impl DirectoryStaged {
         let mut first_error = None;
         for (present, name) in [
             (files.manifest, manifest_name.clone()),
+            (files.pending, pending_name(&self.key)),
             (files.manifest_part, part_name(&manifest_name)),
             (files.cast, cast_name.clone()),
             (files.cast_part, part_name(&cast_name)),
@@ -597,21 +895,32 @@ impl StagedRecording for DirectoryStaged {
         hex(&self.hasher.clone().finalize())
     }
 
-    fn commit(
-        mut self: Box<Self>,
-        manifest: &SessionManifest,
-    ) -> Result<Committed, RecordingStoreError> {
+    fn commit(&mut self, manifest: &SessionManifest) -> Result<Committed, RecordingStoreError> {
         if self.finished {
             return Err(RecordingStoreError::Finished);
         }
         let committed = self.commit_files(manifest);
-        if committed.is_err()
-            && let Err(err) = self.discard()
-        {
-            tracing::warn!(target: "jaunt::recordings", error = %err, "removing a failed recording left files behind");
+        match &committed {
+            Ok(_) => self.finished = true,
+            Err(RecordingStoreError::Exists) => {
+                if let Err(err) = self.restore_after_exists() {
+                    tracing::warn!(target: "jaunt::recordings", error = %err, "restoring a recording after a name collision failed: its files are removed");
+                    let _ = self.discard();
+                    self.finished = true;
+                }
+            }
+            Err(_) => {
+                if let Err(err) = self.discard() {
+                    tracing::warn!(target: "jaunt::recordings", error = %err, "removing a failed recording left files behind");
+                }
+                self.finished = true;
+            }
         }
-        self.finished = true;
         committed
+    }
+
+    fn keep_files(&mut self) {
+        self.release();
     }
 
     fn abort(mut self: Box<Self>) -> Result<(), RecordingStoreError> {

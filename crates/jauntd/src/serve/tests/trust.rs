@@ -85,7 +85,12 @@ fn the_agent_trust_route_serves_the_user_key_printed_by_ca_init() {
         .unwrap();
 
     let started = runtime
-        .block_on(start(settings, authorities, &AuditTap::new(system_clock())))
+        .block_on(start(
+            settings,
+            authorities,
+            &AuditTap::new(system_clock()),
+            &(std::sync::Arc::new(|_: &str| None) as jauntd::ca_reload::IdentityEnv),
+        ))
         .unwrap();
     let (status, body) = runtime.block_on(async {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();

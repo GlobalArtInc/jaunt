@@ -129,10 +129,11 @@ pub enum RecordingRefusal {
     Closed,
     TooMany,
     InsufficientStorage,
+    StorageUnavailable,
 }
 
 impl RecordingRefusal {
-    pub const ALL: [RecordingRefusal; 9] = [
+    pub const ALL: [RecordingRefusal; 10] = [
         RecordingRefusal::Disabled,
         RecordingRefusal::SessionUnknown,
         RecordingRefusal::NotRecordable,
@@ -142,6 +143,7 @@ impl RecordingRefusal {
         RecordingRefusal::Closed,
         RecordingRefusal::TooMany,
         RecordingRefusal::InsufficientStorage,
+        RecordingRefusal::StorageUnavailable,
     ];
 
     pub const fn code(self) -> &'static str {
@@ -155,6 +157,7 @@ impl RecordingRefusal {
             RecordingRefusal::Closed => "recording_closed",
             RecordingRefusal::TooMany => "too_many_recordings",
             RecordingRefusal::InsufficientStorage => "insufficient_storage",
+            RecordingRefusal::StorageUnavailable => "storage_unavailable",
         }
     }
 
@@ -168,13 +171,16 @@ impl RecordingRefusal {
             RecordingRefusal::TooLarge => 413,
             RecordingRefusal::TooMany => 429,
             RecordingRefusal::InsufficientStorage => 507,
+            RecordingRefusal::StorageUnavailable => 503,
         }
     }
 
     pub const fn retry_later(self) -> bool {
         matches!(
             self,
-            RecordingRefusal::TooMany | RecordingRefusal::InsufficientStorage
+            RecordingRefusal::TooMany
+                | RecordingRefusal::InsufficientStorage
+                | RecordingRefusal::StorageUnavailable
         )
     }
 
@@ -278,6 +284,20 @@ mod tests {
                 ("recording_closed", 409),
                 ("too_many_recordings", 429),
                 ("insufficient_storage", 507),
+                ("storage_unavailable", 503),
+            ]
+        );
+        let retryable: Vec<&str> = RecordingRefusal::ALL
+            .iter()
+            .filter(|refusal| refusal.retry_later())
+            .map(|refusal| refusal.code())
+            .collect();
+        assert_eq!(
+            retryable,
+            [
+                "too_many_recordings",
+                "insufficient_storage",
+                "storage_unavailable"
             ]
         );
         for refusal in RecordingRefusal::ALL {

@@ -8,23 +8,14 @@ use crate::support::{Harness, Options, unix_secs};
 
 const STRAY: &str = "8c7d6e5f-4a3b-4c2d-9e1f-0a1b2c3d4e5f";
 
-#[tokio::test]
-async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("recordings");
-    let settings = RecordingsSection {
-        dir: Some(root.clone()),
-        min_free_bytes: 0,
-        ..RecordingsSection::default()
-    }
-    .into_settings()
-    .unwrap()
-    .unwrap();
-    let harness = Harness::start(Options {
-        recordings: Some(settings),
-        ..Options::default()
-    })
-    .await;
+pub struct RecordedSession {
+    pub id: String,
+    pub node_id: String,
+    pub user_id: String,
+    pub started: i64,
+}
+
+pub async fn active_session_with_row(harness: &Harness) -> RecordedSession {
     let enrolled = harness.enroll("web-01").await;
     let store = &harness.store;
     let now = i64::try_from(unix_secs(SystemTime::now())).unwrap();
@@ -95,6 +86,33 @@ async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
         .begin(&session.id, &enrolled.node_id, now)
         .await
         .unwrap();
+    RecordedSession {
+        id: session.id.clone(),
+        node_id: enrolled.node_id.clone(),
+        user_id: user_id.clone(),
+        started: active.authorized_at.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("recordings");
+    let settings = RecordingsSection {
+        dir: Some(root.clone()),
+        min_free_bytes: 0,
+        ..RecordingsSection::default()
+    }
+    .into_settings(dir.path())
+    .unwrap()
+    .unwrap();
+    let harness = Harness::start(Options {
+        recordings: Some(settings),
+        ..Options::default()
+    })
+    .await;
+    let recorded = active_session_with_row(&harness).await;
+    let store = &harness.store;
     let previous_run = DirectorySink::open_existing(
         &root,
         DirectoryLimits {
@@ -103,14 +121,14 @@ async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
         },
     )
     .unwrap();
-    let key = RecordingKey::new(&session.id, active.authorized_at.unwrap()).unwrap();
+    let key = RecordingKey::new(&recorded.id, recorded.started).unwrap();
     let mut staged = previous_run.begin(&key).unwrap();
     staged.write(0, b"zero\n").unwrap();
     let prefix = staged.prefix_sha256();
     std::mem::forget(staged);
     store
         .recordings()
-        .record_progress(&session.id, 1, 5, &prefix)
+        .record_progress(&recorded.id, 1, 5, &prefix)
         .await
         .unwrap();
     let month = root.join(key.location()).parent().unwrap().to_path_buf();
@@ -128,10 +146,10 @@ async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
     assert_eq!(
         names,
         [
-            format!("{}.cast", session.id),
-            format!("{}.manifest.json", session.id)
+            format!("{}.cast", recorded.id),
+            format!("{}.manifest.json", recorded.id)
         ]
     );
-    let row = store.recordings().get(&session.id).await.unwrap().unwrap();
+    let row = store.recordings().get(&recorded.id).await.unwrap().unwrap();
     assert_eq!((row.state, row.chunks), (RecordingState::Incomplete, 1));
 }

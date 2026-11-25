@@ -45,6 +45,7 @@ test-support = []
 [dev-dependencies]
 jaunt-control = { path = ".", features = ["test-support"] }
 jaunt-audit = { workspace = true, features = ["testing"] }
+jaunt-recording-s3 = { path = "../jaunt-recording-s3", features = ["testing"] }
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "tokio"] }
 http-body-util = { version = "0.1.5", features = ["channel"] }
 jsonwebtoken = { version = "12.0.0", default-features = false, features = ["rust_crypto"] }

@@ -23,6 +23,22 @@ jaunt-record jaunt-ca jaunt-store jaunt-audit jaunt-control jaunt-oidc jaunt-pol
 jaunt-gate jaunt-ca jaunt-store
 jaunt-agent jaunt-ca jaunt-store jaunt-control jaunt-oidc jaunt-audit
 jaunt jaunt-ca jaunt-store jaunt-control jaunt-audit
+jaunt-agent jaunt-recording-s3
+jaunt jaunt-recording-s3
+jaunt-control jaunt-recording-s3
+jaunt-audit jaunt-recording-s3
+jaunt-oidc jaunt-recording-s3
+jaunt-policy jaunt-recording-s3
+jaunt-ssh jaunt-recording-s3
+jaunt-tunnel jaunt-recording-s3
+jaunt-gate jaunt-recording-s3
+jaunt-web jaunt-recording-s3
+jaunt-limits jaunt-recording-s3
+jaunt-proto jaunt-recording-s3
+jaunt-ca jaunt-recording-s3
+jaunt-store jaunt-recording-s3
+jaunt-record jaunt-recording-s3
+jaunt-recording-s3 jaunt-ca jaunt-control jaunt-oidc jaunt-policy jaunt-tunnel jaunt-ssh jaunt-gate jaunt-agent jaunt-web
 RULES
 
 exit "$status"

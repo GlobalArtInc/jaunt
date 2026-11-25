@@ -85,6 +85,7 @@ pub struct Options {
     pub revocation_watch_interval: Option<Duration>,
     pub agent_gone_after: Option<Duration>,
     pub recordings: Option<RecordingsSettings>,
+    pub prepared: Option<PreparedRecordings>,
     pub web: bool,
 }
 
@@ -142,10 +143,13 @@ impl Harness {
         let store = Store::open(&db_path).await.unwrap();
         store.migrate().await.unwrap();
         let discovery = FakeDiscovery::start().await;
-        let recordings = options
-            .recordings
-            .as_ref()
-            .map(|settings| jauntd::recordings::prepare(settings).unwrap());
+        let recordings = match options.prepared {
+            Some(prepared) => Some(prepared),
+            None => options
+                .recordings
+                .as_ref()
+                .map(|settings| jauntd::recordings::prepare(settings, &|_| None).unwrap()),
+        };
         let control = Control::new(ControlParts {
             store: store.clone(),
             oidc: discovery.client().await,

@@ -9,6 +9,7 @@ mod enroll;
 mod flow;
 mod recording_support;
 mod recordings;
+mod recordings_s3;
 mod renew;
 mod revoke;
 mod route;

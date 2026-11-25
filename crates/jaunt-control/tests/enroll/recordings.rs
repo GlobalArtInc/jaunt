@@ -917,7 +917,8 @@ async fn a_restart_stores_what_was_delivered_and_fails_what_was_not() {
         RecoveredRecordings {
             adopted: 2,
             salvaged: 1,
-            failed: 2
+            failed: 2,
+            ..RecoveredRecordings::default()
         }
     );
     assert_eq!(named(&events, "recording.completed").len(), 3);
@@ -1046,7 +1047,8 @@ async fn a_failed_progress_write_is_not_acked_and_the_retry_catches_the_row_up()
 }
 
 #[tokio::test]
-async fn a_stored_manifest_that_does_not_match_its_session_is_not_adopted_and_kept() {
+async fn a_stored_manifest_that_does_not_match_its_session_is_neither_adopted_nor_failed_and_is_kept()
+ {
     let r = default_rec().await;
     let foreign_user = r.active().await;
     let oversized = r.active().await;
@@ -1076,15 +1078,23 @@ async fn a_stored_manifest_that_does_not_match_its_session_is_not_adopted_and_ke
     }
     let recovered = r.harness.control.recover_recordings().await.unwrap();
     assert_eq!(
-        recovered,
-        RecoveredRecordings {
-            adopted: 0,
-            salvaged: 0,
-            failed: 2
-        }
+        (recovered.adopted, recovered.salvaged, recovered.failed),
+        (0, 0, 0)
     );
+    let mut left = recovered.left_receiving.clone();
+    left.sort();
+    let mut expected = vec![foreign_user.id.clone(), oversized.id.clone()];
+    expected.sort();
+    assert_eq!(left, expected);
+    assert_eq!(r.harness.control.recordings_conflicts(), 2);
+    let again = r.harness.control.recover_recordings().await.unwrap();
+    assert_eq!(again.left_receiving.len(), 2);
+    assert_eq!(r.harness.control.recordings_conflicts(), 2);
     for session in [&foreign_user, &oversized] {
-        assert_eq!(r.row(session).await.unwrap().state, RecordingState::Failed);
+        assert_eq!(
+            r.row(session).await.unwrap().state,
+            RecordingState::Receiving
+        );
         let location = r.key(session).await.location();
         assert!(r.files().contains(&format!("{location}.manifest.json")));
         assert!(r.files().contains(&format!("{location}.cast")));
@@ -1700,4 +1710,531 @@ async fn without_a_directory_recording_is_disabled_and_anonymous_callers_are_tur
     .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reasons(&capture.finish().await), ["disabled"]);
+}
+
+async fn upload_all(r: &Rec, session: &Session, chunks: &[Chunk]) {
+    for chunk in chunks {
+        acked(&r.chunk(session, &wire(chunk)).await);
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_store_keeps_the_upload_open_and_the_retry_commits_the_real_manifest() {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let session = r.active().await;
+    let (chunks, manifest) = recorded(&session, 300_000, 22);
+    assert!(manifest.digest.is_some() && manifest.exit_status == Some(0));
+    upload_all(&r, &session, &chunks).await;
+    gate.unavailable_for(2);
+
+    let capture = ScopedCapture::start();
+    let location = r.key(&session).await.location();
+    for _ in 0..2 {
+        let reply = r.complete(&session, &manifest).await;
+        refused(
+            &reply,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+        );
+        assert!(reply.headers.contains_key(RETRY_AFTER));
+        assert_eq!(
+            r.row(&session).await.unwrap().state,
+            RecordingState::Receiving
+        );
+        assert_eq!(r.files(), [format!("{location}.cast.part")]);
+    }
+    let receipt = r.complete(&session, &manifest).await;
+    assert_eq!(
+        receipt.json(),
+        json!({"state": "complete", "chunks": chunks.len()})
+    );
+    let events = capture.finish().await;
+
+    assert_eq!(gate.commit_attempts(), 3);
+    assert_eq!(named(&events, "recording.completed").len(), 1);
+    assert!(reasons(&events).is_empty(), "{:?}", reasons(&events));
+    let key = r.key(&session).await;
+    let row = r.row(&session).await.unwrap();
+    assert_eq!(row.state, RecordingState::Complete);
+    assert_eq!(row.digest, manifest.digest);
+    let stored = r.sink().open(&key).unwrap().unwrap();
+    assert_eq!(stored.manifest, manifest);
+    verify_stored(r.sink().as_ref(), &key, &row).unwrap();
+    let cast = std::fs::read(r.harness.recordings_dir.join(format!("{location}.cast"))).unwrap();
+    assert_eq!(cast, cast_of(&session.id, &chunks));
+    assert_eq!(
+        r.complete(&session, &manifest).await.json(),
+        json!({"state": "complete", "chunks": chunks.len()})
+    );
+}
+
+#[tokio::test]
+async fn a_retry_with_another_manifest_during_an_outage_is_refused_and_keeps_the_upload() {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let session = r.active().await;
+    let chunk = crafted(&session.id, 0, b"only\n", true);
+    upload_all(&r, &session, std::slice::from_ref(&chunk)).await;
+    let manifest = manifest_for(&session, std::slice::from_ref(&chunk));
+    gate.unavailable_for(1);
+    refused(
+        &r.complete(&session, &manifest).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "storage_unavailable",
+    );
+    let mut other = manifest.clone();
+    other.exit_status = Some(7);
+    refused(
+        &r.complete(&session, &other).await,
+        StatusCode::CONFLICT,
+        "conflict",
+    );
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Receiving
+    );
+    assert_eq!(
+        r.complete(&session, &manifest).await.json(),
+        json!({"state": "complete", "chunks": 1})
+    );
+    assert_eq!(
+        r.sink()
+            .open(&r.key(&session).await)
+            .unwrap()
+            .unwrap()
+            .manifest,
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn an_agent_that_never_retries_after_an_outage_has_its_real_manifest_committed_by_the_idle_sweep()
+ {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let session = r.active().await;
+    let chunk = crafted(&session.id, 0, b"only\n", true);
+    upload_all(&r, &session, std::slice::from_ref(&chunk)).await;
+    let manifest = manifest_for(&session, std::slice::from_ref(&chunk));
+    gate.unavailable_for(1);
+    refused(
+        &r.complete(&session, &manifest).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "storage_unavailable",
+    );
+    r.end(&session, false).await;
+    r.harness.clock.advance(7200);
+    assert_eq!(r.harness.control.sweep_idle_recordings().await, 1);
+    let row = r.row(&session).await.unwrap();
+    assert_eq!(row.state, RecordingState::Complete);
+    assert!(!row.salvaged);
+    assert_eq!(row.digest, manifest.digest);
+    verify_stored(r.sink().as_ref(), &r.key(&session).await, &row).unwrap();
+    assert_eq!(
+        r.sink()
+            .open(&r.key(&session).await)
+            .unwrap()
+            .unwrap()
+            .manifest,
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn idle_expiry_during_a_long_outage_keeps_the_recording_and_commits_it_when_the_store_returns()
+ {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let session = r.active().await;
+    upload_all(
+        &r,
+        &session,
+        &[
+            crafted(&session.id, 0, b"zero\n", false),
+            crafted(&session.id, 1, b"one\n", false),
+        ],
+    )
+    .await;
+    r.end(&session, false).await;
+    gate.unavailable_for(100);
+    r.harness.clock.advance(7200);
+    assert_eq!(r.harness.control.sweep_idle_recordings().await, 1);
+    let location = r.key(&session).await.location();
+    let mut attempts = gate.commit_attempts();
+    assert_eq!(attempts, 1);
+
+    r.harness.clock.advance(60);
+    assert_eq!(r.harness.control.sweep_idle_recordings().await, 0);
+    assert_eq!(gate.commit_attempts(), attempts);
+    for _ in 0..36 {
+        r.harness.clock.advance(301);
+        assert_eq!(r.harness.control.sweep_idle_recordings().await, 1);
+        attempts += 1;
+        assert_eq!(gate.commit_attempts(), attempts);
+        let row = r.row(&session).await.unwrap();
+        assert_eq!(row.state, RecordingState::Receiving);
+        assert_eq!(r.files(), [format!("{location}.cast.part")]);
+    }
+
+    gate.unavailable_for(0);
+    r.harness.clock.advance(301);
+    assert_eq!(r.harness.control.sweep_idle_recordings().await, 1);
+    let row = r.row(&session).await.unwrap();
+    assert_eq!(row.state, RecordingState::Incomplete);
+    assert!(row.salvaged);
+    assert_eq!(
+        r.files(),
+        [
+            format!("{location}.cast"),
+            format!("{location}.manifest.json")
+        ]
+    );
+    verify_stored(r.sink().as_ref(), &r.key(&session).await, &row).unwrap();
+}
+
+#[tokio::test]
+async fn store_commits_run_one_at_a_time_when_the_limit_says_so() {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            limits: RecordingLimits {
+                max_store_commits: 1,
+                ..RecordingLimits::default()
+            },
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let first = r.active().await;
+    let second = r.active().await;
+    let mut manifests = Vec::new();
+    for session in [&first, &second] {
+        let chunk = crafted(&session.id, 0, b"only\n", true);
+        upload_all(&r, session, std::slice::from_ref(&chunk)).await;
+        manifests.push(manifest_for(session, std::slice::from_ref(&chunk)));
+    }
+    gate.arm(Stage::Commit);
+    let send = |session: &Session, manifest: &jaunt_record::SessionManifest| {
+        tokio::spawn(crate::support::send(
+            r.harness.agent_router.clone(),
+            crate::support::request(
+                &format!("/v1/agent/recordings/{}/complete", session.id),
+                &json!({ "manifest": manifest }),
+                None,
+                Some(&session.node_id),
+            ),
+        ))
+    };
+    let a = send(&first, &manifests[0]);
+    gate.entered().await;
+    let b = send(&second, &manifests[1]);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!b.is_finished());
+    assert_eq!(gate.commit_attempts(), 0);
+    gate.release();
+    assert_eq!(a.await.unwrap().status, StatusCode::OK);
+    assert_eq!(b.await.unwrap().status, StatusCode::OK);
+    assert_eq!(gate.commit_attempts(), 2);
+}
+
+#[tokio::test]
+async fn an_unreadable_store_during_recovery_leaves_the_recording_receiving_for_a_later_adoption() {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    let session = r.active().await;
+    let chunk = crafted(&session.id, 0, b"done\n", true);
+    let manifest = manifest_for(&session, std::slice::from_ref(&chunk));
+    r.harness
+        .store
+        .recordings()
+        .begin(&session.id, &session.node_id, r.harness.clock.now_secs())
+        .await
+        .unwrap();
+    let mut staged = r.sink().begin(&r.key(&session).await).unwrap();
+    staged.write(0, b"done\n").unwrap();
+    staged.commit(&manifest).unwrap();
+
+    gate.unavailable_opens_for(1);
+    let first = r.harness.control.recover_recordings().await.unwrap();
+    assert_eq!(first.left_receiving, std::slice::from_ref(&session.id));
+    assert_eq!((first.adopted, first.salvaged, first.failed), (0, 0, 0));
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Receiving
+    );
+    let second = r.harness.control.recover_recordings().await.unwrap();
+    assert_eq!(second.adopted, 1);
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Complete
+    );
+}
+
+async fn existing_commit_setup(
+    r: &Rec,
+    gate: &Gate,
+) -> (
+    Session,
+    jaunt_record::SessionManifest,
+    Vec<jaunt_record::Chunk>,
+) {
+    let session = r.active().await;
+    let (chunks, manifest) = recorded(&session, 20_000, 31);
+    upload_all(r, &session, &chunks).await;
+    gate.existing_for(1);
+    (session, manifest, chunks)
+}
+
+async fn gated() -> (Rec, Arc<Gate>) {
+    gated_with(RecordingLimits::default()).await
+}
+
+async fn gated_with(limits: RecordingLimits) -> (Rec, Arc<Gate>) {
+    let gate = Arc::new(Gate::default());
+    let r = rec(
+        RecordingOptions {
+            limits,
+            wrap: Some(gate.wrapper()),
+            ..RecordingOptions::default()
+        },
+        true,
+    )
+    .await;
+    (r, gate)
+}
+
+#[tokio::test]
+async fn an_existing_object_that_has_vanished_again_keeps_the_staging_and_asks_for_a_retry() {
+    let (r, gate) = gated().await;
+    let (session, manifest, chunks) = existing_commit_setup(&r, &gate).await;
+    let staged = r.files();
+    let refused = r.complete(&session, &manifest).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Receiving
+    );
+    assert_eq!(r.files(), staged);
+    assert_eq!(
+        r.complete(&session, &manifest).await.json(),
+        json!({"state": "complete", "chunks": chunks.len()})
+    );
+}
+
+#[tokio::test]
+async fn an_existing_object_that_cannot_be_read_now_keeps_the_staging_and_asks_for_a_retry() {
+    let (r, gate) = gated().await;
+    let (session, manifest, chunks) = existing_commit_setup(&r, &gate).await;
+    gate.unavailable_opens_for(1);
+    let staged = r.files();
+    let refused = r.complete(&session, &manifest).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Receiving
+    );
+    assert_eq!(r.files(), staged);
+    assert_eq!(
+        r.complete(&session, &manifest).await.json(),
+        json!({"state": "complete", "chunks": chunks.len()})
+    );
+}
+
+#[tokio::test]
+async fn an_existing_identical_object_whose_row_moved_meanwhile_keeps_the_row_and_answers_closed() {
+    let (r, gate) = gated_with(RecordingLimits {
+        max_uploads_per_node: 1,
+        ..RecordingLimits::default()
+    })
+    .await;
+    let (session, manifest, _) = existing_commit_setup(&r, &gate).await;
+    let location = r.key(&session).await.location();
+    let month = r
+        .harness
+        .recordings_dir
+        .join(&location)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cast = cast_of(&session.id, &recorded(&session, 20_000, 31).0);
+    std::fs::write(month.join(format!("{}.cast", session.id)), &cast).unwrap();
+    std::fs::write(
+        month.join(format!("{}.manifest.json", session.id)),
+        jaunt_audit::manifest_bytes(&manifest).unwrap(),
+    )
+    .unwrap();
+    let pool = raw_pool(&r.harness).await;
+    let handle = tokio::runtime::Handle::current();
+    let id = session.id.clone();
+    gate.on_commit(Arc::new(move || {
+        handle
+            .block_on(
+                sqlx::query("UPDATE recordings SET state = 'failed' WHERE session_id = ?")
+                    .bind(&id)
+                    .execute(&pool),
+            )
+            .unwrap();
+    }));
+    let refused = r.complete(&session, &manifest).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.text());
+    assert_eq!(refused.error_code(), "recording_closed");
+    assert_eq!(r.row(&session).await.unwrap().state, RecordingState::Failed);
+    let next = r.active().await;
+    let accepted = r
+        .chunk(&next, &wire(&crafted(&next.id, 0, b"zero\n", false)))
+        .await;
+    assert_eq!(accepted.status, StatusCode::OK, "the slot was not released");
+}
+
+fn month_of(r: &Rec, location: &str) -> std::path::PathBuf {
+    r.harness
+        .recordings_dir
+        .join(location)
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+#[tokio::test]
+async fn a_real_name_collision_in_the_directory_keeps_the_staging_and_answers_conflict_every_time()
+{
+    let r = default_rec().await;
+    let session = r.active().await;
+    let all = [
+        crafted(&session.id, 0, b"zero\n", false),
+        crafted(&session.id, 1, b"one\n", true),
+    ];
+    upload_all(&r, &session, &all).await;
+    let manifest = manifest_for(&session, &all);
+    let foreign_all = [
+        crafted(&session.id, 0, b"FOREIGN\n", false),
+        crafted(&session.id, 1, b"x\n", true),
+    ];
+    let foreign = manifest_for(&session, &foreign_all);
+    let location = r.key(&session).await.location();
+    let month = month_of(&r, &location);
+    std::fs::write(
+        month.join(format!("{}.cast", session.id)),
+        cast_of(&session.id, &foreign_all),
+    )
+    .unwrap();
+    std::fs::write(
+        month.join(format!("{}.manifest.json", session.id)),
+        jaunt_audit::manifest_bytes(&foreign).unwrap(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let reply = r.complete(&session, &manifest).await;
+        refused(&reply, StatusCode::CONFLICT, "conflict");
+        assert_eq!(
+            r.row(&session).await.unwrap().state,
+            RecordingState::Receiving
+        );
+        assert!(
+            r.files().contains(&format!("{location}.cast.part")),
+            "{:?}",
+            r.files()
+        );
+    }
+    assert_eq!(r.harness.control.recordings_conflicts(), 1);
+    let recovered = r.harness.control.recover_recordings().await.unwrap();
+    assert_eq!(recovered.left_receiving, std::slice::from_ref(&session.id));
+    let row = r.row(&session).await.unwrap();
+    assert_eq!(row.state, RecordingState::Receiving);
+    assert_ne!(row.digest, foreign.digest);
+    assert!(r.files().contains(&format!("{location}.cast.part")));
+}
+
+#[tokio::test]
+async fn an_identical_recording_already_in_the_directory_is_adopted_and_the_staging_released() {
+    let r = default_rec().await;
+    let session = r.active().await;
+    let all = [
+        crafted(&session.id, 0, b"zero\n", false),
+        crafted(&session.id, 1, b"one\n", true),
+    ];
+    upload_all(&r, &session, &all).await;
+    let manifest = manifest_for(&session, &all);
+    let location = r.key(&session).await.location();
+    let month = month_of(&r, &location);
+    std::fs::write(
+        month.join(format!("{}.cast", session.id)),
+        cast_of(&session.id, &all),
+    )
+    .unwrap();
+    std::fs::write(
+        month.join(format!("{}.manifest.json", session.id)),
+        jaunt_audit::manifest_bytes(&manifest).unwrap(),
+    )
+    .unwrap();
+    let reply = r.complete(&session, &manifest).await;
+    assert_eq!(
+        reply.json(),
+        json!({"state": "complete", "chunks": 2}),
+        "{}",
+        reply.text()
+    );
+    assert_eq!(
+        r.row(&session).await.unwrap().state,
+        RecordingState::Complete
+    );
+    assert_eq!(
+        r.files(),
+        [
+            format!("{location}.cast"),
+            format!("{location}.manifest.json")
+        ]
+    );
+    assert_eq!(r.harness.control.recordings_conflicts(), 0);
 }

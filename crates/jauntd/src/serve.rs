@@ -110,6 +110,7 @@ struct Started {
     agent_limits: AddressLimits,
     gate: Option<GatePlan>,
     audit: AuditRuntime,
+    recordings: Option<recordings::PreparedRecordings>,
 }
 
 struct GatePlan {
@@ -138,7 +139,8 @@ async fn serve(
         agent_limits,
         gate,
         audit,
-    } = start(settings, authorities, &tap).await?;
+        recordings,
+    } = start(settings, authorities, &tap, &reload_env).await?;
     let listener = match bind(listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -167,6 +169,12 @@ async fn serve(
         }
     };
     install_killer(&control, agents.as_ref(), gate.as_ref());
+    let maintenance = recordings::start_maintenance(
+        recordings.as_ref(),
+        &control,
+        recordings::RETRY_INTERVAL,
+        recordings::SCAN_INTERVAL,
+    );
     let ca_watcher = start_ca_watcher(&control, ca_dir, reload_env, agents.as_ref(), gate.as_ref());
 
     let (deadline_tx, mut deadline_rx) = watch::channel(None);
@@ -190,6 +198,7 @@ async fn serve(
                 .shutdown(deadline.saturating_duration_since(Instant::now()))
                 .await;
         }
+        maintenance.stop();
         policy::stop_watcher(watcher).await;
     };
     let overdue = async move {
@@ -327,6 +336,7 @@ async fn start(
     settings: RunSettings,
     authorities: Authorities,
     tap: &AuditTap,
+    env: &IdentityEnv,
 ) -> Result<Started, ServeError> {
     let policy = policy::load_at_startup(&settings.policy_dir)?;
 
@@ -364,10 +374,15 @@ async fn start(
         let prepared_recordings = settings
             .recordings
             .as_ref()
-            .map(recordings::prepare)
+            .map(|recordings| {
+                recordings::prepare(recordings, &|name| {
+                    env(name).and_then(|value| value.into_string().ok())
+                })
+            })
             .transpose()?;
-        if prepared_recordings.is_some() {
+        if let Some(prepared) = &prepared_recordings {
             recordings::raise_open_file_limit();
+            recordings::probe(prepared).await?;
         }
         let control = Control::with_request_limits(
             ControlParts {
@@ -411,6 +426,7 @@ async fn start(
             agent_limits: settings.limits.agents,
             gate,
             audit: audit.clone(),
+            recordings: prepared_recordings,
         })
     }
     .await;
@@ -812,6 +828,7 @@ mod tests {
                 settings,
                 authorities(dir.path()),
                 &AuditTap::new(audit_clock()),
+                &no_env(),
             ))
             .unwrap();
 
@@ -850,9 +867,14 @@ mod tests {
                 settings,
                 authorities(dir.path()),
                 &AuditTap::new(audit_clock()),
+                &no_env(),
             ))
             .unwrap();
         (dir, runtime, started)
+    }
+
+    fn no_env() -> IdentityEnv {
+        Arc::new(|_: &str| None)
     }
 
     fn answers(extra: &str, path: &'static str, count: usize) -> Vec<String> {

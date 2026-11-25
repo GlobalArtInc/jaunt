@@ -85,6 +85,7 @@ fn respond<T: Serialize>(joined: Result<Result<T, Failure>, JoinError>) -> Respo
     match joined {
         Ok(Ok(value)) => json_response(StatusCode::OK, &value),
         Ok(Err(Failure::Refused { refusal, .. })) => refusal_response(refusal),
+        Ok(Err(Failure::Unavailable)) => refusal_response(RecordingRefusal::StorageUnavailable),
         Ok(Err(Failure::Internal)) | Err(_) => server_error(),
     }
 }

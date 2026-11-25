@@ -10,7 +10,7 @@ use jaunt_record::SessionKind;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use crate::recording_support::{Rec, Session, cast_of, metadata_only, named, recorded, wire};
+use crate::recording_support::{Gate, Rec, Session, cast_of, metadata_only, named, recorded, wire};
 use crate::session_support::{NODE_NAME, apply_policy, holder, node, raw_pool, role};
 use crate::support::{DEFAULT_PEER, Harness, Options, PUBLIC_ORIGIN, RecordingOptions, Reply};
 use crate::web_support::{ADMIN_ROLES, Admin, Csrf, admin, call, get};
@@ -20,9 +20,13 @@ const WATCHERS: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: watc
      admin: [sessions.read, recordings.read]\n";
 
 async fn setup() -> Rec {
+    setup_with(RecordingOptions::default()).await
+}
+
+async fn setup_with(recordings: RecordingOptions) -> Rec {
     let harness = Harness::with(Options {
         web: true,
-        recordings: Some(RecordingOptions::default()),
+        recordings: Some(recordings),
         ..Options::default()
     })
     .await;
@@ -576,4 +580,25 @@ async fn head_requests_are_refused_and_do_not_use_up_the_audit_window_of_the_get
     fetch(&r, &stream_path(&session), &watcher).await;
     let events = capture.finish().await;
     assert_eq!(named(&events, "recording.viewed").len(), 1);
+}
+
+#[tokio::test]
+async fn a_storage_outage_while_opening_a_recording_answers_503_and_the_next_try_works() {
+    let gate = std::sync::Arc::new(Gate::default());
+    let r = setup_with(RecordingOptions {
+        wrap: Some(gate.wrapper()),
+        ..RecordingOptions::default()
+    })
+    .await;
+    let (session, cast) = stored(&r, 200_000, 4).await;
+    let watcher = admin(&r.harness, "watcher").await;
+    gate.unavailable_opens_for(2);
+    for path in [stream_path(&session), manifest_path(&session)] {
+        let refused = fetch(&r, &path, &watcher).await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(refused.json()["error"], "storage_unavailable");
+    }
+    let served = fetch(&r, &stream_path(&session), &watcher).await;
+    assert_eq!(served.status, StatusCode::OK);
+    assert!(served.body == cast);
 }

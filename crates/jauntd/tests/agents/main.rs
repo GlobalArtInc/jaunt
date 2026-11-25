@@ -7,6 +7,7 @@ mod oidc;
 mod recorder;
 mod recordings;
 mod removal;
+mod s3_recordings;
 mod stand;
 mod subject_key;
 mod support;

@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use jaunt_audit::{Committed, RecordingSink, RecordingStoreError, StagedRecording, StagedSink};
 use jaunt_record::{
     Accepted, AssembleError, Assembler, Chunk, SessionManifest, SinkError, Verified, VerifyError,
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use super::audit::Reason;
 use super::{RecordingLimits, RecordingSettings};
@@ -21,6 +21,7 @@ const MAX_TRACKED_REJECTIONS: usize = 4096;
 pub(crate) enum FinishError {
     Verify(VerifyError),
     Commit(RecordingStoreError),
+    ManifestChanged,
 }
 
 pub(crate) struct Upload {
@@ -31,6 +32,7 @@ pub(crate) struct Upload {
     pending: u64,
     persisted_chunks: u64,
     pub(crate) received: u64,
+    verified: Option<(SessionManifest, Verified)>,
 }
 
 impl Upload {
@@ -43,6 +45,7 @@ impl Upload {
             pending: 0,
             persisted_chunks: 0,
             received: 0,
+            verified: None,
         }
     }
 
@@ -61,22 +64,33 @@ impl Upload {
         manifest: &SessionManifest,
         expects_cast: bool,
     ) -> Result<(Verified, Committed), FinishError> {
-        let Some(mut staged) = self.staged.take() else {
+        let Some(staged) = self.staged.as_mut() else {
             return Err(FinishError::Commit(RecordingStoreError::Finished));
         };
-        match self
-            .assembler
-            .complete(manifest, expects_cast, &mut StagedSink(staged.as_mut()))
-        {
-            Ok(verified) => staged
-                .commit(manifest)
-                .map(|committed| (verified, committed))
-                .map_err(FinishError::Commit),
-            Err(error) => {
-                self.staged = Some(staged);
-                Err(FinishError::Verify(error))
+        let verified = match &self.verified {
+            Some((held, verified)) if held == manifest => verified.clone(),
+            Some(_) => return Err(FinishError::ManifestChanged),
+            None => {
+                let verified = self
+                    .assembler
+                    .complete(manifest, expects_cast, &mut StagedSink(staged.as_mut()))
+                    .map_err(FinishError::Verify)?;
+                self.verified = Some((manifest.clone(), verified.clone()));
+                verified
             }
-        }
+        };
+        staged
+            .commit(manifest)
+            .map(|committed| (verified, committed))
+            .map_err(FinishError::Commit)
+    }
+
+    pub(crate) fn awaiting_commit(&self) -> bool {
+        self.verified.is_some()
+    }
+
+    pub(crate) fn verified_manifest(&self) -> Option<(SessionManifest, Verified)> {
+        self.verified.clone()
     }
 
     pub(crate) fn acked_through(&self) -> Option<u64> {
@@ -165,6 +179,8 @@ pub(crate) struct Entry {
     pub(crate) session_id: String,
     pub(crate) node_id: String,
     last_seen: AtomicI64,
+    retry_after: AtomicI64,
+    deferred_since: AtomicI64,
     waiting: AtomicUsize,
     slot: Arc<AsyncMutex<Slot>>,
 }
@@ -184,6 +200,25 @@ impl Entry {
 
     pub(crate) fn last_seen(&self) -> i64 {
         self.last_seen.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn defer_until(&self, until: i64) {
+        self.retry_after.store(until, Ordering::SeqCst);
+    }
+
+    pub(crate) fn retry_after(&self) -> i64 {
+        self.retry_after.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_deferred(&self, now: i64) -> i64 {
+        let _ = self
+            .deferred_since
+            .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst);
+        self.deferred_since.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn deferred_since(&self) -> i64 {
+        self.deferred_since.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn lock(&self) -> OwnedMutexGuard<Slot> {
@@ -235,11 +270,24 @@ pub(crate) enum Created {
     Refused,
 }
 
+#[cfg(test)]
+type BetweenHook = Arc<dyn Fn(bool, bool) + Send + Sync>;
+
 pub(crate) struct Uploads {
     sink: Arc<dyn RecordingSink>,
     limits: RecordingLimits,
     table: Mutex<Table>,
     disk_full: Mutex<Throttled>,
+    commit_permits: Arc<Semaphore>,
+    held: Mutex<HashMap<String, u64>>,
+    #[cfg(test)]
+    between: Mutex<Option<BetweenHook>>,
+    hold_seq: AtomicU64,
+    given_up: AtomicU64,
+    conflicts: AtomicU64,
+    retries: AtomicU64,
+    noted: Mutex<HashSet<String>>,
+    conflicted: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -310,7 +358,132 @@ impl Uploads {
             limits: settings.limits,
             table: Mutex::new(Table::default()),
             disk_full: Mutex::new(Throttled::default()),
+            held: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            between: Mutex::new(None),
+            hold_seq: AtomicU64::new(0),
+            given_up: AtomicU64::new(0),
+            conflicts: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
+            noted: Mutex::new(HashSet::new()),
+            conflicted: Mutex::new(HashSet::new()),
+            commit_permits: Arc::new(Semaphore::new(settings.limits.max_store_commits.max(1))),
         }
+    }
+
+    pub(crate) fn hold_seq(&self) -> u64 {
+        self.hold_seq.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn refresh_held(&self, left_receiving: &[String], pass_started: u64) {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, seq| *seq > pass_started || left_receiving.contains(id));
+        for id in left_receiving {
+            self.held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(id.clone())
+                .or_insert(0);
+        }
+    }
+
+    pub(crate) fn hold(&self, session_id: &str) {
+        let seq = self.hold_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_id.to_owned(), seq);
+    }
+
+    pub(crate) fn held_ids(&self, limit: usize) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.truncate(limit);
+        ids
+    }
+
+    pub(crate) fn mark_conflicted(&self, session_id: &str) -> bool {
+        self.conflicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_id.to_owned())
+    }
+
+    pub(crate) fn is_conflicted(&self, session_id: &str) -> bool {
+        self.conflicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(session_id)
+    }
+
+    pub(crate) fn conflicted_ids(&self, limit: usize) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .conflicted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.truncate(limit);
+        ids
+    }
+
+    pub(crate) fn note_retry(&self) -> u64 {
+        self.retries.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn retries(&self) -> u64 {
+        self.retries.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_given_up(&self) -> u64 {
+        self.given_up.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn note_conflict(&self) -> u64 {
+        self.conflicts.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub(crate) fn conflicts(&self) -> u64 {
+        self.conflicts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn first_note(&self, session_id: &str) -> bool {
+        self.noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session_id.to_owned())
+    }
+
+    pub(crate) fn given_up(&self) -> u64 {
+        self.given_up.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_held(&self, session_id: &str) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup(&self, session_id: &str) -> (bool, bool) {
+        let table = self.table();
+        let present = table.entries.contains_key(session_id);
+        (present, self.is_held(session_id))
+    }
+
+    pub(crate) async fn commit_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.commit_permits.clone().acquire_owned().await.ok()
     }
 
     pub(crate) fn limits(&self) -> RecordingLimits {
@@ -349,6 +522,8 @@ impl Uploads {
             session_id: session_id.to_owned(),
             node_id: node_id.to_owned(),
             last_seen: AtomicI64::new(now),
+            retry_after: AtomicI64::new(0),
+            deferred_since: AtomicI64::new(0),
             waiting: AtomicUsize::new(0),
             slot: Arc::new(AsyncMutex::new(Slot::Opening)),
         });
@@ -363,6 +538,38 @@ impl Uploads {
 
     pub(crate) fn remove(&self, entry: &Entry, pending: u64) {
         let mut table = self.table();
+        Uploads::remove_in(&mut table, entry, pending);
+    }
+
+    pub(crate) fn remove_and_hold(&self, entry: &Entry, pending: u64) {
+        let mut table = self.table();
+        self.hold(&entry.session_id);
+        #[cfg(test)]
+        self.between_steps(&table, &entry.session_id);
+        Uploads::remove_in(&mut table, entry, pending);
+    }
+
+    #[cfg(test)]
+    fn between_steps(&self, table: &Table, session_id: &str) {
+        let hook = self
+            .between
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(
+                table.entries.contains_key(session_id),
+                self.is_held(session_id),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_between_steps(&self, hook: BetweenHook) {
+        *self.between.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    fn remove_in(table: &mut Table, entry: &Entry, pending: u64) {
         let owned = table
             .entries
             .get(&entry.session_id)
@@ -431,6 +638,7 @@ impl Uploads {
                     .load(Ordering::SeqCst)
                     .saturating_add(idle_secs)
                     <= now
+                    && entry.retry_after() <= now
             })
             .filter_map(|entry| {
                 entry
@@ -605,5 +813,68 @@ mod tests {
             report(NODE, Some("full"), Reason::UnknownSession, 260),
             Some(0)
         );
+    }
+
+    #[test]
+    fn between_its_two_steps_remove_and_hold_never_shows_the_id_as_absent_and_not_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = uploads(&dir, RecordingLimits::default());
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = observed.clone();
+        uploads.set_between_steps(Arc::new(move |present, held| {
+            log.lock().unwrap().push((present, held));
+        }));
+        let Created::Fresh(entry, guard) = uploads.create("session", NODE, 0) else {
+            panic!("the entry could not be created");
+        };
+        drop(guard);
+        uploads.remove_and_hold(&entry, 0);
+        let seen = observed.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0 || seen[0].1, "{seen:?}");
+        let (present, held) = uploads.lookup("session");
+        assert!(!present && held);
+    }
+
+    #[test]
+    fn a_hold_taken_during_a_recovery_pass_survives_the_refresh_at_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = uploads(&dir, RecordingLimits::default());
+        uploads.hold("old-and-gone");
+        uploads.hold("old-and-still-left");
+        let started = uploads.hold_seq();
+        uploads.hold("taken-during-the-pass");
+        uploads.refresh_held(
+            &[
+                "old-and-still-left".to_owned(),
+                "found-by-the-pass".to_owned(),
+            ],
+            started,
+        );
+        assert!(!uploads.is_held("old-and-gone"));
+        for id in [
+            "old-and-still-left",
+            "taken-during-the-pass",
+            "found-by-the-pass",
+        ] {
+            assert!(uploads.is_held(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn conflicts_are_remembered_once_and_listed_with_a_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = uploads(&dir, RecordingLimits::default());
+        assert!(uploads.mark_conflicted("b"));
+        assert!(!uploads.mark_conflicted("b"));
+        for id in ["a", "c", "d"] {
+            uploads.mark_conflicted(id);
+        }
+        assert!(uploads.is_conflicted("a") && !uploads.is_conflicted("z"));
+        assert_eq!(uploads.conflicted_ids(3), ["a", "b", "c"]);
+        for id in ["x", "y"] {
+            uploads.hold(id);
+        }
+        assert_eq!(uploads.held_ids(1), ["x"]);
     }
 }

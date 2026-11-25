@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use hyper::body::Frame;
-use jaunt_audit::{RecordingKey, StoredRecording};
+use jaunt_audit::{RecordingKey, RecordingStoreError, StoredRecording};
 use jaunt_record::SessionKind;
 use jaunt_store::{Recording, RecordingState, is_session_id};
 use serde::Serialize;
@@ -226,6 +226,7 @@ struct ManifestBody {
 enum Unavailable {
     Missing,
     NotReady,
+    Store,
     Server,
 }
 
@@ -234,6 +235,9 @@ impl Unavailable {
         match self {
             Unavailable::Missing => not_found(),
             Unavailable::NotReady => conflict("recording_not_ready"),
+            Unavailable::Store => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable")
+            }
             Unavailable::Server => server_error(),
         }
     }
@@ -278,6 +282,10 @@ async fn locate(control: &Control, id: &str) -> Result<Located, Unavailable> {
         Ok(Ok(None)) => {
             tracing::error!(target: "jaunt::control", "a stored recording is missing from the recording storage");
             Err(Unavailable::Missing)
+        }
+        Ok(Err(RecordingStoreError::Unavailable)) => {
+            tracing::warn!(target: "jaunt::control", "the recording storage is unavailable for playback");
+            Err(Unavailable::Store)
         }
         Ok(Err(err)) => {
             tracing::error!(target: "jaunt::control", error = %err, "opening a stored recording failed");
