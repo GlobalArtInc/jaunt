@@ -9,7 +9,9 @@ use jaunt_limits::{
     LogThrottle, Rate, TrustedProxies, TrustedProxyProblem,
 };
 use jaunt_proto::ControlPlane;
-use jaunt_ssh::{OuterEvent, OuterHop, OuterLimits, RouteBackend, UserCaSource, read_proxy_v2};
+use jaunt_ssh::{
+    OuterEvent, OuterHop, OuterLimits, RouteBackend, UserCaKeys, UserCaSource, read_proxy_v2,
+};
 use jaunt_tunnel::AgentRegistry;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -285,6 +287,25 @@ impl SshGate {
 
     pub async fn reissue_host_certificate(&self) -> Result<(), SshGateError> {
         Ok(self.shared.host.reissue().await?)
+    }
+
+    pub fn host_certificate_signer(&self) -> String {
+        self.shared.host.signer()
+    }
+
+    pub async fn reissue_host_certificate_unless_signed_by(
+        &self,
+        fingerprint: &str,
+    ) -> Result<bool, SshGateError> {
+        Ok(self
+            .shared
+            .host
+            .reissue_unless_signed_by(fingerprint)
+            .await?)
+    }
+
+    pub fn replace_user_cas(&self, keys: UserCaKeys) {
+        self.shared.cas.replace(keys);
     }
 
     pub fn open_streams(&self) -> usize {

@@ -6,7 +6,7 @@ use std::time::Duration;
 use ipnet::IpNet;
 use jaunt_ca::ssh_key::PublicKey;
 use jaunt_ca::{CaError, DEFAULT_HOST_VALIDITY, HostCertParams, Signer, sign_host_certificate};
-use jaunt_control::Clock;
+use jaunt_control::{Clock, Control};
 use jaunt_gate::{HostCertIssuer, IssueError, SshGate, SshGateConfig, SshGateError};
 use jaunt_limits::AddressLimits;
 use jaunt_proto::{BoxFuture, ControlPlane};
@@ -28,8 +28,22 @@ pub struct GateSshSettings {
     pub write_stall: Option<Duration>,
 }
 
+enum HostSigner {
+    Fixed(Arc<dyn Signer>),
+    Snapshot(Control),
+}
+
+impl HostSigner {
+    fn current(&self) -> Arc<dyn Signer> {
+        match self {
+            HostSigner::Fixed(signer) => Arc::clone(signer),
+            HostSigner::Snapshot(control) => Arc::clone(control.ca_snapshot().host_signer()),
+        }
+    }
+}
+
 pub struct HostAuthorityIssuer {
-    signer: Arc<dyn Signer>,
+    signer: HostSigner,
     store: Store,
     clock: Clock,
 }
@@ -37,7 +51,15 @@ pub struct HostAuthorityIssuer {
 impl HostAuthorityIssuer {
     pub fn new(signer: Arc<dyn Signer>, store: Store, clock: Clock) -> Self {
         Self {
-            signer,
+            signer: HostSigner::Fixed(signer),
+            store,
+            clock,
+        }
+    }
+
+    pub fn following(control: Control, store: Store, clock: Clock) -> Self {
+        Self {
+            signer: HostSigner::Snapshot(control),
             store,
             clock,
         }
@@ -60,8 +82,9 @@ impl HostAuthorityIssuer {
                 IssueError::Unavailable
             })?;
         let serial = u64::try_from(serial).map_err(|_| IssueError::Unavailable)?;
+        let signer = self.signer.current();
         let certificate = sign_host_certificate(
-            self.signer.as_ref(),
+            signer.as_ref(),
             HostCertParams {
                 subject_public_key,
                 hostnames: hostnames.to_vec(),

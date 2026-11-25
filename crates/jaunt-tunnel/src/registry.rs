@@ -60,6 +60,12 @@ impl DisconnectReason {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustBroadcast {
+    pub sent: usize,
+    pub failed: Vec<(NodeId, SendError)>,
+}
+
 pub trait RegistryObserver: Send + Sync {
     fn connection_ended(&self, node: &NodeId, connection: ConnectionId, reason: DisconnectReason);
 }
@@ -219,6 +225,22 @@ impl AgentRegistry {
 
     pub fn send_trust_update(&self, node: &NodeId) -> Result<(), SendError> {
         self.send_control(node, ServerMessage::TrustUpdate {})
+    }
+
+    pub fn broadcast_trust_update(&self) -> TrustBroadcast {
+        let connections = self.inner.lock();
+        let mut outcome = TrustBroadcast::default();
+        for (node, registered) in connections.iter() {
+            match registered
+                .connection
+                .queue_control(ServerMessage::TrustUpdate {})
+            {
+                Ok(()) => outcome.sent += 1,
+                Err(error) => outcome.failed.push((node.clone(), error)),
+            }
+        }
+        outcome.failed.sort_by(|left, right| left.0.cmp(&right.0));
+        outcome
     }
 
     pub fn disconnect(&self, node: &NodeId) -> bool {

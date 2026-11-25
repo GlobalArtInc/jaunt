@@ -2,6 +2,7 @@ mod policy;
 mod serve;
 mod storage;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -268,8 +269,12 @@ fn ca_command(config: &Path, command: CaCommand) -> ExitCode {
     ca_rotation::run(config, action)
 }
 
+fn process_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
 fn run(path: &Path) -> ExitCode {
-    match serve::run(path, &|name| std::env::var_os(name)) {
+    match serve::run(path, &process_env) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");

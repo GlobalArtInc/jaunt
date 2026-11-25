@@ -88,8 +88,6 @@ pub struct Options {
 }
 
 pub struct Authorities {
-    pub user: Arc<dyn Signer>,
-    pub host: Arc<dyn Signer>,
     pub user_lines: Vec<String>,
 }
 
@@ -101,6 +99,8 @@ pub struct Harness {
     pub clock: TestClock,
     pub authorities: Authorities,
     pub db_path: PathBuf,
+    pub ca_root: PathBuf,
+    pub identity_file: PathBuf,
     pub recordings: Option<PreparedRecordings>,
     issuer: InternalCa,
     _discovery: FakeDiscovery,
@@ -126,6 +126,8 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let ca_root = dir.path().join("ca");
         let identity = AgeIdentity::generate();
+        let identity_file = dir.path().join("identity.txt");
+        identity.write_new_file(&identity_file).unwrap();
         for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
             FileBackend::init(&ca_root, kind, &identity.recipient()).unwrap();
         }
@@ -133,16 +135,6 @@ impl Harness {
         let (host_trust, host) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (internal_ca, issuer) = internal_cas(&ca_root, &identity);
         let authorities = Authorities {
-            user: Arc::new(
-                FileBackend::load(&ca_root, CaKind::User, &identity)
-                    .unwrap()
-                    .1,
-            ),
-            host: Arc::new(
-                FileBackend::load(&ca_root, CaKind::Host, &identity)
-                    .unwrap()
-                    .1,
-            ),
             user_lines: user_trust.to_authorized_lines().unwrap(),
         };
         let db_path = dir.path().join("jaunt.db");
@@ -214,6 +206,8 @@ impl Harness {
             authorities,
             issuer,
             db_path,
+            ca_root,
+            identity_file,
             recordings,
             _discovery: discovery,
             _dir: dir,

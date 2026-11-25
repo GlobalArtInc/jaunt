@@ -218,8 +218,8 @@ impl client::Handler for Quiet {
 
 pub struct Identity {
     pub serial: u64,
-    key: PrivateKey,
-    certificate: Certificate,
+    pub key: PrivateKey,
+    pub certificate: Certificate,
 }
 
 pub struct Outer {
@@ -301,8 +301,8 @@ impl Stand {
                 client_limits: DEFAULT_SSH_CLIENT_LIMITS,
             },
             ssh_suffix: SUFFIX.to_owned(),
-            issuer: Arc::new(HostAuthorityIssuer::new(
-                Arc::clone(&harness.authorities.host),
+            issuer: Arc::new(HostAuthorityIssuer::following(
+                harness.control.clone(),
                 harness.store.clone(),
                 Arc::new(SystemTime::now),
             )),
@@ -407,7 +407,7 @@ impl Stand {
     fn signed(&self, key: PrivateKey, serial: u64, now: SystemTime) -> Identity {
         let subject = CaPublicKey::from_openssh(&key.public_key().to_openssh().unwrap()).unwrap();
         let signed = sign_user_certificate(
-            self.harness.authorities.user.as_ref(),
+            self.harness.control.ca_snapshot().user_signer().as_ref(),
             UserCertParams {
                 subject_public_key: subject,
                 user_id: Uuid::parse_str(&self.user_id).unwrap(),

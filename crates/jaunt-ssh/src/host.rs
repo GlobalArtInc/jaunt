@@ -9,6 +9,7 @@ use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use zeroize::Zeroizing;
 
+use crate::cert::sha256_hex;
 use crate::error::{HostCertProblem, SshError};
 
 const MAX_FILE_LEN: usize = 64 * 1024;
@@ -97,6 +98,10 @@ impl HostIdentity {
 
     pub fn valid_before(&self) -> u64 {
         self.certificate.valid_before()
+    }
+
+    pub fn signer_fingerprint(&self) -> String {
+        sha256_hex(self.certificate.signature_key())
     }
 
     pub(crate) fn into_parts(self) -> (PrivateKey, Certificate) {
@@ -296,6 +301,14 @@ mod tests {
             (identity.valid_after(), identity.valid_before()),
             (AFTER, BEFORE)
         );
+        let signer: String = ca
+            .public_key()
+            .fingerprint(HashAlg::Sha256)
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(identity.signer_fingerprint(), signer);
         let (_, certificate) = identity.into_parts();
         assert_eq!(certificate, cert);
     }

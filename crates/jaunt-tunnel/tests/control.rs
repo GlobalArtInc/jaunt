@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jaunt_tunnel::{
-    ALPN_TUNNEL, BoxFuture, IncomingStream, MAX_CONTROL_MESSAGE_BYTES, RegistryEvent, SessionId,
-    StreamHandler, TunnelOptions,
+    ALPN_TUNNEL, BoxFuture, IncomingStream, MAX_CONTROL_MESSAGE_BYTES, RegistryEvent, SendError,
+    SessionId, StreamHandler, TrustBroadcast, TunnelOptions,
 };
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -288,6 +288,93 @@ async fn a_trust_update_reaches_the_agent_handler() {
         updates.load(Ordering::SeqCst) == 1
     })
     .await;
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trust_broadcast_reaches_every_connected_agent_once() {
+    let pki = Pki::new("ca");
+    let leaves = [pki.client_leaf("node-a"), pki.client_leaf("node-b")];
+    let auth = MapAuthenticator::new();
+    auth.allow(&leaves[0], "node-a");
+    auth.allow(&leaves[1], "node-b");
+    let gate = TestGate::start(&pki, auth, GateOptions::default()).await;
+    assert_eq!(
+        gate.registry.broadcast_trust_update(),
+        TrustBroadcast::default()
+    );
+    let counters = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let mut agents = Vec::new();
+    for (leaf, counter) in leaves.iter().zip(&counters) {
+        agents.push(spawn_agent(
+            gate.addr,
+            &pki,
+            leaf,
+            Arc::new(TrustCounter(counter.clone())),
+            AgentOptions::default(),
+        ));
+    }
+    eventually("both agents to connect", || {
+        gate.registry.connected_nodes() == [node("node-a"), node("node-b")]
+    })
+    .await;
+
+    let first = gate.registry.broadcast_trust_update();
+
+    assert_eq!(first.sent, 2);
+    assert!(first.failed.is_empty());
+    let counts = || {
+        counters
+            .iter()
+            .map(|counter| counter.load(Ordering::SeqCst))
+    };
+    eventually("both agents to hear the update", || counts().eq([1, 1])).await;
+    let second_agent = agents.pop().unwrap();
+    second_agent.stop().await;
+    eventually("node-b to leave the registry", || {
+        gate.registry.connected_nodes() == [node("node-a")]
+    })
+    .await;
+
+    let second = gate.registry.broadcast_trust_update();
+
+    assert_eq!(second.sent, 1);
+    assert!(second.failed.is_empty());
+    eventually("node-a to hear the second update", || counts().eq([2, 1])).await;
+    for agent in agents {
+        agent.stop().await;
+    }
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn a_full_control_queue_is_reported_per_node_by_the_trust_broadcast() {
+    let (pki, leaf, gate) = started(GateOptions::default()).await;
+    let agent = spawn_agent(
+        gate.addr,
+        &pki,
+        &leaf,
+        Arc::new(TrustCounter(Arc::new(AtomicUsize::new(0)))),
+        AgentOptions::default(),
+    );
+    eventually("the agent to connect", || {
+        gate.registry.connected_nodes() == [node("node-a")]
+    })
+    .await;
+
+    let queued: Vec<TrustBroadcast> = (0..65)
+        .map(|_| gate.registry.broadcast_trust_update())
+        .collect();
+
+    assert!(queued[..64].iter().all(|broadcast| broadcast.sent == 1));
+    assert_eq!(
+        queued[64],
+        TrustBroadcast {
+            sent: 0,
+            failed: vec![(node("node-a"), SendError::Backlogged)],
+        }
+    );
     agent.stop().await;
     gate.stop().await;
 }

@@ -720,7 +720,10 @@ fn an_interrupted_retire_is_finished_printed_and_audited() {
     );
 
     assert_applied(&finished, "finish");
-    assert_eq!(finished.stdout, format!("{}done\n", finished_line(&old)));
+    assert_eq!(
+        finished.stdout,
+        format!("{}applied within 10 s\n", finished_line(&old))
+    );
     assert!(
         !fixture
             .slot(CaKind::User)

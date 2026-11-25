@@ -35,7 +35,7 @@ pub use proto::{
     MAX_SESSION_ID_LEN, MetaError, NodeId, SessionId, StreamKind, StreamMeta,
 };
 pub use registry::{
-    AgentRegistry, DisconnectReason, RegisterError, RegistryEvent, RegistryObserver,
+    AgentRegistry, DisconnectReason, RegisterError, RegistryEvent, RegistryObserver, TrustBroadcast,
 };
 pub use server::{ConnectionId, OpenError, SendError, TunnelConnection, TunnelError};
 pub use session::SessionRegistry;

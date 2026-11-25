@@ -65,6 +65,7 @@ pub(crate) struct HostCertificate {
     clock: Clock,
     cell: Arc<ServerConfigCell>,
     window: Mutex<Window>,
+    signer: Mutex<String>,
     issuing: tokio::sync::Mutex<()>,
 }
 
@@ -76,12 +77,14 @@ impl HostCertificate {
     ) -> Result<Self, HostCertError> {
         let identity = issue(issuer.as_ref(), &hostnames, &clock).await?;
         let window = Window::of(&identity);
+        let signer = identity.signer_fingerprint();
         Ok(Self {
             issuer,
             hostnames,
             clock,
             cell: Arc::new(ServerConfigCell::new(identity, ServerProfile::Gate)),
             window: Mutex::new(window),
+            signer: Mutex::new(signer),
             issuing: tokio::sync::Mutex::new(()),
         })
     }
@@ -98,16 +101,37 @@ impl HostCertificate {
         unix_secs((self.clock)())
     }
 
+    pub(crate) fn signer(&self) -> String {
+        self.signer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) async fn reissue(&self) -> Result<(), HostCertError> {
         let _issuing = self.issuing.lock().await;
         self.replace().await
     }
 
+    pub(crate) async fn reissue_unless_signed_by(
+        &self,
+        fingerprint: &str,
+    ) -> Result<bool, HostCertError> {
+        let _issuing = self.issuing.lock().await;
+        if self.signer() == fingerprint {
+            return Ok(false);
+        }
+        self.replace().await?;
+        Ok(true)
+    }
+
     async fn replace(&self) -> Result<(), HostCertError> {
         let identity = issue(self.issuer.as_ref(), &self.hostnames, &self.clock).await?;
         let window = Window::of(&identity);
+        let signer = identity.signer_fingerprint();
         self.cell.replace(identity);
         *self.window() = window;
+        *self.signer.lock().unwrap_or_else(PoisonError::into_inner) = signer;
         tracing::info!(
             target: "jaunt::gate",
             valid_before = window.valid_before,
@@ -202,7 +226,7 @@ mod tests {
     use jaunt_proto::BoxFuture;
     use russh::keys::key::safe_rng;
     use russh::keys::ssh_key::certificate::{Builder, CertType};
-    use russh::keys::{Algorithm, PrivateKey, PublicKey};
+    use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
@@ -215,7 +239,7 @@ mod tests {
     const DAY: u64 = 24 * 3600;
 
     struct Scripted {
-        ca: PrivateKey,
+        ca: Mutex<PrivateKey>,
         offset: Arc<AtomicU64>,
         failing: AtomicBool,
         hanging: bool,
@@ -225,7 +249,7 @@ mod tests {
     impl Scripted {
         fn new(hanging: bool) -> Arc<Self> {
             Arc::new(Self {
-                ca: PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap(),
+                ca: Mutex::new(PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap()),
                 offset: Arc::new(AtomicU64::new(0)),
                 failing: AtomicBool::new(false),
                 hanging,
@@ -242,6 +266,23 @@ mod tests {
 
         fn calls(&self) -> Vec<Instant> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn ca_fingerprint(&self) -> String {
+            self.ca
+                .lock()
+                .unwrap()
+                .public_key()
+                .fingerprint(HashAlg::Sha256)
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        fn rotate_ca(&self) {
+            *self.ca.lock().unwrap() =
+                PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
         }
     }
 
@@ -273,7 +314,8 @@ mod tests {
                 for name in hostnames {
                     builder.valid_principal(name.as_str()).unwrap();
                 }
-                Ok(builder.sign(&self.ca).unwrap().to_openssh().unwrap())
+                let ca = self.ca.lock().unwrap().clone();
+                Ok(builder.sign(&ca).unwrap().to_openssh().unwrap())
             })
         }
     }
@@ -334,6 +376,37 @@ mod tests {
         calls_reach(&issuer, 8).await;
         stop.cancel();
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_certificate_from_another_authority_is_replaced_only_once_one_is_issued() {
+        let issuer = Scripted::new(false);
+        let host =
+            HostCertificate::obtain(issuer.clone(), vec!["gate.test".to_owned()], issuer.clock())
+                .await
+                .unwrap();
+        let first = issuer.ca_fingerprint();
+        assert_eq!(host.signer(), first);
+        assert!(!host.reissue_unless_signed_by(&first).await.unwrap());
+        assert_eq!(issuer.calls().len(), 1);
+
+        issuer.rotate_ca();
+        let second = issuer.ca_fingerprint();
+        issuer.failing.store(true, Ordering::SeqCst);
+        let served = host.cell().current();
+        assert!(matches!(
+            host.reissue_unless_signed_by(&second).await,
+            Err(HostCertError::Issue(IssueError::Unavailable))
+        ));
+        assert!(Arc::ptr_eq(&served, &host.cell().current()));
+        assert_eq!(host.signer(), first);
+
+        issuer.failing.store(false, Ordering::SeqCst);
+        assert!(host.reissue_unless_signed_by(&second).await.unwrap());
+        assert!(!Arc::ptr_eq(&served, &host.cell().current()));
+        assert_eq!(host.signer(), second);
+        assert!(!host.reissue_unless_signed_by(&second).await.unwrap());
+        assert_eq!(issuer.calls().len(), 3);
     }
 
     #[test]

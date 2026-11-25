@@ -22,7 +22,7 @@ const DATABASE_FILE: &str = "jaunt.db";
 const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_BLOCKED: u8 = 3;
-const LAST_LINE: &str = "done";
+pub(crate) const LAST_LINE: &str = "applied within 10 s";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationAction {

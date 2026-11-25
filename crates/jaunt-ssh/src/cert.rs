@@ -154,7 +154,7 @@ pub fn verify_user_certificate(
     })
 }
 
-fn sha256_hex(key: &KeyData) -> String {
+pub(crate) fn sha256_hex(key: &KeyData) -> String {
     key.fingerprint(HashAlg::Sha256)
         .as_bytes()
         .iter()

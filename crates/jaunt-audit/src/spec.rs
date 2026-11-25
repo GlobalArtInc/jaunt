@@ -223,6 +223,10 @@ events! {
     CaKeyRetired => ("ca.key.retired", "ca.key.retired", ActorRule::User("changed_by"), None, None, None,
         [("kind", SHORT), ("fp", ID), ("forced", BOOL), ("blocked", BOOL), ("old_unexpired", INT),
          ("nodes_old", INT)]),
+    CaReloaded => ("ca.reloaded", "ca.reloaded", ActorRule::System, None, None, None,
+        [("kind", SHORT), ("trust_id", ID), ("active_fp", ID)]),
+    CaReloadFailed => ("ca.reload.failed", "ca.reload.failed", ActorRule::System, None, None, None,
+        [("reason", ERROR)]),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];
