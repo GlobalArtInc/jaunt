@@ -50,7 +50,7 @@ that the script appends, and remembers the user in a cookie, so a later sign-in 
 the server stored: the strict asciicast v2 reader (`stand/cast.py`), the manifest, `jauntd recordings verify`, the
 permissions of the two endpoints, the input rule both ways with a unique secret typed with echo off, metadata-only
 recordings (exec without a PTY, scp, sftp), hostile escape sequences and the `recording.viewed` rule.
-`scenarios/recording_faults.py` cuts the network of `node-a` (`network disconnect`) in the middle of a long output,
+`scenarios/recording_faults.py` cuts the network of `node-a` (`network disconnect`) for `OUTAGE_SECS` in the middle of a long output,
 floods three sessions into an agent that is limited to 1 MiB of recording memory, and turns `recordings.dir` off and on.
 The helpers that fetch a cast byte for byte (`engine cp` out of the client, never through a text pipe), find the stored
 files in the jauntd volume and read the logs are in `stand/recordings.py`.
@@ -69,8 +69,19 @@ to escape recording; an exec without a PTY, scp and sftp leave a metadata-only r
   sessions trips, which is why the step floods three sessions at once.
 - Persistence of queued recordings across an agent restart is not covered: the agent is restarted between steps, never
   with a recording still waiting for upload.
-- Only podman was run. Docker, the engine of the CI job, was not exercised for these scenarios, and the semantics of
-  `network disconnect` and `network connect --alias` may differ there.
+- Docker, the engine of the CI job, was never run locally for these scenarios (podman only); the semantics of
+  `network disconnect` and `network connect --alias` differ between the engines, which is why the outage is verified.
+
+### The network outage
+
+`OUTAGE_SECS` is `TUNNEL_KEEPALIVE_INTERVAL_SECS` (20, `Keepalive::default` in `crates/jaunt-tunnel/src/options.rs`) plus
+`TUNNEL_KEEPALIVE_TIMEOUT_SECS` (10) plus `DETECTION_MARGIN_SECS` (30): 60 s. The ping is sent 20 s after the last
+answer and waits 10 s, so the gate drops a silent tunnel up to 30 s after the cut, and an outage shorter than that can
+leave the established TCP connection unharmed, so no break would happen at all.
+After every outage `require_tunnel_break` reads the audit trail from a marker taken just before the cut and fails with
+`the tunnel did not break on this engine` unless `agent.disconnected` with the tunnel ALPN appears for the node, then
+waits for the matching `agent.connected`. A client session that outlives a verified break is a note, not a failure: the
+property under test is that the recording completes whole and matches what the client saw.
 
 ## The browser run
 

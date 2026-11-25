@@ -11,6 +11,7 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -44,6 +45,7 @@ jobs:
       - run: python3 -I -m unittest discover -s scripts -p 'test_release*.py'
   installer:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -61,6 +63,7 @@ jobs:
         with:
           tool: just
       - run: just ssh-containers
+        timeout-minutes: 35
         env:
           CONTAINER_ENGINE: docker
   e2e:
@@ -82,6 +85,7 @@ jobs:
           key: e2e-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: e2e-linux-
       - run: just e2e
+        timeout-minutes: 40
       - run: just e2e-down
         if: always()
       - uses: actions/upload-artifact@v4
@@ -115,6 +119,7 @@ jobs:
           path: target/e2e/old-agent
           key: e2e-old-agent-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('e2e/build-old-agent.sh') }}
       - run: just e2e-rotation
+        timeout-minutes: 30
       - uses: actions/cache/save@v4
         if: always() && steps.old-agent.outputs.cache-hit != 'true' && hashFiles('target/e2e/old-agent/*/jaunt-agent') != ''
         with:

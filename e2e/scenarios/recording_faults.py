@@ -8,7 +8,14 @@ from scenarios.recording import finished, shell, type_script
 
 LINE = re.compile(r"line-(\d+)-x{8}")
 SMALL_QUEUE = "recording:\n  session_queue_bytes: 1048576\n  memory_budget_bytes: 1048576\n"
-OUTAGE_SECS = 20
+TUNNEL_KEEPALIVE_INTERVAL_SECS = 20
+TUNNEL_KEEPALIVE_TIMEOUT_SECS = 10
+DETECTION_MARGIN_SECS = 30
+OUTAGE_SECS = TUNNEL_KEEPALIVE_INTERVAL_SECS + TUNNEL_KEEPALIVE_TIMEOUT_SECS + DETECTION_MARGIN_SECS
+TUNNEL_ALPN = "jaunt-tunnel/1"
+BREAK_AUDIT_SECS = 30
+RECONNECT_SECS = 120
+CLIENT_END_SECS = 120
 FLOODS = 3
 
 
@@ -30,12 +37,36 @@ def restore_network(stand, node):
 
 
 def outage(stand, node, seconds):
+    marker = stand.marker()
     started = cut_network(stand, node)
     try:
         stand.wait_until("{} s without a network".format(seconds), lambda: time.monotonic() - started >= seconds, seconds + 20, interval=1)
     finally:
         restore_network(stand, node)
-    return started
+    return started, marker
+
+
+def tunnel_events(stand, node, marker, kind):
+    events = audit.after(stand.audit_events(), marker)
+    return [event for event in audit.of_type(events, kind)
+            if event.get("node") == stand.node_ids[node] and event["fields"].get("alpn") == TUNNEL_ALPN]
+
+
+def require_tunnel_break(stand, node, marker):
+    try:
+        stand.wait_until("agent.disconnected for the tunnel of {}".format(node),
+                         lambda: tunnel_events(stand, node, marker, "agent.disconnected"), BREAK_AUDIT_SECS, interval=2)
+    except recordings.StepFailed:
+        raise recordings.StepFailed(
+            "the tunnel did not break on this engine: no agent.disconnected for the tunnel of {} within {} s "
+            "after a {} s outage".format(node, BREAK_AUDIT_SECS, OUTAGE_SECS)) from None
+    try:
+        stand.wait_until("agent.connected for the tunnel of {} after the outage".format(node),
+                         lambda: tunnel_events(stand, node, marker, "agent.connected"), RECONNECT_SECS, interval=2)
+    except recordings.StepFailed:
+        raise recordings.StepFailed(
+            "the agent of {} did not connect its tunnel again within {} s after the network came back".format(
+                node, RECONNECT_SECS)) from None
 
 
 def run(stand, report):
@@ -51,15 +82,20 @@ def tunnel_break(stand, report):
         try:
             session.send("for i in $(seq 1 300); do echo line-$i-xxxxxxxx; sleep 0.1; done; echo finished-$((6*7))\n")
             step.expect(session.expect("line-40-xxxxxxxx", 60), "the output did not start")
-            started = outage(stand, "node-a", OUTAGE_SECS)
-            status = session.wait(90)
+            started, cut_marker = outage(stand, "node-a", OUTAGE_SECS)
+            require_tunnel_break(stand, "node-a", cut_marker)
+            status = session.wait(CLIENT_END_SECS)
             received = numbers(session.text())
-            step.expect(status is not None, "the client session was still open 90 s after the break")
         finally:
             session.close()
-        step.note("the client exited {} after {:.0f} s and had seen lines 1..{}".format(
-            status, time.monotonic() - started, max(received or [0])))
-        step.expect(status != 0 and received, "the client exited {} and saw lines {}".format(status, received[:3]))
+        if status is None:
+            step.note("the client session survived the tunnel break and was still open {} s after the network came back; "
+                      "the test closed it; it had seen lines 1..{}".format(CLIENT_END_SECS, max(received or [0])))
+        else:
+            step.note("the client exited {} after {:.0f} s and had seen lines 1..{}".format(
+                status, time.monotonic() - started, max(received or [0])))
+            step.expect(status != 0, "the client exited {} after a broken tunnel".format(status))
+        step.expect(received, "the client saw no lines: {}".format(received[:3]))
         step.expect(received == list(range(1, len(received) + 1)), "the client saw a gap: {}".format(received[:60]))
         started_ids = recordings.started_since(stand, marker, "alice", "node-a")
         step.expect(len(started_ids) == 1, "sessions started: {}".format(started_ids))
@@ -102,9 +138,10 @@ def queue_overflow(stand, report):
                 wait_recording(stand, session_id, ("receiving",), 60)
             for session in sessions:
                 session.send(flood + "\n")
-            outage(stand, "node-a", OUTAGE_SECS)
+            cut_marker = outage(stand, "node-a", OUTAGE_SECS)[1]
+            require_tunnel_break(stand, "node-a", cut_marker)
             for session in sessions:
-                session.wait(90)
+                session.wait(CLIENT_END_SECS)
         finally:
             for session in sessions:
                 session.close()
