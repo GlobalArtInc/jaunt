@@ -199,6 +199,8 @@ events! {
         [("chunks", INT), ("raw_bytes", INT), ("incomplete", BOOL), ("input_recorded", BOOL)]),
     RecordingRejected => ("recording.rejected", "recording.rejected", ActorRule::Node("node_id"), NODE, SESSION, None,
         [("reason", NAME), ("suppressed", INT)], Class::Noisy),
+    RecordingViewed => ("recording.viewed", "recording.viewed", ActorRule::User("user_id"), None, SESSION, None,
+        [("kind", SHORT)]),
     RecordingMismatch => ("recording.mismatch", "recording.mismatch", ActorRule::Node("node_id"), NODE, SESSION, None,
         [("manifest_incomplete", BOOL), ("session_incomplete", BOOL)]),
     PolicyReload => ("policy.reload", "policy.reload", ActorRule::System, None, None, Some("hash"),

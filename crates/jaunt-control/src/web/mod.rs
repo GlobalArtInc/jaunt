@@ -13,6 +13,7 @@ mod login;
 mod lookup_limit;
 mod nodes;
 pub(crate) mod pages;
+mod recording_view;
 mod revocations;
 mod session;
 
@@ -25,6 +26,7 @@ use crate::control::Control;
 pub(crate) use self::cookies::login_binding_matches;
 pub(crate) use self::headers::SecurityHeaders;
 pub(crate) use self::login::establish;
+pub use self::recording_view::DEFAULT_PLAYBACK_LIMIT_BYTES;
 
 pub(crate) const SESSION_TTL_SECS: i64 = 28_800;
 pub(crate) const MAX_SESSIONS_PER_USER: u32 = 20;
@@ -34,6 +36,8 @@ pub(crate) struct WebState {
     pub(crate) headers: SecurityHeaders,
     pub(crate) intents: intents::IntentTable,
     pub(crate) lookups: lookup_limit::LookupLimiter,
+    pub(crate) views: recording_view::ViewLog,
+    pub(crate) playback: recording_view::PlaybackLimit,
 }
 
 impl WebState {
@@ -43,6 +47,8 @@ impl WebState {
             headers: SecurityHeaders::new(public_origin),
             intents: intents::IntentTable::default(),
             lookups: lookup_limit::LookupLimiter::default(),
+            views: recording_view::ViewLog::default(),
+            playback: recording_view::PlaybackLimit::default(),
         }
     }
 }
@@ -125,5 +131,22 @@ pub(crate) fn mount(
             control.clone(),
             headers::apply_to_response,
         ));
-    routes.merge(site)
+    let recordings = Router::new()
+        .route(
+            "/v1/admin/sessions/{id}/recording",
+            get(recording_view::stream),
+        )
+        .route(
+            "/v1/admin/sessions/{id}/recording/manifest",
+            get(recording_view::manifest),
+        )
+        .layer(middleware::from_fn_with_state(
+            control.clone(),
+            session::guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            control.clone(),
+            headers::apply_sandboxed_to_response,
+        ));
+    routes.merge(site).merge(recordings)
 }

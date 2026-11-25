@@ -85,5 +85,6 @@ pub use session_sweep::{
     OVERDUE_MARGIN_SECS, REVOCATION_PRUNE_AFTER_EXPIRY_SECS, REVOCATION_WATCH_INTERVAL,
     ROUTED_GRACE_SECS, SESSION_SWEEP_INTERVAL, SessionSweep,
 };
+pub use web::DEFAULT_PLAYBACK_LIMIT_BYTES;
 #[cfg(feature = "test-support")]
 pub use web::TestWebSession;

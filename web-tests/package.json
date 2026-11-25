@@ -9,7 +9,9 @@
   },
   "scripts": {
     "test": "node --test \"unit/*.test.mjs\"",
-    "smoke": "node smoke/run.mjs"
+    "smoke": "node smoke/run.mjs",
+    "smoke:recording": "node smoke/recording.mjs",
+    "smoke:csi": "node smoke/csi-sweep.mjs"
   },
   "devDependencies": {
     "jsdom": "31.0.1",

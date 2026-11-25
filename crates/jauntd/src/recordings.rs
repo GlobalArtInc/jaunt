@@ -11,7 +11,8 @@ use jaunt_audit::{
 use jaunt_control::{
     Control, ControlError, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_UPLOADS_PER_NODE,
     DEFAULT_MAX_UPLOADS_TOTAL, DEFAULT_PENDING_BYTES_PER_NODE, DEFAULT_PENDING_BYTES_TOTAL,
-    DEFAULT_SESSION_PENDING_BYTES, RecordingLimits, RecordingSettings,
+    DEFAULT_PLAYBACK_LIMIT_BYTES, DEFAULT_SESSION_PENDING_BYTES, RecordingLimits,
+    RecordingSettings,
 };
 use jaunt_record::Limits;
 use jaunt_store::{Store, StoreError, is_session_id};
@@ -26,6 +27,8 @@ const MIN_IDLE_TIMEOUT_SECS: u64 = 60;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
 const MAX_CHUNK_COMPRESSED_LIMIT: u64 = 16 * 1024 * 1024;
 const MAX_CHUNK_RAW_LIMIT: u64 = 64 * 1024 * 1024;
+const MIN_PLAYBACK_BYTES: u64 = 1024 * 1024;
+const MAX_PLAYBACK_BYTES: u64 = 512 * 1024 * 1024;
 const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -56,6 +59,8 @@ pub struct RecordingsSection {
     pub max_chunks: u64,
     #[serde(default = "default_max_total_raw")]
     pub max_total_raw: u64,
+    #[serde(default = "default_max_playback_bytes")]
+    pub max_playback_bytes: u64,
 }
 
 impl Default for RecordingsSection {
@@ -73,6 +78,7 @@ impl Default for RecordingsSection {
             max_chunk_raw: default_max_chunk_raw(),
             max_chunks: default_max_chunks(),
             max_total_raw: default_max_total_raw(),
+            max_playback_bytes: default_max_playback_bytes(),
         }
     }
 }
@@ -125,10 +131,15 @@ fn default_max_total_raw() -> u64 {
     Limits::default().max_total_raw
 }
 
+fn default_max_playback_bytes() -> u64 {
+    DEFAULT_PLAYBACK_LIMIT_BYTES
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingsSettings {
     pub dir: PathBuf,
     pub min_free_bytes: u64,
+    pub max_playback_bytes: u64,
     pub limits: RecordingLimits,
 }
 
@@ -216,6 +227,12 @@ impl RecordingsSection {
         let max_chunk_raw = bounded("max_chunk_raw", self.max_chunk_raw, 1, MAX_CHUNK_RAW_LIMIT)?;
         let max_chunks = bounded("max_chunks", self.max_chunks, 1, u64::MAX)?;
         let max_total_raw = bounded("max_total_raw", self.max_total_raw, 1, u64::MAX)?;
+        let max_playback_bytes = bounded(
+            "max_playback_bytes",
+            self.max_playback_bytes,
+            MIN_PLAYBACK_BYTES,
+            MAX_PLAYBACK_BYTES,
+        )?;
         let Some(dir) = self.dir else {
             return Ok(None);
         };
@@ -225,6 +242,7 @@ impl RecordingsSection {
         Ok(Some(RecordingsSettings {
             dir,
             min_free_bytes: self.min_free_bytes,
+            max_playback_bytes,
             limits: RecordingLimits {
                 chunk: Limits {
                     max_chunk_compressed,
@@ -515,6 +533,7 @@ mod tests {
         assert_eq!(settings.limits.max_uploads_total, 1024);
         assert_eq!(settings.limits.idle_timeout.as_secs(), 7200);
         assert_eq!(settings.limits.chunk.max_chunks, 200_000);
+        assert_eq!(settings.max_playback_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -540,6 +559,8 @@ mod tests {
             ("max_chunk_raw: 0\n", "max_chunk_raw"),
             ("max_chunks: 0\n", "max_chunks"),
             ("max_total_raw: 0\n", "max_total_raw"),
+            ("max_playback_bytes: 1048575\n", "max_playback_bytes"),
+            ("max_playback_bytes: 536870913\n", "max_playback_bytes"),
         ] {
             let err = section(&format!("dir: /r\n{text}"))
                 .unwrap()

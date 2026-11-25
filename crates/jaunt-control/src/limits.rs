@@ -396,6 +396,16 @@ mod tests {
             ),
             (Method::GET, "/v1/admin/sessions", Some(Endpoint::Other)),
             (Method::GET, "/v1/admin/sessions/s-1", Some(Endpoint::Other)),
+            (
+                Method::GET,
+                "/v1/admin/sessions/s-1/recording",
+                Some(Endpoint::Other),
+            ),
+            (
+                Method::GET,
+                "/v1/admin/sessions/s-1/recording/manifest",
+                Some(Endpoint::Other),
+            ),
             (Method::POST, "/login/device", Some(Endpoint::Other)),
             (Method::GET, "/", Some(Endpoint::Other)),
             (Method::GET, "/healthz", None),

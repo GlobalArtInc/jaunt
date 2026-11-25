@@ -228,6 +228,12 @@ impl Permission for SessionsRead {
     const REQUIRED: AdminPermission = AdminPermission::SessionsRead;
 }
 
+pub(crate) struct RecordingsRead;
+
+impl Permission for RecordingsRead {
+    const REQUIRED: AdminPermission = AdminPermission::RecordingsRead;
+}
+
 pub(crate) struct RequireAdmin<P: Permission> {
     pub(crate) session: WebSession,
     permission: PhantomData<P>,

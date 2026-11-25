@@ -128,6 +128,29 @@ export function createApi({ onUnauthorized, onSession }) {
     return reply.body;
   }
 
+  async function stream(path, signal) {
+    let response;
+    try {
+      response = await fetch(path, {
+        method: "GET",
+        headers: { Accept: "application/x-asciicast, application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        signal,
+      });
+    } catch {
+      throw new ApiError(0, signal && signal.aborted ? "aborted" : "network");
+    }
+    if (response.status === 401) {
+      onUnauthorized();
+      throw new ApiError(401, "unauthorized");
+    }
+    if (!response.ok) {
+      throw fail({ response, body: await readBody(response) });
+    }
+    return response;
+  }
+
   function forget() {
     csrf = null;
   }
@@ -135,6 +158,7 @@ export function createApi({ onUnauthorized, onSession }) {
   return {
     session,
     forget,
+    stream,
     get: (path, query) => request("GET", path, { query }),
     post: (path, body) => request("POST", path, { body }),
     del: (path, body) => request("DELETE", path, { body }),

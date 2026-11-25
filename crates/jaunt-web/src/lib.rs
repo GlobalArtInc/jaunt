@@ -166,6 +166,117 @@ mod tests {
         assert!(checked >= 20, "{checked}");
     }
 
+    const VENDORED: &[(&str, &str)] = &[
+        (
+            "assets/vendor/xterm/xterm.js",
+            "1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495",
+        ),
+        (
+            "assets/vendor/xterm/xterm.css",
+            "ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6",
+        ),
+        (
+            "assets/vendor/xterm/LICENSE.txt",
+            "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+        ),
+        (
+            "assets/vendor/xterm/NOTICE.txt",
+            "d1101d6a2e3714b6e14eeec3fe0d688a4d3f374e99c8c71172cc409ef99348e4",
+        ),
+        (
+            "assets/vendor/xterm/README.txt",
+            "eb2cc407a421a77c50d791ea738a93423b6627673fff36e3c9622a96e69d4933",
+        ),
+        (
+            "assets/vendor/xterm-addon-canvas/addon-canvas.js",
+            "7b3e904d5bec98b54d26674994cf994396c4af0971010ffd0d4983229b65d933",
+        ),
+        (
+            "assets/vendor/xterm-addon-canvas/LICENSE.txt",
+            "689ceb10716bd7a87a804c14951d7c2b818cbd60aab83d540902470ce3b13444",
+        ),
+        (
+            "assets/vendor/xterm-addon-canvas/NOTICE.txt",
+            "9871afac62c1841e6614ea413f03c09291e69a995434061530a6756ff5b6a51c",
+        ),
+        (
+            "assets/vendor/xterm-addon-canvas/README.txt",
+            "6f30f7538c794b154b863f96a784296813f1844a3ee1b7b6f2b5088b0b37ae1e",
+        ),
+    ];
+
+    const VENDOR_PREFIX: &str = "assets/vendor/";
+    const ADDRESS_NEEDLES: &[&str] = &["http://", "https://"];
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        use sha2::{Digest, Sha256};
+
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+    }
+
+    fn is_pinned_vendored(path: &str, bytes: &[u8]) -> bool {
+        VENDORED
+            .iter()
+            .any(|(pinned, hash)| *pinned == path && *hash == sha256_of(bytes))
+    }
+
+    #[test]
+    fn every_vendored_file_is_pinned_by_hash_and_nothing_else_lives_in_the_vendor_directory() {
+        let embedded: HashSet<&str> = assets()
+            .iter()
+            .map(|asset| asset.path)
+            .filter(|path| path.starts_with(VENDOR_PREFIX))
+            .collect();
+        let pinned: HashSet<&str> = VENDORED.iter().map(|(path, _)| *path).collect();
+        assert_eq!(embedded, pinned);
+        for asset in assets()
+            .iter()
+            .filter(|asset| embedded.contains(asset.path))
+        {
+            assert!(
+                is_pinned_vendored(asset.path, asset.bytes),
+                "{} does not match its pinned hash",
+                asset.path
+            );
+        }
+    }
+
+    #[test]
+    fn each_vendored_directory_has_a_license_a_notice_and_a_readme_naming_the_version_and_hashes() {
+        let directories: HashSet<&str> = VENDORED
+            .iter()
+            .filter_map(|(path, _)| path.rsplit_once('/').map(|(directory, _)| directory))
+            .collect();
+        assert!(!directories.is_empty());
+        for directory in directories {
+            for name in ["LICENSE.txt", "NOTICE.txt", "README.txt"] {
+                assert!(
+                    find(&format!("{directory}/{name}")).is_some(),
+                    "{directory}/{name}"
+                );
+            }
+            let readme = text_of(&format!("{directory}/README.txt"));
+            assert!(readme.contains("Version:") && readme.contains("sha512-"));
+            for (path, hash) in VENDORED.iter().filter(|(path, _)| {
+                path.starts_with(&format!("{directory}/"))
+                    && !path.ends_with("README.txt")
+                    && !path.ends_with("NOTICE.txt")
+            }) {
+                assert!(
+                    readme.contains(hash),
+                    "{directory} README misses the hash of {path}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn no_asset_can_turn_data_into_markup_or_code() {
         let forbidden = [
@@ -182,10 +293,27 @@ mod tests {
         ];
         for asset in assets() {
             let source = text_of(asset.path);
+            let pinned = is_pinned_vendored(asset.path, asset.bytes);
             for needle in forbidden {
+                if pinned && ADDRESS_NEEDLES.contains(&needle) {
+                    continue;
+                }
                 assert!(!source.contains(needle), "{} contains {needle}", asset.path);
             }
             assert!(!source.contains(" style=\""), "{}", asset.path);
+        }
+    }
+
+    #[test]
+    fn the_address_exemption_covers_only_pinned_documentation_and_stylesheet_comments_not_scripts()
+    {
+        for (path, _) in VENDORED {
+            if path.ends_with(".js") {
+                let source = text_of(path);
+                for needle in ADDRESS_NEEDLES {
+                    assert!(!source.contains(needle), "{path} contains {needle}");
+                }
+            }
         }
     }
 }

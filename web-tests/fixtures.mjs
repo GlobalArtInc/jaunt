@@ -130,3 +130,28 @@ export function lookup(overrides = {}) {
     intent_expires_at: NOW + 300,
   };
 }
+
+export const SESSION_ID = "5b1c0a42-aaaa-bbbb-cccc-111122223333";
+
+export function recordingManifest(overrides = {}) {
+  return {
+    state: "complete",
+    kind: "shell",
+    chunks: 3,
+    raw_bytes: 4096,
+    incomplete: false,
+    salvaged: false,
+    input_recorded: false,
+    dropped_chunks: 0,
+    has_cast: true,
+    started_at: NOW - 600,
+    ended_at: NOW - 300,
+    command: null,
+    playback_limit_bytes: 64 * 1024 * 1024,
+    ...overrides,
+  };
+}
+
+export function castLines(...events) {
+  return new TextEncoder().encode(['{"version":2,"width":80,"height":24,"timestamp":1700000000}', ...events.map((event) => (typeof event === "string" ? event : JSON.stringify(event)))].join("\n") + "\n");
+}

@@ -236,6 +236,10 @@ impl Control {
         crate::web::open_for_tests(self, user_id).await
     }
 
+    pub fn set_recording_playback_limit(&self, bytes: u64) {
+        self.web.playback.set(bytes);
+    }
+
     pub fn install_agent_presence(&self, presence: Arc<dyn AgentPresence>) {
         self.inner.presence.install(presence);
     }

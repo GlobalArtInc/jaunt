@@ -9,6 +9,8 @@ pub(crate) const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src
 style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; \
 frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
+pub(crate) const RECORDING_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; sandbox";
+
 const STRICT_TRANSPORT_SECURITY: &str = "max-age=31536000";
 
 pub(crate) struct SecurityHeaders {
@@ -48,6 +50,26 @@ impl SecurityHeaders {
     }
 }
 
+impl SecurityHeaders {
+    pub(crate) fn apply_sandboxed(&self, headers: &mut HeaderMap) {
+        self.apply(headers);
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(RECORDING_CONTENT_SECURITY_POLICY),
+        );
+    }
+}
+
+pub(crate) async fn apply_sandboxed_to_response(
+    State(control): State<Control>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    control.web.headers.apply_sandboxed(response.headers_mut());
+    response
+}
+
 pub(crate) async fn apply_to_response(
     State(control): State<Control>,
     request: Request,
@@ -62,7 +84,7 @@ pub(crate) async fn apply_to_response(
 mod tests {
     use axum::http::HeaderMap;
 
-    use super::{CONTENT_SECURITY_POLICY, SecurityHeaders};
+    use super::{CONTENT_SECURITY_POLICY, RECORDING_CONTENT_SECURITY_POLICY, SecurityHeaders};
 
     fn applied(origin: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -111,5 +133,23 @@ mod tests {
 
         assert_eq!(headers["content-security-policy"], CONTENT_SECURITY_POLICY);
         assert_eq!(headers["referrer-policy"], "strict-origin");
+    }
+
+    #[test]
+    fn sandboxed_responses_keep_every_guard_and_replace_only_the_policy() {
+        let mut headers = HeaderMap::new();
+        SecurityHeaders::new("https://jaunt.example").apply_sandboxed(&mut headers);
+
+        assert_eq!(
+            headers["content-security-policy"],
+            RECORDING_CONTENT_SECURITY_POLICY
+        );
+        assert_eq!(
+            RECORDING_CONTENT_SECURITY_POLICY,
+            "default-src 'none'; sandbox"
+        );
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
     }
 }

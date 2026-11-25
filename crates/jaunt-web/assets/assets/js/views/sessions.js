@@ -1,8 +1,9 @@
 import { el, replace, encodeSegment } from "../dom.js";
 import { bytes, clean, parseUtcInput, span, time } from "../format.js";
 import { S } from "../strings.js";
-import { badge, banner, button, crumbs, errorLine, facts, field, pageHead, panel, selectInput, textInput } from "../ui.js";
+import { badge, button, crumbs, errorLine, facts, field, pageHead, panel, selectInput, textInput } from "../ui.js";
 import { emptyState, filterBar, pagedTable, takeFlash, timeFilterField } from "./shared.js";
+import { recordingPanel } from "./recording.js";
 import { openRevokeDialog } from "./revocations.js";
 
 const SESSIONS = "/v1/admin/sessions";
@@ -221,7 +222,6 @@ export async function sessionView(ctx) {
     [S.sessions.serial, session.serial === undefined || session.serial === null ? null : clean(session.serial), { mono: true }],
     [S.sessions.expires, session.expires_at ? time(session.expires_at) : null],
     [S.sessions.maxDuration, Number.isInteger(session.max_duration_secs) ? span(session.max_duration_secs) : null],
-    [S.sessions.recordingState, session.recording ? clean(typeof session.recording === "string" ? session.recording : session.recording.state) : null],
   ];
   replace(
     ctx.main,
@@ -229,6 +229,6 @@ export async function sessionView(ctx) {
     takeFlash(),
     pageHead(S.sessions.detailTitle + " " + clean(String(session.id).slice(0, 8)), { actions }),
     panel(S.sessions.facts, facts(entries)),
-    banner("info", S.sessions.recordingTitle + ".", S.sessions.recordingNote),
+    recordingPanel(ctx, session),
   );
 }

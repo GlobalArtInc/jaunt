@@ -45,8 +45,9 @@ export function createServer(routes) {
       handler = queue.length > 1 ? queue.shift() : queue[0];
     }
     const reply = typeof handler === "function" ? await handler(request) : handler;
-    const headers = new Headers({ "Content-Type": "application/json", ...(reply.headers || {}) });
-    const body = reply.status === 204 || reply.body === undefined ? null : JSON.stringify(reply.body);
+    const headers = new Headers({ "Content-Type": reply.contentType || "application/json", ...(reply.headers || {}) });
+    const raw = reply.raw !== undefined;
+    const body = reply.status === 204 || (reply.body === undefined && !raw) ? null : raw ? reply.raw : JSON.stringify(reply.body);
     return new Response(body, { status: reply.status, headers });
   };
   return {

@@ -514,3 +514,23 @@ table.data th, table.data td { overflow-wrap: anywhere; }
   table.data td a.chip { min-height: 44px; }
   .skip { min-height: 44px; }
 }
+
+.recording > * + * { margin-top: var(--space-4); }
+.recording-state { margin: 0; }
+.player { display: grid; gap: var(--space-4); min-width: 0; }
+.player-controls { display: flex; flex-wrap: wrap; gap: var(--space-3) var(--space-4); align-items: flex-end; }
+.player-field, .player-seek { display: grid; gap: var(--space-2); min-width: 0; }
+.player-field label, .player-seek label { font-size: var(--fs-sm); color: var(--text-muted); font-weight: 600; }
+.player-seek { flex: 1 1 14rem; }
+.player-seek input[type="range"] { width: 100%; min-height: var(--control-h); accent-color: var(--accent); margin: 0; }
+.player-time { font-family: var(--font-mono); font-size: var(--fs-mono); min-height: var(--control-h); display: inline-flex; align-items: center; }
+.player-options { display: grid; gap: var(--space-3); }
+.player-screen {
+  background: var(--term-bg); color: var(--term-text); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+  padding: var(--space-3); overflow: auto; max-width: 100%; min-height: 6rem;
+}
+.player-screen .xterm { width: max-content; }
+@media (max-width: 520px) {
+  .player-controls { align-items: stretch; }
+  .player-seek { flex-basis: 100%; }
+}

@@ -106,7 +106,7 @@ test("a missing node shows the not found page and a removed node offers no remov
   assert.doesNotMatch(ui.text(), /Who can reach this node/);
 });
 
-test("the sessions screen marks live sessions and links to the detail with the recording note", async () => {
+test("the sessions screen marks live sessions and links to the detail", async () => {
   ui = await mount(
     {
       ...signedIn(),
@@ -123,8 +123,7 @@ test("the sessions screen marks live sessions and links to the detail with the r
   window.location.hash = "#/sessions/5b1c0a42-aaaa-bbbb-cccc-111122223333";
   await settle();
   assert.match(ui.text(), /203\.0\.113\.9:51022/);
-  assert.match(ui.text(), /recordings\.read/);
-  assert.match(ui.text(), /not part of this version/);
+  assert.match(ui.text(), /No recording/);
 });
 
 test("the revocations screen lists entries and offers lifting only with the write permission", async () => {

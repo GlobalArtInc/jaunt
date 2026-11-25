@@ -1,11 +1,12 @@
 const FORBIDDEN_ATTRIBUTE = /^(on|style$|srcdoc$|formaction$|xlink:href$)/i;
 const SAFE_HASH_LINK = /^#\/[A-Za-z0-9\/_\-.~%:=&?+]*$/;
 const LOGIN_LINK = /^\/v1\/web\/login(\?return_to=[A-Za-z0-9%._~-]*)?$/;
+const DOWNLOAD_LINK = /^\/v1\/admin\/sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/recording\?download=1$/;
 const PROPERTY_ATTRIBUTES = new Set(["value", "checked", "disabled", "selected", "hidden", "required", "readOnly"]);
 
 export function safeHref(href) {
   const text = String(href);
-  if (SAFE_HASH_LINK.test(text) || LOGIN_LINK.test(text)) {
+  if (SAFE_HASH_LINK.test(text) || LOGIN_LINK.test(text) || DOWNLOAD_LINK.test(text)) {
     return text;
   }
   throw new Error("refused to build a link from an unsafe address");

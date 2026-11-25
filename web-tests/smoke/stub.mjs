@@ -75,6 +75,8 @@ export async function startStub({ permissions }) {
     enrolments: new Map(),
     sessionsTokens: new Map(),
     lookupLimited: false,
+    recordings: new Map(),
+    recordingRequests: [],
     log: [],
   };
   const origin = { value: "" };
@@ -224,6 +226,20 @@ export async function startStub({ permissions }) {
       state.nodes.push(node);
       return send(response, 200, { enrolment_id: entry.id, node: { id: node.id, name: node.name }, labels: node.labels, replaced: null });
     }
+    if ((match = /^\/v1\/admin\/sessions\/([^/]+)\/recording(\/manifest)?$/.exec(path)) && method === "GET") {
+      if (!need("recordings.read")) return;
+      const stored = state.recordings.get(decodeURIComponent(match[1]));
+      state.recordingRequests.push({ path, query: url.search, session: decodeURIComponent(match[1]) });
+      if (!stored) return send(response, 404, { error: "not_found" });
+      if (match[2]) return send(response, 200, stored.manifest);
+      if (!stored.cast) return send(response, 404, { error: "not_found" });
+      if (!url.searchParams.has("download") && stored.manifest.raw_bytes > stored.manifest.playback_limit_bytes) return send(response, 413, { error: "recording_too_large" });
+      const headers = { "Content-Type": "application/x-asciicast; charset=utf-8", "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; sandbox", "X-Content-Type-Options": "nosniff" };
+      if (url.searchParams.get("download") === "1") headers["Content-Disposition"] = 'attachment; filename="' + match[1] + '.cast"';
+      response.writeHead(200, headers);
+      response.end(stored.cast);
+      return;
+    }
     if (path === "/v1/admin/sessions" && method === "GET") {
       if (!need("sessions.read")) return;
       const wanted = url.searchParams.get("state");
@@ -234,7 +250,8 @@ export async function startStub({ permissions }) {
       if (!need("sessions.read")) return;
       const entry = state.sessions.find((candidate) => candidate.id === decodeURIComponent(match[1]));
       if (!entry) return send(response, 404, { error: "not_found" });
-      return send(response, 200, { ...entry, serial: "4242", expires_at: now() + 120, max_duration_secs: 3600, client_addr: "203.0.113.9:51022" });
+      const stored = state.recordings.get(entry.id);
+      return send(response, 200, { ...entry, recording: stored ? stored.manifest.state : "none", serial: "4242", expires_at: now() + 120, max_duration_secs: 3600, client_addr: "203.0.113.9:51022" });
     }
     if (path === "/v1/admin/revocations") {
       if (method === "GET") {
@@ -304,6 +321,9 @@ export async function startStub({ permissions }) {
       return (await reply.json()).code;
     },
     expireSessions: () => state.sessionsTokens.clear(),
+    setRecording(id, manifest, cast) {
+      state.recordings.set(id, { manifest, cast });
+    },
     setNodes(nodes) {
       state.nodes = nodes;
     },

@@ -394,6 +394,9 @@ async fn start(
             },
             settings.limits.http,
         )?;
+        if let Some(configured) = &settings.recordings {
+            control.set_recording_playback_limit(configured.max_playback_bytes);
+        }
         if let Some(prepared) = &prepared_recordings {
             recordings::recover(prepared, &control).await?;
         }

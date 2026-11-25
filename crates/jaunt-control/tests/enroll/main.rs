@@ -22,6 +22,7 @@ mod trust;
 mod web_enrolments;
 mod web_guard;
 mod web_nodes;
+mod web_recordings;
 mod web_sessions;
 mod web_support;
 

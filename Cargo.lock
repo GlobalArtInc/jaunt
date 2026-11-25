@@ -2436,6 +2436,9 @@ dependencies = [
 [[package]]
 name = "jaunt-web"
 version = "0.0.0"
+dependencies = [
+ "sha2 0.11.1",
+]
 
 [[package]]
 name = "jauntd"
