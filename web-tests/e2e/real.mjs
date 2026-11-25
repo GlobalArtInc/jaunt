@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
@@ -8,7 +8,6 @@ const IDP_PRIME =
   "https://idp.e2e.test/authorize?response_type=code&client_id=jaunt-e2e&code_challenge=e2e-test-only-challenge&code_challenge_method=S256" +
   "&redirect_uri=https%3A%2F%2Fjaunt.e2e.test%2Fv1%2Flogin%2Fcallback&state=e2e-prime&login_hint=admin";
 const WIDTHS = [380, 1440];
-const KNOWN_MISSING = ["/v1/web/terminal/targets"];
 const OUT = process.env.E2E_SCREENSHOTS || fileURLToPath(new URL("../../target/e2e/screenshots/", import.meta.url));
 
 function required(name) {
@@ -23,8 +22,12 @@ const WEB_PORT = required("E2E_WEB_PORT");
 const IDP_PORT = required("E2E_IDP_PORT");
 const PENDING = required("E2E_PENDING").split(",").map((pair) => pair.split(":"));
 const REVOKE = required("E2E_REVOKE_USERS").split(",");
+const TERMINAL_USER = required("E2E_TERMINAL_USER");
+const TERMINAL_OUT = required("E2E_TERMINAL_OUT");
+const TERMINAL_WAIT_MS = 30000;
 const failures = [];
 const seen = [];
+const terminals = [];
 
 function fail(context, message) {
   failures.push(`${context}: ${message}`);
@@ -108,6 +111,164 @@ async function revoke(page, context, subject) {
   await shot(page, context, "revocations");
 }
 
+function watch(page, problems) {
+  page.on("console", (message) => {
+    if (message.type() === "error" && !/Failed to load resource/.test(message.text())) {
+      problems.push(`console: ${message.text()}`);
+    }
+  });
+  page.on("response", (response) => {
+    if (response.status() >= 400 && ![401, 429].includes(response.status())) {
+      problems.push(`HTTP ${response.status()} for ${response.url()}`);
+    }
+  });
+  page.on("pageerror", (error) => problems.push(`pageerror: ${error.message}`));
+}
+
+async function instrument(browserContext) {
+  await browserContext.addInitScript(() => {
+    window.__csp = [];
+    window.__terminals = [];
+    document.addEventListener("securitypolicyviolation", (event) => window.__csp.push(`${event.violatedDirective} ${event.blockedURI}`));
+    let constructor;
+    Object.defineProperty(window, "Terminal", {
+      configurable: true,
+      get: () => constructor,
+      set(value) {
+        constructor = new Proxy(value, {
+          construct(target, args, newTarget) {
+            const created = Reflect.construct(target, args, newTarget);
+            window.__terminals.push(created);
+            return created;
+          },
+        });
+      },
+    });
+  });
+}
+
+async function terminalText(page) {
+  return page.evaluate(() => {
+    const terminal = window.__terminals[window.__terminals.length - 1];
+    if (!terminal) {
+      return "";
+    }
+    const buffer = terminal.buffer.active;
+    const lines = [];
+    for (let row = 0; row < buffer.length; row += 1) {
+      const line = buffer.getLine(row);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+    return lines.join("\n");
+  });
+}
+
+async function terminalShows(page, context, what, pattern) {
+  const deadline = Date.now() + TERMINAL_WAIT_MS;
+  let text = "";
+  while (Date.now() < deadline) {
+    text = await terminalText(page);
+    const found = text.match(pattern);
+    if (found) {
+      return found;
+    }
+    await page.waitForTimeout(100);
+  }
+  fail(context, `${what} did not appear in the terminal within ${TERMINAL_WAIT_MS / 1000} s: ${JSON.stringify(text.slice(-300))}`);
+  return null;
+}
+
+async function typeLine(page, line) {
+  await page.keyboard.type(line);
+  await page.keyboard.press("Enter");
+}
+
+async function terminalSize(page) {
+  return page.evaluate(() => {
+    const terminal = window.__terminals[window.__terminals.length - 1];
+    return terminal ? `${terminal.rows}x${terminal.cols}` : "";
+  });
+}
+
+async function webTerminal(browser, width) {
+  const context = `terminal-${width}`;
+  const height = width < 600 ? 800 : 900;
+  const browserContext = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width, height }, deviceScaleFactor: 1 });
+  await instrument(browserContext);
+  const priming = await browserContext.newPage();
+  await priming.goto(IDP_PRIME.replace("login_hint=admin", `login_hint=${encodeURIComponent(TERMINAL_USER)}`));
+  await priming.close();
+  const page = await browserContext.newPage();
+  const problems = [];
+  watch(page, problems);
+  await page.goto(`${ORIGIN}/`);
+  await page.waitForSelector("a.btn-primary");
+  await page.click("a.btn-primary");
+  await page.waitForSelector(".rail a", { state: "attached" });
+  await page.goto(`${ORIGIN}/#/terminal`);
+  await page.waitForSelector('input[name="terminal-node"]');
+  await page.click('label.pick-card:has(input[value="node-a"])');
+  await page.click('label.pick-login:has(input[value="deploy"])');
+  await shot(page, context, "terminal-picker");
+  await page.click("button:has-text('Open terminal')");
+  await page.waitForSelector(".term-host canvas");
+  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: TERMINAL_WAIT_MS });
+  await page.click(".term-host");
+  await typeLine(page, "echo hello-$((6*7))");
+  await terminalShows(page, context, "hello-42", /^hello-42$/m);
+  await typeLine(page, "seq 1 200000 | tail -n 1");
+  await terminalShows(page, context, "200000", /^200000$/m);
+  await shot(page, context, "terminal-session");
+  await typeLine(page, "echo size-before-$(stty size | tr ' ' x)");
+  const before = await terminalShows(page, context, "the size before the resize", /^size-before-(\d+x\d+)$/m);
+  const shown = await terminalSize(page);
+  if (before && before[1] !== shown) {
+    fail(context, `the shell sees ${before[1]} while the page shows ${shown}`);
+  }
+  await page.setViewportSize(width < 600 ? { width, height: height - 240 } : { width: width - 360, height: height - 200 });
+  const resizeDeadline = Date.now() + TERMINAL_WAIT_MS;
+  while ((await terminalSize(page)) === shown && Date.now() < resizeDeadline) {
+    await page.waitForTimeout(100);
+  }
+  const resized = await terminalSize(page);
+  if (resized === shown) {
+    fail(context, `the terminal kept ${shown} after the window was resized`);
+  }
+  await typeLine(page, "echo size-after-$(stty size | tr ' ' x)");
+  const after = await terminalShows(page, context, "the size after the resize", /^size-after-(\d+x\d+)$/m);
+  if (after && after[1] !== resized) {
+    fail(context, `after the resize the shell sees ${after[1]} while the page shows ${resized}`);
+  }
+  await typeLine(page, "exit");
+  await page.waitForSelector(".term-banner:has-text('Session ended')", { timeout: TERMINAL_WAIT_MS });
+  const ended = await page.textContent(".term-banner");
+  if (!/exited with status 0/.test(ended)) {
+    fail(context, `the ended banner says: ${ended.slice(0, 160)}`);
+  }
+  const session = await page.evaluate(() => {
+    for (const paragraph of document.querySelectorAll("p")) {
+      const id = paragraph.querySelector(".mono");
+      if (id && /^Session: /.test(paragraph.textContent)) {
+        return id.textContent.trim();
+      }
+    }
+    return null;
+  });
+  if (!session) {
+    fail(context, "the ended screen does not name the session");
+  } else {
+    terminals.push({ width, session });
+  }
+  await shot(page, context, "terminal-ended");
+  for (const violation of await page.evaluate(() => window.__csp)) {
+    problems.push(`CSP violation: ${violation}`);
+  }
+  for (const problem of problems) {
+    fail(context, problem);
+  }
+  await browserContext.close();
+}
+
 async function run(browser, width, index) {
   const context = `real-${width}`;
   const browserContext = await browser.newContext({
@@ -120,18 +281,7 @@ async function run(browser, width, index) {
   await priming.close();
   const page = await browserContext.newPage();
   const problems = [];
-  page.on("console", (message) => {
-    if (message.type() === "error" && !/Failed to load resource/.test(message.text())) {
-      problems.push(`console: ${message.text()}`);
-    }
-  });
-  page.on("response", (response) => {
-    const known = KNOWN_MISSING.some((path) => response.url().endsWith(path));
-    if (response.status() >= 400 && ![401, 429].includes(response.status()) && !(response.status() === 404 && known)) {
-      problems.push(`HTTP ${response.status()} for ${response.url()}`);
-    }
-  });
-  page.on("pageerror", (error) => problems.push(`pageerror: ${error.message}`));
+  watch(page, problems);
   await signIn(page, context);
   await listNodes(page, context);
   const [code, name] = PENDING[index];
@@ -154,10 +304,12 @@ async function main() {
   });
   try {
     for (const [index, width] of WIDTHS.entries()) {
+      await webTerminal(browser, width);
       await run(browser, width, index);
     }
   } finally {
     await browser.close();
+    await writeFile(TERMINAL_OUT, JSON.stringify({ sessions: terminals }));
   }
   console.log(`screens captured: ${seen.length}`);
   console.log(`screenshots: ${OUT}`);

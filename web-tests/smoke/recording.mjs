@@ -21,6 +21,13 @@ const IDS = {
 
 const failures = [];
 const notes = [];
+const RUN_LIMIT_MS = 15 * 60 * 1000;
+
+setTimeout(() => {
+  console.error(`the run exceeded ${RUN_LIMIT_MS / 1000} s and was stopped`);
+  for (const entry of failures) console.error(" - " + entry);
+  process.exit(1);
+}, RUN_LIMIT_MS).unref();
 
 function fail(context, message) {
   failures.push(context + ": " + message);

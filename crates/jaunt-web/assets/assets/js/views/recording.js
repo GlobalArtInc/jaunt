@@ -3,6 +3,7 @@ import { bytes, clean, time } from "../format.js";
 import { CAST_LIMITS, CastError, readCast } from "../recording/cast.js";
 import { SPEEDS, createDriver, realClock } from "../recording/driver.js";
 import { createTerminalSink, loadTerminalLibraries } from "../recording/terminal.js";
+import { isUnsafeTerminalError } from "../terminal/cells.js";
 import { S } from "../strings.js";
 import { badge, banner, button, facts, linkButton, panel } from "../ui.js";
 
@@ -234,8 +235,8 @@ export function recordingPanel(ctx, session) {
     let sink;
     try {
       sink = playerHooks.createSink({ container: screen, cols: cast.header.cols, rows: cast.header.rows, libraries });
-    } catch {
-      show(statusLine(state), banner("danger", S.recording.failed), el("div", { class: "actions" }, downloadLink(base, S.recording.download)));
+    } catch (error) {
+      show(statusLine(state), banner("danger", isUnsafeTerminalError(error) ? S.recording.unsafe : S.recording.failed), el("div", { class: "actions" }, downloadLink(base, S.recording.download)));
       return;
     }
     const driver = createDriver({ cast, sink, clock: playerHooks.clock });

@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createTerminalBackend } from "./terminal-stub.mjs";
+
 const ASSETS = resolve(process.env.JAUNT_ASSETS || fileURLToPath(new URL("../../crates/jaunt-web/assets", import.meta.url)));
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png" };
@@ -85,6 +87,7 @@ export async function startStub({ permissions }) {
     log: [],
   };
   const origin = { value: "" };
+  const terminal = createTerminalBackend({ origin });
 
   function auditEvents() {
     const events = [];
@@ -164,6 +167,10 @@ export async function startStub({ permissions }) {
     if (path === "/v1/web/terminal/targets" && method === "GET") {
       if (state.targets === null) return send(response, 404, { error: "not_found" });
       return send(response, 200, state.targets);
+    }
+    if (path === "/v1/web/terminal/ticket" && method === "POST") {
+      const reply = terminal.issue(current, await body(request), state.targets);
+      return send(response, reply.status, reply.body);
     }
     if (path === "/v1/web/logout" && method === "POST") {
       send(response, 204, undefined);
@@ -324,11 +331,13 @@ export async function startStub({ permissions }) {
       response.end();
     });
   });
+  server.on("upgrade", (request, socket) => terminal.upgrade(request, socket, sessionOf));
   await new Promise((done) => server.listen(0, "127.0.0.1", done));
   origin.value = "http://127.0.0.1:" + server.address().port;
   return {
     origin: origin.value,
     state,
+    terminal: terminal.control,
     async enrol(name, labels) {
       const reply = await fetch(origin.value + "/v1/agent/enroll", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, labels }) });
       return (await reply.json()).code;

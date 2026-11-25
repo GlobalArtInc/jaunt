@@ -88,15 +88,18 @@ property under test is that the recording completes whole and matches what the c
 `just e2e-web` starts the same stand with the TLS edges published on `127.0.0.1:18443` and `:18444`, enrols the nodes,
 signs in, opens a live session and two pending enrolments, and then runs `web-tests/e2e/real.mjs` (Playwright,
 Chromium) against the real console at 380 and 1440 px: sign-in through the fake IdP, the node list, approval of a
-pending enrolment through the UI, the session list, and a revocation from the UI. `web-tests/e2e/recording.mjs` opens
+pending enrolment through the UI, the session list, and a revocation from the UI. Before each width it signs in as
+`dave` and opens a web terminal on `node-a` as `deploy` through the Terminal screen: `echo hello-$((6*7))` must show
+`hello-42`, `seq 1 200000 | tail -n 1` must show `200000`, a window resize must change `stty size` to the size the page
+shows, and `exit` must show the ended state with exit status 0. The runner then checks that each of these sessions has a
+complete recording whose cast contains `hello-42` and exactly one `terminal.opened` (with `client_addr`) and one
+`terminal.closed` event. `web-tests/e2e/recording.mjs` opens
 the session detail of a recorded session, presses "Watch recording", reads the typed text from the terminal buffer
 (the terminal draws on a canvas, so the script captures the `Terminal` instance with an init script), checks that the page
 does not overflow horizontally and that the canvas holds painted text, and fails on any CSP violation, on any console
 error and on any HTTP response of 400 or above except 401 and 429 (the 401 is the console probing for a session before
 sign-in; both scripts ignore only these two statuses, and the browser's own "Failed to load resource" console line is
-dropped because the response check names the URL). One 404 is accepted by name (`KNOWN_MISSING` in both scripts):
-`/v1/web/terminal/targets`, which the redesigned console probes and the daemon does not serve yet; remove it from the list
-when the endpoint exists. The browser ignores TLS errors
+dropped because the response check names the URL). The browser ignores TLS errors
 (`ignoreHTTPSErrors`) only because the TLS edge of this stand uses a certificate of a throw-away test CA. Screenshots go to
 `target/e2e/screenshots/`. Prepare once with `cd web-tests && npm ci && npx playwright install chromium`.
 

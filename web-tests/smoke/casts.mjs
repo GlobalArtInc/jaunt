@@ -65,6 +65,13 @@ export function hostileCast() {
   for (const [letter, final] of [["a", "b"], ["b", "L"], ["c", "M"], ["d", "S"], ["e", "T"], ["f", "Z"], ["g", "I"], ["h", "^"], ["i", "@"], ["j", "P"], ["k", "X"]]) {
     cast.out(0.05, `${letter}${ESC}[999999999${final}${ESC}[2147483647${final}\r\n`);
   }
+  const marks = Array.from({ length: 63 }, (_, offset) => String.fromCodePoint(0x300 + offset)).join("");
+  cast.out(0.05, "e" + marks.slice(0, 21));
+  cast.out(0.05, marks.slice(21, 42));
+  cast.out(0.05, marks.slice(42) + "\r\n");
+  cast.out(0.1, "\u007f".repeat(65536));
+  cast.out(0.1, ("x" + ESC + "[5000S").repeat(500));
+  cast.out(0.1, ("x" + ["S", "T", "L", "M", "Z", "b"].map((final) => ESC + "[5000" + final).join("")).repeat(2000));
   cast.out(0.1, `${"A".repeat(300000)}\r\n`);
   cast.out(0.1, `${ESC}]0;${"T".repeat(200000)}\u0007${ESC}]52;c;${"Zm9v".repeat(50000)}\u0007`);
   cast.out(0.1, `${ESC}[?1049l${ESC}[?25h${ESC}[?1000l${ESC}[?1006l${ESC}[?2004l${ESC}[0m\r\nend of hostile output\r\n`);

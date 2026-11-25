@@ -1,3 +1,8 @@
+import { cellUnitsLimit, installCellLimit, installPaintLimit } from "../terminal/cells.js";
+import { FONT_SIZES, LARGEST_FONT_SIZE, PLAYER_FONT_SIZE } from "../terminal/fonts.js";
+import { LIMITED_FINALS, createOutputGuard, installCountLimits } from "../terminal/guard.js";
+import { installReplyPolicy } from "../terminal/replies.js";
+
 const VENDOR_ROOT = "/assets/vendor/";
 const STYLESHEET = VENDOR_ROOT + "xterm/xterm.css";
 const SCRIPTS = [VENDOR_ROOT + "xterm/xterm.js", VENDOR_ROOT + "xterm-addon-canvas/addon-canvas.js"];
@@ -7,8 +12,10 @@ const FALLBACK_BACKGROUND = "#0b0d10";
 const FALLBACK_FOREGROUND = "#d8dee7";
 const SELECTION = "#3b4a63";
 const OVERSIZED_COUNT = 5000;
-const CSI_FINALS = Array.from({ length: 0x7f - 0x40 }, (_, index) => String.fromCharCode(0x40 + index));
+const CSI_FINALS = Array.from({ length: 0x7f - 0x40 }, (_, index) => String.fromCharCode(0x40 + index)).filter((final) => !LIMITED_FINALS.includes(final));
 const FULL_RESET = "\u001bc";
+const INTERACTIVE_SCROLLBACK = 5000;
+const PENDING_FLUSH_MS = 30;
 
 let loading = null;
 let shared = null;
@@ -87,7 +94,17 @@ function oversizedCount(params) {
   return typeof first === "number" && first > OVERSIZED_COUNT;
 }
 
-function buildTerminal({ container, cols, rows, libraries, doc }) {
+export function neutralise(terminal) {
+  for (const id of SWALLOWED_OSC) {
+    terminal.parser.registerOscHandler(id, () => true);
+  }
+  for (const final of CSI_FINALS) {
+    terminal.parser.registerCsiHandler({ final }, oversizedCount);
+  }
+  installCountLimits(terminal);
+}
+
+function construct({ container, cols, rows, libraries, doc, largestFont }, overrides) {
   const { Terminal, CanvasAddon } = libraries;
   const terminal = withInertStyleElements(() => {
     const created = new Terminal({
@@ -102,19 +119,27 @@ function buildTerminal({ container, cols, rows, libraries, doc }) {
       screenReaderMode: false,
       linkHandler: null,
       fontFamily: FONT,
-      fontSize: 14,
+      fontSize: PLAYER_FONT_SIZE,
       theme: themeOf(container, doc),
+      ...overrides,
     });
-    created.open(container);
-    created.loadAddon(new CanvasAddon());
+    try {
+      installCellLimit(created, cellUnitsLimit(created, { largestFont }));
+      created.open(container);
+      created.loadAddon(new CanvasAddon());
+      installPaintLimit(created);
+    } catch (error) {
+      created.dispose();
+      throw error;
+    }
     return created;
   }, doc);
-  for (const id of SWALLOWED_OSC) {
-    terminal.parser.registerOscHandler(id, () => true);
-  }
-  for (const final of CSI_FINALS) {
-    terminal.parser.registerCsiHandler({ final }, oversizedCount);
-  }
+  neutralise(terminal);
+  return terminal;
+}
+
+function buildTerminal(options) {
+  const terminal = construct({ ...options, largestFont: PLAYER_FONT_SIZE }, {});
   if (terminal.textarea) {
     terminal.textarea.tabIndex = -1;
     terminal.textarea.setAttribute("aria-hidden", "true");
@@ -147,6 +172,7 @@ function acquire(options) {
 
 export function createTerminalSink({ container, cols, rows, libraries, doc = document }) {
   const { terminal, reused } = acquire({ container, cols, rows, libraries, doc });
+  const guard = createOutputGuard(() => ({ cols: terminal.cols, rows: terminal.rows }));
   let tasks = [];
   let waiters = [];
   let busy = false;
@@ -195,9 +221,14 @@ export function createTerminalSink({ container, cols, rows, libraries, doc = doc
   }
 
   return {
-    write: (text) => enqueue({ kind: "write", text }),
+    write(text) {
+      for (const piece of guard.pieces(text)) {
+        enqueue({ kind: "write", text: piece });
+      }
+    },
     resize: (newCols, newRows) => enqueue({ kind: "resize", cols: newCols, rows: newRows }),
     reset(newCols, newRows) {
+      guard.reset();
       tasks = [];
       enqueue({ kind: "reset", cols: newCols, rows: newRows });
     },
@@ -220,5 +251,54 @@ export function createTerminalSink({ container, cols, rows, libraries, doc = doc
       reused.inUse = false;
     },
     terminal,
+  };
+}
+
+export function createInteractiveTerminal({ container, cols, rows, libraries, doc = document, fontSize = FONT_SIZES[0], now = () => Date.now(), onInput, onReply }) {
+  const terminal = construct({ container, cols, rows, libraries, doc, largestFont: LARGEST_FONT_SIZE }, { scrollback: INTERACTIVE_SCROLLBACK, fontSize, windowOptions: {} });
+  installReplyPolicy(terminal, { send: onReply, now });
+  terminal.onData((text) => onInput(text));
+  terminal.onBinary((text) => onInput(Uint8Array.from(text, (char) => char.charCodeAt(0) & 0xff)));
+  return terminal;
+}
+
+export function createGuardedWriter(terminal, timers) {
+  const guard = createOutputGuard(() => ({ cols: terminal.cols, rows: terminal.rows }));
+  const decoder = new TextDecoder("utf-8");
+  let timer = null;
+  let disposed = false;
+
+  function cancel() {
+    if (timer !== null) {
+      timers.clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function flush() {
+    timer = null;
+    const rest = guard.flush();
+    if (rest !== "" && !disposed) {
+      terminal.write(rest);
+    }
+  }
+
+  return {
+    write(bytes) {
+      if (disposed) {
+        return;
+      }
+      cancel();
+      for (const piece of guard.pieces(decoder.decode(bytes, { stream: true }))) {
+        terminal.write(piece);
+      }
+      if (guard.hasPending()) {
+        timer = timers.setTimeout(flush, PENDING_FLUSH_MS);
+      }
+    },
+    dispose() {
+      disposed = true;
+      cancel();
+    },
   };
 }

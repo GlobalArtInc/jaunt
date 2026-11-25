@@ -51,10 +51,9 @@ test("a session with fewer permissions sees fewer areas and no add new item", as
   assert.equal(ui.root.querySelector(".subnav-title").textContent, "Audit");
 });
 
-test("the terminal area opens a placeholder page for any signed-in user", async () => {
+test("the terminal area opens for any signed-in user without any admin permission", async () => {
   ui = await mount({ ...signedIn([]) }, "#/terminal");
-  assert.match(ui.main().textContent, /The web terminal is coming/);
-  assert.match(ui.main().textContent, /Node picker: Coming with the terminal/);
+  assert.match(ui.main().textContent, /No nodes available to you/);
   assert.equal(ui.root.querySelector(".rail [aria-current]").textContent, "Terminal");
 });
 

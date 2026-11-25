@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import time
@@ -14,6 +15,8 @@ IDP_PORT = 18444
 WEB_TESTS = os.path.join(ROOT, "web-tests")
 SCREENSHOTS = os.path.join(OUT, "screenshots")
 PENDING = ("web-pending-380", "web-pending-1440")
+TERMINAL_USER = "dave"
+TERMINAL_OUT = os.path.join(OUT, "web-terminal-sessions.json")
 
 
 def start_pending(stand, name):
@@ -83,11 +86,36 @@ def run(args):
             recorded = recordings.last_session(stand, marker, "alice", "node-a")
             step.expect(recordings.wait_recording(stand, recorded, ("complete",))["recording"] == "complete", "not recorded")
             run_node(step, "recording.mjs", stand, {"E2E_RECORDED_SESSION": recorded, "E2E_TYPED_TEXT": typed})
-        with report.step("Chromium drives the real console at 380 and 1440 px, screenshots in target/e2e/screenshots") as step:
+        with report.step("Chromium drives the real console and a web terminal on node-a at 380 and 1440 px, screenshots in target/e2e/screenshots") as step:
+            if os.path.exists(TERMINAL_OUT):
+                os.remove(TERMINAL_OUT)
             run_node(step, "real.mjs", stand, {
                 "E2E_PENDING": ",".join("{}:{}".format(code, name) for code, name in zip(codes, PENDING)),
                 "E2E_REVOKE_USERS": ",".join([stand.certs["alice"]["principal"], stand.certs["bob"]["principal"]]),
+                "E2E_TERMINAL_USER": TERMINAL_USER,
+                "E2E_TERMINAL_OUT": TERMINAL_OUT,
             })
+        with report.step("each web terminal session was recorded with its output and audited as opened and closed") as step:
+            terminals = []
+            if os.path.exists(TERMINAL_OUT):
+                with open(TERMINAL_OUT) as handle:
+                    terminals = json.load(handle)["sessions"]
+            step.expect(len(terminals) == 2, "web terminal sessions reported by real.mjs: {}".format(terminals))
+            for entry in terminals:
+                session_id = entry["session"]
+                detail = recordings.wait_recording(stand, session_id, ("complete", "incomplete"), timeout=90)
+                step.expect(detail["recording"] == "complete", "the recording of {} is {}".format(session_id, detail["recording"]))
+                cast = recordings.fetch(stand, stand.admin, "/v1/admin/sessions/{}/recording".format(session_id),
+                                        "web-terminal-{}.cast".format(entry["width"]))
+                step.expect(cast.status == 200, "the recording of {} answered {}".format(session_id, cast.status))
+                step.expect(b"hello-42" in cast.body(), "the recording of {} does not contain hello-42".format(session_id))
+                events = [event for event in stand.audit_events() if event.get("session_id") == session_id]
+                opened = [event for event in events if event["type"] == "terminal.opened"]
+                closed = [event for event in events if event["type"] == "terminal.closed"]
+                step.expect(len(opened) == 1 and opened[0].get("fields", {}).get("client_addr"), "terminal.opened of {}: {}".format(session_id, opened))
+                step.expect(len(closed) == 1, "terminal.closed of {}: {}".format(session_id, closed))
+                step.note("{} px: session {} recorded, closed with reason {}".format(
+                    entry["width"], session_id[:8], closed[0].get("fields", {}).get("reason")))
         with report.step("the approved enrolments reached the node list") as step:
             status, listed = stand.api("GET", "/v1/admin/nodes")
             names = [node["name"] for node in listed["nodes"]] if status == 200 else []

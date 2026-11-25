@@ -4,6 +4,8 @@ import { startStub } from "./stub.mjs";
 
 const LIMIT_MS = 500;
 const GUARD_MS = Number(process.env.CSI_SWEEP_GUARD_MS || 120_000);
+const RUN_LIMIT_MS = Number(process.env.CSI_SWEEP_RUN_LIMIT_MS || 20 * 60 * 1000);
+const CLOSE_MS = 5000;
 const COUNTS = ["999999999", "2147483647", "999999999;999999999"];
 const PREFIXES = ["", "?", ">", "<", "="];
 const INTERMEDIATES = ["", ...Array.from({ length: 16 }, (_, index) => String.fromCharCode(0x20 + index))];
@@ -38,9 +40,20 @@ async function sweepGroup(page, group) {
   );
 }
 
+function closeWithin(promise) {
+  return Promise.race([promise.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, CLOSE_MS).unref())]);
+}
+
 async function main() {
   const stub = await startStub({ permissions: [] });
-  const browser = await chromium.launch();
+  const server = await chromium.launchServer();
+  const child = server.process();
+  setTimeout(() => {
+    console.error(`the sweep exceeded ${RUN_LIMIT_MS / 1000} s and was stopped`);
+    child.kill("SIGKILL");
+    process.exit(1);
+  }, RUN_LIMIT_MS).unref();
+  const browser = await chromium.connect(server.wsEndpoint());
   const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
   const problems = [];
   page.on("pageerror", (error) => problems.push("page error: " + String(error).slice(0, 200)));
@@ -101,18 +114,20 @@ async function main() {
   failures.push(...problems);
   console.log(`sequences tested: ${tested}; slowest ${slowest[0] ? JSON.stringify(slowest[0]) + " " + Math.round(slowest[1]) + " ms" : "none"}`);
   for (const entry of slow.slice(0, 10)) console.log("slow: " + entry);
-  await browser.close();
+  await closeWithin(browser.close());
+  await closeWithin(server.close());
+  child.kill("SIGKILL");
   await stub.close();
   if (failures.length > 0) {
     console.error(`${failures.length} failure(s):`);
     for (const entry of failures.slice(0, 40)) console.error(" - " + entry);
-    process.exitCode = 1;
-  } else {
-    console.log("csi sweep: no sequence kept the main thread for 500 ms or more");
+    process.exit(1);
   }
+  console.log("csi sweep: no sequence kept the main thread for 500 ms or more");
+  process.exit(0);
 }
 
 main().catch((error) => {
   console.error(error);
-  process.exitCode = 1;
+  process.exit(1);
 });

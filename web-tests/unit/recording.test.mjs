@@ -224,6 +224,19 @@ test("a recording over the playback limit offers only the download and never ope
   assert.equal(streamCalls().filter((call) => !call.path.endsWith("/manifest")).length, 0);
 });
 
+test("a player that cannot switch on its output protection says so, plays nothing and keeps the download", async () => {
+  const { UnsafeTerminalError } = await import("../../crates/jaunt-web/assets/assets/js/terminal/cells.js");
+  hooks.createSink = () => {
+    throw new UnsafeTerminalError("the cell store of the terminal library was not found");
+  };
+  ui = await open({ [SESSION]: json(200, sessionDetail({ recording: "complete" })), [MANIFEST]: json(200, recordingManifest()), [STREAM]: castReply(castLines(...SCRIPT)) });
+  click(byText(ui.root, "button", "Watch recording"));
+  await until(() => ui.root.querySelector(".banner-danger"), "the refusal");
+  assert.match(panelText(), /cannot start safely/);
+  assert.equal(ui.root.querySelector(".player"), null);
+  assert.equal(ui.root.querySelector('a[href$="download=1"]').getAttribute("href"), DOWNLOAD);
+});
+
 test("the size the browser accepts follows the limit the server announces", async () => {
   const cast = castLines(...SCRIPT, [4, "o", "x".repeat(400)]);
   ui = await open({ [SESSION]: json(200, sessionDetail({ recording: "complete" })), [MANIFEST]: json(200, recordingManifest({ raw_bytes: 100, playback_limit_bytes: 300 })), [STREAM]: castReply(cast) });

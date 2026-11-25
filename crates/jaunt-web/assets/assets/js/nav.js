@@ -50,8 +50,10 @@ export function visiblePages(area, session) {
   return area.pages.filter((page) => hasPermission(session, page.permission));
 }
 
-export function visibleAreas(session) {
-  return AREAS.map((area) => ({ area, pages: visiblePages(area, session) })).filter((entry) => entry.pages.length > 0);
+export function visibleAreas(session, features = {}) {
+  return AREAS.filter((area) => !(area.id === "terminal" && features.terminal === false))
+    .map((area) => ({ area, pages: visiblePages(area, session) }))
+    .filter((entry) => entry.pages.length > 0);
 }
 
 export function firstAllowedHref(session) {

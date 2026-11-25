@@ -26,6 +26,10 @@ export function queryString(query) {
   return text === "" ? "" : "?" + text;
 }
 
+function isRefusal(body) {
+  return Boolean(body) && body.error === "denied";
+}
+
 function isUnsafe(method) {
   return method !== "GET" && method !== "HEAD";
 }
@@ -114,7 +118,7 @@ export function createApi({ onUnauthorized, onSession }) {
       await reload();
     }
     let reply = await attempt(method, path, options);
-    if (reply.response.status === 403 && isUnsafe(method)) {
+    if (reply.response.status === 403 && isUnsafe(method) && !isRefusal(reply.body)) {
       await reload();
       reply = await attempt(method, path, options);
     }

@@ -126,7 +126,7 @@ function connectEntries(ctx, node) {
       entries.push({ text: S.nodes.openAs(login), icon: "terminal", href: "#/terminal?node=" + encodeSegment(node.name) + "&login=" + encodeSegment(login) });
     }
   } else {
-    entries.push({ text: S.nodes.openTerminal, icon: "terminal", disabled: true, hint: connect.hasTargets() ? S.nodes.noLogins : S.nodes.openTerminalSoon });
+    entries.push({ text: S.nodes.openTerminal, icon: "terminal", disabled: true, hint: connect.hasTargets() ? S.nodes.noLogins : connect.terminalEnabled() === false ? S.nodes.openTerminalOff : S.nodes.openTerminalUnknown });
   }
   entries.push({ type: "separator" });
   const only = logins && logins.length === 1 ? logins[0] : undefined;

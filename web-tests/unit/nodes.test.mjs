@@ -141,18 +141,19 @@ test("a card shows three labels and a plus-more control that expands and collaps
   assert.equal(card.querySelectorAll(".chip").length, 3);
 });
 
-test("the Connect menu without targets disables Open terminal with its reason, copies the ssh command and links to the details", async () => {
+test("the Connect menu with the terminal turned off disables Open terminal with its reason, copies the ssh command and links to the details", async () => {
   const written = [];
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { writeText: async (text) => written.push(text) } } });
-  ui = await mount({ ...signedIn(), ...config, "GET /v1/admin/nodes": page([FLEET[0]]) }, "#/nodes");
+  ui = await mount({ ...signedIn(), ...config, "GET /v1/web/terminal/targets": json(404, { error: "not_found" }), "GET /v1/admin/nodes": page([FLEET[0]]) }, "#/nodes");
   assert.equal(ui.server.count("GET", "/v1/web/terminal/targets"), 1);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail-list:not(.rail-foot) a")).map((link) => link.getAttribute("href")), ["#/nodes", "#/sessions", "#/revocations", "#/audit"]);
   click(trigger("Connect"));
   assert.deepEqual(menuLabels(), ["Open terminal", "Copy SSH command", "Details"]);
-  const open = byText(ui.root, '[role="menuitem"]', "Open terminalAvailable with the web terminal");
+  const open = byText(ui.root, '[role="menuitem"]', "Open terminalThe web terminal is turned off on this server");
   assert.equal(open.getAttribute("aria-disabled"), "true");
   click(open);
   assert.ok(ui.root.querySelector(".menu"));
-  assert.match(ui.root.querySelector(".menu").textContent, /Available with the web terminal/);
+  assert.match(ui.root.querySelector(".menu").textContent, /The web terminal is turned off on this server/);
   assert.equal(ui.root.querySelector('.menu a[role="menuitem"]').getAttribute("href"), "#/nodes/n-b");
   click(ui.root.querySelectorAll('.menu [role="menuitem"]')[1]);
   await settle();

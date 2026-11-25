@@ -63,7 +63,7 @@ export function createServer(routes) {
 }
 
 export function signedIn(permissions = ALL, extra = {}) {
-  return { "GET /v1/web/session": json(200, session(permissions, extra)) };
+  return { "GET /v1/web/session": json(200, session(permissions, extra)), "GET /v1/web/terminal/targets": json(200, []) };
 }
 
 export async function settle(rounds = 8) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { installDom } from "./support.mjs";
+import { fakePrintPath } from "./terminal-support.mjs";
 
 const JS = "../../crates/jaunt-web/assets/assets/js/recording/terminal.js";
 const RESET = "\u001bc";
@@ -9,20 +10,28 @@ const RESET = "\u001bc";
 function fakeLibraries(log) {
   class Terminal {
     constructor(options) {
+      this._core = fakePrintPath();
       this.options = options;
       this.rows = options.rows;
+      this.cols = options.cols;
       this.oscHandlers = new Map();
       this.csiHandlers = new Map();
       this.textarea = document.createElement("textarea");
       this.element = document.createElement("div");
       this.pendingWrites = [];
+      this.decide = (final, params) => [...(this.csiHandlers.get(final) || [])].reverse().some((handler) => handler(params));
       this.parser = {
         registerOscHandler: (id, handler) => this.oscHandlers.set(id, handler),
-        registerCsiHandler: (identifier, handler) => this.csiHandlers.set(identifier.final, handler),
+        registerDcsHandler: () => undefined,
+        registerCsiHandler: (identifier, handler) => this.csiHandlers.set(identifier.final, [...(this.csiHandlers.get(identifier.final) || []), handler]),
       };
       log.created.push(this);
       log.styleDuringConstruction = document.createElement("style").tagName;
     }
+
+    onData() {}
+
+    onBinary() {}
 
     open(container) {
       log.opened = container;
@@ -99,22 +108,48 @@ test("the terminal is created read-only with links, titles and clipboard escapes
   dom.window.close();
 });
 
-test("every csi final swallows a first parameter above the bound and lets ordinary counts through", async () => {
+test("every csi final swallows a first parameter above its bound and lets ordinary counts through, as the handler stack does", async () => {
   const dom = installDom();
   const { createTerminalSink } = await import(JS);
   const log = freshLog();
   createTerminalSink({ container: newContainer(), cols: 80, rows: 24, libraries: fakeLibraries(log) });
-  const handlers = log.created[0].csiHandlers;
+  const terminal = log.created[0];
 
-  assert.equal(handlers.size, 63);
+  assert.equal(terminal.csiHandlers.size, 63);
   for (let code = 0x40; code <= 0x7e; code += 1) {
     const final = String.fromCharCode(code);
-    assert.equal(handlers.get(final)([999999999]), true, final);
-    assert.equal(handlers.get(final)([2147483647, 1]), true, final);
-    assert.equal(handlers.get(final)([[5001, 1]]), true, final);
-    assert.equal(handlers.get(final)([5000]), false, final);
-    assert.equal(handlers.get(final)([]), false, final);
-    assert.equal(handlers.get(final)([1, 999999999]), false, final);
+    const limited = "STLMZ@PX".includes(final);
+    assert.equal(terminal.decide(final, [999999999]), true, final);
+    assert.equal(terminal.decide(final, [2147483647, 1]), true, final);
+    assert.equal(terminal.decide(final, [[5001, 1]]), true, final);
+    assert.equal(terminal.decide(final, [5000]), limited || final === "b", final);
+    assert.equal(terminal.decide(final, [1]), false, final);
+    assert.equal(terminal.decide(final, []), false, final);
+    assert.equal(terminal.decide(final, [1, 999999999]), false, final);
+  }
+  dom.window.close();
+});
+
+test("a repeat count is held to the screen area and not to the old fixed bound, in both adapters", async () => {
+  const dom = installDom();
+  const { createTerminalSink, createInteractiveTerminal } = await import(JS);
+  const log = freshLog();
+  createTerminalSink({ container: newContainer(), cols: 133, rows: 110, libraries: fakeLibraries(log) });
+  createInteractiveTerminal({ container: newContainer(), cols: 133, rows: 110, libraries: fakeLibraries(log), onInput() {}, onReply() {} });
+  for (const terminal of log.created) {
+    assert.equal(terminal.decide("b", [6000]), false);
+    assert.equal(terminal.decide("b", [14630]), false);
+    assert.equal(terminal.decide("b", [14631]), true);
+    assert.equal(terminal.decide("L", [110]), false);
+    assert.equal(terminal.decide("L", [111]), true);
+    assert.equal(terminal.decide("P", [133]), false);
+    assert.equal(terminal.decide("P", [134]), true);
+    terminal.rows = 40;
+    assert.equal(terminal.decide("L", [41]), true);
+    terminal.cols = 500;
+    terminal.rows = 200;
+    assert.equal(terminal.decide("b", [16384]), false);
+    assert.equal(terminal.decide("b", [16385]), true);
   }
   dom.window.close();
 });
@@ -249,5 +284,36 @@ test("already loaded libraries are reused without injecting any tag", async () =
   assert.equal(loaded.Terminal, libraries.Terminal);
   assert.equal(loaded.CanvasAddon, libraries.CanvasAddon);
   assert.equal(document.head.children.length, before);
+  dom.window.close();
+});
+
+test("a reset drops a held fragment of a sequence so it cannot join the text that follows", async () => {
+  const dom = installDom();
+  const { createTerminalSink } = await import(JS);
+  const log = freshLog();
+  const sink = createTerminalSink({ container: newContainer(), cols: 80, rows: 24, libraries: fakeLibraries(log) });
+  const terminal = log.created[0];
+  sink.write("\u001b[50");
+  assert.deepEqual(log.writes, []);
+  sink.reset(80, 24);
+  sink.write("00S");
+  terminal.flush();
+  terminal.flush();
+  assert.deepEqual(log.writes, [RESET, "00S"]);
+  dom.window.close();
+});
+
+test("a long write reaches the terminal in pieces of at most 2048 units with the counts clamped", async () => {
+  const dom = installDom();
+  const { createTerminalSink } = await import(JS);
+  const log = freshLog();
+  const sink = createTerminalSink({ container: newContainer(), cols: 80, rows: 24, libraries: fakeLibraries(log) });
+  sink.write("a\u001b[5000S" + "b".repeat(5000));
+  const terminal = log.created[0];
+  while (terminal.pendingWrites.length > 0) {
+    terminal.flush();
+  }
+  assert.equal(log.writes.every((piece) => piece.length <= 2048), true);
+  assert.equal(log.writes.join(""), "a\u001b[24S" + "b".repeat(5000));
   dom.window.close();
 });

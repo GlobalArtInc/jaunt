@@ -23,6 +23,13 @@ const TOKENS = Array.from(new Set([...TEXT_PAIRS, ...NON_TEXT_PAIRS].flat()));
 let touchChecked = 0;
 const failures = [];
 const report = [];
+const RUN_LIMIT_MS = Number(process.env.SMOKE_RUN_LIMIT_MS || 15 * 60 * 1000);
+
+setTimeout(() => {
+  console.error(`the run exceeded ${RUN_LIMIT_MS / 1000} s and was stopped`);
+  for (const entry of failures) console.error(" - " + entry);
+  process.exit(1);
+}, RUN_LIMIT_MS).unref();
 
 function fail(context, message) {
   failures.push(context + ": " + message);

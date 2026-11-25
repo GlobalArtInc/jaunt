@@ -56,7 +56,7 @@ function initialOf(name) {
 export function createShell({ root, onSignOut }) {
   let drawerOpen = false;
   let collapsed = readCollapsed();
-  let model = { session: null, current: { area: null, page: null }, counts: {} };
+  let model = { session: null, current: { area: null, page: null }, counts: {}, terminal: null };
 
   const main = el("main", { id: "main", tabindex: "-1" });
   const live = el("div", { class: "visually-hidden", role: "status", "aria-live": "polite" });
@@ -231,7 +231,7 @@ export function createShell({ root, onSignOut }) {
 
   function paintNav() {
     const { session, current, counts } = model;
-    const entries = visibleAreas(session);
+    const entries = visibleAreas(session, { terminal: model.terminal });
     replace(
       railList,
       entries.map(({ area, pages }) => railItem({ href: pages[0].href, icon: area.icon, label: area.label }, area.id === current.area)),

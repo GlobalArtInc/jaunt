@@ -186,11 +186,18 @@ test("an unreachable server offers a retry instead of the sign-in button", async
   assert.ok(byText(ui.root, "button", "Try again"));
 });
 
-test("a signed-in user without any admin permission gets the not allowed page and only the terminal in the nav", async () => {
+test("a signed-in user without any admin permission lands on the terminal and sees only it in the nav", async () => {
   ui = await mount({ ...signedIn([]) });
+  assert.equal(window.location.hash, "#/terminal");
+  assert.match(ui.text(), /No nodes available to you/);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail a")).map((link) => link.getAttribute("href")), ["#/terminal"]);
+});
+
+test("a signed-in user without any admin permission gets the not allowed page when the terminal is turned off", async () => {
+  ui = await mount({ ...signedIn([]), "GET /v1/web/terminal/targets": json(404, { error: "not_found" }) });
   assert.match(ui.text(), /Not allowed/);
   assert.match(ui.text(), /none of your roles grants an administration permission/);
-  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail a")).map((link) => link.getAttribute("href")), ["#/terminal"]);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll(".rail a")).map((link) => link.getAttribute("href")), []);
 });
 
 test("navigation hides what the session cannot use and routes to it are refused without any request", async () => {

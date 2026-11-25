@@ -83,6 +83,7 @@ export function start(root) {
   });
 
   const connect = createConnectInfo(api);
+  connect.onChange(() => refreshNav());
 
   function runCleanups() {
     const pending = state.cleanups;
@@ -135,7 +136,7 @@ export function start(root) {
   }
 
   function currentModel() {
-    return { session: state.session, current: state.current, counts: state.counts };
+    return { session: state.session, current: state.current, counts: state.counts, terminal: connect.terminalEnabled() };
   }
 
   function buildShell() {
@@ -208,6 +209,14 @@ export function start(root) {
       const target = firstAllowedHref(state.session);
       if (target) {
         go(target, null, { replace: true });
+        return;
+      }
+      await connect.load();
+      if (state.token !== mine || !state.active) {
+        return;
+      }
+      if (connect.terminalEnabled() !== false) {
+        go("/terminal", null, { replace: true });
         return;
       }
       state.current = { area: null, page: null };
@@ -285,6 +294,21 @@ export function start(root) {
     render();
   }
 
+  function onLinkClick(event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+    const link = event.target && typeof event.target.closest === "function" ? event.target.closest("a[href]") : null;
+    if (link === null || (link.target && link.target !== "_self")) {
+      return;
+    }
+    const href = link.getAttribute("href");
+    if (href.startsWith("#/") && href === location.hash) {
+      event.preventDefault();
+      render();
+    }
+  }
+
   async function boot() {
     replace(root, el("p", { class: "boot", role: "status", text: S.loading }));
     let session;
@@ -305,6 +329,7 @@ export function start(root) {
   }
 
   window.addEventListener("hashchange", onHashChange);
+  root.addEventListener("click", onLinkClick);
   const booted = boot();
 
   return {
@@ -312,6 +337,7 @@ export function start(root) {
     stop() {
       state.active = false;
       window.removeEventListener("hashchange", onHashChange);
+      root.removeEventListener("click", onLinkClick);
       runCleanups();
       if (state.shell) {
         state.shell.handle.destroy();

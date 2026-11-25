@@ -29,6 +29,8 @@ export function createConnectInfo(api) {
   let pending = null;
   let targets = null;
   let suffix = null;
+  let terminal = null;
+  const listeners = new Set();
 
   async function fetchOne(path) {
     try {
@@ -37,6 +39,9 @@ export function createConnectInfo(api) {
       if (error.status === 0) {
         pending = null;
       }
+      if (path === TARGETS && error.status === 404) {
+        terminal = false;
+      }
       return null;
     }
   }
@@ -44,7 +49,13 @@ export function createConnectInfo(api) {
   async function fetchAll() {
     const [targetsBody, configBody] = await Promise.all([fetchOne(TARGETS), fetchOne(CLIENT_CONFIG)]);
     targets = readTargets(targetsBody);
+    if (targets !== null) {
+      terminal = true;
+    }
     suffix = configBody && typeof configBody.ssh_suffix === "string" && DNS_NAME.test(configBody.ssh_suffix) ? configBody.ssh_suffix : null;
+    for (const listener of listeners) {
+      listener();
+    }
   }
 
   return {
@@ -52,6 +63,18 @@ export function createConnectInfo(api) {
       pending = null;
       targets = null;
       suffix = null;
+      terminal = null;
+    },
+    terminalEnabled: () => terminal,
+    markTerminal(enabled) {
+      terminal = enabled;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+    onChange(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     },
     load() {
       if (pending === null) {
