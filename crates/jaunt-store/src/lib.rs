@@ -1,5 +1,6 @@
 mod api_tokens;
 mod audit_events;
+mod ca_counters;
 mod certificates;
 mod enrollments;
 mod error;
@@ -20,6 +21,7 @@ pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
 pub use audit_events::{
     AuditCursor, AuditEvents, AuditQuery, AuditRecord, MAX_AUDIT_PAGE, MAX_AUDIT_PAYLOAD_BYTES,
 };
+pub use ca_counters::{CaCounters, NodeHostCertificate, NodeTrustServed, UnexpiredGroup};
 pub use certificates::{Certificate, Certificates, NewCertificate};
 pub use enrollments::{
     ApproveEnrollment, ApproveOutcome, Approved, CodeFailure, CreateOutcome, Enrollment,
@@ -85,6 +87,10 @@ impl Store {
 
     pub fn login_requests(&self) -> LoginRequests {
         LoginRequests::new(self.pool.clone())
+    }
+
+    pub fn ca_counters(&self) -> CaCounters {
+        CaCounters::new(self.pool.clone())
     }
 
     pub fn certificates(&self) -> Certificates {

@@ -3,6 +3,7 @@ mod agent;
 mod agent_trust;
 mod audit;
 mod authorize;
+pub mod ca_rotation;
 mod callback;
 mod client_config;
 mod clock;

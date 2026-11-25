@@ -1,9 +1,3 @@
-mod audit;
-mod ca;
-mod config;
-mod limits;
-mod logging;
-mod node;
 mod policy;
 mod serve;
 mod storage;
@@ -11,7 +5,9 @@ mod storage;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use jaunt_ca::CaKind;
+use jauntd::{ca, ca_rotation, node};
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt control daemon")]
@@ -59,6 +55,42 @@ enum CaCommand {
         )]
         generate_identity: bool,
     },
+    #[command(about = "Show the user and host keys and whether the next rotation step is safe")]
+    Status {
+        #[arg(long, help = "Print JSON instead of text")]
+        json: bool,
+    },
+    #[command(about = "Create the next key of an authority and add it to the trust set")]
+    AddNext { authority: Authority },
+    #[command(about = "Make the next key the signing key and keep the old one as previous")]
+    Promote {
+        authority: Authority,
+        #[arg(long, help = "Skip the safety check; the override is audited")]
+        force: bool,
+    },
+    #[command(about = "Remove the previous key from the trust set and delete its private key")]
+    Retire {
+        authority: Authority,
+        #[arg(long, help = "Skip the safety check; the override is audited")]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Authority {
+    User,
+    Host,
+    Internal,
+}
+
+impl From<Authority> for CaKind {
+    fn from(authority: Authority) -> CaKind {
+        match authority {
+            Authority::User => CaKind::User,
+            Authority::Host => CaKind::Host,
+            Authority::Internal => CaKind::Internal,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -110,14 +142,28 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Run => run(&cli.config),
-        Command::Ca {
-            command: CaCommand::Init { generate_identity },
-        } => ca::init(&cli.config, generate_identity),
+        Command::Ca { command } => ca_command(&cli.config, command),
         Command::Node { command } => node::run(&cli.config, command.into()),
         Command::Db {
             command: DbCommand::Copy,
         } => not_implemented("db copy"),
     }
+}
+
+fn ca_command(config: &Path, command: CaCommand) -> ExitCode {
+    use ca_rotation::{ChangeStep, RotationAction};
+    let change = |authority: Authority, step| RotationAction::Change {
+        kind: authority.into(),
+        step,
+    };
+    let action = match command {
+        CaCommand::Init { generate_identity } => return ca::init(config, generate_identity),
+        CaCommand::Status { json } => RotationAction::Status { json },
+        CaCommand::AddNext { authority } => change(authority, ChangeStep::AddNext),
+        CaCommand::Promote { authority, force } => change(authority, ChangeStep::Promote { force }),
+        CaCommand::Retire { authority, force } => change(authority, ChangeStep::Retire { force }),
+    };
+    ca_rotation::run(config, action)
 }
 
 fn run(path: &Path) -> ExitCode {

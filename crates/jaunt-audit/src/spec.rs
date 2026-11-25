@@ -198,6 +198,14 @@ events! {
         [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
     AgentLimited => ("agent.limited", "agent.limited", ActorRule::Anonymous, None, None, None,
         [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
+    CaKeyAdded => ("ca.key.added", "ca.key.added", ActorRule::User("changed_by"), None, None, None,
+        [("kind", SHORT), ("fp", ID)]),
+    CaKeyPromoted => ("ca.key.promoted", "ca.key.promoted", ActorRule::User("changed_by"), None, None, None,
+        [("kind", SHORT), ("fp", ID), ("forced", BOOL), ("blocked", BOOL), ("nodes_behind", INT),
+         ("old_unexpired", INT)]),
+    CaKeyRetired => ("ca.key.retired", "ca.key.retired", ActorRule::User("changed_by"), None, None, None,
+        [("kind", SHORT), ("fp", ID), ("forced", BOOL), ("blocked", BOOL), ("old_unexpired", INT),
+         ("nodes_old", INT)]),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];

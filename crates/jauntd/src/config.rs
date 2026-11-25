@@ -4,6 +4,8 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
+use crate::gate_ssh::GateSshSettings;
 use ipnet::IpNet;
 use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
 use jaunt_gate::{
@@ -11,8 +13,6 @@ use jaunt_gate::{
     MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem, normalize_dns_name, trusted_proxy_problem,
 };
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
-use jauntd::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
-use jauntd::gate_ssh::GateSshSettings;
 use serde::Deserialize;
 use url::Url;
 
@@ -560,9 +560,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use crate::agents::AgentsSettings;
+    use crate::gate_ssh::GateSshSettings;
     use jaunt_gate::TrustedProxyProblem;
-    use jauntd::agents::AgentsSettings;
-    use jauntd::gate_ssh::GateSshSettings;
 
     use super::{CLIENT_SECRET_VAR, Config, ConfigError, load};
 

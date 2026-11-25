@@ -35,6 +35,22 @@ pub enum CaError {
     Sign,
     DuplicateTrustedKey,
     ActiveKeyNotTrusted,
+    NextKeyNotTrusted,
+    NextKeyIsActive,
+    NextKeyExists(CaKind),
+    NoNextKey(CaKind),
+    PreviousKeyPresent(CaKind),
+    NoPreviousKey(CaKind),
+    SlotChanged(CaKind),
+    RotationUnsupported(CaKind),
+    LockBusy,
+    UnsafeLock(PathBuf),
+    NotOwner {
+        path: PathBuf,
+        owner: u32,
+        euid: u32,
+    },
+    KeyRoundTrip,
     AlreadyInitialized(CaKind),
     NotInitialized(CaKind),
     CorruptStore {
@@ -111,6 +127,49 @@ impl fmt::Display for CaError {
             CaError::Sign => f.write_str("signing failed"),
             CaError::DuplicateTrustedKey => f.write_str("trust set contains a duplicate key"),
             CaError::ActiveKeyNotTrusted => f.write_str("active key is not in the trust set"),
+            CaError::NextKeyNotTrusted => f.write_str("next key is not in the trust set"),
+            CaError::NextKeyIsActive => f.write_str("next key must differ from the active key"),
+            CaError::NextKeyExists(kind) => write!(
+                f,
+                "the {kind} certificate authority already has a next key: promote it first"
+            ),
+            CaError::NoNextKey(kind) => write!(
+                f,
+                "the {kind} certificate authority has no next key: run add-next first"
+            ),
+            CaError::PreviousKeyPresent(kind) => write!(
+                f,
+                "the {kind} certificate authority still has a previous key: retire it first"
+            ),
+            CaError::NoPreviousKey(kind) => write!(
+                f,
+                "the {kind} certificate authority has no previous key to retire"
+            ),
+            CaError::SlotChanged(kind) => write!(
+                f,
+                "the {kind} certificate authority keys changed during the command, nothing was changed"
+            ),
+            CaError::RotationUnsupported(kind) => write!(
+                f,
+                "rotating the {kind} certificate authority is not supported in v1, see the runbook"
+            ),
+            CaError::LockBusy => f.write_str(
+                "another certificate authority command is running, nothing was changed: try again when it finishes",
+            ),
+            CaError::UnsafeLock(path) => write!(
+                f,
+                "{} is not a regular file owned by you; remove it and try again",
+                path.display()
+            ),
+            CaError::NotOwner { path, owner, euid } => write!(
+                f,
+                "{} belongs to uid {owner} but this command runs as uid {euid}: run it as the \
+                 owner of the directory so the server can read the keys, nothing was changed",
+                path.display()
+            ),
+            CaError::KeyRoundTrip => {
+                f.write_str("the new key did not survive encryption and decryption")
+            }
             CaError::AlreadyInitialized(kind) => {
                 write!(f, "the {kind} certificate authority is already initialized")
             }

@@ -4,6 +4,7 @@ mod file;
 mod fsutil;
 mod identity;
 mod kind;
+mod rotation;
 mod signer;
 mod staging;
 mod trust;
@@ -20,12 +21,14 @@ pub use cert::{
     MAX_USER_VALIDITY, UserCertParams, sign_host_certificate, sign_user_certificate,
 };
 pub use error::CaError;
-pub use file::FileBackend;
+pub use file::{FileBackend, SlotListing};
+pub use fsutil::fingerprint_hex;
 pub use identity::{AgeIdentity, AgeRecipient, IDENTITY_FILE_VAR, IDENTITY_VAR};
 pub use kind::CaKind;
+pub use rotation::{CaLock, Promoted};
 pub use signer::Signer;
 pub use staging::{Committed, StagingDir};
-pub use trust::TrustSet;
+pub use trust::{KeyRole, TrustSet};
 pub use x509::{
     DEFAULT_NODE_VALIDITY, DEFAULT_SERVER_VALIDITY, InternalCa, IssuedCertificate,
     MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, NodeCertParams, NodeIdentity, ROOT_VALIDITY,

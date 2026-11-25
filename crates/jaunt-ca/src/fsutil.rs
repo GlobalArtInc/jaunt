@@ -20,8 +20,12 @@ const FILE_MODE: u32 = 0o600;
 
 pub(crate) const SHA256_HEX_LEN: usize = 64;
 
-pub(crate) fn fingerprint_hex(key: &PublicKey) -> String {
+pub fn fingerprint_hex(key: &PublicKey) -> String {
     to_hex(key.fingerprint(HashAlg::Sha256).as_bytes())
+}
+
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+    to_hex(bytes)
 }
 
 pub(crate) fn fingerprint_from_hex(hex: &str) -> Option<Fingerprint> {
@@ -139,7 +143,7 @@ pub(crate) fn write_new_with(
         .and_then(|name| name.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
 
-    let temp: PathBuf = dir.join(format!(".{name}.{}.tmp", random_hex(8)?));
+    let temp = temp_path(dir, name)?;
 
     let linked = write_temp(&temp, contents).and_then(|()| link_new(&temp, path));
     let removed = fs::remove_file(&temp);
@@ -152,6 +156,81 @@ pub(crate) fn write_new_with(
         return Err(err);
     }
     Ok(())
+}
+
+pub(crate) fn replace_with(
+    path: &Path,
+    contents: &[u8],
+    after_step: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (dir, name) = split(path)?;
+    let temp = temp_path(dir, name)?;
+    let renamed = write_temp(&temp, contents).and_then(|()| fs::rename(&temp, path));
+    if let Err(err) = renamed {
+        drop(fs::remove_file(&temp));
+        return Err(err);
+    }
+    after_step(path)?;
+    sync_dir(dir)
+}
+
+pub(crate) fn remove_with(
+    path: &Path,
+    after_step: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (dir, _) = split(path)?;
+    fs::remove_file(path)?;
+    after_step(path)?;
+    sync_dir(dir)
+}
+
+pub(crate) fn move_with(
+    from: &Path,
+    to: &Path,
+    after_step: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let (from_dir, _) = split(from)?;
+    let (to_dir, _) = split(to)?;
+    fs::rename(from, to)?;
+    after_step(to)?;
+    sync_dir(to_dir)?;
+    sync_dir(from_dir)
+}
+
+pub(crate) fn create_private_dir_with(
+    path: &Path,
+    after_step: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "path exists and is not a directory",
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let (parent, _) = split(path)?;
+    create_new_private_dir(path)?;
+    after_step(path)?;
+    sync_dir(parent)
+}
+
+fn split(path: &Path) -> io::Result<(&Path, &str)> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    Ok((dir, name))
+}
+
+fn temp_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    Ok(dir.join(format!(".{name}.{}.tmp", random_hex(8)?)))
 }
 
 fn link_new(temp: &Path, path: &Path) -> io::Result<()> {
@@ -193,7 +272,10 @@ pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
 mod tests {
     use ssh_key::{Algorithm, PrivateKey};
 
-    use super::{fingerprint_from_hex, fingerprint_hex, read_limited, write_new};
+    use super::{
+        create_private_dir_with, fingerprint_from_hex, fingerprint_hex, move_with, read_limited,
+        remove_with, replace_with, write_new,
+    };
     use crate::error::CaError;
 
     #[test]
@@ -237,5 +319,52 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replace_move_and_remove_change_one_name_each_and_leave_no_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pointer");
+        write_new(&path, b"old").unwrap();
+        let names = || {
+            let mut names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+
+        replace_with(&path, b"new", &|_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(names(), ["pointer"]);
+
+        let failed = replace_with(&path, b"newer", &|_| Err(std::io::Error::other("injected")));
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer");
+        assert_eq!(names(), ["pointer"]);
+
+        let archive = dir.path().join("archive");
+        create_private_dir_with(&archive, &|_| Ok(())).unwrap();
+        create_private_dir_with(&archive, &|_| Err(std::io::Error::other("not called"))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(create_private_dir_with(&path, &|_| Ok(())).is_err());
+
+        let moved = archive.join("pointer");
+        move_with(&path, &moved, &|_| Ok(())).unwrap();
+        assert_eq!(names(), ["archive"]);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"newer");
+
+        remove_with(&moved, &|_| Ok(())).unwrap();
+        assert!(!moved.exists());
+        assert_eq!(
+            remove_with(&moved, &|_| Ok(())).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

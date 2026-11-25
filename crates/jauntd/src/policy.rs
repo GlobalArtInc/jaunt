@@ -165,7 +165,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::{PolicyError, audit_reload, load_at_startup, start_watcher};
-    use crate::logging::{build_filter, subscriber};
+    use jauntd::logging::{build_filter, subscriber};
 
     const TICK: Duration = Duration::from_millis(20);
     const DEADLINE: Duration = Duration::from_secs(5);

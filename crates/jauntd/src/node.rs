@@ -384,7 +384,7 @@ fn render_nodes(nodes: &[NodeListing]) -> String {
     text
 }
 
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|ch| {
             if (' '..='~').contains(&ch) {

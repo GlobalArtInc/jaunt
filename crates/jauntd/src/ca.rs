@@ -12,7 +12,7 @@ use jaunt_ca::{
 
 use crate::config::{self, EnvLookup};
 
-const CA_DIR: &str = "ca";
+pub(crate) const CA_DIR: &str = "ca";
 const STAGING_PREFIX: &str = "ca.staging";
 const IDENTITY_FILE: &str = "age-identity.txt";
 
@@ -65,7 +65,7 @@ pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authoriti
     })
 }
 
-fn resolve_identity(ca_dir: &Path, env: EnvLookup<'_>) -> Result<AgeIdentity, String> {
+pub(crate) fn resolve_identity(ca_dir: &Path, env: EnvLookup<'_>) -> Result<AgeIdentity, String> {
     let key = env(IDENTITY_VAR);
     let key_file = env(IDENTITY_FILE_VAR);
     if key.is_some() || key_file.is_some() {

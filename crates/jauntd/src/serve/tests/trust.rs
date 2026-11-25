@@ -13,7 +13,7 @@ use jaunt_store::{CreateOutcome, EnrollmentLimits, NewEnrollment, Store};
 use tower::ServiceExt;
 
 use super::{fake_discovery, secret_only, start, write_config};
-use crate::{ca, config};
+use jauntd::{ca, config};
 
 const CODE: &str = "ABCD-2345";
 const SPKI_PREFIX: [u8; 12] = [

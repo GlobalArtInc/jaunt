@@ -2222,6 +2222,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "jaunt-proto",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "signature 2.2.0",
@@ -2415,6 +2416,7 @@ version = "0.0.0"
 name = "jauntd"
 version = "0.0.0"
 dependencies = [
+ "age",
  "axum",
  "base64 0.23.1",
  "bytes",

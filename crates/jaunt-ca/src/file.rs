@@ -16,21 +16,30 @@ use crate::kind::CaKind;
 use crate::signer::Signer;
 use crate::trust::TrustSet;
 
-const ACTIVE_FILE: &str = "active";
-const PUBLIC_SUFFIX: &str = ".pub";
-const ENCRYPTED_SUFFIX: &str = ".age";
+pub(crate) const ACTIVE_FILE: &str = "active";
+pub(crate) const NEXT_FILE: &str = "next";
+pub(crate) const RETIRED_DIR: &str = "retired";
+pub(crate) const PUBLIC_SUFFIX: &str = ".pub";
+pub(crate) const ENCRYPTED_SUFFIX: &str = ".age";
 const ROOT_SUFFIX: &str = ".root.der";
 
 const MAX_ACTIVE_LEN: u64 = 128;
 const MAX_ROOT_LEN: u64 = 16 * 1024;
 const MAX_PUBLIC_LEN: u64 = 4096;
 const MAX_ENCRYPTED_LEN: u64 = 64 * 1024;
-const MAX_PRIVATE_LEN: usize = 8 * 1024;
+pub(crate) const MAX_PRIVATE_LEN: usize = 8 * 1024;
 
 pub struct FileBackend {
     kind: CaKind,
     private_key: PrivateKey,
     public_key: PublicKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlotListing {
+    pub trust: TrustSet,
+    pub retired: Vec<String>,
+    pub stray: Vec<String>,
 }
 
 impl FileBackend {
@@ -68,11 +77,14 @@ impl FileBackend {
 
         let mut created: Vec<PathBuf> = Vec::new();
         let outcome = write_key_files(
-            kind,
             &dir,
-            &hex,
-            &encrypted,
-            public_line.as_bytes(),
+            KeyFiles {
+                hex: &hex,
+                encrypted: &encrypted,
+                public_line: public_line.as_bytes(),
+                pointer: ACTIVE_FILE,
+                pointer_taken: CaError::AlreadyInitialized(kind),
+            },
             after_link,
             &mut created,
         );
@@ -91,9 +103,7 @@ impl FileBackend {
         identity: &AgeIdentity,
     ) -> Result<(TrustSet, FileBackend), CaError> {
         let dir = kind_dir(root, kind);
-        let (active_hex, active_fingerprint) = read_active_key(&dir, kind)?;
-
-        let trust = TrustSet::new(read_public_keys(&dir)?, active_fingerprint)?;
+        let (active_hex, trust) = read_trust(&dir, kind)?;
 
         let private_key = read_private_key(&dir, &active_hex, identity)?;
         let public_key = trust.active().clone();
@@ -105,6 +115,35 @@ impl FileBackend {
                 public_key,
             },
         ))
+    }
+
+    pub fn load_with_next(
+        root: &Path,
+        kind: CaKind,
+        identity: &AgeIdentity,
+    ) -> Result<(TrustSet, FileBackend), CaError> {
+        let (trust, backend) = Self::load(root, kind, identity)?;
+        if let Some(next) = trust.next() {
+            let dir = kind_dir(root, kind);
+            read_private_key(&dir, &fingerprint_hex(next), identity).map(|_| ())?;
+        }
+        Ok((trust, backend))
+    }
+
+    pub fn read_slot(root: &Path, kind: CaKind) -> Result<SlotListing, CaError> {
+        let dir = kind_dir(root, kind);
+        let (_, trust) = read_trust(&dir, kind)?;
+        let trusted: Vec<String> = trust.keys().iter().map(fingerprint_hex).collect();
+        let retired = list_fingerprints(&dir.join(RETIRED_DIR), PUBLIC_SUFFIX)?;
+        let stray = list_fingerprints(&dir, ENCRYPTED_SUFFIX)?
+            .into_iter()
+            .filter(|hex| !trusted.contains(hex))
+            .collect();
+        Ok(SlotListing {
+            trust,
+            retired,
+            stray,
+        })
     }
 }
 
@@ -162,44 +201,58 @@ impl fmt::Debug for FileBackend {
     }
 }
 
-fn kind_dir(root: &Path, kind: CaKind) -> PathBuf {
+pub(crate) fn kind_dir(root: &Path, kind: CaKind) -> PathBuf {
     root.join(kind.as_str())
 }
 
-fn write_key_files(
-    kind: CaKind,
+pub(crate) struct KeyFiles<'a> {
+    pub(crate) hex: &'a str,
+    pub(crate) encrypted: &'a [u8],
+    pub(crate) public_line: &'a [u8],
+    pub(crate) pointer: &'static str,
+    pub(crate) pointer_taken: CaError,
+}
+
+pub(crate) fn write_key_files(
     dir: &Path,
-    hex: &str,
-    encrypted: &[u8],
-    public_line: &[u8],
+    files: KeyFiles<'_>,
     after_link: &dyn Fn(&Path) -> io::Result<()>,
     created: &mut Vec<PathBuf>,
 ) -> Result<(), CaError> {
-    let encrypted_path = dir.join(format!("{hex}{ENCRYPTED_SUFFIX}"));
-    write_new_with(&encrypted_path, encrypted, after_link)
+    let encrypted_path = dir.join(format!("{}{ENCRYPTED_SUFFIX}", files.hex));
+    write_new_with(&encrypted_path, files.encrypted, after_link)
         .map_err(CaError::io("write", &encrypted_path))?;
     created.push(encrypted_path);
 
-    let public_path = dir.join(format!("{hex}{PUBLIC_SUFFIX}"));
-    write_new_with(&public_path, public_line, after_link)
+    let public_path = dir.join(format!("{}{PUBLIC_SUFFIX}", files.hex));
+    write_new_with(&public_path, files.public_line, after_link)
         .map_err(CaError::io("write", &public_path))?;
     created.push(public_path);
 
-    let active_path = dir.join(ACTIVE_FILE);
-    match write_new_with(&active_path, format!("{hex}\n").as_bytes(), after_link) {
+    let pointer_path = dir.join(files.pointer);
+    match write_new_with(
+        &pointer_path,
+        format!("{}\n", files.hex).as_bytes(),
+        after_link,
+    ) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            Err(CaError::AlreadyInitialized(kind))
-        }
-        Err(err) => Err(CaError::io("write", &active_path)(err)),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(files.pointer_taken),
+        Err(err) => Err(CaError::io("write", &pointer_path)(err)),
     }
 }
 
-fn corrupt(path: &Path, reason: &'static str) -> CaError {
+pub(crate) fn corrupt(path: &Path, reason: &'static str) -> CaError {
     CaError::CorruptStore {
         path: path.to_path_buf(),
         reason,
     }
+}
+
+pub(crate) fn read_trust(dir: &Path, kind: CaKind) -> Result<(String, TrustSet), CaError> {
+    let (active_hex, active_fingerprint) = read_active_key(dir, kind)?;
+    let next = read_next_key(dir)?.filter(|next| *next != active_fingerprint);
+    let trust = TrustSet::with_next(read_public_keys(dir)?, active_fingerprint, next)?;
+    Ok((active_hex, trust))
 }
 
 fn read_active_key(dir: &Path, kind: CaKind) -> Result<(String, Fingerprint), CaError> {
@@ -207,16 +260,49 @@ fn read_active_key(dir: &Path, kind: CaKind) -> Result<(String, Fingerprint), Ca
     if !exists(&active_path)? {
         return Err(CaError::NotInitialized(kind));
     }
-    let active_hex = read_active(&active_path)?;
+    let active_hex = read_pointer(&active_path, "active file is not text")?;
     let fingerprint = fingerprint_from_hex(&active_hex)
         .ok_or_else(|| corrupt(&active_path, "active file does not hold a key fingerprint"))?;
     Ok((active_hex, fingerprint))
 }
 
-fn read_active(path: &Path) -> Result<String, CaError> {
+fn read_next_key(dir: &Path) -> Result<Option<Fingerprint>, CaError> {
+    let next_path = dir.join(NEXT_FILE);
+    if !exists(&next_path)? {
+        return Ok(None);
+    }
+    let next_hex = read_pointer(&next_path, "next file is not text")?;
+    fingerprint_from_hex(&next_hex)
+        .map(Some)
+        .ok_or_else(|| corrupt(&next_path, "next file does not hold a key fingerprint"))
+}
+
+fn read_pointer(path: &Path, not_text: &'static str) -> Result<String, CaError> {
     let bytes = read_limited(path, MAX_ACTIVE_LEN)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| corrupt(path, "active file is not text"))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| corrupt(path, not_text))?;
     Ok(text.strip_suffix('\n').unwrap_or(text).to_owned())
+}
+
+fn list_fingerprints(dir: &Path, suffix: &str) -> Result<Vec<String>, CaError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(CaError::io("read directory", dir)(err)),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(CaError::io("read directory", dir))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if let Some(stem) = name.strip_suffix(suffix)
+            && fingerprint_from_hex(stem).is_some()
+        {
+            found.push(stem.to_owned());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 fn read_public_keys(dir: &Path) -> Result<Vec<PublicKey>, CaError> {
@@ -253,7 +339,7 @@ fn read_public_keys(dir: &Path) -> Result<Vec<PublicKey>, CaError> {
     Ok(keys)
 }
 
-fn read_private_key(
+pub(crate) fn read_private_key(
     dir: &Path,
     active_hex: &str,
     identity: &AgeIdentity,

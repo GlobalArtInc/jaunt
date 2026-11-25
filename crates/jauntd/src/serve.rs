@@ -22,12 +22,12 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
-use crate::audit::{self, AuditRuntime, AuditStartError, Surface};
-use crate::ca::{self, Authorities};
-use crate::config::{self, ConfigError, EnvLookup, RunSettings};
-use crate::logging::{self, LoggingError};
 use crate::policy::{self, PolicyError};
 use crate::storage::{self, Exposure, StorageError};
+use jauntd::audit::{self, AuditRuntime, AuditStartError, Surface};
+use jauntd::ca::{self, Authorities};
+use jauntd::config::{self, ConfigError, EnvLookup, RunSettings};
+use jauntd::logging::{self, LoggingError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -402,9 +402,9 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{ServeError, run, serve, start};
-    use crate::ca::Authorities;
-    use crate::config;
     use crate::policy::PolicyError;
+    use jauntd::ca::Authorities;
+    use jauntd::config;
 
     mod trust;
 
