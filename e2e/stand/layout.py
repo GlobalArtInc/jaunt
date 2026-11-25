@@ -33,7 +33,7 @@ CLIENT_FORWARD_PORT = 7002
 CLI_SERVER = "http://127.0.0.1:{}".format(CLIENT_FORWARD_PORT)
 CA_PEM = "/certs/e2e-test-only-ca.pem"
 
-CLIENT_USERS = ("alice", "bob", "carol")
+CLIENT_USERS = ("alice", "bob", "carol", "dave")
 IDP_CLIENT_ID = "jaunt-e2e"
 
 NODES = {

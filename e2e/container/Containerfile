@@ -18,6 +18,6 @@ RUN set -eu; \
       sed -i 's/^\(session[[:space:]]\{1,\}\)required\([[:space:]]\{1,\}pam_loginuid.so\)/\1optional\2/' /etc/pam.d/sshd; \
     fi; \
     useradd -m -s /bin/bash -p '*' deploy; \
-    for user in alice bob carol; do useradd -m -s /bin/bash -p '*' "$user"; done; \
+    for user in alice bob carol dave; do useradd -m -s /bin/bash -p '*' "$user"; done; \
     groupadd --system --gid 65532 jauntd; \
     useradd --system --uid 65532 --gid 65532 --no-create-home --home-dir /var/lib/jaunt --shell /usr/sbin/nologin jauntd

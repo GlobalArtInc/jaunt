@@ -42,8 +42,10 @@ def engine(*args, timeout=120, input_text=None):
     return run([ENGINE, *args], timeout=timeout, input_text=input_text)
 
 
-def exec_argv(container, argv, user=None, env=None, tty=False, detach=False):
+def exec_argv(container, argv, user=None, env=None, tty=False, detach=False, interactive=False):
     command = [ENGINE, "exec"]
+    if interactive:
+        command.append("-i")
     if detach:
         command.append("-d")
     if tty:

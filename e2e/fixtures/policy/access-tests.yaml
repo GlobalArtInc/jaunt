@@ -7,3 +7,4 @@ spec:
   - { user: bob@e2e.test, node: { env: prod }, login: deploy, expect: deny }
   - { user: carol@e2e.test, node: { env: test }, login: deploy, expect: deny }
   - { user: carol@e2e.test, node: { env: prod }, login: deploy, expect: deny }
+  - { user: dave@e2e.test, node: { env: test }, login: deploy, expect: allow }

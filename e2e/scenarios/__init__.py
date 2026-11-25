@@ -1,4 +1,7 @@
-from . import enrol, expiry, forwarding, logins, nodes, policy, revocation, rotation_audit, rotation_force, rotation_host, rotation_setup, rotation_user, ssh, transfers
+from . import (
+    enrol, expiry, forwarding, logins, nodes, policy, recording, recording_faults, revocation, rotation_audit,
+    rotation_force, rotation_host, rotation_setup, rotation_user, ssh, transfers,
+)
 
 SCENARIOS = [
     ("enrol", enrol.run),
@@ -7,6 +10,8 @@ SCENARIOS = [
     ("transfers", transfers.run),
     ("forwarding", forwarding.run),
     ("policy", policy.run),
+    ("recording", recording.run),
+    ("recording_faults", recording_faults.run),
     ("revocation", revocation.run),
     ("nodes", nodes.run),
     ("expiry", expiry.run),

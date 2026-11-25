@@ -25,3 +25,21 @@ metadata: { name: admins }
 spec:
   members: { users: [admin@e2e.test] }
   admin: [nodes.approve, sessions.read, recordings.read, revocations.write, audit.read]
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: audited }
+spec:
+  members: { users: [dave@e2e.test] }
+  ssh:
+    nodes: { env: [test, prod] }
+    logins: [deploy]
+    portForwarding: false
+    recordInput: true
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: session-viewers }
+spec:
+  members: { users: [viewer@e2e.test] }
+  admin: [sessions.read]

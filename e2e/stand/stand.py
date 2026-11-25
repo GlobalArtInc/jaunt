@@ -40,7 +40,7 @@ def write_file(path, text, mode=0o644):
     os.chmod(path, mode)
 
 
-def jauntd_config(cert_ttl_secs):
+def jauntd_config(cert_ttl_secs, recordings=True):
     return "\n".join([
         "data_dir: /var/lib/jaunt",
         "listen: 0.0.0.0:{}".format(CONTROL_PORT),
@@ -60,10 +60,7 @@ def jauntd_config(cert_ttl_secs):
         "  client_id: {}".format(IDP_CLIENT_ID),
         "  client_secret_file: /etc/jaunt/oidc-client-secret",
         "  extra_root_certificates_file: {}".format(CA_PEM),
-        "recordings:",
-        "  dir: /var/lib/jaunt/recordings",
-        "",
-    ])
+    ] + (["recordings:", "  dir: /var/lib/jaunt/recordings"] if recordings else []) + [""])
 
 
 class Stand:
@@ -80,8 +77,10 @@ class Stand:
         self.log_dir = os.path.join(OUT, "logs", slug(base_image))
         self.ca_pin = None
         self.admin = None
+        self.viewer = None
         self.secrets = [CLIENT_SECRET]
         self.cert_ttl_secs = 28800
+        self.recordings_enabled = True
         self.publish_ports = {}
         self.codes = {}
         self.node_ids = {}
@@ -165,7 +164,7 @@ class Stand:
         if not made.ok:
             raise RuntimeError("creating the test certificates failed:\n" + made.err[-2000:])
 
-        write_file(os.path.join(etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs))
+        write_file(os.path.join(etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled))
         write_file(os.path.join(etc, "oidc-client-secret"), CLIENT_SECRET + "\n")
         shutil.copytree(os.path.join(FIXTURES, "policy"), os.path.join(etc, "policy"))
         write_file(os.path.join(idp, "client-secret"), CLIENT_SECRET + "\n")
@@ -362,8 +361,7 @@ class Stand:
             parsed = None
         return int(code or 0), parsed, text
 
-    def admin_login(self, hint="admin"):
-        jar = "/tmp/admin-cookies"
+    def web_login(self, hint, jar):
         self.on_client(["rm", "-f", jar])
         first = self.on_client([
             "curl", "-sS", "-D", "-", "-o", "/dev/null", "--max-time", "30", "--cacert", CA_PEM, "-c", jar,
@@ -381,17 +379,21 @@ class Stand:
         status, session, text = self.curl_json(jar, "GET", "/v1/web/session")
         if status != 200 or not session:
             raise StepFailed("no web session after sign-in: {} {}".format(status, text[:200]))
-        self.admin = {"jar": jar, "csrf": session["csrf_token"], "user_id": session["user_id"],
-                      "permissions": session["permissions"]}
         self.secrets.append(session["csrf_token"])
-        return session
+        return {"jar": jar, "csrf": session["csrf_token"], "user_id": session["user_id"],
+                "permissions": session["permissions"]}
 
-    def api(self, method, path, body=None):
-        if not self.admin:
+    def admin_login(self, hint="admin"):
+        self.admin = self.web_login(hint, "/tmp/admin-cookies")
+        return self.admin
+
+    def api(self, method, path, body=None, session=None):
+        session = session or self.admin
+        if not session:
             raise StepFailed("no admin web session")
         status, parsed, text = self.curl_json(
-            self.admin["jar"], method, path, body=body,
-            token=self.admin["csrf"] if method != "GET" else None,
+            session["jar"], method, path, body=body,
+            token=session["csrf"] if method != "GET" else None,
         )
         return status, parsed
 
@@ -416,9 +418,12 @@ class Stand:
         from .audit import last_marker
         return last_marker(self.audit_events())
 
-    def restart_jauntd(self, cert_ttl_secs):
-        self.cert_ttl_secs = cert_ttl_secs
-        write_file(os.path.join(self.etc, "jauntd.yaml"), jauntd_config(cert_ttl_secs))
+    def restart_jauntd(self, cert_ttl_secs=None, recordings=None):
+        if cert_ttl_secs is not None:
+            self.cert_ttl_secs = cert_ttl_secs
+        if recordings is not None:
+            self.recordings_enabled = recordings
+        write_file(os.path.join(self.etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled))
         restarted = engine.engine("restart", "-t", "30", container("jauntd"), timeout=90)
         if not restarted.ok:
             raise StepFailed("restarting jauntd failed: " + restarted.text())
@@ -446,6 +451,9 @@ class Stand:
                 fetched = self.on_node(node, ["cat", path])
                 write_file(os.path.join(self.log_dir, "{}-{}.log".format(node, name)), fetched.out)
                 gathered["{}-{}".format(node, name)] = fetched.out
+            for index, (path, text) in enumerate(self.saved_agent_logs(node).items(), start=1):
+                write_file(os.path.join(self.log_dir, "{}-agent-saved-{}.log".format(node, index)), text)
+                gathered["{}-agent-saved-{}".format(node, index)] = text
         return gathered
 
     def enrol_start(self, node, replace=False):
@@ -480,7 +488,16 @@ class Stand:
         self.wait_until("{} finishes enrolling".format(node), enrolled, 60)
         return holder["id"]
 
+    def save_agent_log(self, node):
+        self.on_node(node, ["sh", "-c",
+            "if [ -s /tmp/agent.log ]; then n=$(ls /tmp/agent-saved-*.log 2>/dev/null | wc -l); cp /tmp/agent.log /tmp/agent-saved-$((n + 1)).log; fi"])
+
+    def saved_agent_logs(self, node):
+        names = self.on_node(node, ["sh", "-c", "ls /tmp/agent-saved-*.log 2>/dev/null | sort"]).out.split()
+        return {name: self.on_node(node, ["cat", name]).out for name in names}
+
     def agent_start(self, node):
+        self.save_agent_log(node)
         started = exec_in(container(node), ["/e2e/agentctl.sh", "start"], env=self.agent_env)
         if not started.ok:
             raise StepFailed("cannot start the agent on {}: {}".format(node, started.text()))
@@ -489,6 +506,11 @@ class Stand:
             return "the tunnel is connected" in self.on_node(node, ["cat", "/tmp/agent.log"]).out
 
         self.wait_until("the agent on {} connects its tunnel".format(node), connected, 60)
+
+    def agent_config(self, node, text):
+        written = exec_in(container(node), ["sh", "-c", 'printf "%s" "$0" >/etc/jaunt/agent.yaml && chmod 0644 /etc/jaunt/agent.yaml', text])
+        if not written.ok:
+            raise StepFailed("cannot write the agent config on {}: {}".format(node, written.text()))
 
     def agent_stop(self, node):
         stopped = self.on_node(node, ["/e2e/agentctl.sh", "stop"], timeout=60)

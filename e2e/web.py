@@ -3,7 +3,8 @@ import subprocess
 import time
 
 from scenarios import enrol, logins
-from stand import engine
+from scenarios.recording import record_shell
+from stand import engine, recordings
 from stand.layout import OUT, ROOT, container
 from stand.report import Report
 from stand.stand import Stand
@@ -40,6 +41,21 @@ def start_pending(stand, name):
     return holder["code"]
 
 
+def run_node(step, script, stand, extra):
+    step.expect(os.path.isdir(os.path.join(WEB_TESTS, "node_modules", "playwright")),
+                "run `npm ci` in web-tests first (and `npx playwright install chromium`)")
+    env = dict(os.environ)
+    env.update({"E2E_WEB_PORT": str(WEB_PORT), "E2E_IDP_PORT": str(IDP_PORT), "E2E_SCREENSHOTS": SCREENSHOTS + os.sep})
+    env.update(extra)
+    started = time.monotonic()
+    done = subprocess.run(["node", os.path.join(WEB_TESTS, "e2e", script)], env=env, cwd=WEB_TESTS,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
+    step.note("{} took {:.1f} s".format(script, time.monotonic() - started))
+    for line in done.stdout.strip().splitlines()[-12:]:
+        step.note(line)
+    step.expect(done.returncode == 0, "{} exited {}".format(script, done.returncode))
+
+
 def run(args):
     stand = Stand("debian:13", keep=args.keep)
     stand.publish_ports = {"edge-web": "127.0.0.1:{}:443".format(WEB_PORT), "edge-idp": "127.0.0.1:{}:443".format(IDP_PORT)}
@@ -60,24 +76,18 @@ def run(args):
             stand.wait_until("alice's session", lambda: stand.accepted_logins("node-a") >= 1, 30)
             codes = [start_pending(stand, name) for name in PENDING]
             step.note("pending enrolment codes are held back from this output")
+        with report.step("a recorded session is played in the real console at 380 and 1440 px, screenshots in target/e2e/screenshots") as step:
+            typed = recordings.unique_token("web-recorded")
+            marker, ran, status, output = record_shell(stand, "alice", "node-a", ["echo {}".format(typed), "exit"], typed)
+            step.expect(ran and status == 0, "the typed session failed: {}".format(output[-300:]))
+            recorded = recordings.last_session(stand, marker, "alice", "node-a")
+            step.expect(recordings.wait_recording(stand, recorded, ("complete",))["recording"] == "complete", "not recorded")
+            run_node(step, "recording.mjs", stand, {"E2E_RECORDED_SESSION": recorded, "E2E_TYPED_TEXT": typed})
         with report.step("Chromium drives the real console at 380 and 1440 px, screenshots in target/e2e/screenshots") as step:
-            step.expect(os.path.isdir(os.path.join(WEB_TESTS, "node_modules", "playwright")),
-                        "run `npm ci` in web-tests first (and `npx playwright install chromium`)")
-            env = dict(os.environ)
-            env.update({
-                "E2E_WEB_PORT": str(WEB_PORT),
-                "E2E_IDP_PORT": str(IDP_PORT),
+            run_node(step, "real.mjs", stand, {
                 "E2E_PENDING": ",".join("{}:{}".format(code, name) for code, name in zip(codes, PENDING)),
                 "E2E_REVOKE_USERS": ",".join([stand.certs["alice"]["principal"], stand.certs["bob"]["principal"]]),
-                "E2E_SCREENSHOTS": SCREENSHOTS + os.sep,
             })
-            started = time.monotonic()
-            done = subprocess.run(["node", os.path.join(WEB_TESTS, "e2e", "real.mjs")], env=env, cwd=WEB_TESTS,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
-            step.note("{:.1f} s".format(time.monotonic() - started))
-            for line in done.stdout.strip().splitlines()[-12:]:
-                step.note(line)
-            step.expect(done.returncode == 0, "the browser run exited {}".format(done.returncode))
         with report.step("the approved enrolments reached the node list") as step:
             status, listed = stand.api("GET", "/v1/admin/nodes")
             names = [node["name"] for node in listed["nodes"]] if status == 200 else []

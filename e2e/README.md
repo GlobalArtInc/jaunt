@@ -35,19 +35,57 @@ so `target/` stays writable for the host scripts; podman and rootless docker map
 The `jaunt` CLI and `jaunt-agent enrol` trust only the WebPKI roots, so on the client
 and on the nodes a loopback `socat` forwards `127.0.0.1` to the plain control port, which both accept for loopback.
 
-The people are `alice` (role `ops`, both nodes, forwarding on), `bob` (role `limited`, `node-a` only, no forwarding),
-`carol` (no role) and `admin` (role `admins`, the web console and the admin API). The policy files are in
+The people are `alice` (role `ops`, both nodes, forwarding on, `recordInput` off), `bob` (role `limited`, `node-a` only,
+no forwarding), `carol` (no role), `dave` (role `audited`, both nodes, `recordInput` on), `admin` (role `admins`, the web
+console and the admin API with every permission) and `viewer` (role `session-viewers`, only `sessions.read`, for the
+refusals of the recording endpoints). The policy files are in
 `e2e/fixtures/policy`, the identities of the fake IdP in `e2e/fixtures/idp-users.json`. The `browser` step of a login
 is `curl` following the redirects with a cookie jar; the fake IdP completes `authorize` at once for the `login_hint`
 that the script appends, and remembers the user in a cookie, so a later sign-in without a hint (`jaunt ensure`, run by
 `ssh`) succeeds as long as the IdP session lives.
+
+## Recording scenarios
+
+`scenarios/recording.py` drives interactive sessions through a pseudo-terminal (`stand/interactive.py`) and checks what
+the server stored: the strict asciicast v2 reader (`stand/cast.py`), the manifest, `jauntd recordings verify`, the
+permissions of the two endpoints, the input rule both ways with a unique secret typed with echo off, metadata-only
+recordings (exec without a PTY, scp, sftp), hostile escape sequences and the `recording.viewed` rule.
+`scenarios/recording_faults.py` cuts the network of `node-a` (`network disconnect`) in the middle of a long output,
+floods three sessions into an agent that is limited to 1 MiB of recording memory, and turns `recordings.dir` off and on.
+The helpers that fetch a cast byte for byte (`engine cp` out of the client, never through a text pipe), find the stored
+files in the jauntd volume and read the logs are in `stand/recordings.py`.
+
+Policy confirmed for these scenarios: `ssh -t host bash` (an exec with a PTY) is recorded as a cast, so it cannot be used
+to escape recording; an exec without a PTY, scp and sftp leave a metadata-only recording.
+
+### What the recording scenarios cannot prove
+
+- A header-less incomplete cast is never produced here: the overflow step waits until every session shows `receiving`
+  (its first chunk, with the cast header, is on the server) before the flood. Without that wait the header chunk can be
+  dropped under the memory budget and the stored file has no header; the stand does not pin that product finding.
+- The 10-minute pause of the agent after the server answered 404 is observed (a note in the step), not asserted.
+- The 24 hour retry cap and the per-session queue cap are not reachable end to end: a single flood is held at about 1 MiB
+  by the SSH channel window and never reaches the queue limit. Only the agent-wide memory budget shared by several
+  sessions trips, which is why the step floods three sessions at once.
+- Persistence of queued recordings across an agent restart is not covered: the agent is restarted between steps, never
+  with a recording still waiting for upload.
+- Only podman was run. Docker, the engine of the CI job, was not exercised for these scenarios, and the semantics of
+  `network disconnect` and `network connect --alias` may differ there.
 
 ## The browser run
 
 `just e2e-web` starts the same stand with the TLS edges published on `127.0.0.1:18443` and `:18444`, enrols the nodes,
 signs in, opens a live session and two pending enrolments, and then runs `web-tests/e2e/real.mjs` (Playwright,
 Chromium) against the real console at 380 and 1440 px: sign-in through the fake IdP, the node list, approval of a
-pending enrolment through the UI, the session list, and a revocation from the UI. The browser ignores TLS errors
+pending enrolment through the UI, the session list, and a revocation from the UI. `web-tests/e2e/recording.mjs` opens
+the session detail of a recorded session, presses "Watch recording", reads the typed text from the terminal buffer
+(the terminal draws on a canvas, so the script captures the `Terminal` instance with an init script), checks that the page
+does not overflow horizontally and that the canvas holds painted text, and fails on any CSP violation, on any console
+error and on any HTTP response of 400 or above except 401 and 429 (the 401 is the console probing for a session before
+sign-in; both scripts ignore only these two statuses, and the browser's own "Failed to load resource" console line is
+dropped because the response check names the URL). One 404 is accepted by name (`KNOWN_MISSING` in both scripts):
+`/v1/web/terminal/targets`, which the redesigned console probes and the daemon does not serve yet; remove it from the list
+when the endpoint exists. The browser ignores TLS errors
 (`ignoreHTTPSErrors`) only because the TLS edge of this stand uses a certificate of a throw-away test CA. Screenshots go to
 `target/e2e/screenshots/`. Prepare once with `cd web-tests && npm ci && npx playwright install chromium`.
 
@@ -147,6 +185,5 @@ JSONL on stdout), then `just e2e-down`.
    `api(method, path, body)` for the admin API with the admin web session, `audit_events()`, `jauntd(...)` for the
    server CLI, `on_node(...)`, `restart_jauntd(cert_ttl_secs)`. `marker = stand.marker()` at the start and
    `audit.after(stand.audit_events(), marker)` (module `stand.audit`) scope audit assertions to one scenario.
-4. Recording (S21), CA rotation (S30) and the web console in a browser (S26) attach the same way: the recordings
-   directory is already configured in `jauntd.yaml`, `jauntd ca ...` runs through `stand.jauntd`, and the browser
-   deliverable is `just e2e-web`.
+4. CA rotation (S30) and further recording cases attach the same way: `jauntd ca ...` runs through `stand.jauntd`,
+   interactive sessions through `stand.interactive.Interactive`, and the browser deliverable is `just e2e-web`.

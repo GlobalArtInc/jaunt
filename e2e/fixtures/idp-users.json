@@ -2,5 +2,7 @@
   {"login_hint": "alice", "subject": "e2e-alice", "email": "alice@e2e.test", "username": "alice", "name": "Alice Ops", "groups": []},
   {"login_hint": "bob", "subject": "e2e-bob", "email": "bob@e2e.test", "username": "bob", "name": "Bob Limited", "groups": []},
   {"login_hint": "carol", "subject": "e2e-carol", "email": "carol@e2e.test", "username": "carol", "name": "Carol Nobody", "groups": []},
-  {"login_hint": "admin", "subject": "e2e-admin", "email": "admin@e2e.test", "username": "admin", "name": "Admin Operator", "groups": []}
+  {"login_hint": "admin", "subject": "e2e-admin", "email": "admin@e2e.test", "username": "admin", "name": "Admin Operator", "groups": []},
+  {"login_hint": "dave", "subject": "e2e-dave", "email": "dave@e2e.test", "username": "dave", "name": "Dave Audited", "groups": []},
+  {"login_hint": "viewer", "subject": "e2e-viewer", "email": "viewer@e2e.test", "username": "viewer", "name": "Viewer Sessions", "groups": []}
 ]

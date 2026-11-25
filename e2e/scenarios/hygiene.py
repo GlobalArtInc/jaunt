@@ -3,7 +3,7 @@ import os
 import re
 
 from stand import engine
-from stand.layout import FIXTURES, container
+from stand.layout import CLIENT_USERS, FIXTURES, container
 from stand.stand import SECRET_PATTERNS
 
 ALLOWED_ERRORS_FILE = "allowed-errors.txt"
@@ -34,7 +34,7 @@ def error_lines(text, allowed):
 
 def profile_secrets(stand):
     values = []
-    for user in ("alice", "bob", "carol"):
+    for user in CLIENT_USERS:
         listed = stand.on_client(["sh", "-c", "ls /home/{0}/.jaunt/default/ 2>/dev/null".format(user)], user=user).out.split()
         for name in listed:
             if "token" in name:
@@ -100,7 +100,8 @@ def finish(stand, report):
     with report.step("hygiene: no ERROR lines in the jauntd and agent logs") as step:
         allowed = allowed_errors()
         found = []
-        for name in ["jauntd", "idp", "edge-web", "edge-idp"] + ["{}-agent".format(node) for node in stand.nodes]:
+        scanned = ["jauntd", "idp", "edge-web", "edge-idp"] + sorted(name for name in logs if "-agent" in name)
+        for name in scanned:
             for line in error_lines(logs.get(name, ""), allowed):
                 found.append("{}: {}".format(name, line))
         step.expect(not found, "\n".join(found[:10]))

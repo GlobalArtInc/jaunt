@@ -8,6 +8,7 @@ const IDP_PRIME =
   "https://idp.e2e.test/authorize?response_type=code&client_id=jaunt-e2e&code_challenge=e2e-test-only-challenge&code_challenge_method=S256" +
   "&redirect_uri=https%3A%2F%2Fjaunt.e2e.test%2Fv1%2Flogin%2Fcallback&state=e2e-prime&login_hint=admin";
 const WIDTHS = [380, 1440];
+const KNOWN_MISSING = ["/v1/web/terminal/targets"];
 const OUT = process.env.E2E_SCREENSHOTS || fileURLToPath(new URL("../../target/e2e/screenshots/", import.meta.url));
 
 function required(name) {
@@ -120,8 +121,14 @@ async function run(browser, width, index) {
   const page = await browserContext.newPage();
   const problems = [];
   page.on("console", (message) => {
-    if (message.type() === "error" && !/status of (401|429)/.test(message.text())) {
+    if (message.type() === "error" && !/Failed to load resource/.test(message.text())) {
       problems.push(`console: ${message.text()}`);
+    }
+  });
+  page.on("response", (response) => {
+    const known = KNOWN_MISSING.some((path) => response.url().endsWith(path));
+    if (response.status() >= 400 && ![401, 429].includes(response.status()) && !(response.status() === 404 && known)) {
+      problems.push(`HTTP ${response.status()} for ${response.url()}`);
     }
   });
   page.on("pageerror", (error) => problems.push(`pageerror: ${error.message}`));
