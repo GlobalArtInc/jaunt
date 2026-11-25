@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use jaunt_ca::fingerprint_hex;
+use jaunt_ca::ssh_key::rand_core::OsRng;
+use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
 use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, ControlPlane, NodeCaller, RouteDecision, RouteRequest,
     SessionEnd, SessionEndOutcome,
@@ -21,6 +24,7 @@ pub struct Holder {
     pub user_id: String,
     pub serial: u64,
     pub key_id: String,
+    pub subject_fingerprint: Option<String>,
 }
 
 impl Holder {
@@ -31,6 +35,7 @@ impl Holder {
             key_id: self.key_id.clone(),
             node_name: node_name.to_owned(),
             client_addr: CLIENT.to_owned(),
+            subject_fingerprint: self.subject_fingerprint.clone(),
         }
     }
 
@@ -42,6 +47,7 @@ impl Holder {
             key_id: self.key_id.clone(),
             login: login.to_owned(),
             client_addr: CLIENT.to_owned(),
+            subject_fingerprint: self.subject_fingerprint.clone(),
         }
     }
 }
@@ -100,11 +106,26 @@ pub async fn user(harness: &Harness, subject: &str, groups: &[&str]) -> String {
         .id
 }
 
+pub fn subject_fingerprint() -> String {
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+    fingerprint_hex(key.public_key())
+}
+
 pub async fn certificate(
     harness: &Harness,
     user_id: &str,
     valid_after: i64,
     valid_before: i64,
+) -> Holder {
+    let subject = Some(subject_fingerprint());
+    recorded_certificate(harness, user_id, (valid_after, valid_before), subject).await
+}
+
+pub async fn recorded_certificate(
+    harness: &Harness,
+    user_id: &str,
+    (valid_after, valid_before): (i64, i64),
+    subject_fingerprint: Option<String>,
 ) -> Holder {
     let certificates = harness.store.certificates();
     let serial = certificates.allocate_serial().await.unwrap();
@@ -118,6 +139,9 @@ pub async fn certificate(
             valid_after,
             valid_before,
             issued_at: harness.clock.now_secs(),
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: subject_fingerprint.clone(),
         })
         .await
         .unwrap();
@@ -125,6 +149,7 @@ pub async fn certificate(
         user_id: user_id.to_owned(),
         serial: u64::try_from(serial).unwrap(),
         key_id,
+        subject_fingerprint,
     }
 }
 

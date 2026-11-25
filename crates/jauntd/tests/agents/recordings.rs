@@ -55,6 +55,9 @@ async fn startup_stores_interrupted_uploads_before_it_removes_leftover_parts() {
             valid_after: now - 60,
             valid_before: now + 3600,
             issued_at: now,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

@@ -8,6 +8,7 @@ use jaunt_store::{NewNodeCertificate, NodeCertificateKind, StoreError};
 
 use crate::clock::Moment;
 use crate::control::Control;
+use crate::finish::key_fingerprint;
 use crate::node_keys::{SshHostKey, TlsKey};
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +36,7 @@ pub(crate) struct Bundle {
     pub(crate) ssh_serial: String,
     pub(crate) ssh_not_before: i64,
     pub(crate) ssh_not_after: i64,
+    pub(crate) ssh_ca_fingerprint: String,
 }
 
 impl Bundle {
@@ -46,6 +48,7 @@ impl Bundle {
                 not_before: self.x509_not_before,
                 not_after: self.x509_not_after,
                 issued_at,
+                ca_fingerprint: None,
             },
             NewNodeCertificate {
                 kind: NodeCertificateKind::SshHost,
@@ -53,6 +56,7 @@ impl Bundle {
                 not_before: self.ssh_not_before,
                 not_after: self.ssh_not_after,
                 issued_at,
+                ca_fingerprint: Some(self.ssh_ca_fingerprint.clone()),
             },
         ]
     }
@@ -67,6 +71,7 @@ pub(crate) async fn issue(
     now: Moment,
 ) -> Result<Bundle, IssueError> {
     let node_uuid = Uuid::parse_str(node_id).map_err(|_| IssueError::NodeId)?;
+    let ca = control.ca_snapshot();
     let x509 = control
         .internal_ca
         .issue_node_certificate(
@@ -87,7 +92,7 @@ pub(crate) async fn issue(
         .map_err(IssueError::Serial)?;
     let serial_number = u64::try_from(serial).map_err(|_| IssueError::SerialRange)?;
     let host_certificate = sign_host_certificate(
-        control.host_authority.as_ref(),
+        ca.host_signer().as_ref(),
         HostCertParams {
             subject_public_key: ssh.key.clone(),
             hostnames: vec![
@@ -115,6 +120,7 @@ pub(crate) async fn issue(
             .map_err(|_| IssueError::Time)?,
         ssh_not_after: i64::try_from(host_certificate.valid_before())
             .map_err(|_| IssueError::Time)?,
+        ssh_ca_fingerprint: key_fingerprint(host_certificate.signature_key()),
     })
 }
 

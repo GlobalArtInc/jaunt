@@ -63,6 +63,9 @@ async fn fixture() -> Fixture {
             valid_after: NOW - 120,
             valid_before: NOW + 3600,
             issued_at: NOW,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

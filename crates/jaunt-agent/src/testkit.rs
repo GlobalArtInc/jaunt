@@ -631,6 +631,7 @@ pub enum ApiStep {
 
 pub const RENEW_PATH: &str = "/v1/agent/renew";
 pub const TRUST_PATH: &str = "/v1/agent/trust";
+pub const TRUST_V2_PATH: &str = "/v2/agent/trust";
 pub const AUTHORIZE_PATH: &str = "/v1/agent/authorize";
 pub const SESSION_END_PATH: &str = "/v1/agent/session/end";
 

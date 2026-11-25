@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -8,8 +9,8 @@ use h2::{Ping, PingPong};
 use http::header::{ACCEPT, CONTENT_TYPE, DATE};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
-    AgentTrust, AuthorizeRequest, AuthorizeResponse, ErrorBody, RenewRequest, RenewResponse,
-    SessionEnd, SessionEndOutcome,
+    AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody, RenewRequest,
+    RenewResponse, SessionEnd, SessionEndOutcome,
 };
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
@@ -28,6 +29,7 @@ const RENEW_PATH: &str = "/v1/agent/renew";
 const AUTHORIZE_PATH: &str = "/v1/agent/authorize";
 const SESSION_END_PATH: &str = "/v1/agent/session/end";
 const TRUST_PATH: &str = "/v1/agent/trust";
+const TRUST_V2_PATH: &str = "/v2/agent/trust";
 const JSON: &str = "application/json";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -89,6 +91,21 @@ pub struct Dated<T> {
     pub server_time: Option<SystemTime>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedTrust {
+    V1(AgentTrust),
+    V2(AgentTrustV2),
+}
+
+impl ServedTrust {
+    pub fn into_user_ca_keys(self) -> Vec<String> {
+        match self {
+            ServedTrust::V1(trust) => trust.user_ca_keys,
+            ServedTrust::V2(trust) => trust.user_ca_keys,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
     Idempotent,
@@ -117,6 +134,7 @@ pub struct AgentApi {
     connection: SharedConnection,
     connecting: Mutex<()>,
     shutdown: CancellationToken,
+    first_trust_version_only: AtomicBool,
 }
 
 impl AgentApi {
@@ -143,6 +161,7 @@ impl AgentApi {
             })),
             connecting: Mutex::new(()),
             shutdown,
+            first_trust_version_only: AtomicBool::new(false),
         })
     }
 
@@ -154,6 +173,17 @@ impl AgentApi {
         &self,
         request: &AuthorizeRequest,
     ) -> Result<AuthorizeResponse, ApiError> {
+        if self.first_trust_version_only.load(Ordering::Acquire)
+            && request.subject_fingerprint.is_some()
+        {
+            let older = AuthorizeRequest {
+                subject_fingerprint: None,
+                ..request.clone()
+            };
+            return self
+                .post_json(AUTHORIZE_PATH, &older, Retry::OnlyUnsent)
+                .await;
+        }
         self.post_json(AUTHORIZE_PATH, request, Retry::OnlyUnsent)
             .await
     }
@@ -163,9 +193,36 @@ impl AgentApi {
             .await
     }
 
-    pub async fn trust(&self) -> Result<Dated<AgentTrust>, ApiError> {
-        self.call(Method::GET, TRUST_PATH, None, Retry::Idempotent)
-            .await
+    pub async fn trust(&self) -> Result<Dated<ServedTrust>, ApiError> {
+        if !self.first_trust_version_only.load(Ordering::Acquire) {
+            match self
+                .call::<AgentTrustV2>(Method::GET, TRUST_V2_PATH, None, Retry::Idempotent)
+                .await
+            {
+                Ok(dated) => {
+                    return Ok(Dated {
+                        value: ServedTrust::V2(dated.value),
+                        server_time: dated.server_time,
+                    });
+                }
+                Err(ApiError::Status { status: 404, .. }) => {
+                    self.first_trust_version_only.store(true, Ordering::Release);
+                    tracing::info!(
+                        target: "jaunt::agent",
+                        "the control plane does not serve the second trust version; \
+                         the first one is used until the agent restarts"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let dated = self
+            .call::<AgentTrust>(Method::GET, TRUST_PATH, None, Retry::Idempotent)
+            .await?;
+        Ok(Dated {
+            value: ServedTrust::V1(dated.value),
+            server_time: dated.server_time,
+        })
     }
 
     pub async fn reset(&self) {
@@ -425,19 +482,19 @@ mod tests {
 
     use http::StatusCode;
     use jaunt_proto::{
-        AgentTrust, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse, SessionEnd,
-        SessionEndOutcome, SessionPermissions,
+        AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse,
+        SessionEnd, SessionEndOutcome, SessionPermissions,
     };
     use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{API_KEEPALIVE, AgentApi, ApiError, forget, interpret};
+    use super::{API_KEEPALIVE, AgentApi, ApiError, ServedTrust, forget, interpret};
     use crate::keys::HostKey;
     use crate::testkit::{
         AGENT_HOST, AUTHORIZE_PATH, ApiStep, FakeGate, NodeIdentity, RawTlsServer, RenewStep,
-        SESSION_END_PATH, TRUST_PATH, TestPki, agent_api, eventually, soon, trust_reply, unix_now,
-        user_ca_line,
+        SESSION_END_PATH, TRUST_PATH, TRUST_V2_PATH, TestPki, agent_api, eventually, soon,
+        trust_reply, unix_now, user_ca_line,
     };
 
     const EMPTY: RenewRequest = RenewRequest {
@@ -453,6 +510,7 @@ mod tests {
             key_id: "jaunt:alice@example.com:7".to_owned(),
             login: "deploy".to_owned(),
             client_addr: "203.0.113.5:40000".to_owned(),
+            subject_fingerprint: Some("ab".repeat(32)),
         }
     }
 
@@ -475,6 +533,78 @@ mod tests {
 
     fn client(pki: &TestPki, endpoint: &str, keepalive: Keepalive) -> (AgentApi, NodeIdentity) {
         agent_api(pki, endpoint, keepalive)
+    }
+
+    #[tokio::test]
+    async fn the_second_trust_version_is_preferred_and_a_404_switches_to_the_first_for_good() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        let first = vec![user_ca_line()];
+        let host = user_ca_line();
+        gate.set_standing(TRUST_PATH, trust_reply(&first));
+        gate.script(
+            TRUST_V2_PATH,
+            vec![
+                ApiStep::Json(
+                    200,
+                    json!({"trust_id": "t1", "user_ca_keys": first, "host_ca_active": host}),
+                ),
+                ApiStep::Json(500, json!({"error": "server_error"})),
+            ],
+        );
+
+        assert_eq!(
+            api.trust().await.unwrap().value,
+            ServedTrust::V2(AgentTrustV2 {
+                trust_id: "t1".to_owned(),
+                user_ca_keys: first.clone(),
+                host_ca_active: host,
+            })
+        );
+        assert!(matches!(
+            api.trust().await,
+            Err(ApiError::Status { status: 500, .. })
+        ));
+        assert!(gate.requests(TRUST_PATH).is_empty());
+
+        let fallen_back = api.trust().await.unwrap().value;
+        let again = api.trust().await.unwrap().value;
+
+        assert_eq!(
+            fallen_back,
+            ServedTrust::V1(AgentTrust {
+                user_ca_keys: first.clone()
+            })
+        );
+        assert_eq!(again, fallen_back);
+        assert_eq!(gate.requests(TRUST_V2_PATH).len(), 3);
+        assert_eq!(gate.requests(TRUST_PATH).len(), 2);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn authorize_names_the_certified_key_unless_the_server_only_speaks_the_first_trust_version()
+     {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        gate.set_standing(
+            AUTHORIZE_PATH,
+            ApiStep::Json(200, json!({"decision": "deny"})),
+        );
+        gate.set_standing(TRUST_PATH, trust_reply(&[user_ca_line()]));
+
+        api.authorize(&authorize_request()).await.unwrap();
+        api.trust().await.unwrap();
+        api.authorize(&authorize_request()).await.unwrap();
+
+        let sent: Vec<serde_json::Value> = gate
+            .requests(AUTHORIZE_PATH)
+            .iter()
+            .map(|seen| serde_json::from_slice(&seen.body).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["subject_fingerprint"], json!("ab".repeat(32)));
+        assert!(sent[1].get("subject_fingerprint").is_none(), "{}", sent[1]);
+        assert_eq!(sent[1]["serial"], json!(7));
+        gate.stop().await;
     }
 
     async fn gate_with(renewals: &[RenewStep]) -> (Arc<TestPki>, FakeGate, AgentApi) {
@@ -591,9 +721,9 @@ mod tests {
         let trust = api.trust().await.unwrap();
         assert_eq!(
             trust.value,
-            AgentTrust {
+            ServedTrust::V1(AgentTrust {
                 user_ca_keys: lines
-            }
+            })
         );
         assert_eq!(trust.server_time, Some(server_time));
         gate.set_server_time(None);
@@ -720,6 +850,13 @@ mod tests {
         let endpoint = format!("{AGENT_HOST}:{}", relay.local_addr().unwrap().port());
         let (api, node) = client(&pki, &endpoint, API_KEEPALIVE);
         gate.set_identity(node);
+        gate.set_standing(
+            TRUST_V2_PATH,
+            ApiStep::Json(
+                200,
+                json!({"trust_id": "t", "user_ca_keys": [user_ca_line()], "host_ca_active": user_ca_line()}),
+            ),
+        );
         let api = Arc::new(api);
         let pending = tokio::spawn({
             let api = api.clone();

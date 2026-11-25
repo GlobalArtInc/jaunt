@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use jaunt_ca::ssh_key::PublicKey as CaPublicKey;
-use jaunt_ca::{UserCertParams, Uuid, sign_user_certificate};
+use jaunt_ca::{UserCertParams, Uuid, fingerprint_hex, sign_user_certificate};
 use jaunt_control::{RevokeRequest, Revoked};
 use jaunt_gate::DEFAULT_SSH_CLIENT_LIMITS;
 use jaunt_proto::{
@@ -154,6 +154,7 @@ impl server::Handler for AgentSession {
                     key_id: identity.key_id,
                     login: user.to_owned(),
                     client_addr: self.client_addr.clone(),
+                    subject_fingerprint: Some(identity.subject_fingerprint),
                 },
             )
             .await;
@@ -362,6 +363,8 @@ impl Stand {
         let serial = certificates.allocate_serial().await.unwrap();
         let now = SystemTime::now();
         let now_secs = i64::try_from(unix_secs(now)).unwrap();
+        let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        let subject = CaPublicKey::from_openssh(&key.public_key().to_openssh().unwrap()).unwrap();
         certificates
             .record(&NewCertificate {
                 serial,
@@ -371,12 +374,22 @@ impl Stand {
                 valid_after: now_secs - 120,
                 valid_before: now_secs + 3600,
                 issued_at: now_secs,
+                ca_fingerprint: None,
+                host_trust_id: None,
+                subject_fingerprint: Some(fingerprint_hex(&subject)),
             })
             .await
             .unwrap();
+        self.signed(key, u64::try_from(serial).unwrap(), now)
+    }
+
+    pub fn forged_for(&self, victim: &Identity) -> Identity {
         let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        self.signed(key, victim.serial, SystemTime::now())
+    }
+
+    fn signed(&self, key: PrivateKey, serial: u64, now: SystemTime) -> Identity {
         let subject = CaPublicKey::from_openssh(&key.public_key().to_openssh().unwrap()).unwrap();
-        let serial = u64::try_from(serial).unwrap();
         let signed = sign_user_certificate(
             self.harness.authorities.user.as_ref(),
             UserCertParams {

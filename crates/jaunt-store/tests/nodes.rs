@@ -110,6 +110,7 @@ fn certificate(kind: NodeCertificateKind, serial: &str) -> NewNodeCertificate {
         not_before: NOW,
         not_after: NOW + 100,
         issued_at: NOW,
+        ca_fingerprint: None,
     }
 }
 

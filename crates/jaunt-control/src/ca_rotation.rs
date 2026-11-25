@@ -1,10 +1,14 @@
 use std::fmt;
+use std::path::Path;
 
-use jaunt_ca::{CaKind, TrustSet, fingerprint_hex};
+use jaunt_ca::{CaError, CaKind, FileBackend, KeyRole, SlotListing, TrustSet, fingerprint_hex};
 use jaunt_store::{NodeHostCertificate, NodeTrustServed, Store, StoreError, UnexpiredGroup};
+use serde_json::{Map, Value, json};
 
 pub const TRUST_FRESHNESS_SECS: i64 = 20 * 60;
 pub const MAX_LISTED_NODES: usize = 20;
+pub const STATUS_VERSION: u32 = 1;
+const RETIRE_FIRST: &str = "retire the previous key first";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationKind {
@@ -297,6 +301,195 @@ pub fn verdict(kind: RotationKind, step: RotationStep, counters: &Counters, now:
         Some(reason) => Verdict::Blocked(vec![reason]),
         None => Verdict::Allowed,
     }
+}
+
+pub struct SlotReport {
+    pub kind: RotationKind,
+    pub listing: SlotListing,
+    pub summary: Summary,
+    pub steps: Vec<StepReport>,
+}
+
+pub struct StepReport {
+    pub step: &'static str,
+    pub allowed: bool,
+    pub reasons: Vec<String>,
+    pub line: String,
+}
+
+impl StepReport {
+    fn ready(step: &'static str) -> StepReport {
+        StepReport {
+            step,
+            allowed: true,
+            reasons: Vec::new(),
+            line: format!("{step}: ready"),
+        }
+    }
+
+    fn blocked_by_state(step: &'static str, reason: &str) -> StepReport {
+        StepReport {
+            step,
+            allowed: false,
+            reasons: vec![reason.to_owned()],
+            line: format!("{step}: blocked: {reason}"),
+        }
+    }
+
+    fn of(step: RotationStep, verdict: &Verdict) -> StepReport {
+        let reasons = match verdict {
+            Verdict::Allowed => Vec::new(),
+            Verdict::Blocked(reasons) => reasons.iter().map(ToString::to_string).collect(),
+        };
+        StepReport {
+            step: step.as_str(),
+            allowed: verdict.is_allowed(),
+            reasons,
+            line: verdict.line(step),
+        }
+    }
+}
+
+pub fn read_listings(ca_dir: &Path) -> Result<Vec<(RotationKind, SlotListing)>, CaError> {
+    [RotationKind::User, RotationKind::Host]
+        .into_iter()
+        .map(|kind| Ok((kind, FileBackend::read_slot(ca_dir, kind.ca_kind())?)))
+        .collect()
+}
+
+pub async fn reports(
+    store: &Store,
+    listings: Vec<(RotationKind, SlotListing)>,
+    now: i64,
+) -> Result<Vec<SlotReport>, StoreError> {
+    let mut reports = Vec::with_capacity(listings.len());
+    for (kind, listing) in listings {
+        let counters = gather(store, kind, &listing.trust, now).await?;
+        let summary = summarize(kind, &counters, now);
+        let steps = next_steps(kind, &listing, &counters, now);
+        reports.push(SlotReport {
+            kind,
+            listing,
+            summary,
+            steps,
+        });
+    }
+    Ok(reports)
+}
+
+fn next_steps(
+    kind: RotationKind,
+    listing: &SlotListing,
+    counters: &Counters,
+    now: i64,
+) -> Vec<StepReport> {
+    let trust = &listing.trust;
+    let has_previous = trust.previous().next().is_some();
+    let mut steps = Vec::new();
+    if has_previous {
+        if trust.next().is_some() {
+            steps.push(StepReport::blocked_by_state(
+                RotationStep::Promote.as_str(),
+                RETIRE_FIRST,
+            ));
+        }
+        let verdict = verdict(kind, RotationStep::Retire, counters, now);
+        steps.push(StepReport::of(RotationStep::Retire, &verdict));
+    } else if trust.next().is_some() {
+        let verdict = verdict(kind, RotationStep::Promote, counters, now);
+        steps.push(StepReport::of(RotationStep::Promote, &verdict));
+    } else {
+        steps.push(StepReport::ready("add-next"));
+    }
+    steps
+}
+
+pub fn ordered_keys(listing: &SlotListing) -> Vec<(&'static str, String)> {
+    let mut keys: Vec<(&'static str, String)> = Vec::new();
+    for role in [KeyRole::Active, KeyRole::Next, KeyRole::Previous] {
+        for (_, key) in listing.trust.roles().filter(|(found, _)| *found == role) {
+            keys.push((role.as_str(), fingerprint_hex(key)));
+        }
+    }
+    keys.extend(listing.retired.iter().map(|fp| ("retired", fp.clone())));
+    keys.extend(listing.stray.iter().map(|fp| ("stray", fp.clone())));
+    keys
+}
+
+pub fn status_json(reports: &[SlotReport]) -> Value {
+    let mut root = Map::new();
+    root.insert("version".to_owned(), Value::from(STATUS_VERSION));
+    for report in reports {
+        let keys: Vec<Value> = ordered_keys(&report.listing)
+            .into_iter()
+            .map(|(state, fp)| json!({ "state": state, "fingerprint": fp }))
+            .collect();
+        let summary = &report.summary;
+        let mut slot = Map::new();
+        slot.insert("keys".to_owned(), Value::from(keys));
+        slot.insert(
+            "trust_id".to_owned(),
+            Value::from(report.listing.trust.set_id()),
+        );
+        match report.kind {
+            RotationKind::User => {
+                slot.insert(
+                    "nodes".to_owned(),
+                    json!({
+                        "current": summary.nodes_current,
+                        "behind": summary.nodes_behind.len(),
+                        "offline": summary.nodes_offline.len(),
+                        "behind_names": first_names(&summary.nodes_behind),
+                        "offline_names": first_names(&summary.nodes_offline),
+                    }),
+                );
+                slot.insert(
+                    "old_certificates".to_owned(),
+                    unexpired_json(&summary.old_certificates),
+                );
+            }
+            RotationKind::Host => {
+                slot.insert(
+                    "old_host_trust_certificates".to_owned(),
+                    unexpired_json(&summary.old_host_trust),
+                );
+                slot.insert(
+                    "nodes_on_previous_host_keys".to_owned(),
+                    json!({
+                        "count": summary.nodes_on_old_host_key.len(),
+                        "names": first_names(&summary.nodes_on_old_host_key),
+                    }),
+                );
+            }
+        }
+        let steps: Vec<Value> = report
+            .steps
+            .iter()
+            .map(|step| {
+                json!({
+                    "step": step.step,
+                    "allowed": step.allowed,
+                    "reasons": step.reasons,
+                    "line": step.line,
+                })
+            })
+            .collect();
+        slot.insert("steps".to_owned(), Value::from(steps));
+        root.insert(report.kind.as_str().to_owned(), Value::Object(slot));
+    }
+    Value::Object(root)
+}
+
+fn first_names(names: &[String]) -> Vec<String> {
+    names.iter().take(MAX_LISTED_NODES).cloned().collect()
+}
+
+fn unexpired_json(unexpired: &Unexpired) -> Value {
+    json!({
+        "count": unexpired.count,
+        "nearest_valid_before": unexpired.nearest_valid_before,
+        "farthest_valid_before": unexpired.farthest_valid_before,
+    })
 }
 
 #[cfg(test)]

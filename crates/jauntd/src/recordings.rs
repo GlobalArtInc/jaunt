@@ -595,6 +595,9 @@ mod tests {
                 valid_after: NOW - 60,
                 valid_before: NOW + 3600,
                 issued_at: NOW,
+                ca_fingerprint: None,
+                host_trust_id: None,
+                subject_fingerprint: None,
             })
             .await
             .unwrap();

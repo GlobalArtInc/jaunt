@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use crate::provider::{FakeProvider, Identity, form_pairs};
+use crate::sign_hook::SignHook;
 
 pub const DEFAULT_CERT_TTL_SECS: u64 = 8 * 60 * 60;
 pub const LOGIN_TTL_SECS: u64 = 300;
@@ -99,6 +100,7 @@ pub struct Options {
     pub web: bool,
     pub extra_web_routes: Option<Router<Control>>,
     pub request_limits: RequestLimits,
+    pub sign_hook: Option<SignHook>,
 }
 
 impl Default for Options {
@@ -115,6 +117,7 @@ impl Default for Options {
             web: false,
             extra_web_routes: None,
             request_limits: RequestLimits::default(),
+            sign_hook: None,
         }
     }
 }
@@ -196,6 +199,8 @@ pub struct Harness {
     pub clock: TestClock,
     pub host_keys: Vec<String>,
     pub policy: PolicyHandle,
+    pub ca_root: PathBuf,
+    pub identity: AgeIdentity,
     policy_dir: PathBuf,
     database: PathBuf,
     counter: AtomicU64,
@@ -268,6 +273,10 @@ impl Harness {
             CaKind::Host => Arc::new(host_authority),
             CaKind::Internal => Arc::new(internal_authority),
         };
+        let authority = match options.sign_hook {
+            Some(hook) => hook.wrap(authority),
+            None => authority,
+        };
         let host_keys = host_trust.to_authorized_lines().unwrap();
         let (_, host_signer) = FileBackend::load(&ca_root, CaKind::Host, &identity).unwrap();
         let (_, internal_signer) =
@@ -296,6 +305,7 @@ impl Harness {
                 user_trust,
                 host_trust,
                 host_authority: Arc::new(host_signer),
+                ca_dir: ca_root.clone(),
                 internal_ca,
                 ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
                 gate_endpoint: None,
@@ -331,6 +341,8 @@ impl Harness {
             clock,
             host_keys,
             policy,
+            ca_root,
+            identity,
             policy_dir,
             database,
             counter: AtomicU64::new(0),

@@ -189,6 +189,9 @@ async fn record_rejects_unknown_user() {
         valid_after: NOW,
         valid_before: NOW + 60,
         issued_at: NOW,
+        ca_fingerprint: None,
+        host_trust_id: None,
+        subject_fingerprint: None,
     };
     let result = certificates.record(&certificate).await;
     assert!(matches!(result, Err(StoreError::Database(_))));
@@ -213,11 +216,17 @@ async fn record_and_get_round_trip() {
         valid_after: NOW,
         valid_before: NOW + 60,
         issued_at: NOW,
+        ca_fingerprint: Some("aa".repeat(32)),
+        host_trust_id: Some("bb".repeat(32)),
+        subject_fingerprint: Some("cc".repeat(32)),
     };
     certificates.record(&certificate).await.unwrap();
     let stored = certificates.get(serial).await.unwrap().expect("exists");
     assert_eq!(stored.user_id, certificate.user_id);
     assert_eq!(stored.valid_before, NOW + 60);
+    assert_eq!(stored.ca_fingerprint, certificate.ca_fingerprint);
+    assert_eq!(stored.host_trust_id, certificate.host_trust_id);
+    assert_eq!(stored.subject_fingerprint, certificate.subject_fingerprint);
 }
 
 #[tokio::test]
@@ -292,6 +301,9 @@ async fn token_fixture(store: &Store, token_hash: &str, expires_at: i64) -> (Use
             valid_after: NOW,
             valid_before: expires_at,
             issued_at: NOW,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

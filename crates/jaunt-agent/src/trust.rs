@@ -227,7 +227,7 @@ impl TrustLoader {
 
     async fn load_once(&self) -> Result<Option<SystemTime>, TrustError> {
         let reply = self.api.trust().await.map_err(TrustError::Api)?;
-        let lines = reply.value.user_ca_keys;
+        let lines = reply.value.into_user_ca_keys();
         let keys = UserCaKeys::from_openssh_lines(&lines).map_err(TrustError::Invalid)?;
         self.ssh.install_trust(keys);
         tracing::info!(

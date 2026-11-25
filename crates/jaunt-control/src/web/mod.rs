@@ -1,6 +1,7 @@
 mod api;
 mod assets;
 mod audit_log;
+mod ca_status;
 mod cookies;
 mod csrf;
 mod headers;
@@ -50,6 +51,7 @@ pub(crate) fn mount(
         .route("/v1/web/logout", post(api::logout))
         .route("/v1/admin/whoami", get(api::whoami))
         .route("/v1/admin/audit", get(audit_log::list))
+        .route("/v1/admin/ca", get(ca_status::show))
         .route(
             "/v1/admin/revocations",
             get(revocations::list).post(revocations::create),

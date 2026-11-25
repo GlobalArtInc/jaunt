@@ -46,6 +46,9 @@ async fn upsert_stores_the_username_and_replaces_it_on_every_login() {
             valid_after: 40,
             valid_before: 100,
             issued_at: 40,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

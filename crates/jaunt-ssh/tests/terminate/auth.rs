@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use jaunt_proto::{AuthorizeRequest, SessionEnd};
 use jaunt_ssh::{AgentLimits, EndReason};
 use russh::keys::ssh_key::certificate::CertType;
+use russh::keys::{HashAlg, PublicKey};
 
 use crate::sshd::{LoginMode, SshdOptions, SshdStats};
 use crate::support::{
@@ -109,6 +110,7 @@ async fn authorize_is_asked_once_with_the_stream_and_certificate_fields() {
             key_id: KEY_ID.to_owned(),
             login: LOGIN.to_owned(),
             client_addr: CLIENT_ADDR.to_owned(),
+            subject_fingerprint: Some(sha256_hex(fixture.user_key.public_key())),
         }]
     );
     assert!(outcome.authorized);
@@ -240,4 +242,12 @@ async fn a_stalled_inner_login_times_out_and_ends_the_session_once() {
     let outcome = client.finish().await;
     assert_eq!(outcome.reason, EndReason::InnerLoginFailed);
     assert_eq!(fixture.authority.ends(), [end_without_exit()]);
+}
+
+fn sha256_hex(key: &PublicKey) -> String {
+    key.fingerprint(HashAlg::Sha256)
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

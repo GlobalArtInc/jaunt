@@ -62,6 +62,7 @@ pub(crate) fn agent_router(control: Control) -> Router {
             "/v1/agent/recordings/{session_id}/complete",
             post(recordings::complete).layer(DefaultBodyLimit::max(MAX_COMPLETE_BODY_BYTES)),
         )
+        .route("/v2/agent/trust", get(agent_trust::handle_v2))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)

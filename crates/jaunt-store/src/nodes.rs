@@ -113,6 +113,7 @@ pub struct NewNodeCertificate {
     pub not_before: i64,
     pub not_after: i64,
     pub issued_at: i64,
+    pub ca_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +125,7 @@ pub struct NodeCertificate {
     pub not_before: i64,
     pub not_after: i64,
     pub issued_at: i64,
+    pub ca_fingerprint: Option<String>,
 }
 
 macro_rules! node_columns {
@@ -178,11 +180,17 @@ const ROTATE_KEYS: &str = "UPDATE nodes SET tls_public_key = ?, ssh_host_public_
     WHERE id = ? AND state = 'active' RETURNING id";
 
 const INSERT_CERTIFICATE: &str = "INSERT INTO node_certificates \
-    (id, node_id, kind, serial, not_before, not_after, issued_at) \
-    VALUES (?, ?, ?, ?, ?, ?, ?)";
+    (id, node_id, kind, serial, not_before, not_after, issued_at, ca_fingerprint) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
 const LIST_CERTIFICATES: &str = "SELECT id, node_id, kind, serial, not_before, not_after, \
-    issued_at FROM node_certificates WHERE node_id = ? ORDER BY issued_at, kind, serial, id";
+    issued_at, ca_fingerprint FROM node_certificates WHERE node_id = ? \
+    ORDER BY issued_at, kind, serial, id";
+
+const RECORD_TRUST_SERVED: &str = "UPDATE nodes SET trust_served_id = ?, trust_served_at = ? \
+    WHERE id = ? AND state = 'active' \
+    AND (trust_served_id IS NULL OR trust_served_id <> ? OR trust_served_at IS NULL \
+         OR trust_served_at <= ?)";
 
 #[derive(Clone)]
 pub struct Nodes {
@@ -277,6 +285,24 @@ impl Nodes {
         Ok(true)
     }
 
+    pub async fn record_trust_served(
+        &self,
+        node_id: &str,
+        trust_id: &str,
+        now: i64,
+        min_interval_secs: i64,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(RECORD_TRUST_SERVED)
+            .bind(trust_id)
+            .bind(now)
+            .bind(node_id)
+            .bind(trust_id)
+            .bind(now.saturating_sub(min_interval_secs))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn certificates(&self, node_id: &str) -> Result<Vec<NodeCertificate>, StoreError> {
         let rows = sqlx::query(LIST_CERTIFICATES)
             .bind(node_id)
@@ -311,6 +337,7 @@ pub(crate) async fn insert_certificates(
             .bind(certificate.not_before)
             .bind(certificate.not_after)
             .bind(certificate.issued_at)
+            .bind(&certificate.ca_fingerprint)
             .execute(&mut **tx)
             .await?;
     }
@@ -352,5 +379,6 @@ fn certificate_from_row(row: &SqliteRow) -> Result<NodeCertificate, StoreError> 
         not_before: row.try_get("not_before")?,
         not_after: row.try_get("not_after")?,
         issued_at: row.try_get("issued_at")?,
+        ca_fingerprint: row.try_get("ca_fingerprint")?,
     })
 }

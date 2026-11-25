@@ -318,6 +318,7 @@ async fn start(
             .await
             .map_err(ServeError::Oidc)?;
         let agents_store = store.clone();
+        let ca_dir = settings.data_dir.join(ca::CA_DIR);
         let host_authority: Arc<dyn Signer> = Arc::new(authorities.host);
         let gate = settings
             .ssh_gate
@@ -347,6 +348,7 @@ async fn start(
                 user_trust: authorities.user_trust,
                 host_trust: authorities.host_trust,
                 host_authority,
+                ca_dir,
                 internal_ca: authorities.internal,
                 ssh_suffix: settings.ssh_suffix,
                 gate_endpoint: settings.gate_endpoint,

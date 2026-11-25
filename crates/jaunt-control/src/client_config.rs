@@ -18,7 +18,7 @@ pub(crate) async fn handle(State(control): State<Control>) -> Response {
                 host: gate.host().to_owned(),
                 port: gate.port(),
             },
-            host_ca_keys: control.host_ca_keys.clone(),
+            host_ca_keys: control.ca_snapshot().host_ca_keys().to_vec(),
         },
     )
 }

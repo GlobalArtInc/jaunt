@@ -35,7 +35,8 @@ use crate::state::{EnrollmentFiles, EnrollmentRecord, StateDir, StateError};
 use crate::testkit::{
     AUTHORIZE_PATH, ApiStep, Approval, ControlScript, FakeControl, FakeGate, LogCapture,
     ManualClock, NODE_ID, NODE_NAME, NodeIdentity, PollStep, RenewStep, SESSION_END_PATH,
-    TRUST_PATH, TestPki, eventually, soon, sshd_host_key_file, trust_reply, unix_now, user_ca_line,
+    TRUST_PATH, TRUST_V2_PATH, TestPki, eventually, soon, sshd_host_key_file, trust_reply,
+    unix_now, user_ca_line,
 };
 use crate::trust::TrustTiming;
 
@@ -568,7 +569,7 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
     })
     .await;
     assert_eq!(gate.renewals().len(), 1);
-    assert_eq!(gate.paths(), ["/v1/agent/renew", TRUST_PATH]);
+    assert_eq!(gate.paths(), ["/v1/agent/renew", TRUST_PATH, TRUST_V2_PATH]);
 
     agent.stop().await;
     gate.stop().await;
@@ -594,7 +595,7 @@ async fn an_expired_certificate_asks_for_reenrollment_without_renewal() {
         })
         .await;
         assert!(gate.renewals().is_empty());
-        assert_eq!(gate.paths(), [TRUST_PATH]);
+        assert_eq!(gate.paths(), [TRUST_PATH, TRUST_V2_PATH]);
 
         agent.stop().await;
         gate.stop().await;

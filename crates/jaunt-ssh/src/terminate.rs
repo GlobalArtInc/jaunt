@@ -539,6 +539,7 @@ impl Gatekeeper {
             key_id: identity.key_id.clone(),
             login: login.to_owned(),
             client_addr: self.shared.client_addr.clone(),
+            subject_fingerprint: Some(identity.subject_fingerprint.clone()),
         };
         match self
             .shared

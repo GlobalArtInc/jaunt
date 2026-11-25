@@ -100,12 +100,13 @@ pub(crate) fn node_removed(node_id: &str, name: &str, reason: &'static str, remo
     );
 }
 
-pub(crate) fn trust_served(node_id: &str, keys: usize) {
+pub(crate) fn trust_served(node_id: &str, keys: usize, trust_id: &str) {
     tracing::info!(
         target: "jaunt::audit",
         event = "agent.trust.served",
         node_id,
-        keys
+        keys,
+        trust_id
     );
 }
 

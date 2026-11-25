@@ -2,7 +2,7 @@ use jaunt_proto::{ControlError as PlaneError, DenyReason, RouteDecision, RouteRe
 use jaunt_store::{NewSession, Subjects};
 
 use crate::control::Control;
-use crate::holder::{self, Presented};
+use crate::holder::{self, Absent, Presented};
 use crate::identity::policy_identity;
 use crate::plane::{check_fields, clock_failure, node_info, store_failure};
 use crate::revocation::revoked;
@@ -19,6 +19,7 @@ pub(crate) async fn route(
         &request.key_id,
         &request.node_name,
         &request.client_addr,
+        request.subject_fingerprint.as_deref().unwrap_or_default(),
     ])?;
     let now = control.now().ok_or_else(clock_failure)?;
     let policy = control.policy_snapshot();
@@ -26,6 +27,8 @@ pub(crate) async fn route(
         user_id: &request.user_id,
         serial: request.serial,
         key_id: &request.key_id,
+        subject_fingerprint: request.subject_fingerprint.as_deref(),
+        absent: Absent::Refused,
     };
     let holder = match holder::verify(control, &presented, now.secs).await? {
         Ok(holder) => holder,

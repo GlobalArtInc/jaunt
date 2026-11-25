@@ -149,6 +149,7 @@ async fn the_control_authority_maps_answers_and_failures() {
         key_id: "jaunt:alice@example.com:3".to_owned(),
         login: "deploy".to_owned(),
         client_addr: "203.0.113.9:5000".to_owned(),
+        subject_fingerprint: Some("cd".repeat(32)),
     };
     assert_eq!(
         authority.authorize(request.clone()).await,

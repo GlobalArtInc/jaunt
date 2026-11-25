@@ -3,8 +3,9 @@ use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use jaunt_ca::ssh_key::public::KeyData;
 use jaunt_ca::ssh_key::{Algorithm, PublicKey};
-use jaunt_ca::{UserCertParams, Uuid, sign_user_certificate};
+use jaunt_ca::{UserCertParams, Uuid, fingerprint_hex, sign_user_certificate};
 use jaunt_proto::{FinishRequest, FinishResponse};
 use jaunt_store::{LoginRequestState, NewApiToken, NewCertificate};
 
@@ -98,6 +99,7 @@ pub(crate) struct Issued {
     valid_after: i64,
     valid_before: i64,
     api_token: String,
+    host_ca_keys: Vec<String>,
 }
 
 pub(crate) async fn handle(
@@ -110,12 +112,12 @@ pub(crate) async fn handle(
         Err(failure) => Err(Failure::from(failure)),
     };
     match outcome {
-        Ok(issued) => success_response(&control, issued),
+        Ok(issued) => success_response(issued),
         Err(failure) => failure_response(failure),
     }
 }
 
-pub(crate) fn success_response(control: &Control, issued: Issued) -> Response {
+pub(crate) fn success_response(issued: Issued) -> Response {
     audit::cert_issued(
         &issued.login_id,
         &issued.user_id,
@@ -134,7 +136,7 @@ pub(crate) fn success_response(control: &Control, issued: Issued) -> Response {
             token_expires_at: issued.valid_before,
             user_id: issued.user_id,
             email: issued.email,
-            host_ca_keys: control.host_ca_keys.clone(),
+            host_ca_keys: issued.host_ca_keys,
         },
     )
 }
@@ -262,6 +264,7 @@ pub(crate) async fn redeem_and_issue(
         failed(Failure::internal(FinishReason::CorruptRecord))
     })?;
 
+    let ca = control.ca_snapshot();
     let certificates = control.store.certificates();
     let serial = certificates.allocate_serial().await.map_err(|err| {
         tracing::error!(target: "jaunt::control", error = %err, "allocating a serial failed");
@@ -273,7 +276,7 @@ pub(crate) async fn redeem_and_issue(
     })?;
 
     let certificate = sign_user_certificate(
-        control.user_authority.as_ref(),
+        ca.user_signer().as_ref(),
         UserCertParams {
             subject_public_key: subject_key,
             user_id: user_uuid,
@@ -305,6 +308,9 @@ pub(crate) async fn redeem_and_issue(
             valid_after,
             valid_before,
             issued_at: now.secs,
+            ca_fingerprint: Some(key_fingerprint(certificate.signature_key())),
+            host_trust_id: Some(ca.host_trust_id().to_owned()),
+            subject_fingerprint: Some(key_fingerprint(certificate.public_key())),
         })
         .await
         .map_err(|err| {
@@ -342,5 +348,10 @@ pub(crate) async fn redeem_and_issue(
         valid_after,
         valid_before,
         api_token: api_token.secret,
+        host_ca_keys: ca.host_ca_keys().to_vec(),
     })
+}
+
+pub(crate) fn key_fingerprint(key: &KeyData) -> String {
+    fingerprint_hex(&PublicKey::from(key.clone()))
 }

@@ -166,6 +166,13 @@ async fn authorize_rejects_unsafe_fields_before_any_decision() {
                     ..base.clone()
                 },
             ),
+            (
+                s.node_id.clone(),
+                AuthorizeRequest {
+                    subject_fingerprint: Some(bad.clone()),
+                    ..base.clone()
+                },
+            ),
             (bad.clone(), base.clone()),
         ];
         for (caller, request) in cases {

@@ -6,6 +6,7 @@ mod oidc;
 mod recorder;
 mod recordings;
 mod stand;
+mod subject_key;
 mod support;
 
 use std::time::Duration;

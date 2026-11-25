@@ -12,6 +12,9 @@ pub struct NewCertificate {
     pub valid_after: i64,
     pub valid_before: i64,
     pub issued_at: i64,
+    pub ca_fingerprint: Option<String>,
+    pub host_trust_id: Option<String>,
+    pub subject_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,17 +26,21 @@ pub struct Certificate {
     pub valid_after: i64,
     pub valid_before: i64,
     pub issued_at: i64,
+    pub ca_fingerprint: Option<String>,
+    pub host_trust_id: Option<String>,
+    pub subject_fingerprint: Option<String>,
 }
 
 const ALLOCATE_SERIAL: &str = "UPDATE serial_counter SET next_serial = next_serial + 1 \
     WHERE id = 1 RETURNING next_serial - 1 AS serial";
 
 const RECORD: &str = "INSERT INTO certificates \
-    (serial, user_id, kind, key_id, valid_after, valid_before, issued_at) \
-    VALUES (?, ?, ?, ?, ?, ?, ?)";
+    (serial, user_id, kind, key_id, valid_after, valid_before, issued_at, ca_fingerprint, \
+    host_trust_id, subject_fingerprint) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-const GET: &str = "SELECT serial, user_id, kind, key_id, valid_after, valid_before, issued_at \
-    FROM certificates WHERE serial = ?";
+const GET: &str = "SELECT serial, user_id, kind, key_id, valid_after, valid_before, issued_at, \
+    ca_fingerprint, host_trust_id, subject_fingerprint FROM certificates WHERE serial = ?";
 
 #[derive(Clone)]
 pub struct Certificates {
@@ -59,6 +66,9 @@ impl Certificates {
             .bind(certificate.valid_after)
             .bind(certificate.valid_before)
             .bind(certificate.issued_at)
+            .bind(&certificate.ca_fingerprint)
+            .bind(&certificate.host_trust_id)
+            .bind(&certificate.subject_fingerprint)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -82,5 +92,8 @@ fn certificate_from_row(row: &SqliteRow) -> Result<Certificate, StoreError> {
         valid_after: row.try_get("valid_after")?,
         valid_before: row.try_get("valid_before")?,
         issued_at: row.try_get("issued_at")?,
+        ca_fingerprint: row.try_get("ca_fingerprint")?,
+        host_trust_id: row.try_get("host_trust_id")?,
+        subject_fingerprint: row.try_get("subject_fingerprint")?,
     })
 }

@@ -159,6 +159,7 @@ impl Harness {
             user_trust,
             host_trust,
             host_authority: Arc::new(host),
+            ca_dir: ca_root.clone(),
             internal_ca,
             ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
             gate_endpoint: None,

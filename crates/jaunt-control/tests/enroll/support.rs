@@ -32,6 +32,7 @@ use tower::ServiceExt;
 
 use crate::audit;
 use crate::provider::FakeProvider;
+use crate::sign_hook::SignHook;
 
 pub const SUFFIX: &str = "jaunt.test";
 pub const AGENT_ENDPOINT: &str = "agents.example.com:443";
@@ -111,6 +112,7 @@ pub struct Options {
     pub client_ip_header: Option<&'static str>,
     pub trusted_proxies: &'static [&'static str],
     pub recordings: Option<RecordingOptions>,
+    pub host_sign_hook: Option<SignHook>,
 }
 
 impl Default for Options {
@@ -123,6 +125,7 @@ impl Default for Options {
             client_ip_header: None,
             trusted_proxies: &[],
             recordings: None,
+            host_sign_hook: None,
         }
     }
 }
@@ -214,6 +217,8 @@ pub struct Harness {
     pub user_trust: TrustSet,
     pub db_path: PathBuf,
     pub recordings_dir: PathBuf,
+    pub ca_root: PathBuf,
+    pub identity: AgeIdentity,
     _provider: FakeProvider,
     _dir: TempDir,
 }
@@ -371,6 +376,10 @@ impl Harness {
                 Arc::new(foreign)
             }
         };
+        let host_authority = match options.host_sign_hook {
+            Some(hook) => hook.wrap(host_authority),
+            None => host_authority,
+        };
         let host_ca = host_trust.active().clone();
         let root = InternalCa::create_root(&internal_signer, SystemTime::now()).unwrap();
         let root_der = root.certificate_der.clone();
@@ -412,6 +421,7 @@ impl Harness {
                 user_trust: user_trust.clone(),
                 host_trust,
                 host_authority,
+                ca_dir: ca_root.clone(),
                 internal_ca,
                 ssh_suffix: SshSuffix::parse(SUFFIX).unwrap(),
                 gate_endpoint: options
@@ -451,6 +461,8 @@ impl Harness {
             user_trust,
             db_path,
             recordings_dir,
+            ca_root,
+            identity,
             _provider: provider,
             _dir: dir,
         })

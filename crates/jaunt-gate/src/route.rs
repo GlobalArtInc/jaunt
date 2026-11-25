@@ -126,6 +126,7 @@ impl ControlRoute {
             key_id: identity.key_id.clone(),
             node_name: node.clone(),
             client_addr: client.clone(),
+            subject_fingerprint: Some(identity.subject_fingerprint.clone()),
         };
         let decision =
             tokio::time::timeout(self.control_timeout, self.control.route(request)).await;
@@ -314,6 +315,7 @@ mod tests {
             key_id: "jaunt:alice@example.com:42".to_owned(),
             email: "alice@example.com".to_owned(),
             valid_before: u64::MAX,
+            subject_fingerprint: "ab".repeat(32),
         }
     }
 
@@ -386,6 +388,10 @@ mod tests {
             assert_eq!(seen[0].serial, 42);
             assert_eq!(seen[0].key_id, "jaunt:alice@example.com:42");
             assert_eq!(seen[0].client_addr, "192.0.2.7:50000");
+            assert_eq!(
+                seen[0].subject_fingerprint.as_deref(),
+                Some(identity().subject_fingerprint.as_str())
+            );
         }
     }
 

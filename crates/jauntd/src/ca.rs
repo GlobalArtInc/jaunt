@@ -12,7 +12,7 @@ use jaunt_ca::{
 
 use crate::config::{self, EnvLookup};
 
-pub(crate) const CA_DIR: &str = "ca";
+pub const CA_DIR: &str = "ca";
 const STAGING_PREFIX: &str = "ca.staging";
 const IDENTITY_FILE: &str = "age-identity.txt";
 

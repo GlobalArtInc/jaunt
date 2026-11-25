@@ -5,15 +5,12 @@ use std::time::UNIX_EPOCH;
 
 use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::ssh_key::{Fingerprint, HashAlg};
-use jaunt_ca::{
-    CaError, CaKind, CaLock, FileBackend, KeyRole, SlotListing, TrustSet, fingerprint_hex,
-};
+use jaunt_ca::{CaError, CaKind, CaLock, FileBackend, TrustSet, fingerprint_hex};
 use jaunt_control::ca_rotation::{
-    self, Counters, RotationKind, RotationStep, Summary, Unexpired, Verdict,
+    self, Counters, RotationKind, RotationStep, SlotReport, Summary, Unexpired, Verdict,
 };
 use jaunt_control::{Clock, system_clock};
 use jaunt_store::{Store, StoreError};
-use serde_json::{Map, Value, json};
 
 use crate::audit::{self, AuditSettings, AuditStartError, Surface};
 use crate::ca::{CA_DIR, resolve_identity};
@@ -26,8 +23,6 @@ const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_BLOCKED: u8 = 3;
 const LAST_LINE: &str = "done";
-const RETIRE_FIRST: &str = "retire the previous key first";
-const STATUS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationAction {
@@ -498,53 +493,6 @@ fn say(streams: &mut Streams<'_>, text: &str) -> Result<(), RotationError> {
         .map_err(RotationError::Output)
 }
 
-struct SlotReport {
-    kind: RotationKind,
-    listing: SlotListing,
-    summary: Summary,
-    steps: Vec<StepReport>,
-}
-
-struct StepReport {
-    step: &'static str,
-    allowed: bool,
-    reasons: Vec<String>,
-    line: String,
-}
-
-impl StepReport {
-    fn ready(step: &'static str) -> StepReport {
-        StepReport {
-            step,
-            allowed: true,
-            reasons: Vec::new(),
-            line: format!("{step}: ready"),
-        }
-    }
-
-    fn blocked_by_state(step: &'static str, reason: &str) -> StepReport {
-        StepReport {
-            step,
-            allowed: false,
-            reasons: vec![reason.to_owned()],
-            line: format!("{step}: blocked: {reason}"),
-        }
-    }
-
-    fn of(step: RotationStep, verdict: &Verdict) -> StepReport {
-        let reasons = match verdict {
-            Verdict::Allowed => Vec::new(),
-            Verdict::Blocked(reasons) => reasons.iter().map(ToString::to_string).collect(),
-        };
-        StepReport {
-            step: step.as_str(),
-            allowed: verdict.is_allowed(),
-            reasons,
-            line: verdict.line(step),
-        }
-    }
-}
-
 async fn status(
     store: &Store,
     ca_dir: &Path,
@@ -552,23 +500,12 @@ async fn status(
     json: bool,
     streams: &mut Streams<'_>,
 ) -> Result<u8, RotationError> {
-    let mut reports = Vec::new();
-    for kind in [RotationKind::User, RotationKind::Host] {
-        let listing = FileBackend::read_slot(ca_dir, kind.ca_kind())?;
-        let counters = ca_rotation::gather(store, kind, &listing.trust, now)
-            .await
-            .map_err(RotationError::Counters)?;
-        let summary = ca_rotation::summarize(kind, &counters, now);
-        let steps = next_steps(kind, &listing, &counters, now);
-        reports.push(SlotReport {
-            kind,
-            listing,
-            summary,
-            steps,
-        });
-    }
+    let listings = ca_rotation::read_listings(ca_dir)?;
+    let reports = ca_rotation::reports(store, listings, now)
+        .await
+        .map_err(RotationError::Counters)?;
     let text = if json {
-        let mut text = render_json(&reports).to_string();
+        let mut text = ca_rotation::status_json(&reports).to_string();
         text.push('\n');
         text
     } else {
@@ -578,51 +515,12 @@ async fn status(
     Ok(EXIT_OK)
 }
 
-fn next_steps(
-    kind: RotationKind,
-    listing: &SlotListing,
-    counters: &Counters,
-    now: i64,
-) -> Vec<StepReport> {
-    let trust = &listing.trust;
-    let has_previous = trust.previous().next().is_some();
-    let mut steps = Vec::new();
-    if has_previous {
-        if trust.next().is_some() {
-            steps.push(StepReport::blocked_by_state(
-                RotationStep::Promote.as_str(),
-                RETIRE_FIRST,
-            ));
-        }
-        let verdict = ca_rotation::verdict(kind, RotationStep::Retire, counters, now);
-        steps.push(StepReport::of(RotationStep::Retire, &verdict));
-    } else if trust.next().is_some() {
-        let verdict = ca_rotation::verdict(kind, RotationStep::Promote, counters, now);
-        steps.push(StepReport::of(RotationStep::Promote, &verdict));
-    } else {
-        steps.push(StepReport::ready("add-next"));
-    }
-    steps
-}
-
-fn ordered_keys(listing: &SlotListing) -> Vec<(&'static str, String)> {
-    let mut keys: Vec<(&'static str, String)> = Vec::new();
-    for role in [KeyRole::Active, KeyRole::Next, KeyRole::Previous] {
-        for (_, key) in listing.trust.roles().filter(|(found, _)| *found == role) {
-            keys.push((role.as_str(), fingerprint_hex(key)));
-        }
-    }
-    keys.extend(listing.retired.iter().map(|fp| ("retired", fp.clone())));
-    keys.extend(listing.stray.iter().map(|fp| ("stray", fp.clone())));
-    keys
-}
-
 fn render_text(reports: &[SlotReport]) -> String {
     let mut text = String::new();
     for report in reports {
         text.push_str(report.kind.as_str());
         text.push('\n');
-        for (state, fp) in ordered_keys(&report.listing) {
+        for (state, fp) in ca_rotation::ordered_keys(&report.listing) {
             text.push_str(&format!("  {state:<9} {fp}\n"));
         }
         text.push_str(&format!("  trust id  {}\n", report.listing.trust.set_id()));
@@ -693,86 +591,6 @@ fn listed(names: &[String]) -> String {
         shown.push("…".to_owned());
     }
     shown.join(", ")
-}
-
-fn render_json(reports: &[SlotReport]) -> Value {
-    let mut root = Map::new();
-    root.insert("version".to_owned(), Value::from(STATUS_VERSION));
-    for report in reports {
-        let keys: Vec<Value> = ordered_keys(&report.listing)
-            .into_iter()
-            .map(|(state, fp)| json!({ "state": state, "fingerprint": fp }))
-            .collect();
-        let summary = &report.summary;
-        let mut slot = Map::new();
-        slot.insert("keys".to_owned(), Value::from(keys));
-        slot.insert(
-            "trust_id".to_owned(),
-            Value::from(report.listing.trust.set_id()),
-        );
-        match report.kind {
-            RotationKind::User => {
-                slot.insert(
-                    "nodes".to_owned(),
-                    json!({
-                        "current": summary.nodes_current,
-                        "behind": summary.nodes_behind.len(),
-                        "offline": summary.nodes_offline.len(),
-                        "behind_names": first_names(&summary.nodes_behind),
-                        "offline_names": first_names(&summary.nodes_offline),
-                    }),
-                );
-                slot.insert(
-                    "old_certificates".to_owned(),
-                    unexpired_json(&summary.old_certificates),
-                );
-            }
-            RotationKind::Host => {
-                slot.insert(
-                    "old_host_trust_certificates".to_owned(),
-                    unexpired_json(&summary.old_host_trust),
-                );
-                slot.insert(
-                    "nodes_on_previous_host_keys".to_owned(),
-                    json!({
-                        "count": summary.nodes_on_old_host_key.len(),
-                        "names": first_names(&summary.nodes_on_old_host_key),
-                    }),
-                );
-            }
-        }
-        let steps: Vec<Value> = report
-            .steps
-            .iter()
-            .map(|step| {
-                json!({
-                    "step": step.step,
-                    "allowed": step.allowed,
-                    "reasons": step.reasons,
-                    "line": step.line,
-                })
-            })
-            .collect();
-        slot.insert("steps".to_owned(), Value::from(steps));
-        root.insert(report.kind.as_str().to_owned(), Value::Object(slot));
-    }
-    Value::Object(root)
-}
-
-fn first_names(names: &[String]) -> Vec<String> {
-    names
-        .iter()
-        .take(ca_rotation::MAX_LISTED_NODES)
-        .cloned()
-        .collect()
-}
-
-fn unexpired_json(unexpired: &Unexpired) -> Value {
-    json!({
-        "count": unexpired.count,
-        "nearest_valid_before": unexpired.nearest_valid_before,
-        "farthest_valid_before": unexpired.farthest_valid_before,
-    })
 }
 
 #[cfg(test)]

@@ -55,6 +55,9 @@ async fn bearer(harness: &Harness, email: &str, groups: &[&str]) -> String {
             valid_after: now - 120,
             valid_before: now + 3600,
             issued_at: now,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

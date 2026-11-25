@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use russh::keys::ssh_key::certificate::CertType;
 use russh::keys::ssh_key::public::KeyData;
-use russh::keys::{Algorithm, Certificate, PublicKey};
+use russh::keys::{Algorithm, Certificate, HashAlg, PublicKey};
 
 use crate::error::SshError;
 
@@ -72,6 +72,7 @@ pub struct UserIdentity {
     pub key_id: String,
     pub email: String,
     pub valid_before: u64,
+    pub subject_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -149,7 +150,16 @@ pub fn verify_user_certificate(
         key_id: cert.key_id().to_owned(),
         email: email.to_owned(),
         valid_before: cert.valid_before(),
+        subject_fingerprint: sha256_hex(cert.public_key()),
     })
+}
+
+fn sha256_hex(key: &KeyData) -> String {
+    key.fingerprint(HashAlg::Sha256)
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn is_user_id(text: &str) -> bool {
@@ -183,7 +193,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use russh::keys::ssh_key::certificate::{Builder, CertType};
-    use russh::keys::{Algorithm, Certificate, EcdsaCurve, PrivateKey};
+    use russh::keys::{Algorithm, Certificate, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
 
     use super::{
         CertRejection, UserCaKeys, UserCaSource, is_key_id_email, verify_user_certificate,
@@ -251,6 +261,30 @@ mod tests {
 
     fn trust(ca: &PrivateKey) -> UserCaKeys {
         UserCaKeys::from_openssh_lines([ca.public_key().to_openssh().unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn the_identity_carries_the_certified_key_fingerprint_as_lowercase_sha256_hex() {
+        let ca = key(Algorithm::Ed25519);
+        let profile = Profile::jaunt();
+        let subject = profile.subject.public_key().clone();
+        let identity = verify_user_certificate(&profile.sign(&ca), &trust(&ca), ISSUED).unwrap();
+        let hex = |key: &PublicKey| -> String {
+            key.fingerprint(HashAlg::Sha256)
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        assert_eq!(identity.subject_fingerprint, hex(&subject));
+        assert_ne!(identity.subject_fingerprint, hex(ca.public_key()));
+        assert_eq!(identity.subject_fingerprint.len(), 64);
+        assert!(
+            identity
+                .subject_fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 
     #[test]

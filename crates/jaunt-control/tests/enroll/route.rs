@@ -67,6 +67,9 @@ async fn route_denies_every_holder_and_node_that_does_not_check_out() {
             valid_after: now - 60,
             valid_before: now + 3600,
             issued_at: now,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();
@@ -218,6 +221,10 @@ async fn route_rejects_fields_that_cannot_be_audited_safely() {
         },
         RouteRequest {
             node_name: "n".repeat(257),
+            ..s.alice.route_to(NODE_NAME)
+        },
+        RouteRequest {
+            subject_fingerprint: Some("f\u{0}".to_owned()),
             ..s.alice.route_to(NODE_NAME)
         },
     ] {

@@ -177,7 +177,7 @@ events! {
     AgentRejected => ("agent.rejected", "agent.rejected", ActorRule::Anonymous, NODE, None, None,
         [("reason", NAME), ("remote_addr", ADDR)], Class::Noisy),
     AgentTrustServed => ("agent.trust.served", "agent.trust.served", ActorRule::Node("node_id"), NODE, None, None,
-        [("keys", INT)]),
+        [("keys", INT), ("trust_id", ID)]),
     NodeEnrollRequested => ("node.enroll.requested", "node.enroll.requested", ActorRule::Anonymous, None, None, None,
         [("enrollment_id", ID), ("name", NAME), ("hostname", HOST), ("source_ip", ADDR),
          ("source_network", ADDR), ("agent_version", SHORT), ("replace", BOOL)]),

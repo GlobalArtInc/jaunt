@@ -1,5 +1,6 @@
 mod audit;
 mod audit_events;
+mod ca_rotation;
 mod callback;
 mod control;
 mod device_audit;
@@ -15,6 +16,7 @@ mod headers;
 mod limits;
 mod provider;
 mod revoked_user;
+mod sign_hook;
 mod start;
 mod support;
 mod sweep;

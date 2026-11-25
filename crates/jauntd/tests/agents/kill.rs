@@ -389,6 +389,9 @@ async fn a_starting_agent_server_closes_the_sessions_an_earlier_run_left_open() 
             valid_after: now - 60,
             valid_before: now + 3600,
             issued_at: now,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

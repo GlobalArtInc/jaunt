@@ -1,12 +1,13 @@
 use std::future::Future;
 use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwap;
 use axum::Router;
 use jaunt_ca::{
-    CaError, CaKind, InternalCa, IssuedCertificate, MAX_USER_VALIDITY, ServerCertParams, Signer,
-    TrustSet,
+    CaError, InternalCa, IssuedCertificate, MAX_USER_VALIDITY, ServerCertParams, Signer, TrustSet,
 };
 use jaunt_limits::RateLimiter;
 use jaunt_oidc::OidcClient;
@@ -17,6 +18,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::admin::NodeAdmin;
 use crate::audit::{self, SessionEnd};
+use crate::ca_snapshot::CaSnapshot;
 use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
@@ -48,6 +50,7 @@ pub struct ControlParts {
     pub user_trust: TrustSet,
     pub host_trust: TrustSet,
     pub host_authority: Arc<dyn Signer>,
+    pub ca_dir: PathBuf,
     pub internal_ca: InternalCa,
     pub ssh_suffix: SshSuffix,
     pub gate_endpoint: Option<GateEndpoint>,
@@ -64,10 +67,8 @@ pub struct ControlParts {
 pub struct Inner {
     pub(crate) store: Store,
     pub(crate) oidc: OidcClient,
-    pub(crate) user_authority: Arc<dyn Signer>,
-    pub(crate) user_ca_keys: Vec<String>,
-    pub(crate) host_ca_keys: Vec<String>,
-    pub(crate) host_authority: Arc<dyn Signer>,
+    ca: ArcSwap<CaSnapshot>,
+    pub(crate) ca_dir: PathBuf,
     pub(crate) internal_ca: InternalCa,
     pub(crate) ssh_suffix: SshSuffix,
     pub(crate) gate_endpoint: Option<GateEndpoint>,
@@ -128,26 +129,18 @@ impl Control {
         limits: RequestLimits,
         ticker: Ticker,
     ) -> Result<Control, ControlError> {
-        if parts.user_authority.kind() != CaKind::User {
-            return Err(ControlError::NotUserAuthority);
-        }
-        let user_ca_keys = active_first(&parts.user_trust, parts.user_authority.as_ref())?;
+        let ca = CaSnapshot::new(
+            parts.user_authority,
+            parts.user_trust,
+            parts.host_authority,
+            parts.host_trust,
+        )?;
         if parts.cert_ttl < Duration::from_secs(1) {
             return Err(ControlError::CertificateTtlTooShort);
         }
         if parts.pending_capacity == 0 {
             return Err(ControlError::NoPendingCapacity);
         }
-        if parts.host_authority.kind() != CaKind::Host {
-            return Err(ControlError::NotHostAuthority);
-        }
-        if parts.host_trust.active().key_data() != parts.host_authority.public_key().key_data() {
-            return Err(ControlError::HostAuthorityNotTrusted);
-        }
-        let host_ca_keys = parts
-            .host_trust
-            .to_authorized_lines()
-            .map_err(ControlError::HostKeys)?;
         if parts
             .recordings
             .as_ref()
@@ -164,10 +157,8 @@ impl Control {
             inner: Arc::new(Inner {
                 store: parts.store,
                 oidc: parts.oidc,
-                user_authority: parts.user_authority,
-                user_ca_keys,
-                host_ca_keys,
-                host_authority: parts.host_authority,
+                ca: ArcSwap::from_pointee(ca),
+                ca_dir: parts.ca_dir,
                 internal_ca: parts.internal_ca,
                 ssh_suffix: parts.ssh_suffix,
                 gate_endpoint: parts.gate_endpoint,
@@ -205,6 +196,14 @@ impl Control {
 
     pub fn policy(&self) -> &PolicyHandle {
         &self.inner.policy
+    }
+
+    pub fn ca_snapshot(&self) -> Arc<CaSnapshot> {
+        self.inner.ca.load_full()
+    }
+
+    pub fn replace_snapshot(&self, snapshot: CaSnapshot) -> Arc<CaSnapshot> {
+        self.inner.ca.swap(Arc::new(snapshot))
     }
 
     pub(crate) fn policy_snapshot(&self) -> Arc<PolicySet> {
@@ -382,26 +381,6 @@ impl Control {
     }
 }
 
-fn active_first(trust: &TrustSet, authority: &dyn Signer) -> Result<Vec<String>, ControlError> {
-    let signing = authority.public_key();
-    if trust.active().key_data() != signing.key_data() {
-        return Err(ControlError::UserAuthorityNotTrusted);
-    }
-    let lines = trust
-        .to_authorized_lines()
-        .map_err(ControlError::UserKeys)?;
-    let (active, retired): (Vec<_>, Vec<_>) = trust
-        .keys()
-        .iter()
-        .zip(lines)
-        .partition(|(key, _)| key.key_data() == signing.key_data());
-    Ok(active
-        .into_iter()
-        .chain(retired)
-        .map(|(_, line)| line)
-        .collect())
-}
-
 async fn sweep_forever(control: Control) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -520,6 +499,7 @@ mod tests {
             user_trust,
             host_trust,
             host_authority: Arc::new(host),
+            ca_dir: ca_root.clone(),
             internal_ca,
             ssh_suffix: SshSuffix::parse("jaunt.test").unwrap(),
             gate_endpoint: None,

@@ -40,7 +40,7 @@ pub(super) async fn handle(
         Err(failure) => Err(Stop::Failed(Failure::from(failure))),
     };
     match outcome {
-        Ok(issued) => finish::success_response(&control, issued),
+        Ok(issued) => finish::success_response(issued),
         Err(Stop::Answer(code)) => error_response(StatusCode::BAD_REQUEST, code),
         Err(Stop::Failed(failure)) => finish::failure_response(failure),
     }

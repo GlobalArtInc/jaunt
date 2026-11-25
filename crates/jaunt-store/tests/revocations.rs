@@ -65,6 +65,9 @@ async fn certificate(store: &Store, user_id: &str, valid_before: i64) -> i64 {
             valid_after: NOW - 60,
             valid_before,
             issued_at: NOW,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
         })
         .await
         .unwrap();

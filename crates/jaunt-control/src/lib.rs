@@ -4,6 +4,7 @@ mod agent_trust;
 mod audit;
 mod authorize;
 pub mod ca_rotation;
+mod ca_snapshot;
 mod callback;
 mod client_config;
 mod clock;
@@ -52,6 +53,7 @@ pub use admin::{
     RejectedEnrollment, RemoveError,
 };
 pub use agent::AuthenticatedNode;
+pub use ca_snapshot::CaSnapshot;
 #[cfg(feature = "test-support")]
 pub use clock::Ticker;
 pub use clock::{Clock, system_clock};

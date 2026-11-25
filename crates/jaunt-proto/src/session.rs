@@ -12,6 +12,8 @@ pub struct RouteRequest {
     pub key_id: String,
     pub node_name: String,
     pub client_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_fingerprint: Option<String>,
 }
 
 impl fmt::Debug for RouteRequest {
@@ -22,6 +24,7 @@ impl fmt::Debug for RouteRequest {
             .field("key_id", &REDACTED)
             .field("node_name", &self.node_name)
             .field("client_addr", &self.client_addr)
+            .field("subject_fingerprint", &self.subject_fingerprint)
             .finish()
     }
 }
@@ -48,6 +51,7 @@ pub enum DenyReason {
     SessionUsed,
     UserMismatch,
     SerialMismatch,
+    SubjectKeyMismatch,
 }
 
 impl DenyReason {
@@ -67,6 +71,7 @@ impl DenyReason {
             DenyReason::SessionUsed => "session_used",
             DenyReason::UserMismatch => "user_mismatch",
             DenyReason::SerialMismatch => "serial_mismatch",
+            DenyReason::SubjectKeyMismatch => "subject_key_mismatch",
         }
     }
 }
@@ -83,6 +88,8 @@ pub struct AuthorizeRequest {
     pub key_id: String,
     pub login: String,
     pub client_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_fingerprint: Option<String>,
 }
 
 impl fmt::Debug for AuthorizeRequest {
@@ -94,6 +101,7 @@ impl fmt::Debug for AuthorizeRequest {
             .field("key_id", &REDACTED)
             .field("login", &self.login)
             .field("client_addr", &self.client_addr)
+            .field("subject_fingerprint", &self.subject_fingerprint)
             .finish()
     }
 }
@@ -221,6 +229,37 @@ mod tests {
     }
 
     #[test]
+    fn the_subject_fingerprint_is_optional_and_left_out_of_the_wire_when_absent() {
+        let fingerprint = "ab".repeat(32);
+        let authorize = json!({
+            "session_id": "s", "user_id": "u", "serial": 7, "key_id": "k",
+            "login": "deploy", "client_addr": "203.0.113.5:4000",
+        });
+        let mut with_key = authorize.clone();
+        with_key["subject_fingerprint"] = json!(fingerprint);
+        let parsed: AuthorizeRequest = serde_json::from_value(with_key.clone()).unwrap();
+        assert_eq!(
+            parsed.subject_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), with_key);
+        let older: AuthorizeRequest = serde_json::from_value(authorize.clone()).unwrap();
+        assert_eq!(older.subject_fingerprint, None);
+        assert_eq!(serde_json::to_value(&older).unwrap(), authorize);
+
+        let route = json!({
+            "user_id": "u", "serial": 7, "key_id": "k", "node_name": "web-01",
+            "client_addr": "203.0.113.5:4000", "subject_fingerprint": fingerprint,
+        });
+        let parsed: RouteRequest = serde_json::from_value(route.clone()).unwrap();
+        assert_eq!(
+            parsed.subject_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), route);
+    }
+
+    #[test]
     fn session_end_outcomes_and_reason_codes_are_stable() {
         assert_eq!(
             serde_json::to_value(SessionEndOutcome::Recorded).unwrap(),
@@ -232,6 +271,10 @@ mod tests {
         );
         assert_eq!(DenyReason::WrongNode.code(), "wrong_node");
         assert_eq!(DenyReason::NodeInactive.code(), "node_inactive");
+        assert_eq!(
+            DenyReason::SubjectKeyMismatch.code(),
+            "subject_key_mismatch"
+        );
         assert_eq!(
             DenyReason::CertificateNotIssued.code(),
             "certificate_not_issued"
@@ -247,6 +290,7 @@ mod tests {
             key_id: key_id.to_owned(),
             node_name: "web-01".to_owned(),
             client_addr: "203.0.113.5:4000".to_owned(),
+            subject_fingerprint: None,
         };
         let authorize = AuthorizeRequest {
             session_id: "session-1".to_owned(),
@@ -255,6 +299,7 @@ mod tests {
             key_id: key_id.to_owned(),
             login: "deploy".to_owned(),
             client_addr: "203.0.113.5:4000".to_owned(),
+            subject_fingerprint: None,
         };
         let end = SessionEnd {
             session_id: "session-1".to_owned(),
