@@ -20,7 +20,7 @@ impl SessionState {
         }
     }
 
-    fn parse(value: &str) -> Result<SessionState, StoreError> {
+    pub(crate) fn parse(value: &str) -> Result<SessionState, StoreError> {
         match value {
             "routed" => Ok(SessionState::Routed),
             "active" => Ok(SessionState::Active),
@@ -101,6 +101,8 @@ pub struct ActivateSession<'a> {
     pub serial: i64,
     pub login: &'a str,
     pub max_duration_secs: i64,
+    pub pty: bool,
+    pub record_input: bool,
     pub now: i64,
 }
 
@@ -180,7 +182,8 @@ const CREATE: &str = concat!(
 const GET: &str = concat!("SELECT ", session_columns!(), " FROM sessions WHERE id = ?");
 
 const ACTIVATE: &str = concat!(
-    "UPDATE sessions SET state = 'active', authorized_at = ?, login = ?, max_duration_secs = ? \
+    "UPDATE sessions SET state = 'active', authorized_at = ?, login = ?, max_duration_secs = ?, \
+     pty = ?, record_input = ? \
      WHERE id = ? AND node_id = ? AND user_id = ? AND serial = ? \
      AND state = 'routed' AND expires_at > ? \
      AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') RETURNING ",
@@ -282,6 +285,8 @@ impl Sessions {
             .bind(activation.now)
             .bind(activation.login)
             .bind(activation.max_duration_secs)
+            .bind(activation.pty)
+            .bind(activation.record_input)
             .bind(activation.id)
             .bind(activation.node_id)
             .bind(activation.user_id)

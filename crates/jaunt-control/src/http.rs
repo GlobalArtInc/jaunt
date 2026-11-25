@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
+use crate::recordings::{self, MAX_COMPLETE_BODY_BYTES};
 use crate::{
     agent_trust, callback, client_config, device, enroll, finish, limits, nodes, poll, renew,
     session_http, start, web, whoami,
@@ -51,6 +52,16 @@ pub(crate) fn agent_router(control: Control) -> Router {
         .route("/v1/agent/authorize", post(session_http::authorize))
         .route("/v1/agent/session/end", post(session_http::end))
         .route("/v1/agent/trust", get(agent_trust::handle))
+        .route(
+            "/v1/agent/recordings/{session_id}/chunks",
+            post(recordings::chunk).layer(DefaultBodyLimit::max(recordings::chunk_route_limit(
+                &control,
+            ))),
+        )
+        .route(
+            "/v1/agent/recordings/{session_id}/complete",
+            post(recordings::complete).layer(DefaultBodyLimit::max(MAX_COMPLETE_BODY_BYTES)),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)

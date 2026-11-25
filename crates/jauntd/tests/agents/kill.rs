@@ -414,6 +414,8 @@ async fn a_starting_agent_server_closes_the_sessions_an_earlier_run_left_open() 
             serial,
             login: "deploy",
             max_duration_secs: 3600,
+            pty: true,
+            record_input: false,
             now,
         })
         .await

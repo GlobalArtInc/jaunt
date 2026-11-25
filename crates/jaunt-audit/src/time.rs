@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_MILLIS: i64 = 253_402_300_799_999;
 const MILLIS_PER_SECOND: i64 = 1000;
-const SECONDS_PER_DAY: i64 = 86_400;
+pub(crate) const SECONDS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(i64);
@@ -142,7 +142,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted.rem_euclid(146_097);

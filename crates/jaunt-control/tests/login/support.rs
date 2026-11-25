@@ -314,6 +314,7 @@ impl Harness {
                 policy: policy.clone(),
                 web_enabled: options.web,
                 clock: clock.clock(),
+                recordings: None,
             },
             options.request_limits,
             options.ticker.unwrap_or_else(|| clock.ticker()),

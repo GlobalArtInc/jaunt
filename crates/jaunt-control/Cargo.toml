@@ -17,6 +17,7 @@ jaunt-policy = { workspace = true }
 jaunt-store = { workspace = true }
 jaunt-oidc = { workspace = true }
 jaunt-audit = { workspace = true }
+jaunt-record = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
 jaunt-web = { workspace = true }
@@ -51,3 +52,4 @@ sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
+zstd = { version = "0.14.4", default-features = false }

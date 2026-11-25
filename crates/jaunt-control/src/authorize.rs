@@ -104,6 +104,8 @@ pub(crate) async fn authorize(
             serial: holder.serial,
             login: &request.login,
             max_duration_secs: recorded_duration(permissions.max_duration_secs),
+            pty: permissions.pty,
+            record_input: permissions.record_input,
             now: now.secs,
         })
         .await

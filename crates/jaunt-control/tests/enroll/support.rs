@@ -10,12 +10,14 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use jaunt_audit::{DirectoryLimits, DirectorySink, RecordingSink};
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer, TrustSet};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
-    DeviceSettings, GateEndpoint, NodeAdmin, RequestLimits, SshSuffix, Ticker,
+    DeviceSettings, GateEndpoint, NodeAdmin, RecordingLimits, RecordingSettings, RequestLimits,
+    SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -92,6 +94,15 @@ pub enum UserTrust {
     NotTheSigningKey,
 }
 
+pub type SinkWrapper = Arc<dyn Fn(Arc<dyn RecordingSink>) -> Arc<dyn RecordingSink> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct RecordingOptions {
+    pub limits: RecordingLimits,
+    pub min_free_bytes: u64,
+    pub wrap: Option<SinkWrapper>,
+}
+
 pub struct Options {
     pub host_authority: HostAuthority,
     pub user_trust: UserTrust,
@@ -99,6 +110,7 @@ pub struct Options {
     pub gate_endpoint: Option<&'static str>,
     pub client_ip_header: Option<&'static str>,
     pub trusted_proxies: &'static [&'static str],
+    pub recordings: Option<RecordingOptions>,
 }
 
 impl Default for Options {
@@ -110,6 +122,7 @@ impl Default for Options {
             gate_endpoint: None,
             client_ip_header: None,
             trusted_proxies: &[],
+            recordings: None,
         }
     }
 }
@@ -200,6 +213,7 @@ pub struct Harness {
     pub host_ca: PublicKey,
     pub user_trust: TrustSet,
     pub db_path: PathBuf,
+    pub recordings_dir: PathBuf,
     _provider: FakeProvider,
     _dir: TempDir,
 }
@@ -373,6 +387,23 @@ impl Harness {
         } else {
             loaded_policy(&dir.path().join("policy"))
         };
+        let recordings_dir = dir.path().join("recordings");
+        let recordings = options.recordings.map(|recording| {
+            let sink: Arc<dyn RecordingSink> = Arc::new(
+                DirectorySink::create(
+                    &recordings_dir,
+                    DirectoryLimits {
+                        min_free_bytes: recording.min_free_bytes,
+                        max_total_raw: recording.limits.chunk.max_total_raw,
+                    },
+                )
+                .unwrap(),
+            );
+            RecordingSettings {
+                sink: recording.wrap.map_or(sink.clone(), |wrap| wrap(sink)),
+                limits: recording.limits,
+            }
+        });
         let control = Control::with_limits_and_ticker(
             ControlParts {
                 store: store.clone(),
@@ -402,6 +433,7 @@ impl Harness {
                 policy: policy.clone(),
                 web_enabled: false,
                 clock: clock.clock(),
+                recordings,
             },
             RequestLimits::default(),
             clock.ticker(),
@@ -418,6 +450,7 @@ impl Harness {
             host_ca,
             user_trust,
             db_path,
+            recordings_dir,
             _provider: provider,
             _dir: dir,
         })

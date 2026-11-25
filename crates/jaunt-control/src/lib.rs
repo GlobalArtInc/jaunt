@@ -31,6 +31,7 @@ mod plane;
 mod poll;
 mod principal;
 mod rate_limit;
+mod recordings;
 mod renew;
 mod revocation;
 mod revocation_audit;
@@ -64,6 +65,13 @@ pub use limits::{
     RequestLimits,
 };
 pub use naming::{AgentEndpoint, GateEndpoint, NamingError, SshSuffix};
+pub use recordings::{
+    CHUNK_ENVELOPE_BYTES, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_UPLOADS_PER_NODE,
+    DEFAULT_MAX_UPLOADS_TOTAL, DEFAULT_PENDING_BYTES_PER_NODE, DEFAULT_PENDING_BYTES_TOTAL,
+    DEFAULT_SESSION_PENDING_BYTES, LATE_UPLOAD_SECS, MAX_COMPLETE_BODY_BYTES,
+    PENDING_CHUNK_OVERHEAD, RecordingLimits, RecordingSettings, RecoveredRecordings,
+    chunk_body_limit,
+};
 pub use revocation::{
     ListRevocationsError, MAX_LIST_PAGE, MAX_REASON_CHARS, RevocationAdmin, RevokeError,
     RevokeRequest, Revoked, SESSION_CLOSE_BUDGET, SLOW_REVOCATION_WRITE, UnrevokeError,

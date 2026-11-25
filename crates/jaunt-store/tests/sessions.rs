@@ -108,6 +108,8 @@ impl Fixture {
             serial: self.serial,
             login: "deploy",
             max_duration_secs: MAX_DURATION,
+            pty: true,
+            record_input: false,
             now,
         }
     }
@@ -186,6 +188,8 @@ async fn exactly_one_of_sixteen_concurrent_activations_wins() {
                     serial,
                     login: "deploy",
                     max_duration_secs: MAX_DURATION,
+                    pty: true,
+                    record_input: false,
                     now: NOW + 1,
                 })
                 .await

@@ -2205,6 +2205,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "syn 2.0.119",
  "tempfile",
  "thiserror 2.0.21",
@@ -2252,6 +2253,7 @@ dependencies = [
  "jaunt-oidc",
  "jaunt-policy",
  "jaunt-proto",
+ "jaunt-record",
  "jaunt-ssh",
  "jaunt-store",
  "jaunt-tunnel",
@@ -2268,6 +2270,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -2434,6 +2437,7 @@ dependencies = [
  "jaunt-oidc",
  "jaunt-policy",
  "jaunt-proto",
+ "jaunt-record",
  "jaunt-ssh",
  "jaunt-store",
  "jaunt-tunnel",

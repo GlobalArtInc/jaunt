@@ -6,6 +6,7 @@ mod enrollments;
 mod error;
 mod login_requests;
 mod nodes;
+mod recordings;
 mod revocations;
 mod sessions;
 mod users;
@@ -35,6 +36,10 @@ pub use login_requests::{
 pub use nodes::{
     CertificateState, Labels, NewNodeCertificate, Node, NodeCertificate, NodeCertificateKind,
     NodeKeys, NodeState, Nodes,
+};
+pub use recordings::{
+    MAX_RECORDING_PAGE, Reconciled, Recording, RecordingCursor, RecordingState, Recordings,
+    SESSION_ID_LEN, StoredRecording, UploadTarget, is_session_id,
 };
 pub use revocations::{
     MAX_REVOCATION_PAGE, NewRevocation, Revocation, RevocationCursor, RevocationKind,
@@ -108,6 +113,10 @@ impl Store {
 
     pub fn enrollments(&self) -> Enrollments {
         Enrollments::new(self.pool.clone())
+    }
+
+    pub fn recordings(&self) -> Recordings {
+        Recordings::new(self.pool.clone())
     }
 
     pub fn sessions(&self) -> Sessions {

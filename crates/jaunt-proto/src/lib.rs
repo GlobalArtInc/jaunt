@@ -5,6 +5,7 @@ mod enroll;
 mod error;
 mod login;
 mod plane;
+mod recording;
 mod session;
 mod whoami;
 
@@ -18,6 +19,11 @@ pub use enroll::{
 pub use error::ErrorBody;
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
 pub use plane::{BoxFuture, ControlError, ControlPlane};
+pub use recording::{
+    RECORDING_CHUNKS_SUFFIX, RECORDING_COMPLETE_SUFFIX, RECORDINGS_PATH_PREFIX, RecordingAck,
+    RecordingChunk, RecordingComplete, RecordingKind, RecordingManifest, RecordingReceipt,
+    RecordingRefusal, RecordingState, recording_chunks_path, recording_complete_path,
+};
 pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
     RouteRequest, SessionEnd, SessionEndOutcome, SessionPermissions,

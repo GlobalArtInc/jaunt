@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use jaunt_ca::CaKind;
 use jaunt_store::RevocationKind;
-use jauntd::{ca, ca_rotation, node, revoke};
+use jauntd::{ca, ca_rotation, node, recordings, revoke};
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt control daemon")]
@@ -53,6 +53,11 @@ enum Command {
     Revocations {
         #[command(subcommand)]
         command: RevocationsCommand,
+    },
+    #[command(about = "Session recording commands")]
+    Recordings {
+        #[command(subcommand)]
+        command: RecordingsCommand,
     },
 }
 
@@ -129,6 +134,12 @@ impl From<RevocationsCommand> for revoke::RevokeAction {
             RevocationsCommand::Rm { id } => revoke::RevokeAction::Remove { id },
         }
     }
+}
+
+#[derive(Subcommand)]
+enum RecordingsCommand {
+    #[command(about = "Check a stored recording against the digests taken when it was accepted")]
+    Verify { session_id: String },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +246,9 @@ fn main() -> ExitCode {
         } => not_implemented("db copy"),
         Command::Revoke { command } => revoke::run(&cli.config, command.into()),
         Command::Revocations { command } => revoke::run(&cli.config, command.into()),
+        Command::Recordings {
+            command: RecordingsCommand::Verify { session_id },
+        } => recordings::verify_command(&cli.config, &session_id),
     }
 }
 

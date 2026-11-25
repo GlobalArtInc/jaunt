@@ -51,4 +51,8 @@ pub enum ControlError {
     PurgeWebSessions(#[source] StoreError),
     #[error("closing ended sessions failed: {0}")]
     Sessions(#[source] StoreError),
+    #[error("every recording limit must be positive")]
+    RecordingLimits,
+    #[error("recovering the recordings interrupted by the last stop failed: {0}")]
+    RecoverRecordings(#[source] StoreError),
 }

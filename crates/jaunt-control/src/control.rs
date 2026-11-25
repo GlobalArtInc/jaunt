@@ -27,6 +27,7 @@ use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
 use crate::rate_limit;
+use crate::recordings::{self, RecordingSettings, RecoveredRecordings, RejectionLog, Uploads};
 use crate::revocation::RevocationAdmin;
 use crate::serve;
 use crate::session_sweep::RevocationWatch;
@@ -57,6 +58,7 @@ pub struct ControlParts {
     pub policy: PolicyHandle,
     pub web_enabled: bool,
     pub clock: Clock,
+    pub recordings: Option<RecordingSettings>,
 }
 
 pub struct Inner {
@@ -82,6 +84,8 @@ pub struct Inner {
     ticker: Ticker,
     pub(crate) killer: Arc<KillerSlot>,
     pub(crate) watched: Arc<RevocationWatch>,
+    pub(crate) recordings: Option<Uploads>,
+    pub(crate) recording_rejections: RejectionLog,
 }
 
 #[derive(Clone)]
@@ -144,6 +148,13 @@ impl Control {
             .host_trust
             .to_authorized_lines()
             .map_err(ControlError::HostKeys)?;
+        if parts
+            .recordings
+            .as_ref()
+            .is_some_and(|settings| !settings.limits.is_usable())
+        {
+            return Err(ControlError::RecordingLimits);
+        }
         let web = WebState::new(parts.web_enabled, &parts.device.public_origin);
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
@@ -173,6 +184,8 @@ impl Control {
                 ticker,
                 killer: Arc::default(),
                 watched: Arc::new(watched),
+                recordings: parts.recordings.map(Uploads::new),
+                recording_rejections: RejectionLog::default(),
             }),
         })
     }
@@ -314,6 +327,23 @@ impl Control {
         Ok(ended.len())
     }
 
+    pub async fn sweep_idle_recordings(&self) -> usize {
+        recordings::sweep(self).await
+    }
+
+    #[doc(hidden)]
+    pub fn recording_upload_waiters(&self, session_id: &str) -> usize {
+        self.recordings
+            .as_ref()
+            .map_or(0, |uploads| uploads.waiting_for(session_id))
+    }
+
+    pub async fn recover_recordings(&self) -> Result<RecoveredRecordings, ControlError> {
+        recordings::recover(self)
+            .await
+            .map_err(ControlError::RecoverRecordings)
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
@@ -393,6 +423,7 @@ async fn sweep_forever(control: Control) {
         if let Err(err) = control.purge_web_sessions().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired web sessions failed");
         }
+        control.sweep_idle_recordings().await;
     }
 }
 
@@ -504,6 +535,7 @@ mod tests {
             policy: policy.clone(),
             web_enabled: false,
             clock: system_clock(),
+            recordings: None,
         })
         .unwrap();
 

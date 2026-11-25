@@ -3,9 +3,29 @@ use jaunt_store::{EndOutcome, EndRejection, EndSession};
 
 use crate::control::Control;
 use crate::plane::{check_fields, clock_failure, store_failure};
+use crate::recordings;
 use crate::session_audit::{self, Ended};
 
 pub(crate) async fn session_end(
+    control: &Control,
+    caller: NodeCaller,
+    request: SessionEnd,
+) -> Result<SessionEndOutcome, PlaneError> {
+    let control = control.clone();
+    match tokio::spawn(async move { end_and_reconcile(&control, caller, request).await }).await {
+        Ok(outcome) => outcome,
+        Err(err) if err.is_cancelled() => {
+            tracing::warn!(target: "jaunt::control", "ending a session was cancelled by the runtime shutting down");
+            Err(PlaneError::Store)
+        }
+        Err(_) => {
+            tracing::error!(target: "jaunt::control", "ending a session panicked");
+            Err(PlaneError::Store)
+        }
+    }
+}
+
+async fn end_and_reconcile(
     control: &Control,
     caller: NodeCaller,
     request: SessionEnd,
@@ -42,13 +62,36 @@ pub(crate) async fn session_end(
                 bytes_out,
                 recording_incomplete: request.recording_incomplete,
             });
+            recordings::reconcile_after_end(
+                control,
+                &session.id,
+                &session.node_id,
+                request.recording_incomplete,
+            )
+            .await;
+            Ok(SessionEndOutcome::Recorded)
+        }
+        EndOutcome::Repeated => {
+            recordings::reconcile_after_end(
+                control,
+                &request.session_id,
+                &node_id,
+                request.recording_incomplete,
+            )
+            .await;
             Ok(SessionEndOutcome::Recorded)
         }
         EndOutcome::Late(session) => {
             session_audit::late_end(&session);
+            recordings::reconcile_after_end(
+                control,
+                &session.id,
+                &session.node_id,
+                request.recording_incomplete,
+            )
+            .await;
             Ok(SessionEndOutcome::Recorded)
         }
-        EndOutcome::Repeated => Ok(SessionEndOutcome::Recorded),
         EndOutcome::Rejected(rejection) => {
             if rejection == EndRejection::ClosedByControl {
                 tracing::warn!(

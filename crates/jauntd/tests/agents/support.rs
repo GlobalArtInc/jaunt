@@ -27,6 +27,7 @@ use jaunt_tunnel::{
     TunnelClientConfig, agent_client_config,
 };
 use jauntd::agents::{AgentServer, AgentServerParts, AgentsSettings, ApiLimits};
+use jauntd::recordings::{PreparedRecordings, RecordingsSettings};
 use rcgen::{KeyPair, PKCS_ED25519, PublicKeyData};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -82,6 +83,7 @@ pub struct Options {
     pub reconcile_interval: Option<Duration>,
     pub session_sweep_interval: Option<Duration>,
     pub agent_gone_after: Option<Duration>,
+    pub recordings: Option<RecordingsSettings>,
 }
 
 pub struct Authorities {
@@ -98,6 +100,7 @@ pub struct Harness {
     pub clock: TestClock,
     pub authorities: Authorities,
     pub db_path: PathBuf,
+    pub recordings: Option<PreparedRecordings>,
     issuer: InternalCa,
     _discovery: FakeDiscovery,
     _dir: TempDir,
@@ -145,6 +148,10 @@ impl Harness {
         let store = Store::open(&db_path).await.unwrap();
         store.migrate().await.unwrap();
         let discovery = FakeDiscovery::start().await;
+        let recordings = options
+            .recordings
+            .as_ref()
+            .map(|settings| jauntd::recordings::prepare(settings).unwrap());
         let control = Control::new(ControlParts {
             store: store.clone(),
             oidc: discovery.client().await,
@@ -167,6 +174,9 @@ impl Harness {
             policy: PolicyHandle::empty(),
             web_enabled: false,
             clock: Arc::new(SystemTime::now),
+            recordings: recordings
+                .as_ref()
+                .map(|prepared| prepared.settings.clone()),
         })
         .unwrap();
         let clock = TestClock::starting_days_ago(options.clock_days_behind);
@@ -202,6 +212,7 @@ impl Harness {
             authorities,
             issuer,
             db_path,
+            recordings,
             _discovery: discovery,
             _dir: dir,
         }

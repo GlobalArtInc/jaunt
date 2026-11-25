@@ -29,6 +29,7 @@ use jauntd::audit::{self, AuditRuntime, AuditStartError, Surface};
 use jauntd::ca::{self, Authorities};
 use jauntd::config::{self, ConfigError, EnvLookup, RunSettings};
 use jauntd::logging::{self, LoggingError};
+use jauntd::recordings::{self, RecordingsStartError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -74,6 +75,8 @@ pub enum ServeError {
     Gate(#[from] GateSshError),
     #[error("cannot start the audit pipeline: {0}")]
     Audit(#[from] AuditStartError),
+    #[error(transparent)]
+    Recordings(#[from] RecordingsStartError),
 }
 
 pub fn run(config_path: &Path, env: EnvLookup<'_>) -> Result<(), ServeError> {
@@ -328,6 +331,14 @@ async fn start(
                 )
             })
             .transpose()?;
+        let prepared_recordings = settings
+            .recordings
+            .as_ref()
+            .map(recordings::prepare)
+            .transpose()?;
+        if prepared_recordings.is_some() {
+            recordings::raise_open_file_limit();
+        }
         let control = Control::with_request_limits(
             ControlParts {
                 store,
@@ -346,9 +357,15 @@ async fn start(
                 policy: policy.clone(),
                 web_enabled: settings.web,
                 clock: system_clock(),
+                recordings: prepared_recordings
+                    .as_ref()
+                    .map(|prepared| prepared.settings.clone()),
             },
             settings.limits.http,
         )?;
+        if let Some(prepared) = &prepared_recordings {
+            recordings::recover(prepared, &control).await?;
+        }
         let watcher = policy::start_watcher(policy, settings.policy_dir, settings.policy_poll);
         Ok(Started {
             control,

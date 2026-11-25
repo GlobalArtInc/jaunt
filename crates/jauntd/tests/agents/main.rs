@@ -4,6 +4,7 @@ mod kill;
 mod limits;
 mod oidc;
 mod recorder;
+mod recordings;
 mod stand;
 mod support;
 

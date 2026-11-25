@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::audit::{AuditConfigError, AuditSection, AuditSettings};
 use crate::limits::{LimitSettings, LimitsError, LimitsSection};
+use crate::recordings::{RecordingsConfigError, RecordingsSection, RecordingsSettings};
 
 pub const CLIENT_SECRET_VAR: &str = "JAUNT_OIDC_CLIENT_SECRET";
 
@@ -65,6 +66,8 @@ pub struct Config {
     pub audit: AuditSection,
     #[serde(default)]
     pub limits: LimitsSection,
+    #[serde(default)]
+    pub recordings: RecordingsSection,
 }
 
 #[derive(Deserialize)]
@@ -111,12 +114,15 @@ pub struct RunSettings {
     pub oidc: OidcConfig,
     pub audit: AuditSettings,
     pub limits: LimitSettings,
+    pub recordings: Option<RecordingsSettings>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(transparent)]
     Audit(#[from] AuditConfigError),
+    #[error(transparent)]
+    Recordings(#[from] RecordingsConfigError),
     #[error("public_url is required to run the daemon")]
     MissingPublicUrl,
     #[error("public_url {0}")]
@@ -270,6 +276,7 @@ impl Config {
             return Err(ConfigError::PolicyPollOutOfRange);
         }
         let audit = self.audit.into_settings()?;
+        let recordings = self.recordings.into_settings()?;
         let client_ip_header = self
             .client_ip_header
             .map(|name| validate_header_name(&name))
@@ -367,6 +374,7 @@ impl Config {
             oidc,
             audit,
             limits,
+            recordings,
         })
     }
 }
@@ -594,6 +602,24 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, ConfigError::Audit(_)), "{err}");
+    }
+
+    #[test]
+    fn the_recordings_section_reaches_the_run_settings_and_a_bad_one_stops_startup() {
+        let off = parse("").into_run_settings(&secret_env).unwrap();
+        assert!(off.recordings.is_none());
+        let on = parse("recordings:\n  dir: /var/lib/jaunt/recordings\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(
+            on.recordings.map(|recordings| recordings.dir),
+            Some(PathBuf::from("/var/lib/jaunt/recordings"))
+        );
+        let err = parse("recordings:\n  dir: relative\n")
+            .into_run_settings(&secret_env)
+            .err()
+            .unwrap();
+        assert!(matches!(err, ConfigError::Recordings(_)), "{err}");
     }
 
     fn parse(extra: &str) -> Config {
