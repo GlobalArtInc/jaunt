@@ -1,0 +1,18 @@
+{
+  "name": "jaunt-web-tests",
+  "private": true,
+  "type": "module",
+  "description": "Dev-only tests for the embedded web console; not part of the product",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"unit/*.test.mjs\"",
+    "smoke": "node smoke/run.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "31.0.1",
+    "playwright": "1.65.1"
+  }
+}

@@ -7,7 +7,7 @@ use crate::http::{empty_response, server_error};
 
 const FILE_DIRECTORY: &str = "assets";
 const INDEX_CACHE_CONTROL: &str = "no-cache";
-const FILE_CACHE_CONTROL: &str = "public, max-age=3600";
+const FILE_CACHE_CONTROL: &str = "no-cache";
 
 pub(crate) async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path();

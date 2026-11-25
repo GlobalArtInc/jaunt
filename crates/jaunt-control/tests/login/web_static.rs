@@ -50,11 +50,11 @@ async fn pages_json_assets_and_errors_all_carry_the_strict_headers() {
             harness.web_get("/nodes", None).await,
             "no-cache",
         ),
-        ("asset", etag, "public, max-age=3600"),
+        ("asset", etag, "no-cache"),
         (
             "stylesheet",
             harness.web_get("/assets/app.css", None).await,
-            "public, max-age=3600",
+            "no-cache",
         ),
         (
             "json 401",
@@ -98,7 +98,7 @@ async fn pages_json_assets_and_errors_all_carry_the_strict_headers() {
                     &[("if-none-match", &tag)],
                 )
                 .await,
-            "public, max-age=3600",
+            "no-cache",
         ),
         ("sign-in page", signed.reply, "no-store"),
         ("sign-in failure page", refused, "no-store"),
@@ -156,6 +156,30 @@ async fn embedded_files_are_served_with_their_type_a_strong_etag_and_conditional
     let js = harness.web_get("/assets/app.js", None).await;
     let css = harness.web_get("/assets/app.css", None).await;
     assert_ne!(js.header("etag"), css.header("etag"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_embedded_file_including_nested_modules_is_served_with_its_type_and_etag() {
+    let harness = Harness::with_web().await;
+
+    let mut nested = 0;
+    for asset in jaunt_web::assets() {
+        let path = format!("/{}", asset.path);
+        let reply = harness.web_get(&path, None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{path}");
+        assert_eq!(reply.header("content-type"), asset.content_type, "{path}");
+        assert_eq!(reply.header("etag"), asset.etag, "{path}");
+        assert_eq!(reply.header("cache-control"), "no-cache", "{path}");
+        assert_eq!(reply.body, asset.bytes, "{path}");
+        let revalidated = harness
+            .web_request(Method::GET, &path, None, &[("if-none-match", asset.etag)])
+            .await;
+        assert_eq!(revalidated.status, StatusCode::NOT_MODIFIED, "{path}");
+        if asset.path.matches('/').count() >= 2 {
+            nested += 1;
+        }
+    }
+    assert!(nested >= 10, "{nested}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

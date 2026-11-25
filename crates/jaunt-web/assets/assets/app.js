@@ -1,12 +1,3 @@
-const status = document.getElementById("status");
+import { start } from "./js/app.js";
 
-fetch("/v1/web/session", { credentials: "same-origin" })
-  .then((response) => (response.ok ? response.json() : null))
-  .then((session) => {
-    if (session) {
-      status.textContent = "Signed in as " + session.email;
-    }
-  })
-  .catch(() => {
-    status.textContent = "The server could not be reached.";
-  });
+start(document.getElementById("app"));

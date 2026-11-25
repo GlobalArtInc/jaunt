@@ -33,19 +33,21 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_page_and_the_placeholder_app_are_embedded_with_their_types() {
+    fn the_entry_page_the_module_entry_and_the_stylesheet_are_embedded_with_their_types() {
         let entry = entry().unwrap();
         assert_eq!(entry.path, ENTRY_PATH);
         assert_eq!(entry.content_type, "text/html; charset=utf-8");
-        assert_eq!(
-            find("assets/app.js").unwrap().content_type,
-            "text/javascript; charset=utf-8"
-        );
-        assert_eq!(
-            find("assets/app.css").unwrap().content_type,
-            "text/css; charset=utf-8"
-        );
-        assert!(!find("assets/app.js").unwrap().bytes.is_empty());
+        for path in ["assets/app.js", "assets/js/app.js", "assets/theme-init.js"] {
+            let asset = find(path).unwrap();
+            assert_eq!(
+                asset.content_type, "text/javascript; charset=utf-8",
+                "{path}"
+            );
+            assert!(!asset.bytes.is_empty(), "{path}");
+        }
+        let css = find("assets/app.css").unwrap();
+        assert_eq!(css.content_type, "text/css; charset=utf-8");
+        assert!(!css.bytes.is_empty());
     }
 
     #[test]
@@ -92,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_page_has_no_inline_script_or_style() {
+    fn the_entry_page_has_no_inline_script_or_style() {
         let page = text_of(ENTRY_PATH);
         for (start, _) in page.match_indices("<script") {
             let tag = &page[start..start + page[start..].find('>').unwrap()];
@@ -100,5 +102,90 @@ mod tests {
         }
         assert!(!page.contains("<style") && !page.contains(" style="));
         assert!(!page.contains("javascript:"));
+    }
+
+    fn quoted_paths(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for marker in ["from \"", "src=\"", "href=\""] {
+            for (start, _) in source.match_indices(marker) {
+                let rest = &source[start + marker.len()..];
+                if let Some(end) = rest.find('"') {
+                    found.push(rest[..end].to_owned());
+                }
+            }
+        }
+        found
+    }
+
+    fn resolve(base: &str, reference: &str) -> Option<String> {
+        if let Some(absolute) = reference.strip_prefix('/') {
+            return Some(absolute.to_owned());
+        }
+        if !reference.starts_with("./") && !reference.starts_with("../") {
+            return None;
+        }
+        let mut segments: Vec<&str> = base.split('/').collect();
+        segments.pop();
+        for part in reference.split('/') {
+            match part {
+                "." => {}
+                ".." => {
+                    segments.pop()?;
+                }
+                other => segments.push(other),
+            }
+        }
+        Some(segments.join("/"))
+    }
+
+    #[test]
+    fn every_asset_the_page_or_a_module_refers_to_is_embedded() {
+        let mut checked = 0;
+        for asset in assets() {
+            if !(asset.path.ends_with(".js") || asset.path.ends_with(".html")) {
+                continue;
+            }
+            for reference in quoted_paths(text_of(asset.path)) {
+                if reference.starts_with('#') || reference.starts_with("http") {
+                    continue;
+                }
+                let Some(target) = resolve(asset.path, &reference) else {
+                    continue;
+                };
+                if !(target.ends_with(".js") || target.ends_with(".css")) {
+                    continue;
+                }
+                assert!(
+                    find(&target).is_some(),
+                    "{} refers to {reference}, which is not embedded",
+                    asset.path
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "{checked}");
+    }
+
+    #[test]
+    fn no_asset_can_turn_data_into_markup_or_code() {
+        let forbidden = [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function(",
+            "javascript:",
+            "@import",
+            "http://",
+            "https://",
+        ];
+        for asset in assets() {
+            let source = text_of(asset.path);
+            for needle in forbidden {
+                assert!(!source.contains(needle), "{} contains {needle}", asset.path);
+            }
+            assert!(!source.contains(" style=\""), "{}", asset.path);
+        }
     }
 }

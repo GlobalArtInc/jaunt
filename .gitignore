@@ -3,3 +3,6 @@
 .env
 *.pem
 *.key
+/web-tests/node_modules
+/web-tests/screenshots-out
+/web-tests/test-results
