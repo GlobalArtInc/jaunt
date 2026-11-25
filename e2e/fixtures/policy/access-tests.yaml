@@ -1,0 +1,9 @@
+apiVersion: jaunt/v1
+kind: AccessTest
+spec:
+  - { user: alice@e2e.test, node: { env: test }, login: deploy, expect: allow }
+  - { user: alice@e2e.test, node: { env: prod }, login: deploy, expect: allow }
+  - { user: bob@e2e.test, node: { env: test }, login: deploy, expect: allow }
+  - { user: bob@e2e.test, node: { env: prod }, login: deploy, expect: deny }
+  - { user: carol@e2e.test, node: { env: test }, login: deploy, expect: deny }
+  - { user: carol@e2e.test, node: { env: prod }, login: deploy, expect: deny }

@@ -520,38 +520,8 @@ qualify_image() {
   esac
 }
 
-select_rust_image() {
-  if [ -n "${INSTALLER_RUST_IMAGE:-}" ]; then
-    printf '%s' "$INSTALLER_RUST_IMAGE"
-    return
-  fi
-  local channel exact minor
-  channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' "$repo/rust-toolchain.toml")
-  if [ -z "$channel" ]; then
-    echo "cannot read the toolchain channel from rust-toolchain.toml" >&2
-    exit 2
-  fi
-  exact=docker.io/library/rust:${channel}-bookworm
-  minor=docker.io/library/rust:${channel%.*}-bookworm
-  if "$engine" image inspect "$exact" >/dev/null 2>&1; then
-    printf '%s' "$exact"
-  elif "$engine" image inspect "$minor" >/dev/null 2>&1; then
-    printf '%s' "$minor"
-  else
-    printf '%s' "$exact"
-  fi
-}
-
 build_binaries() {
-  local rust_image
-  rust_image=$(select_rust_image)
-  echo "building the Linux agent and test stand in $rust_image"
-  "$engine" run --rm --security-opt label=disable \
-    -v "$repo:/src" -w /src \
-    -v jaunt-installer-cargo-registry:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/src/target/installer-linux \
-    -e CARGO_INCREMENTAL=0 \
-    "$rust_image" cargo build -p jaunt-agent --locked --release --bin jaunt-agent --example ssh_stand
+  build_linux_binaries -p jaunt-agent --bin jaunt-agent --example ssh_stand
 }
 
 run_image() {
@@ -574,6 +544,7 @@ main() {
   engine=${CONTAINER_ENGINE:-podman}
   script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
   repo=$(cd "$(dirname "$script_path")/.." && pwd)
+  source "$repo/scripts/linux-build.sh"
   binaries=$repo/target/installer-linux/release
   build_binaries
   local image status=0

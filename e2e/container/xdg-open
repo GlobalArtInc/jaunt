@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+exec curl -sS -L --max-redirs 10 --max-time 20 --cacert /certs/e2e-test-only-ca.pem \
+  -b "$HOME/.idp-cookies" -c "$HOME/.idp-cookies" -o /dev/null "$1"

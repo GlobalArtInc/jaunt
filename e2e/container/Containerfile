@@ -1,0 +1,23 @@
+ARG BASE=docker.io/library/debian:13
+FROM ${BASE}
+RUN set -eu; \
+    if command -v apt-get >/dev/null 2>&1; then \
+      export DEBIAN_FRONTEND=noninteractive; \
+      apt-get update -qq; \
+      apt-get install -y -qq --no-install-recommends openssh-server openssh-client procps iproute2 rsync python3 socat curl openssl ca-certificates util-linux >/dev/null; \
+      rm -rf /var/lib/apt/lists/*; \
+    elif command -v dnf >/dev/null 2>&1; then \
+      dnf install -y -q openssh-server openssh-clients procps-ng iproute rsync python3 socat openssl util-linux findutils >/dev/null; \
+      dnf clean all >/dev/null; \
+    else \
+      echo "unsupported base image: neither apt-get nor dnf is available" >&2; \
+      exit 2; \
+    fi; \
+    mkdir -p /run/sshd; \
+    if [ -f /etc/pam.d/sshd ]; then \
+      sed -i 's/^\(session[[:space:]]\{1,\}\)required\([[:space:]]\{1,\}pam_loginuid.so\)/\1optional\2/' /etc/pam.d/sshd; \
+    fi; \
+    useradd -m -s /bin/bash -p '*' deploy; \
+    for user in alice bob carol; do useradd -m -s /bin/bash -p '*' "$user"; done; \
+    groupadd --system --gid 65532 jauntd; \
+    useradd --system --uid 65532 --gid 65532 --no-create-home --home-dir /var/lib/jaunt --shell /usr/sbin/nologin jauntd

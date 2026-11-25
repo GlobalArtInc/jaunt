@@ -1,0 +1,27 @@
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: ops }
+spec:
+  members: { users: [alice@e2e.test] }
+  ssh:
+    nodes: { env: [test, prod] }
+    logins: [deploy]
+    portForwarding: true
+    recordInput: false
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: limited }
+spec:
+  members: { users: [bob@e2e.test] }
+  ssh:
+    nodes: { env: [test] }
+    logins: [deploy]
+    portForwarding: false
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: admins }
+spec:
+  members: { users: [admin@e2e.test] }
+  admin: [nodes.approve, sessions.read, recordings.read, revocations.write, audit.read]

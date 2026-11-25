@@ -35,6 +35,15 @@ installer-containers:
 ssh-containers *images="debian:13 rockylinux:9":
     scripts/test-ssh-bridge.sh {{images}}
 
+e2e *images:
+    python3 e2e/run.py {{images}}
+
+e2e-web:
+    python3 e2e/run.py --web
+
+e2e-down:
+    python3 e2e/run.py --down
+
 pg-migrations:
     : "${DATABASE_URL:?DATABASE_URL is required}"; for file in crates/jaunt-store/migrations/*.sql; do psql "$DATABASE_URL" -1 -v ON_ERROR_STOP=1 -q -f "$file" || exit 1; done
 
