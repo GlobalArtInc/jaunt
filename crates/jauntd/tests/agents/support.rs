@@ -82,6 +82,7 @@ pub struct Options {
     pub api_limits: Option<ApiLimits>,
     pub reconcile_interval: Option<Duration>,
     pub session_sweep_interval: Option<Duration>,
+    pub revocation_watch_interval: Option<Duration>,
     pub agent_gone_after: Option<Duration>,
     pub recordings: Option<RecordingsSettings>,
     pub web: bool,
@@ -192,6 +193,9 @@ impl Harness {
         }
         if let Some(every) = options.session_sweep_interval {
             parts.session_sweep_interval = every;
+        }
+        if let Some(every) = options.revocation_watch_interval {
+            parts.revocation_watch_interval = every;
         }
         if let Some(after) = options.agent_gone_after {
             parts.agent_gone_after = after;

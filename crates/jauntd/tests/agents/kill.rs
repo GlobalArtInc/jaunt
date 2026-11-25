@@ -15,6 +15,15 @@ use crate::support::{AGENTS_NAME, Harness, Options, eventually, unix_secs, withi
 
 const KILL_BUDGET: Duration = Duration::from_secs(5);
 const WATCH_BUDGET: Duration = Duration::from_millis(2500);
+const IDLE: Duration = Duration::from_secs(3600);
+
+fn inline_enforcement_only() -> Options {
+    Options {
+        revocation_watch_interval: Some(IDLE),
+        reconcile_interval: Some(IDLE),
+        ..Options::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Teardown {
@@ -72,7 +81,7 @@ fn millis(durations: &[Duration]) -> Vec<u128> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_user_loses_the_live_session_on_both_ends_within_five_seconds_in_ten_runs() {
-    let stand = Stand::start(&["web-01"]).await;
+    let stand = Stand::start_with(&["web-01"], inline_enforcement_only()).await;
     let mut gate_ends = Vec::new();
     let mut both_ends = Vec::new();
     for _ in 0..10 {
@@ -120,7 +129,7 @@ async fn a_revoked_user_loses_the_live_session_on_both_ends_within_five_seconds_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_serial_or_node_loses_its_session_and_every_new_connection() {
     for kind in [RevocationKind::Serial, RevocationKind::Node] {
-        let stand = Stand::start(&["web-01"]).await;
+        let stand = Stand::start_with(&["web-01"], inline_enforcement_only()).await;
         let identity = stand.identity().await;
         let spare = stand.identity().await;
         let (outer, mut inner) = stand.session(&identity, "web-01").await;
@@ -199,7 +208,7 @@ async fn revoking_one_serial_leaves_the_connection_of_the_other_serial_alive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_user_loses_the_sessions_on_both_nodes() {
-    let stand = Stand::start(&["web-01", "web-02"]).await;
+    let stand = Stand::start_with(&["web-01", "web-02"], inline_enforcement_only()).await;
     let identity = stand.identity().await;
     let (first_outer, first) = stand.session(&identity, "web-01").await;
     let (second_outer, second) = stand.session(&identity, "web-02").await;
@@ -240,7 +249,7 @@ async fn a_revoked_user_loses_the_sessions_on_both_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_still_waiting_for_authorize_is_closed_by_the_revocation() {
-    let stand = Stand::start(&["web-01"]).await;
+    let stand = Stand::start_with(&["web-01"], inline_enforcement_only()).await;
     let identity = stand.identity().await;
     let outer = stand.connect(&identity).await;
     let mut forward = outer.forward("web-01").await.unwrap();

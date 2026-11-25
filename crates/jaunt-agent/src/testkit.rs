@@ -4,7 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::Router;
@@ -39,6 +39,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::Registry;
 use tracing_subscriber::fmt::MakeWriter;
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
@@ -373,6 +374,15 @@ impl Clock for ManualClock {
     }
 }
 
+fn keep_callsites_enabled() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        if tracing::subscriber::set_global_default(Registry::default()).is_err() {
+            assert!(tracing::dispatcher::has_been_set());
+        }
+    });
+}
+
 #[derive(Clone, Default)]
 pub struct LogCapture(Arc<Mutex<Vec<u8>>>);
 
@@ -382,6 +392,7 @@ impl LogCapture {
     }
 
     pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        keep_callsites_enabled();
         let filter = crate::run::logging::build_filter(Some("info,jaunt=debug")).unwrap();
         tracing::subscriber::set_default(crate::run::logging::subscriber(filter, self.clone()))
     }

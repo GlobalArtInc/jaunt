@@ -15,6 +15,7 @@ use crate::file::{FileBackend, MAX_PRIVATE_LEN};
 use crate::fsutil::fingerprint_hex;
 use crate::identity::{AgeIdentity, AgeRecipient, encrypt};
 use crate::kind::CaKind;
+use crate::test_support::acquire_lock;
 use crate::trust::KeyRole;
 
 const KIND: CaKind = CaKind::User;
@@ -94,7 +95,7 @@ fn prepared(op: Op) -> Fixture {
     if op == Op::AddNext {
         return fixture;
     }
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let next = FileBackend::add_next(&lock, KIND, &fixture.identity).unwrap();
     fixture.second = Some(fingerprint_hex(&next));
     if op == Op::Retire {
@@ -202,7 +203,7 @@ fn run_op(
     op: Op,
     after_step: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<(), CaError> {
-    let lock = CaLock::acquire(&fixture.root)?;
+    let lock = acquire_lock(&fixture.root)?;
     let trust = FileBackend::read_slot(&fixture.root, KIND)?.trust;
     match op {
         Op::AddNext => {
@@ -258,7 +259,7 @@ fn a_full_rotation_moves_a_key_from_active_to_retired_and_deletes_its_private_ke
         .unwrap()
         .trust
         .set_id();
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
 
     let second = fingerprint_hex(&FileBackend::add_next(&lock, KIND, &fixture.identity).unwrap());
     let staged = FileBackend::read_slot(&fixture.root, KIND).unwrap().trust;
@@ -330,7 +331,7 @@ fn a_full_rotation_moves_a_key_from_active_to_retired_and_deletes_its_private_ke
 fn a_second_next_key_is_refused_and_nothing_changes() {
     let fixture = prepared(Op::Promote);
     let before = shape(&fixture.root);
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     assert!(matches!(
         FileBackend::add_next(&lock, KIND, &fixture.identity),
         Err(CaError::NextKeyExists(KIND))
@@ -341,7 +342,7 @@ fn a_second_next_key_is_refused_and_nothing_changes() {
 #[test]
 fn promote_is_refused_while_a_previous_key_is_present() {
     let fixture = prepared(Op::Retire);
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let third = FileBackend::add_next(&lock, KIND, &fixture.identity).unwrap();
     let before = shape(&fixture.root);
     assert!(matches!(
@@ -360,7 +361,7 @@ fn promote_is_refused_while_a_previous_key_is_present() {
 fn operations_refuse_a_slot_that_changed_since_the_check() {
     let promote = prepared(Op::Promote);
     let stranger = crate::test_support::subject_key().fingerprint(HashAlg::Sha256);
-    let lock = CaLock::acquire(&promote.root).unwrap();
+    let lock = acquire_lock(&promote.root).unwrap();
     assert!(matches!(
         FileBackend::promote(&lock, KIND, &promote.identity, &stranger),
         Err(CaError::SlotChanged(KIND))
@@ -369,7 +370,7 @@ fn operations_refuse_a_slot_that_changed_since_the_check() {
 
     let retire = prepared(Op::Retire);
     let before = shape(&retire.root);
-    let lock = CaLock::acquire(&retire.root).unwrap();
+    let lock = acquire_lock(&retire.root).unwrap();
     for expected in [Vec::new(), vec![stranger]] {
         assert!(matches!(
             FileBackend::retire(&lock, KIND, &expected),
@@ -393,7 +394,7 @@ fn promote_is_refused_when_the_next_key_does_not_decrypt() {
         .unwrap();
     fs::copy(other_age, dir.join(format!("{second}.age"))).unwrap();
     let before = shape(&fixture.root);
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let next = fingerprint_from(&second);
 
     let err = FileBackend::promote(&lock, KIND, &fixture.identity, &next).unwrap_err();
@@ -407,7 +408,7 @@ fn promote_is_refused_when_the_next_key_does_not_decrypt() {
 fn add_next_is_refused_with_an_identity_that_cannot_open_the_active_key() {
     let fixture = fixture();
     let before = shape(&fixture.root);
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     assert!(matches!(
         FileBackend::add_next(&lock, KIND, &AgeIdentity::generate()),
         Err(CaError::Decrypt)
@@ -420,7 +421,7 @@ fn the_internal_authority_is_not_rotated() {
     let dir = tempfile::tempdir().unwrap();
     let identity = AgeIdentity::generate();
     let key = FileBackend::init(dir.path(), CaKind::Internal, &identity.recipient()).unwrap();
-    let lock = CaLock::acquire(dir.path()).unwrap();
+    let lock = acquire_lock(dir.path()).unwrap();
     let fingerprint = key.fingerprint(HashAlg::Sha256);
     let refused = |result: Result<(), CaError>| {
         matches!(result, Err(CaError::RotationUnsupported(CaKind::Internal)))
@@ -494,7 +495,7 @@ fn a_crash_after_any_write_step_leaves_a_directory_that_loads_and_unlocks() {
             let expected_exit = if step <= steps { CRASH_EXIT } else { 0 };
             assert_eq!(child.status.code(), Some(expected_exit), "{context}");
             assert_loads(&fixture, &context);
-            assert!(CaLock::acquire(&fixture.root).is_ok(), "{context}");
+            assert!(acquire_lock(&fixture.root).is_ok(), "{context}");
             let after = shape(&fixture.root);
             match op {
                 Op::AddNext => assert_add_next_crash(&fixture, &before, &after, step),
@@ -531,7 +532,7 @@ fn assert_add_next_crash(fixture: &Fixture, before: &Shape, after: &Shape, step:
 }
 
 fn recover(fixture: &Fixture, op: Op) {
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     match op {
         Op::AddNext => {
             if shape(&fixture.root).next.is_none() {
@@ -606,7 +607,7 @@ fn fingerprint_from(hex: &str) -> Fingerprint {
 fn the_previous_binary_still_loads_every_rotated_directory() {
     let fixture = fixture();
     fs::create_dir(fixture.root.join(KIND.as_str()).join("retired")).unwrap();
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let next = FileBackend::add_next(&lock, KIND, &fixture.identity).unwrap();
     let (active, trusted) = previous_binary_load(&fixture.root, &fixture.identity);
     assert_eq!(active, fixture.first);
@@ -637,7 +638,7 @@ fn a_stale_next_equal_to_the_active_key_is_ignored_and_cleared_by_add_next() {
         expected_shape(&fixture, Op::Retire, 0)
     );
 
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let third = FileBackend::add_next(&lock, KIND, &fixture.identity).unwrap();
     assert_eq!(shape(&fixture.root).next, Some(fingerprint_hex(&third)));
 }
@@ -672,7 +673,7 @@ fn a_held_lock_refuses_a_second_command_until_it_is_released() {
     let identity = &fixture.identity;
     thread::scope(|scope| {
         let first = scope.spawn(move || {
-            let lock = CaLock::acquire(root).unwrap();
+            let lock = acquire_lock(root).unwrap();
             let paused = AtomicBool::new(false);
             let pause_once = |_: &Path| {
                 if !paused.swap(true, Ordering::SeqCst) {
@@ -688,7 +689,7 @@ fn a_held_lock_refuses_a_second_command_until_it_is_released() {
         release_tx.send(()).unwrap();
         first.join().unwrap().unwrap();
     });
-    let lock = CaLock::acquire(root).unwrap();
+    let lock = acquire_lock(root).unwrap();
     assert!(matches!(
         FileBackend::add_next(&lock, KIND, identity),
         Err(CaError::NextKeyExists(KIND))
@@ -717,7 +718,7 @@ fn private_key_material_never_shows_in_debug_output_or_errors() {
         .collect();
     let pem = key.to_openssh(LineEnding::LF).unwrap();
 
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let listing = FileBackend::read_slot(&fixture.root, KIND).unwrap();
     let (trust, backend) =
         FileBackend::load_with_next(&fixture.root, KIND, &fixture.identity).unwrap();
@@ -759,7 +760,7 @@ fn a_half_finished_retirement_is_completed_once_and_unrelated_private_keys_stay(
         expected_shape(&fixture, Op::Retire, 2)
     );
     let orphan = orphan_private_key(&fixture);
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
 
     assert_eq!(
         FileBackend::finish_retired(&lock, KIND).unwrap(),
@@ -799,7 +800,7 @@ fn add_next_refuses_a_key_that_does_not_survive_its_own_encryption() {
         sealed.truncate(sealed.len() - 1);
         Ok(sealed)
     };
-    let lock = CaLock::acquire(&fixture.root).unwrap();
+    let lock = acquire_lock(&fixture.root).unwrap();
     let seals: [&Seal<'_>; 2] = [&to_stranger, &truncated];
     for seal in seals {
         let refused =

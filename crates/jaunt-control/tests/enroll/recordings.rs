@@ -1355,14 +1355,18 @@ async fn an_end_report_dropped_after_its_first_poll_still_reconciles() {
     .await;
     drop(report);
     drop(plane);
-    let mut reconciled = None;
-    for _ in 0..1000 {
-        reconciled = r.row(&session).await.unwrap().session_incomplete;
-        if reconciled.is_some() {
-            break;
-        }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while capture.snapshot().captured < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped end report never finished reconciling"
+        );
+        tokio::task::yield_now().await;
     }
-    assert_eq!(reconciled, Some(true));
+    assert_eq!(
+        r.row(&session).await.unwrap().session_incomplete,
+        Some(true)
+    );
     assert_eq!(
         r.row(&session).await.unwrap().state,
         RecordingState::Incomplete

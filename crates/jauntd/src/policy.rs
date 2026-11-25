@@ -161,6 +161,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use jaunt_audit::keep_callsites_enabled_for_scoped_capture;
     use jaunt_policy::{PolicySet, ReloadOutcome};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -204,6 +205,7 @@ mod tests {
     }
 
     fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+        keep_callsites_enabled_for_scoped_capture();
         let captured = Captured::default();
         let guard = tracing::subscriber::set_default(subscriber(
             build_filter(None).unwrap(),

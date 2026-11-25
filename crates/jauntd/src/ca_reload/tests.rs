@@ -2,6 +2,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use jaunt_audit::keep_callsites_enabled_for_scoped_capture;
 use jaunt_ca::TrustSet;
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, HashAlg, PrivateKey, PublicKey};
@@ -84,6 +85,7 @@ impl MakeWriter<'_> for Captured {
 
 #[test]
 fn agents_that_missed_the_update_are_named_in_a_warning() {
+    keep_callsites_enabled_for_scoped_capture();
     let captured = Captured::default();
     let _guard = tracing::subscriber::set_default(subscriber(
         build_filter(None).unwrap(),

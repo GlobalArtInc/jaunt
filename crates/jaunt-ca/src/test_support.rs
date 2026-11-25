@@ -1,10 +1,16 @@
+use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, PrivateKey, PublicKey};
 use tempfile::TempDir;
 
-use crate::{AgeIdentity, CaKind, FileBackend, Signer, TrustSet};
+use crate::{AgeIdentity, CaError, CaKind, CaLock, FileBackend, Signer, TrustSet};
+
+const LOCK_DEADLINE: Duration = Duration::from_secs(30);
+const LOCK_POLL: Duration = Duration::from_millis(2);
 
 pub(crate) struct Authority {
     pub(crate) dir: TempDir,
@@ -39,4 +45,14 @@ pub(crate) fn subject_key() -> PublicKey {
         .unwrap()
         .public_key()
         .clone()
+}
+
+pub(crate) fn acquire_lock(root: &Path) -> Result<CaLock, CaError> {
+    let deadline = Instant::now() + LOCK_DEADLINE;
+    loop {
+        match CaLock::acquire(root) {
+            Err(CaError::LockBusy) if Instant::now() < deadline => thread::sleep(LOCK_POLL),
+            other => return other,
+        }
+    }
 }
