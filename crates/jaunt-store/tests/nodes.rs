@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use jaunt_store::{
-    ApproveEnrollment, ApproveOutcome, CertificateState, CodeFailure, CreateOutcome, Enrollment,
-    EnrollmentLimits, EnrollmentState, Labels, NewEnrollment, NewNodeCertificate, Node,
-    NodeCertificateKind, NodeKeys, NodeState, RejectOutcome, Store,
+    ApproveEnrollment, ApproveOutcome, CertificateExpiry, CertificateState, CodeFailure,
+    CreateOutcome, Enrollment, EnrollmentLimits, EnrollmentState, Labels, NewEnrollment,
+    NewNodeCertificate, NewRevocation, Node, NodeCertificateKind, NodeCursor, NodeKeys, NodeQuery,
+    NodeState, RejectOutcome, RevocationKind, Store,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -1020,4 +1021,229 @@ async fn an_expiry_is_marked_as_reported_once_and_only_after_it_happened() {
         .collect();
     assert_eq!(flags, [("noticed", true), ("unnoticed", false)]);
     assert_eq!(purged[1].id, unnoticed.id);
+}
+
+async fn enroll_labelled(store: &Store, name: &str, tag: &str, env: &str) -> Node {
+    let mut request = new_enrollment(name, tag, "203.0.113.5", false);
+    request.labels = labels(&[("env", env)]);
+    let created = match store
+        .enrollments()
+        .create(&request, LIMITS, NOW)
+        .await
+        .unwrap()
+    {
+        CreateOutcome::Created(enrollment) => *enrollment,
+        other => panic!("unexpected {other:?}"),
+    };
+    approve(store, &created).await
+}
+
+fn query(limit: u32) -> NodeQuery {
+    NodeQuery {
+        state: None,
+        labels: Vec::new(),
+        name_prefix: None,
+        after: None,
+        limit,
+    }
+}
+
+fn names(nodes: &[Node]) -> Vec<&str> {
+    nodes.iter().map(|node| node.name.as_str()).collect()
+}
+
+#[tokio::test]
+async fn node_pages_filter_by_state_labels_and_name_prefix_and_walk_by_name() {
+    let (_dir, store) = open_store().await;
+    for (name, env) in [
+        ("web-2", "prod"),
+        ("db-1", "prod"),
+        ("web-1", "dev"),
+        ("web-3", "prod"),
+    ] {
+        enroll_labelled(&store, name, name, env).await;
+    }
+    store
+        .nodes()
+        .remove_by_name("web-3", NOW + 5)
+        .await
+        .unwrap();
+    let nodes = store.nodes();
+
+    let first = nodes.page(&query(2)).await.unwrap();
+    assert_eq!(names(&first.nodes), ["db-1", "web-1"]);
+    let cursor = first.next.clone().unwrap();
+    enroll_labelled(&store, "aaa", "late", "prod").await;
+    let second = nodes
+        .page(&NodeQuery {
+            after: Some(cursor),
+            ..query(2)
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&second.nodes), ["web-2", "web-3"]);
+    assert!(second.next.is_none());
+
+    let active_prod_web = nodes
+        .page(&NodeQuery {
+            state: Some(NodeState::Active),
+            labels: vec![("env".to_owned(), "prod".to_owned())],
+            name_prefix: Some("web".to_owned()),
+            ..query(10)
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&active_prod_web.nodes), ["web-2"]);
+    assert!(active_prod_web.next.is_none());
+    let removed = nodes
+        .page(&NodeQuery {
+            state: Some(NodeState::Removed),
+            ..query(10)
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&removed.nodes), ["web-3"]);
+    for limit in [0, 201] {
+        assert!(nodes.page(&query(limit)).await.is_err(), "{limit}");
+    }
+    let unknown = NodeCursor {
+        name: "zzz".to_owned(),
+        id: String::new(),
+    };
+    let beyond = nodes
+        .page(&NodeQuery {
+            after: Some(unknown),
+            ..query(10)
+        })
+        .await
+        .unwrap();
+    assert!(beyond.nodes.is_empty());
+}
+
+#[tokio::test]
+async fn removal_by_id_needs_the_matching_name_and_an_active_node() {
+    let (_dir, store) = open_store().await;
+    let old = approve(&store, &enroll(&store, "web", "a", false).await).await;
+    let replacement = enroll(&store, "web", "b", true).await;
+    let new = approve(&store, &replacement).await;
+    let nodes = store.nodes();
+
+    assert_eq!(
+        nodes
+            .remove_by_id_and_name(&old.id, "web", NOW + 9)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        nodes
+            .remove_by_id_and_name(&new.id, "Web", NOW + 9)
+            .await
+            .unwrap(),
+        None
+    );
+    let removed = nodes
+        .remove_by_id_and_name(&new.id, "web", NOW + 9)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (removed.state, removed.removed_at),
+        (NodeState::Removed, Some(NOW + 9))
+    );
+    assert_eq!(nodes.get_active_by_name("web").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn admin_reads_give_certificate_expiry_agent_versions_pending_count_and_revoked_nodes() {
+    let (_dir, store) = open_store().await;
+    let node = approve(&store, &enroll(&store, "web", "a", false).await).await;
+    enroll(&store, "db", "b", false).await;
+    let keys = NodeKeys {
+        tls_public_key: "tls-a2".to_owned(),
+        ssh_host_public_key: "ssh-a2".to_owned(),
+        tls_spki_sha256: "a2".to_owned(),
+        ssh_host_key_fingerprint: "SHA256:a2".to_owned(),
+    };
+    let mut later = certificate(NodeCertificateKind::X509, "x-2");
+    later.not_after = NOW + 500;
+    store
+        .nodes()
+        .record_renewal(
+            &node.id,
+            &keys,
+            &[
+                certificate(NodeCertificateKind::X509, "x-1"),
+                later,
+                certificate(NodeCertificateKind::SshHost, "s-1"),
+            ],
+        )
+        .await
+        .unwrap();
+    let ids = vec![node.id.clone(), "missing".to_owned()];
+
+    let expiry = store.nodes().certificate_expiry(&ids).await.unwrap();
+    assert_eq!(
+        expiry.get(&node.id),
+        Some(&CertificateExpiry {
+            x509: Some(NOW + 500),
+            ssh_host: Some(NOW + 100),
+        })
+    );
+    assert!(!expiry.contains_key("missing"));
+    assert_eq!(node.agent_version.as_deref(), Some("0.1.0"));
+    assert_eq!(
+        store
+            .nodes()
+            .get(&node.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .agent_version
+            .as_deref(),
+        Some("0.1.0")
+    );
+    let versions = store.enrollments().agent_versions(&ids).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[&node.id], "0.1.0");
+    assert_eq!(store.enrollments().count_pending(NOW).await.unwrap(), 1);
+    assert_eq!(
+        store.enrollments().count_pending(NOW + TTL).await.unwrap(),
+        0
+    );
+    assert!(
+        store
+            .revocations()
+            .revoked_among(RevocationKind::Node, &ids)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .nodes()
+            .certificate_expiry(&[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .revocations()
+        .insert(
+            &NewRevocation {
+                kind: RevocationKind::Node,
+                subject: node.id.clone(),
+                reason: "lost".to_owned(),
+                created_by: "cli:root".to_owned(),
+            },
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+    let revoked = store
+        .revocations()
+        .revoked_among(RevocationKind::Node, &ids)
+        .await
+        .unwrap();
+    assert_eq!(revoked.into_iter().collect::<Vec<_>>(), [node.id]);
 }

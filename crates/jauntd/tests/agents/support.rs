@@ -84,6 +84,7 @@ pub struct Options {
     pub session_sweep_interval: Option<Duration>,
     pub agent_gone_after: Option<Duration>,
     pub recordings: Option<RecordingsSettings>,
+    pub web: bool,
 }
 
 pub struct Authorities {
@@ -173,7 +174,7 @@ impl Harness {
                 client_ip_trusted_proxies: Vec::new(),
             },
             policy: PolicyHandle::empty(),
-            web_enabled: false,
+            web_enabled: options.web,
             clock: Arc::new(SystemTime::now),
             recordings: recordings
                 .as_ref()

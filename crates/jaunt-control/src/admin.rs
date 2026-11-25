@@ -54,6 +54,12 @@ impl From<CodeFailure> for ApproveError {
 pub enum RemoveError {
     #[error("no active node has this name")]
     NoActiveNode,
+    #[error("no node has this id")]
+    UnknownNode,
+    #[error("the node is not active")]
+    NotActive,
+    #[error("the confirmation does not match the node name")]
+    NameMismatch,
     #[error("the operator name is not valid")]
     InvalidOperator,
     #[error("the clock is before the unix epoch")]
@@ -129,10 +135,19 @@ impl NodeAdmin {
     }
 
     pub async fn pending(&self, code: &str) -> Result<PendingEnrollment, ApproveError> {
+        self.pending_with_hash(code)
+            .await
+            .map(|(pending, _)| pending)
+    }
+
+    pub(crate) async fn pending_with_hash(
+        &self,
+        code: &str,
+    ) -> Result<(PendingEnrollment, String), ApproveError> {
         let now = self.now().ok_or(ApproveError::Clock)?;
         let code_hash = hash_typed_code(code)?;
         let enrollment = self.find_pending(&code_hash, now).await?;
-        pending_view(&enrollment)
+        Ok((pending_view(&enrollment)?, code_hash))
     }
 
     pub async fn approve(
@@ -144,9 +159,25 @@ impl NodeAdmin {
         if !is_valid_approver(approver) {
             return Err(ApproveError::InvalidApprover);
         }
-        let now = self.now().ok_or(ApproveError::Clock)?;
         let code_hash = hash_typed_code(code)?;
-        let pending = self.find_pending(&code_hash, now).await?;
+        self.approve_hashed(&code_hash, None, approver, labels_override)
+            .await
+    }
+
+    pub(crate) async fn approve_hashed(
+        &self,
+        code_hash: &str,
+        expected_enrollment: Option<&str>,
+        approver: &str,
+        labels_override: Option<Labels>,
+    ) -> Result<ApprovedNode, ApproveError> {
+        if !is_valid_approver(approver) {
+            return Err(ApproveError::InvalidApprover);
+        }
+        let now = self.now().ok_or(ApproveError::Clock)?;
+        let pending = self
+            .find_expected(code_hash, expected_enrollment, now)
+            .await?;
         let tls =
             node_keys::parse_tls(&pending.tls_public_key).ok_or(ApproveError::CorruptEnrollment)?;
         let ssh = node_keys::parse_ssh(&pending.ssh_host_public_key)
@@ -158,7 +189,7 @@ impl NodeAdmin {
             .enrollments()
             .approve_enrollment(ApproveEnrollment {
                 enrollment_id: &pending.id,
-                code_hash: &code_hash,
+                code_hash,
                 approver,
                 labels_override: override_map.as_ref(),
                 tls_spki_sha256: &tls.sha256,
@@ -198,12 +229,28 @@ impl NodeAdmin {
         if !is_valid_approver(rejected_by) {
             return Err(ApproveError::InvalidApprover);
         }
-        let now = self.now().ok_or(ApproveError::Clock)?;
         let code_hash = hash_typed_code(code)?;
+        self.reject_hashed(&code_hash, None, rejected_by).await
+    }
+
+    pub(crate) async fn reject_hashed(
+        &self,
+        code_hash: &str,
+        expected_enrollment: Option<&str>,
+        rejected_by: &str,
+    ) -> Result<RejectedEnrollment, ApproveError> {
+        if !is_valid_approver(rejected_by) {
+            return Err(ApproveError::InvalidApprover);
+        }
+        let now = self.now().ok_or(ApproveError::Clock)?;
+        if expected_enrollment.is_some() {
+            self.find_expected(code_hash, expected_enrollment, now)
+                .await?;
+        }
         match self
             .store
             .enrollments()
-            .reject_by_code(&code_hash, now.secs)
+            .reject_by_code(code_hash, now.secs)
             .await?
         {
             RejectOutcome::Rejected(enrollment) => {
@@ -226,15 +273,63 @@ impl NodeAdmin {
             return Err(RemoveError::InvalidOperator);
         }
         let now = self.now().ok_or(RemoveError::Clock)?;
-        let removed = self
+        let node = self
             .store
             .nodes()
-            .remove_by_name(name, now.secs)
+            .get_active_by_name(name)
             .await
             .map_err(RemoveError::Store)?
             .ok_or(RemoveError::NoActiveNode)?;
+        self.remove_exact(&node, removed_by, now)
+            .await?
+            .ok_or(RemoveError::NoActiveNode)
+    }
+
+    pub(crate) async fn remove_node_by_id(
+        &self,
+        id: &str,
+        confirm_name: &str,
+        removed_by: &str,
+    ) -> Result<NodeSummary, RemoveError> {
+        if !is_valid_approver(removed_by) {
+            return Err(RemoveError::InvalidOperator);
+        }
+        let now = self.now().ok_or(RemoveError::Clock)?;
+        let node = self
+            .store
+            .nodes()
+            .get(id)
+            .await
+            .map_err(RemoveError::Store)?
+            .ok_or(RemoveError::UnknownNode)?;
+        if node.state != NodeState::Active {
+            return Err(RemoveError::NotActive);
+        }
+        if node.name != confirm_name {
+            return Err(RemoveError::NameMismatch);
+        }
+        self.remove_exact(&node, removed_by, now)
+            .await?
+            .ok_or(RemoveError::NotActive)
+    }
+
+    async fn remove_exact(
+        &self,
+        node: &Node,
+        removed_by: &str,
+        now: Moment,
+    ) -> Result<Option<NodeSummary>, RemoveError> {
+        let Some(removed) = self
+            .store
+            .nodes()
+            .remove_by_id_and_name(&node.id, &node.name, now.secs)
+            .await
+            .map_err(RemoveError::Store)?
+        else {
+            return Ok(None);
+        };
         node_audit::node_removed(&removed.id, &removed.name, "admin", removed_by);
-        summary(removed).map_err(RemoveError::Store)
+        summary(removed).map(Some).map_err(RemoveError::Store)
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeListing>, ListError> {
@@ -262,6 +357,19 @@ impl NodeAdmin {
 
     fn now(&self) -> Option<Moment> {
         Moment::read(&self.clock)
+    }
+
+    async fn find_expected(
+        &self,
+        code_hash: &str,
+        expected_enrollment: Option<&str>,
+        now: Moment,
+    ) -> Result<Enrollment, ApproveError> {
+        let pending = self.find_pending(code_hash, now).await?;
+        match expected_enrollment {
+            Some(expected) if expected != pending.id => Err(ApproveError::UnknownCode),
+            _ => Ok(pending),
+        }
     }
 
     async fn find_pending(&self, code_hash: &str, now: Moment) -> Result<Enrollment, ApproveError> {

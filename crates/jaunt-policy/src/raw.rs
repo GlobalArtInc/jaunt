@@ -7,7 +7,7 @@ use crate::model::{AdminPermission, NodeInfo, is_valid_login};
 use crate::policy::{LabelRequirement, LoginSpec, Role, SshRule};
 
 pub(crate) const API_VERSION: &str = "jaunt/v1";
-const USERNAME_PLACEHOLDER: &str = "{username}";
+pub(crate) const USERNAME_PLACEHOLDER: &str = "{username}";
 const NODE_NAME_KEY: &str = "name";
 
 #[derive(Deserialize)]

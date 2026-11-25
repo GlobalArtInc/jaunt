@@ -1,11 +1,17 @@
+mod admin_common;
+mod admin_sessions;
 mod api;
 mod assets;
 mod audit_log;
 mod ca_status;
 mod cookies;
 mod csrf;
+mod enrolments;
 mod headers;
+mod intents;
 mod login;
+mod lookup_limit;
+mod nodes;
 pub(crate) mod pages;
 mod revocations;
 mod session;
@@ -26,6 +32,8 @@ pub(crate) const MAX_SESSIONS_PER_USER: u32 = 20;
 pub(crate) struct WebState {
     pub(crate) enabled: bool,
     pub(crate) headers: SecurityHeaders,
+    pub(crate) intents: intents::IntentTable,
+    pub(crate) lookups: lookup_limit::LookupLimiter,
 }
 
 impl WebState {
@@ -33,8 +41,44 @@ impl WebState {
         WebState {
             enabled,
             headers: SecurityHeaders::new(public_origin),
+            intents: intents::IntentTable::default(),
+            lookups: lookup_limit::LookupLimiter::default(),
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestWebSession {
+    pub cookie: String,
+    pub csrf_token: String,
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) async fn open_for_tests(control: &Control, user_id: &str) -> Option<TestWebSession> {
+    let issued = crate::completion::issue().ok()?;
+    let csrf_token = csrf::token_for(&issued.secret);
+    let now = control.now()?;
+    control
+        .store
+        .web_sessions()
+        .create(
+            &jaunt_store::NewWebSession {
+                id_hash: issued.hash,
+                user_id: user_id.to_owned(),
+                csrf_token_hash: crate::token::hash_secret(&csrf_token),
+                created_at: now.secs,
+                expires_at: now.secs.saturating_add(SESSION_TTL_SECS),
+                source_ip: None,
+                user_agent: None,
+            },
+            MAX_SESSIONS_PER_USER,
+        )
+        .await
+        .ok()?;
+    Some(TestWebSession {
+        cookie: format!("{}={}", cookies::SESSION_COOKIE, issued.secret),
+        csrf_token,
+    })
 }
 
 pub(crate) fn mount(
@@ -57,6 +101,20 @@ pub(crate) fn mount(
             get(revocations::list).post(revocations::create),
         )
         .route("/v1/admin/revocations/{id}", delete(revocations::remove))
+        .route("/v1/admin/nodes", get(nodes::list))
+        .route(
+            "/v1/admin/nodes/{id}",
+            get(nodes::detail).delete(nodes::remove),
+        )
+        .route("/v1/admin/nodes/{id}/access", get(nodes::access))
+        .route("/v1/admin/enrolments/lookup", post(enrolments::lookup))
+        .route(
+            "/v1/admin/enrolments/{id}/approve",
+            post(enrolments::approve),
+        )
+        .route("/v1/admin/enrolments/{id}/reject", post(enrolments::reject))
+        .route("/v1/admin/sessions", get(admin_sessions::list))
+        .route("/v1/admin/sessions/{id}", get(admin_sessions::detail))
         .merge(extra)
         .fallback(assets::serve)
         .layer(middleware::from_fn_with_state(

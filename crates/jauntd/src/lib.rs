@@ -8,5 +8,6 @@ pub mod killer;
 mod limits;
 pub mod logging;
 pub mod node;
+pub mod presence;
 pub mod recordings;
 pub mod revoke;

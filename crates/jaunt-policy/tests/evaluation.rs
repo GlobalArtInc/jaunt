@@ -460,3 +460,54 @@ fn route_agrees_with_authorize_ssh() {
         }
     }
 }
+
+#[test]
+fn roles_reaching_a_node_are_listed_with_their_subjects_logins_and_flags() {
+    let set = load_ok(&[(
+        "roles.yaml",
+        &[
+            role(
+                "prod-ops",
+                Some("{ users: [alice@example.com], groups: [infra] }"),
+                "{ nodes: { env: [prod], team: [\"*\"] }, logins: [deploy, \"{username}\"], portForwarding: true }",
+                "[nodes.approve]",
+            ),
+            role(
+                "web-deploy",
+                Some("{ groups: [web] }"),
+                "{ nodes: { env: [prod, staging] }, logins: [deploy], recordInput: true }",
+                "[]",
+            ),
+            role(
+                "dev-only",
+                Some("{ groups: [dev] }"),
+                "{ nodes: { env: [dev] }, logins: [dev] }",
+                "[]",
+            ),
+            role(
+                "auditors",
+                Some("{ groups: [audit] }"),
+                "",
+                "[audit.read]",
+            ),
+        ]
+        .join("---\n"),
+    )]);
+
+    let reaching = set.roles_reaching(&node(&[("env", "prod"), ("team", "web")]));
+
+    let names: Vec<&str> = reaching.iter().map(|role| role.role.as_str()).collect();
+    assert_eq!(names, ["prod-ops", "web-deploy"]);
+    assert_eq!(reaching[0].users, ["alice@example.com"]);
+    assert_eq!(reaching[0].groups, ["infra"]);
+    assert_eq!(reaching[0].logins, ["deploy", "{username}"]);
+    assert!(reaching[0].port_forwarding && !reaching[0].record_input);
+    assert_eq!(reaching[0].admin, [AdminPermission::NodesApprove]);
+    assert!(reaching[1].users.is_empty());
+    assert_eq!(reaching[1].groups, ["web"]);
+    assert!(!reaching[1].port_forwarding && reaching[1].record_input);
+    assert!(reaching[1].admin.is_empty());
+
+    assert!(set.roles_reaching(&node(&[("env", "qa")])).is_empty());
+    assert!(set.roles_reaching(&node(&[("env", "prod")])).len() == 1);
+}

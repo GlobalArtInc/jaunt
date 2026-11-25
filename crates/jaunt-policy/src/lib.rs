@@ -9,9 +9,11 @@ mod schema;
 mod watch;
 
 pub use access_test::{AccessTest, AccessTestResult, Expect, run_access_tests};
-pub use handle::{PolicyHandle, ReloadOutcome};
+pub use handle::{LoadedPolicy, PolicyHandle, ReloadOutcome};
 pub use loader::{LoadError, LoadErrors, load_dir};
-pub use model::{AdminPermission, Identity, NodeInfo, SshDecision, UnknownAdminPermission};
+pub use model::{
+    AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, UnknownAdminPermission,
+};
 pub use policy::PolicySet;
 #[cfg(feature = "schema")]
 pub use schema::{policy_schema, policy_schema_pretty};

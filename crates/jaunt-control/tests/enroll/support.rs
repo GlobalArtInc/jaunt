@@ -38,6 +38,7 @@ pub const SUFFIX: &str = "jaunt.test";
 pub const AGENT_ENDPOINT: &str = "agents.example.com:443";
 pub const DEFAULT_PEER: &str = "203.0.113.10";
 pub const APPROVER: &str = "cli:tester";
+pub const PUBLIC_ORIGIN: &str = "https://jaunt.example.test";
 
 const SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -113,6 +114,7 @@ pub struct Options {
     pub trusted_proxies: &'static [&'static str],
     pub recordings: Option<RecordingOptions>,
     pub host_sign_hook: Option<SignHook>,
+    pub web: bool,
 }
 
 impl Default for Options {
@@ -126,6 +128,7 @@ impl Default for Options {
             trusted_proxies: &[],
             recordings: None,
             host_sign_hook: None,
+            web: false,
         }
     }
 }
@@ -441,7 +444,7 @@ impl Harness {
                         .collect(),
                 },
                 policy: policy.clone(),
-                web_enabled: false,
+                web_enabled: options.web,
                 clock: clock.clock(),
                 recordings,
             },

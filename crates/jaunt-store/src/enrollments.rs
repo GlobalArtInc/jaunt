@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::StoreError;
@@ -200,7 +202,7 @@ const ACTIVE_NODE_NAME_TAKEN: &str = "SELECT id FROM nodes WHERE name = ? AND st
 const INSERT_NODE: &str = concat!(
     "INSERT INTO nodes (",
     node_columns!(),
-    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL) RETURNING ",
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?) RETURNING ",
     node_columns!()
 );
 
@@ -225,6 +227,9 @@ const REJECT_DELIVERY: &str =
 
 const PURGE_EXPIRED: &str = "DELETE FROM enrollments WHERE expires_at < ? \
     RETURNING id, name, state, expired_reported_at";
+
+const COUNT_PENDING: &str =
+    "SELECT COUNT(*) AS total FROM enrollments WHERE state = 'pending' AND expires_at > ?";
 
 const MARK_EXPIRY_REPORTED: &str = "UPDATE enrollments SET expired_reported_at = ? \
     WHERE id = ? AND expired_reported_at IS NULL AND expires_at <= ? RETURNING id";
@@ -403,6 +408,7 @@ impl Enrollments {
             .bind(request.ssh_host_key_fingerprint)
             .bind(request.approver)
             .bind(request.now)
+            .bind(&enrollment.agent_version)
             .fetch_one(&mut *tx)
             .await;
         let created = match inserted {
@@ -540,6 +546,36 @@ impl Enrollments {
                 })
             })
             .collect()
+    }
+
+    pub async fn count_pending(&self, now: i64) -> Result<i64, StoreError> {
+        let row = sqlx::query(COUNT_PENDING)
+            .bind(now)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("total")?)
+    }
+
+    pub async fn agent_versions(
+        &self,
+        node_ids: &[String],
+    ) -> Result<BTreeMap<String, String>, StoreError> {
+        let mut versions = BTreeMap::new();
+        if node_ids.is_empty() {
+            return Ok(versions);
+        }
+        let mut builder: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT node_id, agent_version FROM enrollments WHERE node_id IN (");
+        let mut ids = builder.separated(", ");
+        for id in node_ids {
+            ids.push_bind(id.clone());
+        }
+        builder.push(") ORDER BY created_at, id");
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        for row in &rows {
+            versions.insert(row.try_get("node_id")?, row.try_get("agent_version")?);
+        }
+        Ok(versions)
     }
 
     pub async fn mark_expiry_reported(&self, id: &str, now: i64) -> Result<bool, StoreError> {

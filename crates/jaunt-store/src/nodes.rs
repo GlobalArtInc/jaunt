@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::StoreError;
 
 pub type Labels = BTreeMap<String, String>;
+
+pub const MAX_NODE_PAGE: u32 = 200;
+const NODE_SCAN_BATCH: u32 = 500;
+const MAX_NODE_SCAN: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
@@ -71,6 +75,7 @@ pub struct Node {
     pub approved_by: String,
     pub created_at: i64,
     pub removed_at: Option<i64>,
+    pub agent_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,10 +133,37 @@ pub struct NodeCertificate {
     pub ca_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeCursor {
+    pub name: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeQuery {
+    pub state: Option<NodeState>,
+    pub labels: Vec<(String, String)>,
+    pub name_prefix: Option<String>,
+    pub after: Option<NodeCursor>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePage {
+    pub nodes: Vec<Node>,
+    pub next: Option<NodeCursor>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CertificateExpiry {
+    pub x509: Option<i64>,
+    pub ssh_host: Option<i64>,
+}
+
 macro_rules! node_columns {
     () => {
         "id, name, labels, hostname, tls_public_key, ssh_host_public_key, tls_spki_sha256, \
-         ssh_host_key_fingerprint, state, approved_by, created_at, removed_at"
+         ssh_host_key_fingerprint, state, approved_by, created_at, removed_at, agent_version"
     };
 }
 
@@ -171,6 +203,14 @@ const REMOVE_BY_NAME: &str = concat!(
      RETURNING ",
     node_columns!()
 );
+
+const REMOVE_BY_ID_AND_NAME: &str = concat!(
+    "UPDATE nodes SET state = 'removed', removed_at = ? \
+     WHERE id = ? AND name = ? AND state = 'active' RETURNING ",
+    node_columns!()
+);
+
+const SELECT_NODES: &str = concat!("SELECT ", node_columns!(), " FROM nodes WHERE 1 = 1");
 
 const REJECT_UNCLAIMED_FOR_NODE: &str = "UPDATE enrollments SET state = 'rejected' \
      WHERE node_id = ? AND state IN ('approved', 'delivering')";
@@ -261,6 +301,135 @@ impl Nodes {
         Ok(Some(node))
     }
 
+    pub async fn remove_by_id_and_name(
+        &self,
+        id: &str,
+        name: &str,
+        now: i64,
+    ) -> Result<Option<Node>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(REMOVE_BY_ID_AND_NAME)
+            .bind(now)
+            .bind(id)
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let node = node_from_row(&row)?;
+        reject_unclaimed_enrollments(&mut tx, &node.id).await?;
+        tx.commit().await?;
+        Ok(Some(node))
+    }
+
+    pub async fn page(&self, query: &NodeQuery) -> Result<NodePage, StoreError> {
+        if query.limit == 0 || query.limit > MAX_NODE_PAGE {
+            return Err(StoreError::InvalidInput("the page size is out of range"));
+        }
+        let wanted = usize::try_from(query.limit)
+            .map_err(|_| StoreError::InvalidInput("the page size is out of range"))?;
+        let mut nodes = Vec::new();
+        let mut position = query.after.clone();
+        let mut scanned = 0_usize;
+        loop {
+            let rows = self.scan_batch(query, position.as_ref()).await?;
+            let exhausted = rows.len() < NODE_SCAN_BATCH as usize;
+            for row in &rows {
+                let node = node_from_row(row)?;
+                scanned += 1;
+                position = Some(NodeCursor {
+                    name: node.name.clone(),
+                    id: node.id.clone(),
+                });
+                if !has_labels(&node, &query.labels) {
+                    continue;
+                }
+                nodes.push(node);
+                if nodes.len() > wanted {
+                    nodes.truncate(wanted);
+                    let next = nodes.last().map(|last| NodeCursor {
+                        name: last.name.clone(),
+                        id: last.id.clone(),
+                    });
+                    return Ok(NodePage { nodes, next });
+                }
+            }
+            if exhausted {
+                return Ok(NodePage { nodes, next: None });
+            }
+            if scanned >= MAX_NODE_SCAN {
+                return Ok(NodePage {
+                    nodes,
+                    next: position,
+                });
+            }
+        }
+    }
+
+    async fn scan_batch(
+        &self,
+        query: &NodeQuery,
+        after: Option<&NodeCursor>,
+    ) -> Result<Vec<SqliteRow>, StoreError> {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(SELECT_NODES);
+        if let Some(state) = query.state {
+            builder.push(" AND state = ");
+            builder.push_bind(state.as_str());
+        }
+        if let Some(prefix) = &query.name_prefix {
+            let length = i64::try_from(prefix.chars().count())
+                .map_err(|_| StoreError::InvalidInput("the name prefix is too long"))?;
+            builder.push(" AND substr(name, 1, ");
+            builder.push_bind(length);
+            builder.push(") = ");
+            builder.push_bind(prefix.clone());
+        }
+        if let Some(cursor) = after {
+            builder.push(" AND (name > ");
+            builder.push_bind(cursor.name.clone());
+            builder.push(" OR (name = ");
+            builder.push_bind(cursor.name.clone());
+            builder.push(" AND id > ");
+            builder.push_bind(cursor.id.clone());
+            builder.push("))");
+        }
+        builder.push(" ORDER BY name, id LIMIT ");
+        builder.push_bind(i64::from(NODE_SCAN_BATCH));
+        Ok(builder.build().fetch_all(&self.pool).await?)
+    }
+
+    pub async fn certificate_expiry(
+        &self,
+        node_ids: &[String],
+    ) -> Result<BTreeMap<String, CertificateExpiry>, StoreError> {
+        let mut expiry: BTreeMap<String, CertificateExpiry> = BTreeMap::new();
+        if node_ids.is_empty() {
+            return Ok(expiry);
+        }
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT node_id, kind, MAX(not_after) AS not_after FROM node_certificates \
+             WHERE node_id IN (",
+        );
+        let mut ids = builder.separated(", ");
+        for id in node_ids {
+            ids.push_bind(id.clone());
+        }
+        builder.push(") GROUP BY node_id, kind");
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        for row in &rows {
+            let kind: String = row.try_get("kind")?;
+            let not_after: i64 = row.try_get("not_after")?;
+            let entry = expiry.entry(row.try_get("node_id")?).or_default();
+            match NodeCertificateKind::parse(&kind)? {
+                NodeCertificateKind::X509 => entry.x509 = Some(not_after),
+                NodeCertificateKind::SshHost => entry.ssh_host = Some(not_after),
+            }
+        }
+        Ok(expiry)
+    }
+
     pub async fn record_renewal(
         &self,
         node_id: &str,
@@ -344,6 +513,12 @@ pub(crate) async fn insert_certificates(
     Ok(())
 }
 
+fn has_labels(node: &Node, wanted: &[(String, String)]) -> bool {
+    wanted
+        .iter()
+        .all(|(key, value)| node.labels.get(key) == Some(value))
+}
+
 pub(crate) fn labels_to_text(labels: &Labels) -> Result<String, StoreError> {
     serde_json::to_string(labels).map_err(|_| StoreError::InvalidInput("labels serialization"))
 }
@@ -366,6 +541,7 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, StoreError> {
         approved_by: row.try_get("approved_by")?,
         created_at: row.try_get("created_at")?,
         removed_at: row.try_get("removed_at")?,
+        agent_version: row.try_get("agent_version")?,
     })
 }
 

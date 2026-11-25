@@ -34,8 +34,9 @@ pub use login_requests::{
     LoginRequest, LoginRequestState, LoginRequests, NewDeviceLoginRequest, NewLoginRequest,
 };
 pub use nodes::{
-    CertificateState, Labels, NewNodeCertificate, Node, NodeCertificate, NodeCertificateKind,
-    NodeKeys, NodeState, Nodes,
+    CertificateExpiry, CertificateState, Labels, MAX_NODE_PAGE, NewNodeCertificate, Node,
+    NodeCertificate, NodeCertificateKind, NodeCursor, NodeKeys, NodePage, NodeQuery, NodeState,
+    Nodes,
 };
 pub use recordings::{
     MAX_RECORDING_PAGE, Reconciled, Recording, RecordingCursor, RecordingState, Recordings,
@@ -46,8 +47,9 @@ pub use revocations::{
     RevocationPage, Revocations, RevokeOutcome, Subjects,
 };
 pub use sessions::{
-    ActivateSession, EndOutcome, EndRejection, EndSession, NewSession, OpenSessions, Session,
-    SessionEndReason, SessionState, Sessions,
+    ActivateSession, EndOutcome, EndRejection, EndSession, MAX_SESSION_PAGE, NewSession,
+    NodeSessionCounts, OpenSessions, Session, SessionCursor, SessionEndReason, SessionListing,
+    SessionPage, SessionQuery, SessionRecording, SessionState, Sessions,
 };
 pub use users::{NewUser, User, Users};
 pub use web_sessions::{NewWebSession, ValidWebSession, WebSession, WebSessions};

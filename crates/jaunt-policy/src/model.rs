@@ -25,6 +25,17 @@ pub struct SshDecision {
     pub roles: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAccess {
+    pub role: String,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+    pub logins: Vec<String>,
+    pub port_forwarding: bool,
+    pub record_input: bool,
+    pub admin: Vec<AdminPermission>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(try_from = "String")]
 pub enum AdminPermission {

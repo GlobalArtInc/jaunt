@@ -18,6 +18,7 @@ use jauntd::gate_ssh::{
     GateSshError, GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer,
 };
 use jauntd::killer::InProcessKiller;
+use jauntd::presence::RegistryPresence;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -262,6 +263,7 @@ fn install_killer(control: &Control, agents: Option<&AgentServer>, gate: Option<
     let gate = gate.map(|server| Arc::clone(server.gate()));
     let closes_outer = gate.is_some();
     control.install_session_killer(Arc::new(InProcessKiller::new(agents.agents(), gate)));
+    control.install_agent_presence(Arc::new(RegistryPresence::new(agents.agents())));
     tracing::info!(
         target: "jaunt::daemon",
         closes_outer,

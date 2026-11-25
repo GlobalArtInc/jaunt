@@ -45,6 +45,7 @@ url = "2.5.9"
 
 [dev-dependencies]
 jaunt-audit = { workspace = true, features = ["testing"] }
+jaunt-control = { workspace = true, features = ["test-support"] }
 age = "0.11.5"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.23.1"

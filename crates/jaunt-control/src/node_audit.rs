@@ -68,6 +68,20 @@ pub(crate) fn enroll_rejected(enrollment_id: &str, name: &str, rejected_by: &str
     );
 }
 
+pub(crate) fn enrolment_looked_up(
+    looked_up_by: &str,
+    outcome: &'static str,
+    enrollment_id: Option<&str>,
+) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "admin.enrolment.looked_up",
+        looked_up_by,
+        outcome,
+        enrollment_id
+    );
+}
+
 pub(crate) fn enroll_expired(enrollment_id: &str, name: &str) {
     tracing::info!(
         target: "jaunt::audit",

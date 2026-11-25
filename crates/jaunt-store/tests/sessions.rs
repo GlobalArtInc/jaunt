@@ -1,7 +1,8 @@
 use jaunt_store::{
     ActivateSession, EndOutcome, EndRejection, EndSession, NewCertificate, NewRevocation,
-    NewSession, NewUser, OpenSessions, RevocationKind, Session, SessionEndReason, SessionState,
-    Store, StoreError,
+    NewSession, NewUser, NodeSessionCounts, OpenSessions, RevocationKind, Session, SessionCursor,
+    SessionEndReason, SessionQuery, SessionRecording, SessionState, Store, StoreError,
+    StoredRecording,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -707,4 +708,341 @@ async fn a_late_report_for_a_session_control_closed_fills_the_counts_once() {
     );
     let untouched = sessions.get(&never_authorized.id).await.unwrap().unwrap();
     assert_eq!((untouched.bytes_in, untouched.authorized_at), (None, None));
+}
+
+impl Fixture {
+    async fn routed_at(&self, node_id: &str, now: i64) -> Session {
+        self.store
+            .sessions()
+            .create(
+                &NewSession {
+                    user_id: self.user_id.clone(),
+                    serial: self.serial,
+                    node_id: node_id.to_owned(),
+                    ttl_secs: TTL,
+                },
+                now,
+            )
+            .await
+            .expect("create")
+    }
+}
+
+fn page_query(limit: u32) -> SessionQuery {
+    SessionQuery {
+        limit,
+        ..SessionQuery::default()
+    }
+}
+
+fn page_ids(page: &jaunt_store::SessionPage) -> Vec<String> {
+    page.sessions
+        .iter()
+        .map(|listing| listing.session.id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn session_pages_are_newest_first_and_stable_when_sessions_are_added() {
+    let fixture = fixture().await;
+    let mut created = Vec::new();
+    for offset in [0, 0, 1, 2] {
+        created.push(fixture.routed_at(NODE, NOW + offset).await);
+    }
+    let sessions = fixture.store.sessions();
+
+    let first = sessions.page(&page_query(2)).await.unwrap();
+    fixture.routed_at(NODE, NOW + 9).await;
+    fixture.routed_at(NODE, NOW).await;
+    let second = sessions
+        .page(&SessionQuery {
+            after: first.next.clone(),
+            ..page_query(10)
+        })
+        .await
+        .unwrap();
+
+    let mut walked = page_ids(&first);
+    walked.extend(page_ids(&second));
+    for session in &created {
+        assert_eq!(
+            walked.iter().filter(|id| **id == session.id).count(),
+            1,
+            "{walked:?}"
+        );
+    }
+    assert_eq!(walked[0], created[3].id);
+    assert_eq!(walked[1], created[2].id);
+    assert!(second.next.is_none());
+    let listing = &first.sessions[0];
+    assert_eq!(
+        (listing.user_email.as_str(), listing.node_name.as_str()),
+        ("alice@example.com", "web-a")
+    );
+    for limit in [0, 201] {
+        assert!(sessions.page(&page_query(limit)).await.is_err(), "{limit}");
+    }
+    let far = SessionCursor {
+        created_at: 0,
+        id: String::new(),
+    };
+    assert!(
+        sessions
+            .page(&SessionQuery {
+                after: Some(far),
+                ..page_query(10)
+            })
+            .await
+            .unwrap()
+            .sessions
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn session_pages_filter_by_state_user_node_login_and_time() {
+    let fixture = fixture().await;
+    let active = fixture.active().await;
+    let other = fixture.routed_at(OTHER_NODE, NOW + 3).await;
+    let sessions = fixture.store.sessions();
+    let only = |query: SessionQuery| {
+        let sessions = sessions.clone();
+        async move { page_ids(&sessions.page(&query).await.unwrap()) }
+    };
+
+    for (query, expected) in [
+        (
+            SessionQuery {
+                state: Some(SessionState::Active),
+                ..page_query(10)
+            },
+            vec![active.id.clone()],
+        ),
+        (
+            SessionQuery {
+                node: Some("web-b".to_owned()),
+                ..page_query(10)
+            },
+            vec![other.id.clone()],
+        ),
+        (
+            SessionQuery {
+                node: Some(NODE.to_owned()),
+                ..page_query(10)
+            },
+            vec![active.id.clone()],
+        ),
+        (
+            SessionQuery {
+                login: Some("deploy".to_owned()),
+                ..page_query(10)
+            },
+            vec![active.id.clone()],
+        ),
+        (
+            SessionQuery {
+                user: Some("alice@example.com".to_owned()),
+                from: Some(NOW + 1),
+                ..page_query(10)
+            },
+            vec![other.id.clone()],
+        ),
+        (
+            SessionQuery {
+                user: Some(fixture.user_id.clone()),
+                to: Some(NOW + 3),
+                ..page_query(10)
+            },
+            vec![active.id.clone()],
+        ),
+        (
+            SessionQuery {
+                user: Some("bob@example.com".to_owned()),
+                ..page_query(10)
+            },
+            Vec::new(),
+        ),
+    ] {
+        assert_eq!(only(query.clone()).await, expected, "{query:?}");
+    }
+    let listing = sessions.listing(&active.id).await.unwrap().unwrap();
+    assert_eq!(listing.session, active);
+    assert_eq!(sessions.listing("missing").await.unwrap(), None);
+    assert_eq!(
+        sessions.node_counts(NODE, NOW + 1).await.unwrap(),
+        NodeSessionCounts { open: 1, since: 0 }
+    );
+    assert_eq!(
+        sessions.node_counts(NODE, NOW).await.unwrap(),
+        NodeSessionCounts { open: 1, since: 1 }
+    );
+    for (query, index) in [
+        (page_query(10), "sessions_created_at_id_idx"),
+        (
+            SessionQuery {
+                user: Some("alice@example.com".to_owned()),
+                ..page_query(10)
+            },
+            "sessions_user_id_idx",
+        ),
+        (
+            SessionQuery {
+                node: Some("web-a".to_owned()),
+                ..page_query(10)
+            },
+            "sessions_node_id_idx",
+        ),
+    ] {
+        let plan = sessions.page_plan(&query).await.unwrap();
+        let on_sessions: Vec<&String> = plan
+            .iter()
+            .filter(|step| step.contains(" s ") || step.ends_with(" s"))
+            .collect();
+        assert!(!on_sessions.is_empty(), "{plan:?}");
+        assert!(
+            on_sessions.iter().all(|step| step.contains("USING INDEX")),
+            "{plan:?}"
+        );
+        assert!(
+            on_sessions.iter().any(|step| step.contains(index)),
+            "{index}: {plan:?}"
+        );
+    }
+    let unfiltered = sessions.page_plan(&page_query(10)).await.unwrap();
+    let on_recordings: Vec<&String> = unfiltered
+        .iter()
+        .filter(|step| step.contains(" r "))
+        .collect();
+    assert!(
+        !on_recordings.is_empty()
+            && on_recordings
+                .iter()
+                .all(|step| step.starts_with("SEARCH r USING")),
+        "{unfiltered:?}"
+    );
+    assert!(
+        !unfiltered.iter().any(|step| step.contains("TEMP B-TREE")),
+        "{unfiltered:?}"
+    );
+}
+
+#[tokio::test]
+async fn sessions_created_in_the_same_second_are_paged_by_id_without_gaps_or_repeats() {
+    let fixture = fixture().await;
+    let mut created = Vec::new();
+    for _ in 0..4 {
+        created.push(fixture.routed_at(NODE, NOW).await.id);
+    }
+    created.sort();
+    created.reverse();
+    let sessions = fixture.store.sessions();
+
+    let mut walked = Vec::new();
+    let mut after = None;
+    loop {
+        let page = sessions
+            .page(&SessionQuery {
+                after: after.clone(),
+                ..page_query(1)
+            })
+            .await
+            .unwrap();
+        walked.extend(page_ids(&page));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(walked, created);
+}
+
+#[tokio::test]
+async fn a_session_listing_summarises_its_recording_without_its_content() {
+    let fixture = fixture().await;
+    let recordings = fixture.store.recordings();
+    let mut expected = Vec::new();
+    for outcome in [
+        "none",
+        "receiving",
+        "complete",
+        "incomplete",
+        "salvaged",
+        "failed",
+    ] {
+        let session = fixture.routed_at(NODE, NOW).await;
+        if outcome != "none" {
+            recordings.begin(&session.id, NODE, NOW).await.unwrap();
+        }
+        let owned = StoredRecordingOwned {
+            session_id: session.id.clone(),
+        };
+        let write = owned.borrowed();
+        match outcome {
+            "complete" => assert!(recordings.mark_complete(&write).await.unwrap()),
+            "incomplete" => assert!(recordings.mark_incomplete(&write).await.unwrap()),
+            "salvaged" => assert!(recordings.mark_salvaged(&write).await.unwrap()),
+            "failed" => assert!(recordings.mark_failed(&session.id, NOW + 1).await.unwrap()),
+            _ => {}
+        }
+        let summary = match outcome {
+            "salvaged" => SessionRecording::Incomplete,
+            "failed" | "none" => SessionRecording::None,
+            "receiving" => SessionRecording::Receiving,
+            "complete" => SessionRecording::Complete,
+            _ => SessionRecording::Incomplete,
+        };
+        expected.push((session.id, summary));
+    }
+
+    let sessions = fixture.store.sessions();
+    let page = sessions.page(&page_query(10)).await.unwrap();
+    for (id, summary) in &expected {
+        let listed = page
+            .sessions
+            .iter()
+            .find(|listing| &listing.session.id == id)
+            .unwrap();
+        assert_eq!(listed.recording, *summary, "{id}");
+        assert_eq!(
+            sessions.listing(id).await.unwrap().unwrap().recording,
+            *summary
+        );
+    }
+    let names: Vec<&str> = expected
+        .iter()
+        .map(|(_, summary)| summary.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "none",
+            "receiving",
+            "complete",
+            "incomplete",
+            "incomplete",
+            "none"
+        ]
+    );
+}
+
+struct StoredRecordingOwned {
+    session_id: String,
+}
+
+impl StoredRecordingOwned {
+    fn borrowed(&self) -> StoredRecording<'_> {
+        StoredRecording {
+            session_id: &self.session_id,
+            node_id: NODE,
+            chunks: 1,
+            raw_bytes: 10,
+            digest: None,
+            input_recorded: false,
+            dropped_chunks: 0,
+            location: "2026/11/cast",
+            cast_sha256: None,
+            manifest_sha256: "manifest",
+            now: NOW + 1,
+        }
+    }
 }

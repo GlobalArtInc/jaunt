@@ -157,3 +157,28 @@ fn a_vanished_generation_keeps_the_last_valid_set() {
             .allowed
     );
 }
+
+#[test]
+fn the_load_time_moves_only_when_the_applied_content_changes() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+    let dir = write_dir(&[("roles.yaml", &role("ops", "deploy"))]);
+    let handle = PolicyHandle::empty();
+    assert_eq!(handle.loaded().loaded_at, None);
+
+    assert!(handle.reload_at(dir.path(), at(100)).applied);
+    assert_eq!(handle.loaded().loaded_at, Some(at(100)));
+    assert!(handle.reload_at(dir.path(), at(200)).unchanged);
+    assert_eq!(handle.loaded().loaded_at, Some(at(100)));
+
+    fs::write(dir.path().join("roles.yaml"), "kind: Nope\n").unwrap();
+    assert!(!handle.reload_at(dir.path(), at(300)).applied);
+    assert_eq!(handle.loaded().loaded_at, Some(at(100)));
+
+    fs::write(dir.path().join("roles.yaml"), role("ops", "admin")).unwrap();
+    assert!(handle.reload_at(dir.path(), at(400)).applied);
+    let loaded = handle.loaded();
+    assert_eq!(loaded.loaded_at, Some(at(400)));
+    assert_eq!(loaded.set.hash(), handle.snapshot().hash());
+}

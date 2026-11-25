@@ -27,6 +27,7 @@ async fn each_unauthenticated_entry_point_limits_one_address_without_touching_an
             web_login: one,
             enroll: one,
             enroll_poll: one,
+            enrolment_lookup: one,
             ..RequestLimits::default()
         },
         ..Options::default()
@@ -41,6 +42,7 @@ async fn each_unauthenticated_entry_point_limits_one_address_without_touching_an
         (Method::GET, "/v1/web/login"),
         (Method::POST, "/v1/agent/enroll"),
         (Method::POST, "/v1/agent/enroll/poll"),
+        (Method::POST, "/v1/admin/enrolments/lookup"),
     ] {
         let send = |peer: &'static str| harness.request_as(method.clone(), path, peer, &[], body());
         let first = send("198.51.100.1:40000").await;

@@ -19,6 +19,11 @@ mod subject_key;
 mod support;
 mod sweep;
 mod trust;
+mod web_enrolments;
+mod web_guard;
+mod web_nodes;
+mod web_sessions;
+mod web_support;
 
 #[allow(dead_code)]
 #[path = "../login/provider.rs"]

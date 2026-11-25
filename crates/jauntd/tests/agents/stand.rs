@@ -15,6 +15,7 @@ use jaunt_store::{NewCertificate, NewUser, RevocationKind, Session, SessionEndRe
 use jaunt_tunnel::{BoxFuture, IncomingStream, NodeId, StreamHandler};
 use jauntd::gate_ssh::{GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer};
 use jauntd::killer::InProcessKiller;
+use jauntd::presence::RegistryPresence;
 use russh::keys::key::safe_rng;
 use russh::keys::{Algorithm, Certificate, PrivateKey, PublicKeyOrCertificate};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, PublicKeyOffer};
@@ -33,6 +34,8 @@ const GATE_NAME: &str = "gate.jaunt.test";
 const EMAIL: &str = "alice@example.com";
 const ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\nspec:\n  \
     members: { users: [alice@example.com] }\n  ssh: { nodes: { env: [test] }, logins: [deploy] }\n";
+const ADMIN_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: admins }\nspec:\n  \
+    members: { users: [alice@example.com] }\n  admin: [nodes.approve]\n";
 
 #[derive(Default)]
 pub struct AgentLog {
@@ -315,12 +318,25 @@ impl Stand {
                 harness.server.agents(),
                 Some(Arc::clone(gate.gate())),
             )));
+        harness
+            .control
+            .install_agent_presence(Arc::new(RegistryPresence::new(harness.server.agents())));
         Stand {
             harness,
             gate,
             user_id,
             nodes,
         }
+    }
+
+    pub fn grant_node_admin(&self) {
+        let policy = tempfile::tempdir().unwrap();
+        std::fs::write(
+            policy.path().join("roles.yaml"),
+            format!("{ROLE}---\n{ADMIN_ROLE}"),
+        )
+        .unwrap();
+        assert!(self.harness.control.policy().reload(policy.path()).applied);
     }
 
     pub fn kill_without_the_gate(&self) {

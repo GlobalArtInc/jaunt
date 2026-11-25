@@ -28,6 +28,7 @@ use crate::limits::{NoiseLog, RequestLimiters, RequestLimits};
 use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
+use crate::presence::{AgentPresence, PresenceSlot};
 use crate::rate_limit;
 use crate::recordings::{self, RecordingSettings, RecoveredRecordings, RejectionLog, Uploads};
 use crate::revocation::RevocationAdmin;
@@ -87,6 +88,7 @@ pub struct Inner {
     pub(crate) watched: Arc<RevocationWatch>,
     pub(crate) recordings: Option<Uploads>,
     pub(crate) recording_rejections: RejectionLog,
+    pub(crate) presence: PresenceSlot,
 }
 
 #[derive(Clone)]
@@ -177,6 +179,7 @@ impl Control {
                 watched: Arc::new(watched),
                 recordings: parts.recordings.map(Uploads::new),
                 recording_rejections: RejectionLog::default(),
+                presence: PresenceSlot::default(),
             }),
         })
     }
@@ -225,6 +228,16 @@ impl Control {
 
     pub fn install_session_killer(&self, killer: Arc<dyn SessionKiller>) {
         self.inner.killer.install(killer);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn open_web_session(&self, user_id: &str) -> Option<crate::web::TestWebSession> {
+        crate::web::open_for_tests(self, user_id).await
+    }
+
+    pub fn install_agent_presence(&self, presence: Arc<dyn AgentPresence>) {
+        self.inner.presence.install(presence);
     }
 
     pub fn issue_server_certificate(

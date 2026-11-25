@@ -25,11 +25,13 @@ mod limits;
 mod naming;
 mod node_audit;
 mod node_keys;
+mod node_removal;
 mod nodes;
 mod pending;
 mod pkce;
 mod plane;
 mod poll;
+mod presence;
 mod principal;
 mod rate_limit;
 mod recordings;
@@ -67,6 +69,7 @@ pub use limits::{
     RequestLimits,
 };
 pub use naming::{AgentEndpoint, GateEndpoint, NamingError, SshSuffix};
+pub use presence::AgentPresence;
 pub use recordings::{
     CHUNK_ENVELOPE_BYTES, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_UPLOADS_PER_NODE,
     DEFAULT_MAX_UPLOADS_TOTAL, DEFAULT_PENDING_BYTES_PER_NODE, DEFAULT_PENDING_BYTES_TOTAL,
@@ -82,3 +85,5 @@ pub use session_sweep::{
     OVERDUE_MARGIN_SECS, REVOCATION_PRUNE_AFTER_EXPIRY_SECS, REVOCATION_WATCH_INTERVAL,
     ROUTED_GRACE_SECS, SESSION_SWEEP_INTERVAL, SessionSweep,
 };
+#[cfg(feature = "test-support")]
+pub use web::TestWebSession;

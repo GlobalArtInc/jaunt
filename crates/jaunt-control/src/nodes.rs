@@ -26,13 +26,20 @@ pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -
     };
     let policy = control.policy_snapshot();
     let identity = policy_identity(&valid.user);
+    let connected = |node_id: &str| control.presence.connected_since(node_id).is_some();
     json_response(
         StatusCode::OK,
-        &reachable(&nodes, &policy, &identity, MAX_NODES),
+        &reachable(&nodes, &policy, &identity, MAX_NODES, connected),
     )
 }
 
-fn reachable(nodes: &[Node], policy: &PolicySet, identity: &Identity, limit: usize) -> NodeList {
+fn reachable(
+    nodes: &[Node],
+    policy: &PolicySet,
+    identity: &Identity,
+    limit: usize,
+    connected: impl Fn(&str) -> bool,
+) -> NodeList {
     let mut visible: Vec<&Node> = nodes
         .iter()
         .filter(|node| node.state == NodeState::Active)
@@ -56,7 +63,7 @@ fn reachable(nodes: &[Node], policy: &PolicySet, identity: &Identity, limit: usi
                 name: node.name.clone(),
                 labels: node.labels.clone(),
                 hostname: node.hostname.clone(),
-                connected: false,
+                connected: connected(&node.id),
             })
             .collect(),
         truncated,
@@ -102,6 +109,7 @@ mod tests {
             approved_by: "cli:test".to_owned(),
             created_at: 0,
             removed_at: None,
+            agent_version: None,
         }
     }
 
@@ -114,12 +122,19 @@ mod tests {
             node("web-2", "prod", NodeState::Removed),
         ];
 
-        let list = reachable(&nodes, &policy(), &identity("alice@example.com"), 10);
+        let list = reachable(
+            &nodes,
+            &policy(),
+            &identity("alice@example.com"),
+            10,
+            |id| id == "id-web-3",
+        );
 
         let names: Vec<&str> = list.nodes.iter().map(|node| node.name.as_str()).collect();
         assert_eq!(names, ["web-1", "web-3"]);
         assert!(!list.truncated);
-        assert!(list.nodes.iter().all(|node| !node.connected));
+        let connected: Vec<bool> = list.nodes.iter().map(|node| node.connected).collect();
+        assert_eq!(connected, [false, true]);
         assert_eq!(list.nodes[0].hostname, "web-1.internal");
         assert_eq!(list.nodes[0].labels["env"], "prod");
     }
@@ -128,7 +143,9 @@ mod tests {
     fn a_user_without_a_matching_role_sees_nothing() {
         let nodes = [node("web-1", "prod", NodeState::Active)];
 
-        let list = reachable(&nodes, &policy(), &identity("bob@example.com"), 10);
+        let list = reachable(&nodes, &policy(), &identity("bob@example.com"), 10, |_| {
+            true
+        });
 
         assert!(list.nodes.is_empty() && !list.truncated);
     }
@@ -140,8 +157,12 @@ mod tests {
             .map(|index| node(&format!("web-{index}"), "prod", NodeState::Active))
             .collect();
 
-        let at_limit = reachable(&nodes, &policy(), &identity("alice@example.com"), 5);
-        let cut = reachable(&nodes, &policy(), &identity("alice@example.com"), 3);
+        let at_limit = reachable(&nodes, &policy(), &identity("alice@example.com"), 5, |_| {
+            false
+        });
+        let cut = reachable(&nodes, &policy(), &identity("alice@example.com"), 3, |_| {
+            false
+        });
 
         assert_eq!(at_limit.nodes.len(), 5);
         assert!(!at_limit.truncated);
@@ -156,7 +177,13 @@ mod tests {
             .map(|index| node(&format!("web-{index:04}"), "prod", NodeState::Active))
             .collect();
 
-        let list = reachable(&nodes, &policy(), &identity("alice@example.com"), MAX_NODES);
+        let list = reachable(
+            &nodes,
+            &policy(),
+            &identity("alice@example.com"),
+            MAX_NODES,
+            |_| false,
+        );
 
         assert_eq!(MAX_NODES, 1000);
         assert_eq!(list.nodes.len(), 1000);
@@ -167,6 +194,7 @@ mod tests {
             &policy(),
             &identity("alice@example.com"),
             MAX_NODES,
+            |_| false,
         );
         assert_eq!(exact.nodes.len(), 1000);
         assert!(!exact.truncated);

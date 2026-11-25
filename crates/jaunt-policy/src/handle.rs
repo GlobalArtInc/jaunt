@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::SystemTime;
 
 use crate::loader::load_dir;
 use crate::policy::PolicySet;
@@ -16,9 +17,15 @@ pub struct ReloadOutcome {
 const EMPTY_RELOAD_REFUSED: &str =
     "refusing to replace a non-empty policy set with an empty one; the last valid set stays active";
 
+#[derive(Debug, Clone)]
+pub struct LoadedPolicy {
+    pub set: Arc<PolicySet>,
+    pub loaded_at: Option<SystemTime>,
+}
+
 #[derive(Debug)]
 struct Shared {
-    current: RwLock<Arc<PolicySet>>,
+    current: RwLock<LoadedPolicy>,
     reload: Mutex<()>,
 }
 
@@ -31,22 +38,32 @@ impl PolicyHandle {
     pub fn empty() -> Self {
         PolicyHandle {
             shared: Arc::new(Shared {
-                current: RwLock::new(Arc::new(PolicySet::empty())),
+                current: RwLock::new(LoadedPolicy {
+                    set: Arc::new(PolicySet::empty()),
+                    loaded_at: None,
+                }),
                 reload: Mutex::new(()),
             }),
         }
     }
 
     pub fn snapshot(&self) -> Arc<PolicySet> {
-        let guard = self
-            .shared
+        Arc::clone(&self.loaded().set)
+    }
+
+    pub fn loaded(&self) -> LoadedPolicy {
+        self.shared
             .current
             .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(&guard)
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn reload(&self, dir: &Path) -> ReloadOutcome {
+        self.reload_at(dir, SystemTime::now())
+    }
+
+    pub fn reload_at(&self, dir: &Path, now: SystemTime) -> ReloadOutcome {
         let _serialized = self
             .shared
             .reload
@@ -60,7 +77,7 @@ impl PolicyHandle {
                     .current
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
-                if set.is_empty() && !guard.is_empty() {
+                if set.is_empty() && !guard.set.is_empty() {
                     return ReloadOutcome {
                         applied: false,
                         unchanged: false,
@@ -69,8 +86,15 @@ impl PolicyHandle {
                         errors: vec![EMPTY_RELOAD_REFUSED.to_owned()],
                     };
                 }
-                let unchanged = guard.hash() == hash;
-                *guard = Arc::new(set);
+                let unchanged = guard.set.hash() == hash;
+                let loaded_at = match guard.loaded_at {
+                    Some(previous) if unchanged => previous,
+                    _ => now,
+                };
+                *guard = LoadedPolicy {
+                    set: Arc::new(set),
+                    loaded_at: Some(loaded_at),
+                };
                 ReloadOutcome {
                     applied: true,
                     unchanged,

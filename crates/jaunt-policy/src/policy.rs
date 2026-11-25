@@ -2,8 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::access_test::AccessTest;
 use crate::model::{
-    AdminPermission, Identity, NodeInfo, SshDecision, is_valid_login, is_valid_substituted_login,
+    AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, is_valid_login,
+    is_valid_substituted_login,
 };
+use crate::raw::USERNAME_PLACEHOLDER;
 
 pub(crate) const ANY_VALUE: &str = "*";
 
@@ -126,6 +128,34 @@ impl PolicySet {
         }
         decision.roles.sort();
         decision
+    }
+
+    pub fn roles_reaching(&self, node: &NodeInfo) -> Vec<RoleAccess> {
+        let mut reaching: Vec<RoleAccess> = self
+            .roles
+            .iter()
+            .filter_map(|role| {
+                let rule = role.ssh.as_ref().filter(|rule| rule.matches_node(node))?;
+                Some(RoleAccess {
+                    role: role.name.clone(),
+                    users: role.users.iter().cloned().collect(),
+                    groups: role.groups.iter().cloned().collect(),
+                    logins: rule
+                        .logins
+                        .iter()
+                        .map(|spec| match spec {
+                            LoginSpec::Literal(login) => login.clone(),
+                            LoginSpec::Username => USERNAME_PLACEHOLDER.to_owned(),
+                        })
+                        .collect(),
+                    port_forwarding: rule.port_forwarding,
+                    record_input: rule.record_input,
+                    admin: role.admin.iter().copied().collect(),
+                })
+            })
+            .collect();
+        reaching.sort_by(|left, right| left.role.cmp(&right.role));
+        reaching
     }
 
     pub fn admin_can(&self, identity: &Identity, permission: AdminPermission) -> bool {

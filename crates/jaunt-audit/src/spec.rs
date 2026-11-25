@@ -136,6 +136,8 @@ events! {
         [("not_after", INT)]),
     AdminCsrfDenied => ("admin.csrf_denied", "web.csrf.denied", ActorRule::User("user_id"), None, None, None,
         [("reason", NAME)]),
+    AdminEnrolmentLookedUp => ("admin.enrolment.looked_up", "admin.enrolment.looked_up", ActorRule::User("looked_up_by"), None, None, None,
+        [("outcome", SHORT), ("enrollment_id", ID)]),
     AuthzDeny => ("authz.deny", "authz.deny", ActorRule::User("user_id"), NODE, SESSION, HASH,
         [("phase", SHORT), ("reason", NAME), ("permission", NAME), ("serial", INT), ("node_name", NAME),
          ("login", NAME), ("client_addr", ADDR)]),

@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::StoreError;
@@ -255,6 +257,30 @@ impl Revocations {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(revocation_from_row).transpose()
+    }
+
+    pub async fn revoked_among(
+        &self,
+        kind: RevocationKind,
+        subjects: &[String],
+    ) -> Result<BTreeSet<String>, StoreError> {
+        let mut revoked = BTreeSet::new();
+        if subjects.is_empty() {
+            return Ok(revoked);
+        }
+        let mut builder: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT subject FROM revocations WHERE kind = ");
+        builder.push_bind(kind.as_str());
+        builder.push(" AND subject IN (");
+        let mut listed = builder.separated(", ");
+        for subject in subjects {
+            listed.push_bind(subject.clone());
+        }
+        builder.push(")");
+        for row in builder.build().fetch_all(&self.pool).await? {
+            revoked.insert(row.try_get("subject")?);
+        }
+        Ok(revoked)
     }
 
     pub async fn any_matches(&self, subjects: Subjects<'_>) -> Result<bool, StoreError> {

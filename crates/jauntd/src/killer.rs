@@ -49,6 +49,12 @@ impl InProcessKiller {
     }
 
     fn close_outer(&self, scope: &KillScope, reason: KillReason) {
+        if reason == KillReason::NodeRemoved
+            && let KillScope::Node { node_id } = scope
+        {
+            self.disconnect_node(node_id);
+            return;
+        }
         if reason != KillReason::Revoked {
             return;
         }
@@ -64,17 +70,21 @@ impl InProcessKiller {
                     gate.terminate(user_id, Some(*serial), reason);
                 }
             }
-            KillScope::Node { node_id } => match NodeId::new(node_id.as_str()) {
-                Ok(node) => {
-                    self.agents.disconnect(&node, DisconnectReason::Removed);
-                }
-                Err(_) => tracing::error!(
-                    target: "jaunt::daemon",
-                    node_id = %node_id,
-                    "a revoked node has an id the tunnel cannot carry"
-                ),
-            },
+            KillScope::Node { node_id } => self.disconnect_node(node_id),
             KillScope::Sessions => {}
+        }
+    }
+
+    fn disconnect_node(&self, node_id: &str) {
+        match NodeId::new(node_id) {
+            Ok(node) => {
+                self.agents.disconnect(&node, DisconnectReason::Removed);
+            }
+            Err(_) => tracing::error!(
+                target: "jaunt::daemon",
+                node_id = %node_id,
+                "a node to disconnect has an id the tunnel cannot carry"
+            ),
         }
     }
 }

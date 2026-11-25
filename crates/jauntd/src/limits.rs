@@ -34,6 +34,7 @@ pub struct HttpLimitsSection {
     pub web_login: Option<RateSection>,
     pub enroll: Option<RateSection>,
     pub enroll_poll: Option<RateSection>,
+    pub enrolment_lookup: Option<RateSection>,
     pub other: Option<RateSection>,
     pub max_connections: Option<usize>,
     pub max_connections_per_address: Option<usize>,
@@ -135,6 +136,11 @@ impl LimitsSection {
             web_login: rate("http.web_login", http.web_login, base.web_login)?,
             enroll: rate("http.enroll", http.enroll, base.enroll)?,
             enroll_poll: rate("http.enroll_poll", http.enroll_poll, base.enroll_poll)?,
+            enrolment_lookup: rate(
+                "http.enrolment_lookup",
+                http.enrolment_lookup,
+                base.enrolment_lookup,
+            )?,
             other: rate("http.other", http.other, base.other)?,
             tracked_addresses: tracked,
             max_connections: bounded(
@@ -203,6 +209,7 @@ mod tests {
             (http.web_login, 60, 30),
             (http.enroll, 60, 6),
             (http.enroll_poll, 120, 120),
+            (http.enrolment_lookup, 30, 10),
             (http.other, 600, 300),
             (defaults.ssh.rate, 600, 600),
             (defaults.agents.rate, 128, 1200),
@@ -222,6 +229,7 @@ mod tests {
         let tuned = settings(
             "tracked_addresses: 1000\n\
              http:\n  login_start: { burst: 5, per_minute: 2 }\n  enroll: { burst: 1, per_minute: 1 }\n  \
+             enrolment_lookup: { burst: 2, per_minute: 3 }\n  \
              max_connections: 10\n  max_connections_per_address: 2\n  other: { burst: 3, per_minute: 4 }\n\
              ssh:\n  connections: { burst: 7, per_minute: 70 }\n  unauthenticated_per_address: 3\n\
              agents:\n  handshakes: { burst: 9, per_minute: 90 }\n  handshaking_per_address: 4\n",
@@ -229,6 +237,7 @@ mod tests {
         .unwrap();
         assert_eq!(tuned.http.login_start, Rate::new(5, 2).unwrap());
         assert_eq!(tuned.http.enroll, Rate::new(1, 1).unwrap());
+        assert_eq!(tuned.http.enrolment_lookup, Rate::new(2, 3).unwrap());
         assert_eq!(
             tuned.http.device_poll,
             LimitSettings::default().http.device_poll

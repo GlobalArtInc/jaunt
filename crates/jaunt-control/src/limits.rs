@@ -34,6 +34,7 @@ pub struct RequestLimits {
     pub web_login: Rate,
     pub enroll: Rate,
     pub enroll_poll: Rate,
+    pub enrolment_lookup: Rate,
     pub other: Rate,
     pub tracked_addresses: usize,
     pub max_connections: usize,
@@ -50,6 +51,7 @@ impl Default for RequestLimits {
             web_login: Rate::clamped(60, 30),
             enroll: Rate::clamped(60, 6),
             enroll_poll: Rate::clamped(120, 120),
+            enrolment_lookup: Rate::clamped(30, 10),
             other: Rate::clamped(600, 300),
             tracked_addresses: DEFAULT_CAPACITY,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -67,11 +69,12 @@ pub(crate) enum Endpoint {
     WebLogin,
     Enroll,
     EnrollPoll,
+    EnrolmentLookup,
     Other,
 }
 
 impl Endpoint {
-    const ALL: [Endpoint; 8] = [
+    const ALL: [Endpoint; 9] = [
         Endpoint::LoginStart,
         Endpoint::LoginFinish,
         Endpoint::DeviceStart,
@@ -79,6 +82,7 @@ impl Endpoint {
         Endpoint::WebLogin,
         Endpoint::Enroll,
         Endpoint::EnrollPoll,
+        Endpoint::EnrolmentLookup,
         Endpoint::Other,
     ];
 
@@ -101,6 +105,7 @@ impl Endpoint {
             "/v1/web/login" => Endpoint::WebLogin,
             "/v1/agent/enroll" => post(Endpoint::Enroll),
             "/v1/agent/enroll/poll" => post(Endpoint::EnrollPoll),
+            "/v1/admin/enrolments/lookup" => post(Endpoint::EnrolmentLookup),
             _ => Endpoint::Other,
         })
     }
@@ -114,6 +119,7 @@ impl Endpoint {
             Endpoint::WebLogin => "web_login",
             Endpoint::Enroll => "enroll",
             Endpoint::EnrollPoll => "enroll_poll",
+            Endpoint::EnrolmentLookup => "enrolment_lookup",
             Endpoint::Other => "other",
         }
     }
@@ -127,6 +133,7 @@ impl Endpoint {
             Endpoint::WebLogin => limits.web_login,
             Endpoint::Enroll => limits.enroll,
             Endpoint::EnrollPoll => limits.enroll_poll,
+            Endpoint::EnrolmentLookup => limits.enrolment_lookup,
             Endpoint::Other => limits.other,
         }
     }
@@ -354,6 +361,41 @@ mod tests {
                 "/v1/admin/revocations/r-1",
                 Some(Endpoint::Other),
             ),
+            (
+                Method::POST,
+                "/v1/admin/enrolments/lookup",
+                Some(Endpoint::EnrolmentLookup),
+            ),
+            (
+                Method::GET,
+                "/v1/admin/enrolments/lookup",
+                Some(Endpoint::Other),
+            ),
+            (
+                Method::POST,
+                "/v1/admin/enrolments/lookup/",
+                Some(Endpoint::Other),
+            ),
+            (
+                Method::POST,
+                "/v1/admin/enrolments/e-1/approve",
+                Some(Endpoint::Other),
+            ),
+            (
+                Method::POST,
+                "/v1/admin/enrolments/e-1/reject",
+                Some(Endpoint::Other),
+            ),
+            (Method::GET, "/v1/admin/nodes", Some(Endpoint::Other)),
+            (Method::GET, "/v1/admin/nodes/n-1", Some(Endpoint::Other)),
+            (Method::DELETE, "/v1/admin/nodes/n-1", Some(Endpoint::Other)),
+            (
+                Method::GET,
+                "/v1/admin/nodes/n-1/access",
+                Some(Endpoint::Other),
+            ),
+            (Method::GET, "/v1/admin/sessions", Some(Endpoint::Other)),
+            (Method::GET, "/v1/admin/sessions/s-1", Some(Endpoint::Other)),
             (Method::POST, "/login/device", Some(Endpoint::Other)),
             (Method::GET, "/", Some(Endpoint::Other)),
             (Method::GET, "/healthz", None),
@@ -365,6 +407,13 @@ mod tests {
         let limits = RequestLimits::default();
         assert_eq!(limits.enroll.burst(), 60);
         assert_eq!(limits.enroll.per_minute(), 6);
+        assert_eq!(
+            (
+                limits.enrolment_lookup.burst(),
+                limits.enrolment_lookup.per_minute()
+            ),
+            (30, 10)
+        );
         assert_eq!(
             (limits.other.burst(), limits.other.per_minute()),
             (600, 300)
