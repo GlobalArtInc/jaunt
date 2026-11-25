@@ -26,6 +26,7 @@ mod web_nodes;
 mod web_recordings;
 mod web_sessions;
 mod web_support;
+mod web_terminal;
 
 #[allow(dead_code)]
 #[path = "../login/provider.rs"]

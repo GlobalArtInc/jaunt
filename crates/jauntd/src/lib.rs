@@ -12,3 +12,4 @@ pub mod node;
 pub mod presence;
 pub mod recordings;
 pub mod revoke;
+pub mod web_terminal;

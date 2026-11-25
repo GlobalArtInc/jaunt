@@ -35,6 +35,7 @@ pub struct RequestLimits {
     pub enroll: Rate,
     pub enroll_poll: Rate,
     pub enrolment_lookup: Rate,
+    pub web_terminal: Rate,
     pub other: Rate,
     pub tracked_addresses: usize,
     pub max_connections: usize,
@@ -52,6 +53,7 @@ impl Default for RequestLimits {
             enroll: Rate::clamped(60, 6),
             enroll_poll: Rate::clamped(120, 120),
             enrolment_lookup: Rate::clamped(30, 10),
+            web_terminal: Rate::clamped(30, 30),
             other: Rate::clamped(600, 300),
             tracked_addresses: DEFAULT_CAPACITY,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -70,11 +72,12 @@ pub(crate) enum Endpoint {
     Enroll,
     EnrollPoll,
     EnrolmentLookup,
+    WebTerminal,
     Other,
 }
 
 impl Endpoint {
-    const ALL: [Endpoint; 9] = [
+    const ALL: [Endpoint; 10] = [
         Endpoint::LoginStart,
         Endpoint::LoginFinish,
         Endpoint::DeviceStart,
@@ -83,6 +86,7 @@ impl Endpoint {
         Endpoint::Enroll,
         Endpoint::EnrollPoll,
         Endpoint::EnrolmentLookup,
+        Endpoint::WebTerminal,
         Endpoint::Other,
     ];
 
@@ -106,6 +110,8 @@ impl Endpoint {
             "/v1/agent/enroll" => post(Endpoint::Enroll),
             "/v1/agent/enroll/poll" => post(Endpoint::EnrollPoll),
             "/v1/admin/enrolments/lookup" => post(Endpoint::EnrolmentLookup),
+            "/v1/web/terminal" => Endpoint::WebTerminal,
+            "/v1/web/terminal/ticket" => post(Endpoint::WebTerminal),
             _ => Endpoint::Other,
         })
     }
@@ -120,6 +126,7 @@ impl Endpoint {
             Endpoint::Enroll => "enroll",
             Endpoint::EnrollPoll => "enroll_poll",
             Endpoint::EnrolmentLookup => "enrolment_lookup",
+            Endpoint::WebTerminal => "web_terminal",
             Endpoint::Other => "other",
         }
     }
@@ -134,6 +141,7 @@ impl Endpoint {
             Endpoint::Enroll => limits.enroll,
             Endpoint::EnrollPoll => limits.enroll_poll,
             Endpoint::EnrolmentLookup => limits.enrolment_lookup,
+            Endpoint::WebTerminal => limits.web_terminal,
             Endpoint::Other => limits.other,
         }
     }
@@ -386,6 +394,28 @@ mod tests {
                 "/v1/admin/enrolments/e-1/reject",
                 Some(Endpoint::Other),
             ),
+            (Method::GET, "/v1/web/terminal", Some(Endpoint::WebTerminal)),
+            (
+                Method::POST,
+                "/v1/web/terminal",
+                Some(Endpoint::WebTerminal),
+            ),
+            (
+                Method::POST,
+                "/v1/web/terminal/ticket",
+                Some(Endpoint::WebTerminal),
+            ),
+            (
+                Method::GET,
+                "/v1/web/terminal/ticket",
+                Some(Endpoint::Other),
+            ),
+            (
+                Method::GET,
+                "/v1/web/terminal/targets",
+                Some(Endpoint::Other),
+            ),
+            (Method::GET, "/v1/web/terminal/", Some(Endpoint::Other)),
             (Method::GET, "/v1/admin/nodes", Some(Endpoint::Other)),
             (Method::GET, "/v1/admin/nodes/n-1", Some(Endpoint::Other)),
             (Method::DELETE, "/v1/admin/nodes/n-1", Some(Endpoint::Other)),
@@ -427,6 +457,13 @@ mod tests {
         assert_eq!(
             (limits.other.burst(), limits.other.per_minute()),
             (600, 300)
+        );
+        assert_eq!(
+            (
+                limits.web_terminal.burst(),
+                limits.web_terminal.per_minute()
+            ),
+            (30, 30)
         );
         assert_eq!(limits.max_connections_per_address, 256);
     }

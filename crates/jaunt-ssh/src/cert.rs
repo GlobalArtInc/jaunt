@@ -300,6 +300,30 @@ mod tests {
     }
 
     #[test]
+    fn a_web_origin_extension_is_ignored_and_yields_the_same_identity_as_a_cli_certificate() {
+        let ca = key(Algorithm::Ed25519);
+        let subject = key(Algorithm::Ed25519);
+        let profile = |extensions| Profile {
+            subject: subject.clone(),
+            extensions,
+            ..Profile::jaunt()
+        };
+        let cli = profile(vec![("permit-port-forwarding", ""), ("permit-pty", "")]).sign(&ca);
+        let web = profile(vec![
+            ("jaunt-origin@globalart.dev", "web"),
+            ("permit-port-forwarding", ""),
+            ("permit-pty", ""),
+        ])
+        .sign(&ca);
+        assert_eq!(web.extensions().len(), cli.extensions().len() + 1);
+        assert_eq!(
+            verify_user_certificate(&web, &trust(&ca), ISSUED),
+            verify_user_certificate(&cli, &trust(&ca), ISSUED)
+        );
+        assert!(verify_user_certificate(&web, &trust(&ca), ISSUED).is_ok());
+    }
+
+    #[test]
     fn the_validity_window_is_checked_at_the_given_instant() {
         let ca = key(Algorithm::Ed25519);
         let cert = Profile::jaunt().sign(&ca);

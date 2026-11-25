@@ -392,6 +392,10 @@ impl Client {
         self.log.failures.lock().unwrap()[index].clone()
     }
 
+    pub fn disconnect_notice_seen(&self) -> Option<(String, String)> {
+        self.log.disconnect.lock().unwrap().clone()
+    }
+
     pub async fn disconnect_notice(&self) -> (String, String) {
         until("a disconnect notice", || {
             self.log.disconnect.lock().unwrap().is_some()
@@ -478,6 +482,14 @@ impl Gate {
     }
 
     pub fn with_clock_shift(limits: OuterLimits, mode: Mode, shift_secs: i64) -> Self {
+        Self::build(limits, mode, shift_secs, true)
+    }
+
+    pub fn keeping_after_expiry(limits: OuterLimits, mode: Mode, shift_secs: i64) -> Self {
+        Self::build(limits, mode, shift_secs, false)
+    }
+
+    fn build(limits: OuterLimits, mode: Mode, shift_secs: i64, cut_at_expiry: bool) -> Self {
         let host_ca = key();
         let host = HostKey::generate().unwrap();
         let public = PublicKey::from_openssh(&host.public_openssh().unwrap()).unwrap();
@@ -522,6 +534,11 @@ impl Gate {
                     SystemTime::now() - shift
                 }
             });
+        let hop = if cut_at_expiry {
+            hop
+        } else {
+            hop.keep_after_certificate_expiry()
+        };
         Self {
             hop: Arc::new(hop),
             backend,

@@ -3,10 +3,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::{Signer, TrustSet};
-use jaunt_control::{Control, ControlError, ControlParts, PENDING_CAPACITY, system_clock};
+use jaunt_control::{
+    Control, ControlError, ControlParts, PENDING_CAPACITY, WebTerminalSettings, system_clock,
+};
 use jaunt_limits::AddressLimits;
 use jaunt_oidc::{OidcClient, OidcError};
 use jaunt_policy::Watcher;
@@ -20,10 +23,13 @@ use jauntd::gate_ssh::{
 };
 use jauntd::killer::InProcessKiller;
 use jauntd::presence::RegistryPresence;
+use jauntd::web_terminal::GateTerminals;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
+
+const TERMINAL_CLOSE_GRACE: Duration = Duration::from_secs(3);
 
 use crate::policy::{self, PolicyError};
 use crate::storage::{self, Exposure, StorageError};
@@ -109,6 +115,7 @@ struct Started {
     agents: Option<AgentsSettings>,
     agent_limits: AddressLimits,
     gate: Option<GatePlan>,
+    web_terminal: Option<WebTerminalSettings>,
     audit: AuditRuntime,
     recordings: Option<recordings::PreparedRecordings>,
 }
@@ -138,6 +145,7 @@ async fn serve(
         agents,
         agent_limits,
         gate,
+        web_terminal,
         audit,
         recordings,
     } = start(settings, authorities, &tap, &reload_env).await?;
@@ -175,6 +183,8 @@ async fn serve(
         recordings::RETRY_INTERVAL,
         recordings::SCAN_INTERVAL,
     );
+    install_web_terminal(&control, gate.as_ref(), web_terminal);
+    let terminals = control.clone();
     let ca_watcher = start_ca_watcher(&control, ca_dir, reload_env, agents.as_ref(), gate.as_ref());
 
     let (deadline_tx, mut deadline_rx) = watch::channel(None);
@@ -186,6 +196,11 @@ async fn serve(
         tracing::info!(target: "jaunt::daemon", "shutting down");
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         deadline_tx.send_replace(Some(deadline));
+        terminals
+            .close_web_terminals(
+                TERMINAL_CLOSE_GRACE.min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         ca_watcher
             .stop(deadline.saturating_duration_since(Instant::now()))
             .await;
@@ -293,6 +308,28 @@ fn install_killer(control: &Control, agents: Option<&AgentServer>, gate: Option<
         target: "jaunt::daemon",
         closes_outer,
         "revocations tear down live sessions in this process, where the gate and control run together"
+    );
+}
+
+fn install_web_terminal(
+    control: &Control,
+    gate: Option<&GateSshServer>,
+    settings: Option<WebTerminalSettings>,
+) {
+    let (Some(gate), Some(settings)) = (gate, settings) else {
+        tracing::info!(target: "jaunt::daemon", "the web terminal is off");
+        return;
+    };
+    control.install_web_terminal(
+        Arc::new(GateTerminals::new(Arc::clone(gate.gate()))),
+        settings,
+    );
+    tracing::info!(
+        target: "jaunt::daemon",
+        max_per_user = settings.max_per_user,
+        max_total = settings.max_total,
+        idle_timeout_secs = settings.idle_timeout.as_secs(),
+        "the web terminal reaches nodes through the gate in this process"
     );
 }
 
@@ -425,6 +462,7 @@ async fn start(
             agents: settings.agents,
             agent_limits: settings.limits.agents,
             gate,
+            web_terminal: settings.web_terminal,
             audit: audit.clone(),
             recordings: prepared_recordings,
         })

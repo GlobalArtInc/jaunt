@@ -15,6 +15,8 @@ pub const MAX_USER_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_HOST_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_HOST_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const BACKDATE: Duration = Duration::from_secs(2 * 60);
+pub const ORIGIN_EXTENSION: &str = "jaunt-origin@globalart.dev";
+pub const WEB_ORIGIN: &str = "web";
 
 const MIN_VALIDITY: Duration = Duration::from_secs(1);
 const MAX_EMAIL_LEN: usize = 254;
@@ -49,6 +51,23 @@ pub fn sign_user_certificate(
     params: UserCertParams,
     now: SystemTime,
 ) -> Result<Certificate, CaError> {
+    sign_user(signer, params, now, None)
+}
+
+pub fn sign_web_user_certificate(
+    signer: &dyn Signer,
+    params: UserCertParams,
+    now: SystemTime,
+) -> Result<Certificate, CaError> {
+    sign_user(signer, params, now, Some(WEB_ORIGIN))
+}
+
+fn sign_user(
+    signer: &dyn Signer,
+    params: UserCertParams,
+    now: SystemTime,
+    origin: Option<&str>,
+) -> Result<Certificate, CaError> {
     require_kind(signer, CaKind::User)?;
     require_ed25519(signer)?;
     validate_email(&params.email)?;
@@ -72,6 +91,11 @@ pub fn sign_user_certificate(
     builder
         .extension("permit-port-forwarding", "")
         .map_err(CaError::SshKey)?;
+    if let Some(origin) = origin {
+        builder
+            .extension(ORIGIN_EXTENSION, origin)
+            .map_err(CaError::SshKey)?;
+    }
 
     finish(builder, signer, &window)
 }
@@ -214,7 +238,8 @@ mod tests {
 
     use super::{
         DEFAULT_HOST_VALIDITY, DEFAULT_USER_VALIDITY, HostCertParams, MAX_HOST_VALIDITY,
-        MAX_USER_VALIDITY, UserCertParams, sign_host_certificate, sign_user_certificate,
+        MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, sign_host_certificate,
+        sign_user_certificate, sign_web_user_certificate,
     };
     use crate::error::CaError;
     use crate::kind::CaKind;
@@ -223,6 +248,7 @@ mod tests {
 
     const NOW_SECS: u64 = 1_700_000_000;
     const USER_ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+    const WEB_VALIDITY: Duration = Duration::from_secs(120);
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(NOW_SECS)
@@ -327,6 +353,47 @@ mod tests {
             extensions,
             [("permit-port-forwarding", ""), ("permit-pty", "")]
         );
+    }
+
+    #[test]
+    fn a_web_certificate_is_the_cli_profile_plus_one_origin_extension() {
+        let authority = authority(CaKind::User);
+        let cli =
+            sign_user_certificate(&authority.backend, user_params(WEB_VALIDITY), now()).unwrap();
+        let web = sign_web_user_certificate(&authority.backend, user_params(WEB_VALIDITY), now())
+            .unwrap();
+        assert_eq!(web.cert_type(), cli.cert_type());
+        assert_eq!(web.valid_principals(), cli.valid_principals());
+        assert_eq!(web.key_id(), cli.key_id());
+        assert_eq!(web.serial(), cli.serial());
+        assert_eq!(web.valid_after(), NOW_SECS - 120);
+        assert_eq!(web.valid_before(), NOW_SECS + 120);
+        assert!(web.critical_options().is_empty());
+        let extensions = |cert: &ssh_key::Certificate| -> Vec<(String, String)> {
+            cert.extensions()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        };
+        let mut expected = extensions(&cli);
+        assert!(!expected.iter().any(|(name, _)| name == ORIGIN_EXTENSION));
+        expected.insert(0, (ORIGIN_EXTENSION.to_owned(), WEB_ORIGIN.to_owned()));
+        assert_eq!(extensions(&web), expected);
+        assert_eq!(ORIGIN_EXTENSION, "jaunt-origin@globalart.dev");
+        assert_eq!(WEB_ORIGIN, "web");
+    }
+
+    #[test]
+    fn ssh_keygen_shows_the_web_origin_of_a_web_certificate() {
+        let authority = authority(CaKind::User);
+        let web = sign_web_user_certificate(&authority.backend, user_params(WEB_VALIDITY), now())
+            .unwrap();
+        let cli =
+            sign_user_certificate(&authority.backend, user_params(WEB_VALIDITY), now()).unwrap();
+        let mentions_origin =
+            |lines: &[String]| lines.iter().any(|line| line.contains(ORIGIN_EXTENSION));
+        assert!(mentions_origin(&keygen_listing(&web)));
+        assert!(!mentions_origin(&keygen_listing(&cli)));
     }
 
     #[test]

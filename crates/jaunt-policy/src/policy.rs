@@ -130,6 +130,19 @@ impl PolicySet {
         decision
     }
 
+    pub fn ssh_logins(&self, identity: &Identity, node: &NodeInfo) -> Vec<String> {
+        let mut logins: Vec<String> = self
+            .roles
+            .iter()
+            .filter(|role| role.applies_to(identity))
+            .filter_map(|role| role.ssh.as_ref().filter(|rule| rule.matches_node(node)))
+            .flat_map(|rule| rule.resolved_logins(identity).map(str::to_owned))
+            .collect();
+        logins.sort();
+        logins.dedup();
+        logins
+    }
+
     pub fn roles_reaching(&self, node: &NodeInfo) -> Vec<RoleAccess> {
         let mut reaching: Vec<RoleAccess> = self
             .roles

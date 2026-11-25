@@ -5,9 +5,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use jaunt_ca::ssh_key::public::KeyData;
 use jaunt_ca::ssh_key::{Algorithm, PublicKey};
-use jaunt_ca::{UserCertParams, Uuid, fingerprint_hex, sign_user_certificate};
+use jaunt_ca::{Uuid, fingerprint_hex};
 use jaunt_proto::{FinishRequest, FinishResponse};
-use jaunt_store::{LoginRequestState, NewApiToken, NewCertificate};
+use jaunt_store::{LoginRequestState, NewApiToken};
 
 use crate::audit::{self, FinishReason};
 use crate::clock::Moment;
@@ -18,6 +18,7 @@ use crate::pkce;
 use crate::principal::{self, Channel, Refusal};
 use crate::start::LOGIN_KIND;
 use crate::token;
+use crate::user_cert::{self, CertOrigin, UserCertFailure};
 
 const MAX_PUBLIC_KEY_LEN: usize = 1024;
 pub(crate) const CERTIFICATE_KIND: &str = "user";
@@ -259,64 +260,23 @@ pub(crate) async fn redeem_and_issue(
         Err(Refusal::Revoked) => return Err(failed(Failure::grant(FinishReason::Revoked))),
         Err(Refusal::Unavailable) => return Err(failed(Failure::internal(FinishReason::Store))),
     }
-    let user_uuid = Uuid::parse_str(&user.id).map_err(|_| {
-        tracing::error!(target: "jaunt::control", "a stored user id is not a uuid");
-        failed(Failure::internal(FinishReason::CorruptRecord))
-    })?;
-
-    let ca = control.ca_snapshot();
-    let certificates = control.store.certificates();
-    let serial = certificates.allocate_serial().await.map_err(|err| {
-        tracing::error!(target: "jaunt::control", error = %err, "allocating a serial failed");
-        failed(Failure::internal(FinishReason::Store))
-    })?;
-    let serial_number = u64::try_from(serial).map_err(|_| {
-        tracing::error!(target: "jaunt::control", "the serial counter is not positive");
-        failed(Failure::internal(FinishReason::CorruptRecord))
-    })?;
-
-    let certificate = sign_user_certificate(
-        ca.user_signer().as_ref(),
-        UserCertParams {
-            subject_public_key: subject_key,
-            user_id: user_uuid,
-            email: user.email.clone(),
-            serial: serial_number,
-            validity: control.cert_ttl,
-        },
-        now.system,
+    let signed = user_cert::issue(
+        control,
+        &user,
+        subject_key,
+        control.cert_ttl,
+        CertOrigin::Cli,
+        now,
     )
-    .map_err(|err| {
-        tracing::error!(target: "jaunt::control", error = %err, "signing the user certificate failed");
-        failed(Failure::internal(FinishReason::Signing))
+    .await
+    .map_err(|failure| {
+        failed(Failure::internal(match failure {
+            UserCertFailure::Store => FinishReason::Store,
+            UserCertFailure::CorruptRecord => FinishReason::CorruptRecord,
+            UserCertFailure::Signing => FinishReason::Signing,
+        }))
     })?;
-    let certificate_line = certificate.to_openssh().map_err(|err| {
-        tracing::error!(target: "jaunt::control", error = %err, "encoding the user certificate failed");
-        failed(Failure::internal(FinishReason::Signing))
-    })?;
-    let valid_after = i64::try_from(certificate.valid_after())
-        .map_err(|_| failed(Failure::internal(FinishReason::Signing)))?;
-    let valid_before = i64::try_from(certificate.valid_before())
-        .map_err(|_| failed(Failure::internal(FinishReason::Signing)))?;
-
-    certificates
-        .record(&NewCertificate {
-            serial,
-            user_id: user.id.clone(),
-            kind: CERTIFICATE_KIND.to_owned(),
-            key_id: certificate.key_id().to_owned(),
-            valid_after,
-            valid_before,
-            issued_at: now.secs,
-            ca_fingerprint: Some(key_fingerprint(certificate.signature_key())),
-            host_trust_id: Some(ca.host_trust_id().to_owned()),
-            subject_fingerprint: Some(key_fingerprint(certificate.public_key())),
-        })
-        .await
-        .map_err(|err| {
-            tracing::error!(target: "jaunt::control", error = %err, "recording the certificate failed");
-            failed(Failure::internal(FinishReason::Store))
-        })?;
+    let serial = signed.serial;
 
     let api_token = token::issue().map_err(|_| {
         tracing::error!(target: "jaunt::control", "the system entropy source failed");
@@ -330,7 +290,7 @@ pub(crate) async fn redeem_and_issue(
             user_id: user.id.clone(),
             cert_serial: serial,
             created_at: now.secs,
-            expires_at: valid_before,
+            expires_at: signed.valid_before,
         })
         .await
         .map_err(|err| {
@@ -343,12 +303,12 @@ pub(crate) async fn redeem_and_issue(
         user_id: user.id,
         email: user.email,
         serial,
-        certificate: certificate_line,
-        key_id: certificate.key_id().to_owned(),
-        valid_after,
-        valid_before,
+        certificate: signed.line,
+        key_id: signed.key_id,
+        valid_after: signed.valid_after,
+        valid_before: signed.valid_before,
         api_token: api_token.secret,
-        host_ca_keys: ca.host_ca_keys().to_vec(),
+        host_ca_keys: signed.host_ca_keys,
     })
 }
 

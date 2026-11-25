@@ -134,6 +134,7 @@ async fn the_background_sweeper_purges_stored_enrollments() {
             started.elapsed() < DEADLINE,
             "the enrollment was not purged"
         );
+        tokio::time::advance(SWEEP_INTERVAL).await;
         tokio::task::yield_now().await;
     }
     running.shut_down().await;
@@ -155,6 +156,7 @@ async fn the_background_sweeper_recovers_interrupted_deliveries() {
             started.elapsed() < DEADLINE,
             "the delivery was not recovered"
         );
+        tokio::time::advance(SWEEP_INTERVAL).await;
         tokio::task::yield_now().await;
     }
     running.shut_down().await;
@@ -174,6 +176,7 @@ async fn the_background_sweeper_purges_stale_routed_sessions() {
             started.elapsed() < DEADLINE,
             "the routed session was not purged"
         );
+        tokio::time::advance(SWEEP_INTERVAL).await;
         tokio::task::yield_now().await;
     }
     running.shut_down().await;

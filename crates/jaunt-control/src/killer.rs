@@ -1,9 +1,10 @@
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use jaunt_proto::BoxFuture;
 use jaunt_store::Session;
 
 use crate::revocation_audit;
+use crate::web::terminal::LiveTerminals;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KillReason {
@@ -50,11 +51,18 @@ pub trait SessionKiller: Send + Sync {
 }
 
 #[derive(Default)]
-pub(crate) struct KillerSlot(Mutex<Option<Arc<dyn SessionKiller>>>);
+pub(crate) struct KillerSlot {
+    killer: Mutex<Option<Arc<dyn SessionKiller>>>,
+    terminals: OnceLock<Arc<LiveTerminals>>,
+}
 
 impl KillerSlot {
     fn lock(&self) -> MutexGuard<'_, Option<Arc<dyn SessionKiller>>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.killer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn watch_terminals(&self, terminals: Arc<LiveTerminals>) {
+        self.terminals.get_or_init(|| terminals);
     }
 
     pub(crate) fn install(&self, killer: Arc<dyn SessionKiller>) {
@@ -71,6 +79,9 @@ impl KillerSlot {
         reason: KillReason,
         sessions: &[Session],
     ) -> bool {
+        if let Some(terminals) = self.terminals.get() {
+            terminals.stop_matching(&scope, reason, sessions);
+        }
         let Some(killer) = self.current() else {
             if !sessions.is_empty() {
                 tracing::warn!(

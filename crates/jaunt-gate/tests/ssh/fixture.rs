@@ -46,12 +46,21 @@ pub fn user_certificate(ca: &PrivateKey, subject: &PrivateKey) -> Certificate {
 }
 
 pub fn serial_certificate(ca: &PrivateKey, subject: &PrivateKey, serial: u64) -> Certificate {
+    short_certificate(ca, subject, serial, 3600)
+}
+
+pub fn short_certificate(
+    ca: &PrivateKey,
+    subject: &PrivateKey,
+    serial: u64,
+    valid_secs: u64,
+) -> Certificate {
     let now = unix(SystemTime::now());
     let mut builder = Builder::new_with_random_nonce(
         &mut safe_rng(),
         subject.public_key().key_data().clone(),
         now - 120,
-        now + 3600,
+        now + valid_secs,
     )
     .unwrap();
     builder.serial(serial).unwrap();
@@ -310,9 +319,13 @@ impl Fixture {
     }
 
     pub async fn login_with_serial(&self, serial: u64) -> Client {
-        let mut client = self.connect().await;
+        let client = self.connect().await;
+        self.authenticate(client, serial, 3600).await
+    }
+
+    pub async fn authenticate(&self, mut client: Client, serial: u64, valid_secs: u64) -> Client {
         let subject = key();
-        let certificate = serial_certificate(&self.user_ca, &subject, serial);
+        let certificate = short_certificate(&self.user_ca, &subject, serial, valid_secs);
         assert!(
             client
                 .handle
@@ -380,7 +393,10 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn over(stream: TcpStream) -> Result<Self, russh::Error> {
+    pub async fn over<S>(stream: S) -> Result<Self, russh::Error>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let config = client::Config {
             preferred: Preferred {
                 host_key_certificates: Cow::Borrowed(&[Algorithm::Ed25519]),

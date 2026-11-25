@@ -35,6 +35,7 @@ pub struct HttpLimitsSection {
     pub enroll: Option<RateSection>,
     pub enroll_poll: Option<RateSection>,
     pub enrolment_lookup: Option<RateSection>,
+    pub web_terminal: Option<RateSection>,
     pub other: Option<RateSection>,
     pub max_connections: Option<usize>,
     pub max_connections_per_address: Option<usize>,
@@ -141,6 +142,7 @@ impl LimitsSection {
                 http.enrolment_lookup,
                 base.enrolment_lookup,
             )?,
+            web_terminal: rate("http.web_terminal", http.web_terminal, base.web_terminal)?,
             other: rate("http.other", http.other, base.other)?,
             tracked_addresses: tracked,
             max_connections: bounded(
@@ -210,6 +212,7 @@ mod tests {
             (http.enroll, 60, 6),
             (http.enroll_poll, 120, 120),
             (http.enrolment_lookup, 30, 10),
+            (http.web_terminal, 30, 30),
             (http.other, 600, 300),
             (defaults.ssh.rate, 600, 600),
             (defaults.agents.rate, 128, 1200),
@@ -230,6 +233,7 @@ mod tests {
             "tracked_addresses: 1000\n\
              http:\n  login_start: { burst: 5, per_minute: 2 }\n  enroll: { burst: 1, per_minute: 1 }\n  \
              enrolment_lookup: { burst: 2, per_minute: 3 }\n  \
+             web_terminal: { burst: 4, per_minute: 5 }\n  \
              max_connections: 10\n  max_connections_per_address: 2\n  other: { burst: 3, per_minute: 4 }\n\
              ssh:\n  connections: { burst: 7, per_minute: 70 }\n  unauthenticated_per_address: 3\n\
              agents:\n  handshakes: { burst: 9, per_minute: 90 }\n  handshaking_per_address: 4\n",
@@ -238,6 +242,7 @@ mod tests {
         assert_eq!(tuned.http.login_start, Rate::new(5, 2).unwrap());
         assert_eq!(tuned.http.enroll, Rate::new(1, 1).unwrap());
         assert_eq!(tuned.http.enrolment_lookup, Rate::new(2, 3).unwrap());
+        assert_eq!(tuned.http.web_terminal, Rate::new(4, 5).unwrap());
         assert_eq!(
             tuned.http.device_poll,
             LimitSettings::default().http.device_poll

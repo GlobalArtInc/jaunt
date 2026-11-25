@@ -14,6 +14,7 @@ mod test_support;
 mod bridge;
 mod forward;
 mod inner;
+mod jump;
 mod observer;
 mod output;
 mod terminate;
@@ -32,6 +33,13 @@ pub use proxy::{MAX_PROXY_PAYLOAD, ProxiedAddr, ProxyError, decode_proxy_v2, rea
 pub use target::parse_node_target;
 
 pub use inner::{InnerTarget, OUTPUT_WINDOW};
+#[cfg(feature = "test-support")]
+pub use jump::KeyWatch;
+pub use jump::{
+    EphemeralKey, HostAuthorities, JumpError, JumpHop, JumpRequest, TerminalDimensions,
+    TerminalEvent, TerminalExit, TerminalGone, TerminalInput, TerminalOutput, WEB_WINDOW,
+    WebTerminal, WindowGrant, open_terminal,
+};
 pub use observer::{
     ChannelExit, ChannelProgram, ChannelStart, ForwardTarget, NoObserver, ObserverFactory,
     OutputStream, Recording, SessionInfo, SessionObserver, Terminal, TerminalSize,

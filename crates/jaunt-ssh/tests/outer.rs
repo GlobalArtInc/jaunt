@@ -732,6 +732,31 @@ async fn the_connection_ends_when_the_certificate_expires() {
     gate.assert_settled(&[StreamEnd::Shutdown]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hop_told_to_keep_connections_carries_data_past_the_certificate_expiry() {
+    const SHIFT: u64 = 3595;
+    let gate = Gate::keeping_after_expiry(
+        OuterLimits::default(),
+        Mode::Echo,
+        i64::try_from(SHIFT).unwrap(),
+    );
+    let expires_at = unix_now() + 3601;
+    let client = gate.login().await;
+    let (mut read, write) = client.open_node().await.split();
+    until("the hop clock to pass the certificate expiry", || {
+        unix_now() + SHIFT > expires_at
+    })
+    .await;
+    send(&write, b"still here").await;
+    assert_eq!(
+        tokio::time::timeout(STEP, next_data(&mut read))
+            .await
+            .unwrap(),
+        Bytes::from_static(b"still here")
+    );
+    assert!(client.disconnect_notice_seen().is_none());
+}
+
 fn blocked_reader() -> client::Config {
     client::Config {
         window_size: 64 * 1024,

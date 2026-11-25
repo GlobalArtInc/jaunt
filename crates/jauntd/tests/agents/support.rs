@@ -18,7 +18,8 @@ use jaunt_ca::{
     SubjectPublicKey, Uuid,
 };
 use jaunt_control::{
-    AgentEndpoint, Clock, Control, ControlParts, DeviceSettings, NodeAdmin, SshSuffix,
+    AgentEndpoint, Clock, Control, ControlParts, DeviceSettings, NodeAdmin, RequestLimits,
+    SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -48,6 +49,7 @@ use crate::oidc::FakeDiscovery;
 use crate::recorder::{Captured, audit_events, install_recorder};
 
 pub const AGENTS_NAME: &str = "agents.jaunt.test";
+pub const PUBLIC_ORIGIN: &str = "https://jaunt.example.test";
 pub const APPROVER: &str = "cli:tester";
 const WAIT_LIMIT: Duration = Duration::from_secs(15);
 const DAY: u64 = 24 * 60 * 60;
@@ -87,6 +89,9 @@ pub struct Options {
     pub recordings: Option<RecordingsSettings>,
     pub prepared: Option<PreparedRecordings>,
     pub web: bool,
+    pub control_clock: Option<Clock>,
+    pub control_ticker: Option<Ticker>,
+    pub forwarded_for: bool,
 }
 
 pub struct Authorities {
@@ -113,6 +118,8 @@ pub struct EnrolledAgent {
     pub name: String,
     pub node_id: String,
     pub chain: Vec<CertificateDer<'static>>,
+    pub ssh_private_openssh: String,
+    pub ssh_certificate: String,
     key: Vec<u8>,
 }
 
@@ -150,7 +157,7 @@ impl Harness {
                 .as_ref()
                 .map(|settings| jauntd::recordings::prepare(settings, &|_| None).unwrap()),
         };
-        let control = Control::new(ControlParts {
+        let parts = ControlParts {
             store: store.clone(),
             oidc: discovery.client().await,
             user_authority: Arc::new(user),
@@ -166,18 +173,30 @@ impl Harness {
             pending_capacity: 100,
             device: DeviceSettings {
                 enabled: false,
-                public_origin: "https://jaunt.example.test".to_owned(),
-                client_ip_header: None,
-                client_ip_trusted_proxies: Vec::new(),
+                public_origin: PUBLIC_ORIGIN.to_owned(),
+                client_ip_header: options.forwarded_for.then(|| "x-forwarded-for".to_owned()),
+                client_ip_trusted_proxies: if options.forwarded_for {
+                    vec!["127.0.0.0/8".parse().unwrap()]
+                } else {
+                    Vec::new()
+                },
             },
             policy: PolicyHandle::empty(),
             web_enabled: options.web,
-            clock: Arc::new(SystemTime::now),
+            clock: options
+                .control_clock
+                .clone()
+                .unwrap_or_else(|| Arc::new(SystemTime::now)),
             recordings: recordings
                 .as_ref()
                 .map(|prepared| prepared.settings.clone()),
-        })
-        .unwrap();
+        };
+        let control = match options.control_ticker.clone() {
+            Some(ticker) => {
+                Control::with_limits_and_ticker(parts, RequestLimits::default(), ticker).unwrap()
+            }
+            None => Control::new(parts).unwrap(),
+        };
         let clock = TestClock::starting_days_ago(options.clock_days_behind);
         let mut parts = AgentServerParts::new(
             AgentsSettings {
@@ -266,6 +285,11 @@ impl Harness {
             name: name.to_owned(),
             node_id: polled["node_id"].as_str().unwrap().to_owned(),
             chain: vec![certificate_of(&polled)],
+            ssh_private_openssh: ssh_key
+                .to_openssh(jaunt_ca::ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+            ssh_certificate: polled["ssh_host_certificate"].as_str().unwrap().to_owned(),
             key: tls_key.serialize_der(),
         }
     }

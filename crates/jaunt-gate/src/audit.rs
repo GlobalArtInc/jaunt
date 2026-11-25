@@ -36,6 +36,16 @@ pub(crate) fn ssh_connected(client_addr: SocketAddr, peer_addr: SocketAddr, prox
     );
 }
 
+pub(crate) fn ssh_connected_in_process(client_addr: SocketAddr) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.ssh.connect",
+        client_addr = %client_addr,
+        peer_addr = "in-process",
+        proxied = false
+    );
+}
+
 pub(crate) fn ssh_terminated(
     user_id: &str,
     serial: Option<u64>,

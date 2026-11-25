@@ -105,7 +105,7 @@ impl TryFrom<String> for AdminPermission {
 const MAX_LOGIN_BYTES: usize = 32;
 const FORBIDDEN_SUBSTITUTED_LOGIN: &str = "root";
 
-pub(crate) fn is_valid_login(login: &str) -> bool {
+pub fn is_valid_login(login: &str) -> bool {
     let mut chars = login.chars();
     let Some(first) = chars.next() else {
         return false;

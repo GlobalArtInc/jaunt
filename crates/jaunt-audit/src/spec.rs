@@ -229,6 +229,13 @@ events! {
         [("kind", SHORT), ("trust_id", ID), ("active_fp", ID)]),
     CaReloadFailed => ("ca.reload.failed", "ca.reload.failed", ActorRule::System, None, None, None,
         [("reason", ERROR)]),
+    TerminalOpened => ("terminal.opened", "terminal.opened", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("node", NAME), ("login", NAME), ("serial", INT), ("client_addr", ADDR)]),
+    TerminalClosed => ("terminal.closed", "terminal.closed", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("reason", NAME), ("bytes_in", INT), ("bytes_out", INT), ("duration_ms", INT), ("serial", INT)]),
+    TerminalDenied => ("terminal.denied", "terminal.denied", ActorRule::User("user_id"), None, None, None,
+        [("reason", NAME), ("node", NAME), ("login", NAME), ("client_addr", ADDR), ("suppressed", INT)],
+        Class::Noisy),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];
@@ -369,7 +376,8 @@ mod tests {
                 "http.connection_limited",
                 "http.client_ip_header_ignored",
                 "gate.limited",
-                "agent.limited"
+                "agent.limited",
+                "terminal.denied"
             ]
         );
     }

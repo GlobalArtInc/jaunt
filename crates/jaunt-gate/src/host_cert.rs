@@ -93,6 +93,10 @@ impl HostCertificate {
         Arc::clone(&self.cell)
     }
 
+    pub(crate) fn hostnames(&self) -> &[String] {
+        &self.hostnames
+    }
+
     fn window(&self) -> MutexGuard<'_, Window> {
         self.window.lock().unwrap_or_else(PoisonError::into_inner)
     }

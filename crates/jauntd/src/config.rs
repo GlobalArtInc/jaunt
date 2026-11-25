@@ -19,6 +19,8 @@ use url::Url;
 use crate::audit::{AuditConfigError, AuditSection, AuditSettings};
 use crate::limits::{LimitSettings, LimitsError, LimitsSection};
 use crate::recordings::{RecordingsConfigError, RecordingsSection, RecordingsSettings};
+use crate::web_terminal::{WebTerminalConfigError, WebTerminalSection};
+use jaunt_control::WebTerminalSettings;
 
 pub const CLIENT_SECRET_VAR: &str = "JAUNT_OIDC_CLIENT_SECRET";
 
@@ -68,6 +70,8 @@ pub struct Config {
     pub limits: LimitsSection,
     #[serde(default)]
     pub recordings: RecordingsSection,
+    #[serde(default)]
+    pub web_terminal: WebTerminalSection,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +119,7 @@ pub struct RunSettings {
     pub audit: AuditSettings,
     pub limits: LimitSettings,
     pub recordings: Option<RecordingsSettings>,
+    pub web_terminal: Option<WebTerminalSettings>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -149,6 +154,8 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     Limits(#[from] LimitsError),
+    #[error(transparent)]
+    WebTerminal(#[from] WebTerminalConfigError),
     #[error("ssh_suffix is required to run the daemon")]
     MissingSshSuffix,
     #[error("ssh_suffix: {0}")]
@@ -320,6 +327,9 @@ impl Config {
                 client_limits: limits.ssh,
                 ..gate
             });
+        let web_terminal = self
+            .web_terminal
+            .into_settings(self.web, ssh_gate.is_some())?;
         let section = self.oidc.ok_or(ConfigError::MissingOidc)?;
         let client_secret = read_client_secret(section.client_secret_file.as_deref(), env)?;
 
@@ -375,6 +385,7 @@ impl Config {
             audit,
             limits,
             recordings,
+            web_terminal,
         })
     }
 }
@@ -952,6 +963,45 @@ cert_ttl_secs: {SECRET}
         assert_eq!(tuned.trusted_proxies.len(), 2);
         assert_eq!(tuned.max_unauthenticated, 64);
         assert_eq!(tuned.write_stall, None);
+    }
+
+    #[test]
+    fn the_web_terminal_follows_the_gate_and_the_web_console_and_refuses_bad_values() {
+        let gated = "gate_endpoint: gate.example.com\nssh_gate:\n  listen: 0.0.0.0:2222\n  \
+                     hostnames: [gate.example.com]\n";
+        let terminal = |extra: &str| {
+            parse(extra)
+                .into_run_settings(&secret_env)
+                .map(|settings| settings.web_terminal)
+        };
+        assert_eq!(
+            terminal(gated).unwrap(),
+            Some(jaunt_control::WebTerminalSettings::default())
+        );
+        assert_eq!(terminal("").unwrap(), None);
+        assert_eq!(terminal(&format!("{gated}web: false\n")).unwrap(), None);
+        assert_eq!(
+            terminal(&format!("{gated}web_terminal:\n  enabled: false\n")).unwrap(),
+            None
+        );
+        let tuned = terminal(&format!(
+            "{gated}web_terminal:\n  max_per_user: 2\n  idle_timeout_secs: 600\n"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(tuned.max_per_user, 2);
+        assert_eq!(tuned.idle_timeout, Duration::from_secs(600));
+        for refused in [
+            "web_terminal:\n  enabled: true\n".to_owned(),
+            format!("{gated}web_terminal:\n  max_total: 0\n"),
+        ] {
+            let err = terminal(&refused).err().unwrap();
+            assert!(matches!(err, ConfigError::WebTerminal(_)), "{err}");
+            assert!(err.to_string().starts_with("web_terminal."), "{err}");
+        }
+        assert!(
+            serde_saphyr::from_str::<Config>("data_dir: /d\nweb_terminal:\n  extra: 1\n").is_err()
+        );
     }
 
     #[test]

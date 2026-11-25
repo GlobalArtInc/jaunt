@@ -227,6 +227,7 @@ struct Hop {
     clock: Clock,
     session_refusal: Arc<str>,
     target_refusal: Arc<str>,
+    cut_at_expiry: bool,
 }
 
 impl Hop {
@@ -282,8 +283,14 @@ impl OuterHop {
                 clock: Arc::new(SystemTime::now),
                 session_refusal: session_refusal.into(),
                 target_refusal: target_refusal.into(),
+                cut_at_expiry: true,
             },
         }
+    }
+
+    pub fn keep_after_certificate_expiry(mut self) -> Self {
+        self.hop.cut_at_expiry = false;
+        self
     }
 
     pub fn with_events(mut self, events: impl Fn(OuterEvent) + Send + Sync + 'static) -> Self {
@@ -531,7 +538,11 @@ async fn supervise(
                 match connection.phase() {
                     Phase::PreAuth => {}
                     Phase::Authenticated(identity) => {
-                        alarm = (connection.expiry(identity.valid_before), Ending::Expired);
+                        alarm = if connection.hop.cut_at_expiry {
+                            (connection.expiry(identity.valid_before), Ending::Expired)
+                        } else {
+                            (later(FAR_FUTURE), Ending::Expired)
+                        };
                     }
                     Phase::Exhausted => alarm = (Instant::now(), Ending::AuthAttempts),
                 }

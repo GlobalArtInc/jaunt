@@ -11,6 +11,8 @@ mod s3_recordings;
 mod stand;
 mod subject_key;
 mod support;
+mod terminal;
+mod terminal_support;
 
 use std::time::Duration;
 

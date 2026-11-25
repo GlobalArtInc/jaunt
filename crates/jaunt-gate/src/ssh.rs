@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,13 +12,15 @@ use jaunt_limits::{
 };
 use jaunt_proto::ControlPlane;
 use jaunt_ssh::{
-    OuterEvent, OuterHop, OuterLimits, RouteBackend, UserCaKeys, UserCaSource, read_proxy_v2,
+    OuterEndReason, OuterEvent, OuterHop, OuterLimits, RouteBackend, TunnelStream, UserCaKeys,
+    UserCaSource, read_proxy_v2,
 };
 use jaunt_tunnel::AgentRegistry;
 use thiserror::Error;
+use tokio::io::DuplexStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +42,7 @@ pub const DEFAULT_SSH_CLIENT_LIMITS: AddressLimits = AddressLimits {
     tracked: DEFAULT_CAPACITY,
 };
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
+const IN_PROCESS_BUFFER: usize = 64 * 1024;
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_LABEL_LEN: usize = 63;
 const MAX_DNS_NAME_LEN: usize = 253;
@@ -111,6 +116,34 @@ pub enum SshGateError {
     HostCertificate(#[from] HostCertError),
     #[error("no tokio runtime is running")]
     NoRuntime,
+}
+
+pub type InProcessEvents = Arc<dyn Fn(&OuterEvent) + Send + Sync>;
+
+pub type InProcessServe = Pin<Box<dyn Future<Output = OuterEndReason> + Send>>;
+
+pub struct InProcessClient {
+    pub client_addr: SocketAddr,
+    pub shutdown: CancellationToken,
+    pub events: InProcessEvents,
+}
+
+pub struct InProcessConnection {
+    pub stream: DuplexStream,
+    pub serve: InProcessServe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InProcessRefusal {
+    #[error("too many ssh connections are still authenticating")]
+    Busy,
+    #[error("the client address is over its ssh connection limits")]
+    Limited,
+}
+
+enum Entry {
+    Network,
+    InProcess(InProcessEvents),
 }
 
 fn check_trusted_proxies(
@@ -289,6 +322,10 @@ impl SshGate {
         Ok(self.shared.host.reissue().await?)
     }
 
+    pub fn host_names(&self) -> &[String] {
+        self.shared.host.hostnames()
+    }
+
     pub fn host_certificate_signer(&self) -> String {
         self.shared.host.signer()
     }
@@ -320,6 +357,33 @@ impl SshGate {
 
     pub fn authenticated(&self) -> usize {
         self.shared.live.authenticated()
+    }
+
+    pub fn connect_in_process(
+        &self,
+        client: InProcessClient,
+    ) -> Result<InProcessConnection, InProcessRefusal> {
+        let shared = Arc::clone(&self.shared);
+        let permit = Arc::clone(&shared.pre_auth)
+            .try_acquire_owned()
+            .map_err(|_| InProcessRefusal::Busy)?;
+        let slot = shared
+            .admit_client(client.client_addr.ip())
+            .ok_or(InProcessRefusal::Limited)?;
+        audit::ssh_connected_in_process(client.client_addr);
+        let (near, far) = tokio::io::duplex(IN_PROCESS_BUFFER);
+        let serve = shared.serve_admitted(
+            far,
+            client.client_addr,
+            permit,
+            Some(slot),
+            client.shutdown,
+            Entry::InProcess(client.events),
+        );
+        Ok(InProcessConnection {
+            stream: near,
+            serve: Box::pin(serve),
+        })
     }
 
     pub fn terminate(
@@ -454,11 +518,28 @@ impl Shared {
             }
         };
         audit::ssh_connected(client, peer, proxied);
+        self.serve_admitted(tcp, client, permit, slot, token, Entry::Network)
+            .await;
+    }
+
+    async fn serve_admitted<S: TunnelStream>(
+        self: Arc<Self>,
+        stream: S,
+        client: SocketAddr,
+        permit: OwnedSemaphorePermit,
+        slot: Option<ConcurrencyGuard<ClientKey>>,
+        token: CancellationToken,
+        entry: Entry,
+    ) -> OuterEndReason {
         let slot = Arc::new(Mutex::new(slot));
         let release = Arc::clone(&slot);
         let live = self.live.register();
         let identify = live.identify();
         let backend: Arc<dyn RouteBackend> = self.backend.clone();
+        let observer = match &entry {
+            Entry::Network => None,
+            Entry::InProcess(events) => Some(Arc::clone(events)),
+        };
         let hop = OuterHop::new(
             self.host.cell(),
             Arc::clone(&self.cas),
@@ -474,12 +555,21 @@ impl Shared {
                 take_slot(&release);
                 identify.holder(user_id, *serial);
             }
+            if let Some(observer) = &observer {
+                observer(&event);
+            }
             audit::ssh_event(client, event);
         });
-        hop.serve_with_termination(tcp, client, permit, token, live.token())
+        let hop = match entry {
+            Entry::Network => hop,
+            Entry::InProcess(_) => hop.keep_after_certificate_expiry(),
+        };
+        let end = hop
+            .serve_with_termination(stream, client, permit, token, live.token())
             .await;
         take_slot(&slot);
         drop(live);
+        end.reason
     }
 }
 

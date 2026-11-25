@@ -18,7 +18,8 @@ pub use uuid::{self, Uuid};
 
 pub use cert::{
     BACKDATE, DEFAULT_HOST_VALIDITY, DEFAULT_USER_VALIDITY, HostCertParams, MAX_HOST_VALIDITY,
-    MAX_USER_VALIDITY, UserCertParams, sign_host_certificate, sign_user_certificate,
+    MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, sign_host_certificate,
+    sign_user_certificate, sign_web_user_certificate,
 };
 pub use error::CaError;
 pub use file::{FileBackend, SlotListing};

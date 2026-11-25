@@ -511,3 +511,110 @@ fn roles_reaching_a_node_are_listed_with_their_subjects_logins_and_flags() {
     assert!(set.roles_reaching(&node(&[("env", "qa")])).is_empty());
     assert!(set.roles_reaching(&node(&[("env", "prod")])).len() == 1);
 }
+
+fn terminal_policy() -> PolicySet {
+    load_roles(&[
+        role(
+            "ops",
+            Some("{ groups: [ops] }"),
+            "{ nodes: { env: [prod] }, logins: [deploy, \"{username}\"] }",
+            "[]",
+        ),
+        role(
+            "dev",
+            Some("{ users: [alice@example.com] }"),
+            "{ nodes: { env: [prod, dev] }, logins: [deploy, app] }",
+            "[]",
+        ),
+        role(
+            "admins",
+            Some("{ users: [alice@example.com] }"),
+            "",
+            "[nodes.approve]",
+        ),
+    ])
+}
+
+#[test]
+fn terminal_logins_of_every_role_reaching_a_node_are_merged_sorted_and_unique() {
+    let alice = identity_named(ALICE, "alice", &["ops"]);
+    let set = terminal_policy();
+    assert_eq!(
+        set.ssh_logins(&alice, &node(&[("env", "prod")])),
+        ["alice", "app", "deploy"]
+    );
+    assert_eq!(
+        set.ssh_logins(&alice, &node(&[("env", "dev")])),
+        ["app", "deploy"]
+    );
+}
+
+#[test]
+fn terminal_logins_expand_the_username_and_never_offer_a_root_username() {
+    let set = terminal_policy();
+    let bob = identity_named("bob@example.com", "bob", &["ops"]);
+    assert_eq!(
+        set.ssh_logins(&bob, &node(&[("env", "prod")])),
+        ["bob", "deploy"]
+    );
+    let root = identity_named("root@example.com", "root", &["ops"]);
+    assert_eq!(set.ssh_logins(&root, &node(&[("env", "prod")])), ["deploy"]);
+}
+
+#[test]
+fn a_role_without_an_ssh_block_offers_no_terminal_and_every_ssh_role_offers_a_pty() {
+    let admins_only = load_roles(&[role(
+        "admins",
+        Some("{ users: [alice@example.com] }"),
+        "",
+        "[nodes.approve]",
+    )]);
+    let alice = identity_named(ALICE, "alice", &[]);
+    assert!(
+        admins_only
+            .ssh_logins(&alice, &node(&[("env", "prod")]))
+            .is_empty()
+    );
+    assert!(
+        !terminal_policy()
+            .ssh_logins(&alice, &node(&[("env", "dev")]))
+            .is_empty()
+    );
+}
+
+#[test]
+fn no_role_means_no_terminal_login_and_unmatched_nodes_offer_nothing() {
+    let set = terminal_policy();
+    let carol = identity_named("carol@example.com", "carol", &[]);
+    assert!(set.ssh_logins(&carol, &node(&[("env", "prod")])).is_empty());
+    let bob = identity_named("bob@example.com", "bob", &["ops"]);
+    assert!(set.ssh_logins(&bob, &node(&[("env", "dev")])).is_empty());
+    assert!(
+        PolicySet::empty()
+            .ssh_logins(&bob, &node(&[("env", "prod")]))
+            .is_empty()
+    );
+}
+
+#[test]
+fn every_terminal_login_is_one_authorize_allows_and_route_agrees() {
+    let set = terminal_policy();
+    for who in [
+        identity_named(ALICE, "alice", &["ops"]),
+        identity_named("bob@example.com", "bob", &["ops"]),
+        identity_named("carol@example.com", "carol", &[]),
+    ] {
+        for target in [node(&[("env", "prod")]), node(&[("env", "dev")])] {
+            let logins = set.ssh_logins(&who, &target);
+            assert_eq!(set.route(&who, &target), !logins.is_empty());
+            for login in &logins {
+                assert!(allowed(&set, &who, &target, login), "{login}");
+            }
+            for other in ["root", "nobody", "carol"] {
+                if !logins.iter().any(|login| login == other) {
+                    assert!(!allowed(&set, &who, &target, other), "{other}");
+                }
+            }
+        }
+    }
+}

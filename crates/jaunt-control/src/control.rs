@@ -35,6 +35,7 @@ use crate::revocation::RevocationAdmin;
 use crate::serve;
 use crate::session_sweep::RevocationWatch;
 use crate::web::WebState;
+use crate::web::terminal::{End, TerminalGate, WebTerminalSettings};
 
 pub const PENDING_CAPACITY: usize = 10_000;
 
@@ -43,6 +44,7 @@ const STORED_REQUEST_RETENTION_SECS: i64 = 3600;
 const STORED_ENROLLMENT_RETENTION_SECS: i64 = 3600;
 const STALE_DELIVERY_SECS: i64 = 120;
 const STALE_SESSION_RETENTION_SECS: i64 = 3600;
+const CLOSE_POLL: Duration = Duration::from_millis(20);
 
 pub struct ControlParts {
     pub store: Store,
@@ -155,6 +157,8 @@ impl Control {
         let cert_ttl =
             Duration::from_secs(parts.cert_ttl.as_secs().min(MAX_USER_VALIDITY.as_secs()));
         let watched = RevocationWatch::starting_at(Moment::read(&parts.clock).map(|now| now.secs));
+        let killer = Arc::new(KillerSlot::default());
+        killer.watch_terminals(Arc::clone(&web.terminals.live));
         Ok(Control {
             inner: Arc::new(Inner {
                 store: parts.store,
@@ -175,7 +179,7 @@ impl Control {
                 web,
                 clock: parts.clock,
                 ticker,
-                killer: Arc::default(),
+                killer,
                 watched: Arc::new(watched),
                 recordings: parts.recordings.map(Uploads::new),
                 recording_rejections: RejectionLog::default(),
@@ -234,6 +238,43 @@ impl Control {
     #[doc(hidden)]
     pub async fn open_web_session(&self, user_id: &str) -> Option<crate::web::TestWebSession> {
         crate::web::open_for_tests(self, user_id).await
+    }
+
+    pub fn install_web_terminal(&self, gate: Arc<dyn TerminalGate>, settings: WebTerminalSettings) {
+        self.web.terminals.install(gate, settings);
+    }
+
+    pub async fn close_web_terminals(&self, grace: Duration) -> usize {
+        let closing = self.web.terminals.live.stop_all(End::Shutdown);
+        let deadline = tokio::time::Instant::now() + grace;
+        while self.web.terminals.live.open() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(CLOSE_POLL).await;
+        }
+        closing
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn web_terminal_counters(&self) -> crate::web::terminal::WebTerminalCounters {
+        self.web.terminals.counters()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn use_web_terminal_keys(
+        &self,
+        source: impl Fn() -> Result<jaunt_ssh::EphemeralKey, jaunt_ssh::JumpError>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.web.terminals.use_keys(Arc::new(source));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn web_terminal_certificates(&self) -> Vec<String> {
+        self.web.terminals.issued()
     }
 
     pub fn set_recording_playback_limit(&self, bytes: u64) {

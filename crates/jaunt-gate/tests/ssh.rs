@@ -11,11 +11,12 @@ use fixture::{
     Verdict, echo_once, key,
 };
 use jaunt_gate::{
-    HostCertError, HostCertIssuer, IssueError, SshGate, SshGateConfig, SshGateError,
-    TerminationReason, TrustedProxyProblem,
+    HostCertError, HostCertIssuer, InProcessClient, InProcessRefusal, IssueError, SshGate,
+    SshGateConfig, SshGateError, TerminationReason, TrustedProxyProblem,
 };
+use jaunt_limits::{AddressLimits, Rate};
 use jaunt_proto::BoxFuture;
-use jaunt_ssh::{UserCaKeys, UserCaSource};
+use jaunt_ssh::{OuterEndReason, OuterEvent, UserCaKeys, UserCaSource};
 use jaunt_tunnel::AgentRegistry;
 use russh::Disconnect;
 use support::{audited, eventually, field};
@@ -424,6 +425,125 @@ async fn terminate_closes_only_the_matching_connections_and_their_forwards() {
     })
     .await;
     eventually("the index to empty", || gate.authenticated() == 0).await;
+    fixture.stop().await;
+}
+
+type InProcess = (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<OuterEndReason>,
+    Arc<std::sync::Mutex<Vec<OuterEvent>>>,
+);
+
+fn in_process(fixture: &Fixture, client_addr: &str) -> Result<InProcess, InProcessRefusal> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let connection = fixture.gate.connect_in_process(InProcessClient {
+        client_addr: client_addr.parse().unwrap(),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        events: Arc::new(move |event: &OuterEvent| sink.lock().unwrap().push(event.clone())),
+    })?;
+    Ok((connection.stream, tokio::spawn(connection.serve), seen))
+}
+
+#[tokio::test]
+async fn an_in_process_connection_is_routed_from_its_given_client_address_and_can_be_terminated() {
+    let fixture = Fixture::start(|_| {}).await;
+    assert_eq!(fixture.gate.host_names(), [GATE_NAME]);
+    let (stream, serve, seen) = in_process(&fixture, "203.0.113.9:0").unwrap();
+    let mut client = Client::over(stream).await.unwrap();
+    assert!(client.login(&fixture.user_ca).await);
+    let mut channel = client.open_node().await.unwrap();
+    echo_once(&mut channel, b"through the gate").await;
+
+    let routed = fixture.control.seen();
+    assert_eq!(routed.len(), 1);
+    assert_eq!(routed[0].client_addr, "203.0.113.9:0");
+    assert!(seen.lock().unwrap().iter().any(|event| matches!(
+        event,
+        OuterEvent::ForwardOpened { session_id, .. } if session_id == "session-0"
+    )));
+    let connected = audited("the in-process connect event", |event| {
+        field(event, "event") == "gate.ssh.connect"
+            && field(event, "client_addr") == "203.0.113.9:0"
+    })
+    .await;
+    assert_eq!(field(&connected, "peer_addr"), "in-process");
+    assert_eq!(field(&connected, "proxied"), "false");
+    eventually("the connection to be indexed", || {
+        fixture.gate.authenticated() == 1
+    })
+    .await;
+
+    assert_eq!(
+        fixture
+            .gate
+            .terminate(USER_ID, Some(42), TerminationReason::Revoked),
+        1
+    );
+    let reason = tokio::time::timeout(STEP, serve).await.unwrap().unwrap();
+    assert_eq!(reason, OuterEndReason::Terminated);
+    eventually("the client to see the end", || client.handle.is_closed()).await;
+    eventually("the index to empty", || fixture.gate.authenticated() == 0).await;
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn in_process_connections_count_against_the_unauthenticated_and_per_address_limits() {
+    let fixture = Fixture::start(|config| config.max_unauthenticated = 1).await;
+    let (first, first_serve, _) = in_process(&fixture, "203.0.113.9:0").unwrap();
+    assert!(matches!(
+        in_process(&fixture, "203.0.113.10:0"),
+        Err(InProcessRefusal::Busy)
+    ));
+    assert_eq!(fixture.gate.unauthenticated(), 1);
+    drop(first);
+    first_serve.abort();
+    let _ = first_serve.await;
+    eventually("the permit to come back", || {
+        fixture.gate.unauthenticated() == 0
+    })
+    .await;
+    assert!(in_process(&fixture, "203.0.113.10:0").is_ok());
+    fixture.stop().await;
+
+    let fixture = Fixture::start(|config| {
+        config.client_limits = AddressLimits {
+            rate: Rate::clamped(600, 600),
+            concurrent: 1,
+            tracked: 64,
+        };
+    })
+    .await;
+    let _held = in_process(&fixture, "203.0.113.9:0").unwrap();
+    assert!(matches!(
+        in_process(&fixture, "203.0.113.9:0"),
+        Err(InProcessRefusal::Limited)
+    ));
+    assert!(in_process(&fixture, "203.0.113.10:0").is_ok());
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn only_in_process_connections_outlive_their_certificate() {
+    let fixture = Fixture::start(|_| {}).await;
+    let network = fixture.connect().await;
+    let network = fixture.authenticate(network, 42, 3).await;
+    let (stream, _serve, _) = in_process(&fixture, "203.0.113.9:0").unwrap();
+    let web = Client::over(stream).await.unwrap();
+    let web = fixture.authenticate(web, 43, 3).await;
+    let mut channel = web.open_node().await.unwrap();
+
+    eventually("the network connection to be cut at its expiry", || {
+        network.handle.is_closed()
+    })
+    .await;
+    echo_once(&mut channel, b"after the expiry").await;
+    assert!(!web.handle.is_closed());
+    audited("the expiry disconnect of the network connection", |event| {
+        field(event, "event") == "gate.ssh.disconnect"
+            && field(event, "reason") == "certificate_expired"
+    })
+    .await;
     fixture.stop().await;
 }
 

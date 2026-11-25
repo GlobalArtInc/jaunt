@@ -13,6 +13,7 @@ use crate::token;
 use super::cookies::{self, SESSION_COOKIE};
 use super::csrf;
 use super::session::{NodesApprove, RequireAdmin, WebSession};
+use super::terminal::End;
 
 #[derive(Serialize)]
 struct SessionBody {
@@ -70,12 +71,13 @@ pub(crate) async fn session(
 }
 
 pub(crate) async fn logout(State(control): State<Control>, session: WebSession) -> Response {
-    match control
-        .store
-        .web_sessions()
-        .delete(&session.0.session.id_hash)
-        .await
-    {
+    let id_hash = &session.0.session.id_hash;
+    control
+        .web
+        .terminals
+        .live
+        .stop_web_session(id_hash, End::WebSessionEnded);
+    match control.store.web_sessions().delete(id_hash).await {
         Ok(Some(user_id)) => audit::web_session_ended(&user_id, SessionEnd::Logout),
         Ok(None) => {}
         Err(err) => {
