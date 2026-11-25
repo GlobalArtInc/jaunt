@@ -1,6 +1,6 @@
 import { el, replace } from "./dom.js";
 import { clean } from "./format.js";
-import { icon } from "./icons.js";
+import { icon, svg } from "./icons.js";
 import { menuButton } from "./menu.js";
 import { ADD_NEW, hasPermission, visibleAreas } from "./nav.js";
 import { S } from "./strings.js";
@@ -30,8 +30,22 @@ function writeCollapsed(value) {
   }
 }
 
+const MARK_SHAPES = [
+  ["rect", { x: 0.75, y: 0.75, width: 62.5, height: 62.5, rx: 14.5, fill: "#17143F", stroke: "#4A4590", "stroke-width": 1.5 }],
+  ["path", { d: "M19 49V31a13 13 0 0 1 26 0v18", fill: "none", stroke: "#FFFFFF", "stroke-width": 6.5, "stroke-linecap": "round", "stroke-linejoin": "round" }],
+  ["circle", { cx: 32, cy: 33, r: 5.5, fill: "#B7A4FF" }],
+];
+
+function brandMark() {
+  const root = svg("svg", { viewBox: "0 0 64 64", class: "brand-mark", "aria-hidden": "true", focusable: "false" });
+  for (const [tag, attributes] of MARK_SHAPES) {
+    root.appendChild(svg(tag, attributes));
+  }
+  return root;
+}
+
 export function wordmark() {
-  return el("span", { class: "wordmark" }, el("span", { class: "brand-mark", "aria-hidden": "true", text: "J" }), el("span", { class: "wordmark-text", text: S.product }));
+  return el("span", { class: "wordmark" }, brandMark(), el("span", { class: "wordmark-text", text: S.product }));
 }
 
 function initialOf(name) {

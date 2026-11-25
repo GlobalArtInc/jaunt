@@ -6,6 +6,8 @@ use jaunt_web::Asset;
 use crate::http::{empty_response, server_error};
 
 const FILE_DIRECTORY: &str = "assets";
+const FAVICON_PATH: &str = "/favicon.ico";
+const FAVICON_KEY: &str = "assets/brand/favicon.ico";
 const INDEX_CACHE_CONTROL: &str = "no-cache";
 const FILE_CACHE_CONTROL: &str = "no-cache";
 
@@ -21,10 +23,19 @@ pub(crate) async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Respo
             .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
         return response;
     }
+    let head = method == Method::HEAD;
+    if path == FAVICON_PATH {
+        return match jaunt_web::find(FAVICON_KEY) {
+            Some(asset) => respond(asset, FILE_CACHE_CONTROL, &headers, head),
+            None => {
+                tracing::error!(target: "jaunt::control", "the embedded favicon is missing");
+                server_error()
+            }
+        };
+    }
     let Some(key) = table_key(path) else {
         return empty_response(StatusCode::NOT_FOUND);
     };
-    let head = method == Method::HEAD;
     if is_file_path(key) {
         return match jaunt_web::find(key).filter(|_| !path.ends_with('/')) {
             Some(asset) => respond(asset, FILE_CACHE_CONTROL, &headers, head),

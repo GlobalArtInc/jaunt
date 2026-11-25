@@ -19,7 +19,7 @@ const hostileLabels = { [HOSTILE.tag]: HOSTILE.quote, rtl: HOSTILE.rtl, [HOSTILE
 function assertInert(scope) {
   assert.equal(scope.querySelectorAll("img, script, iframe, object, embed, style, link, form[action]").length, 0, "no element may come from data");
   for (const drawing of scope.querySelectorAll("svg")) {
-    assert.equal(drawing.getAttribute("class").startsWith("icon"), true, "only the static icons are drawings");
+    assert.match(drawing.getAttribute("class"), /^(icon|brand-mark)/, "only the static icons and the brand mark are drawings");
     for (const part of drawing.querySelectorAll("*")) {
       assert.match(part.localName, /^(path|circle|rect|ellipse)$/, "icons hold plain shapes only");
       for (const attribute of part.getAttributeNames()) {

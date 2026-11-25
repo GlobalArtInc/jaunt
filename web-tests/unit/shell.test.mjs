@@ -237,3 +237,33 @@ test("with storage that throws on every call the nodes page renders and the view
   click(ui.root.querySelector(".collapse-btn"));
   assert.equal(ui.root.querySelector(".app").classList.contains("nav-collapsed"), false);
 });
+
+test("the wordmark is an aria-hidden svg of three fixed shapes next to the product name as real text", async () => {
+  const { installDom } = await import("./support.mjs");
+  installDom();
+  const { wordmark } = await import("../../crates/jaunt-web/assets/assets/js/shell.js");
+  const root = wordmark();
+  const mark = root.querySelector("svg.brand-mark");
+  assert.ok(mark);
+  assert.equal(mark.getAttribute("aria-hidden"), "true");
+  assert.equal(mark.getAttribute("focusable"), "false");
+  assert.equal(mark.getAttribute("viewBox"), "0 0 64 64");
+  assert.equal(mark.hasAttribute("width"), false);
+  assert.equal(mark.hasAttribute("height"), false);
+  assert.deepEqual(
+    Array.from(mark.children).map((shape) => shape.localName),
+    ["rect", "path", "circle"],
+  );
+  const [tile, arch, dot] = Array.from(mark.children);
+  assert.deepEqual([tile.getAttribute("fill"), tile.getAttribute("stroke")], ["#17143F", "#4A4590"]);
+  assert.deepEqual([arch.getAttribute("fill"), arch.getAttribute("stroke")], ["none", "#FFFFFF"]);
+  assert.equal(dot.getAttribute("fill"), "#B7A4FF");
+  assert.equal(mark.textContent, "");
+  assert.equal(mark.getAttribute("role"), null);
+  assert.equal(mark.getAttribute("aria-label"), null);
+  const name = root.querySelector(".wordmark-text");
+  assert.equal(name.textContent, "Jaunt");
+  assert.equal(name.children.length, 0);
+  assert.equal(root.querySelector("img, script, foreignObject, use, style"), null);
+  assert.equal(root.textContent, "Jaunt");
+});

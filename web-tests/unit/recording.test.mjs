@@ -342,7 +342,7 @@ test("hostile output reaches the emulator only as data and builds no element, li
   press(ui.root.querySelector("#player-seek"), "End");
   const written = sinks[0].ops.filter((op) => op[0] === "write").map((op) => op[1]).join("");
   assert.equal(written.includes(hostile), true);
-  assert.equal(ui.root.querySelectorAll("img, script, iframe, object, embed, svg:not(.icon), style").length, 0);
+  assert.equal(ui.root.querySelectorAll("img, script, iframe, object, embed, svg:not(.icon):not(.brand-mark), style").length, 0);
   assert.equal(window.__pwned, undefined);
   assert.equal(document.title, "Session 5b1c0a42 · Jaunt");
   for (const link of ui.root.querySelectorAll("a[href]")) {

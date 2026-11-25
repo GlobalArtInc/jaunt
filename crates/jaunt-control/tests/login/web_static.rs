@@ -322,6 +322,63 @@ async fn only_get_and_head_are_accepted_for_static_content() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_default_favicon_path_serves_the_icon_file_and_nothing_else_changes() {
+    let harness = Harness::with_web().await;
+    let icon = jaunt_web::find("assets/brand/favicon.ico").unwrap();
+
+    let get = harness.web_get("/favicon.ico", None).await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(get.header("content-type"), "image/x-icon");
+    assert_eq!(get.header("cache-control"), "no-cache");
+    assert_eq!(get.header("etag"), icon.etag);
+    assert_eq!(get.header("content-length"), icon.bytes.len().to_string());
+    assert_eq!(get.body, icon.bytes);
+    let canonical = harness.web_get("/assets/brand/favicon.ico", None).await;
+    assert_eq!(canonical.body, get.body);
+    assert_eq!(canonical.header("etag"), get.header("etag"));
+
+    let head = harness
+        .web_request(Method::HEAD, "/favicon.ico", None, &[])
+        .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert!(head.body.is_empty());
+    for name in ["content-type", "content-length", "etag", "cache-control"] {
+        assert_eq!(head.header(name), get.header(name), "{name}");
+    }
+
+    let revalidated = harness
+        .web_request(
+            Method::GET,
+            "/favicon.ico",
+            None,
+            &[("if-none-match", icon.etag)],
+        )
+        .await;
+    assert_eq!(revalidated.status, StatusCode::NOT_MODIFIED);
+    assert!(revalidated.body.is_empty());
+    assert_eq!(revalidated.header("etag"), icon.etag);
+
+    for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+        let reply = harness
+            .web_request(method.clone(), "/favicon.ico", None, &[])
+            .await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(reply.header("allow"), "GET, HEAD");
+    }
+
+    for path in [
+        "/favicon.svg",
+        "/favicon.ico/",
+        "/FAVICON.ICO",
+        "/x/favicon.ico",
+    ] {
+        let reply = harness.web_get(path, None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{path}");
+        assert_eq!(reply.body, entry_bytes(), "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn with_the_web_flag_off_no_web_route_exists() {
     let harness = Harness::new().await;
 
@@ -329,6 +386,7 @@ async fn with_the_web_flag_off_no_web_route_exists() {
         (Method::GET, "/"),
         (Method::GET, "/nodes"),
         (Method::GET, "/assets/app.js"),
+        (Method::GET, "/favicon.ico"),
         (Method::GET, "/v1/web/login"),
         (Method::GET, "/v1/web/session"),
         (Method::POST, "/v1/web/logout"),

@@ -85,7 +85,7 @@ const SHAPES = {
 
 export const ICON_NAMES = Object.keys(SHAPES);
 
-function svg(tag, attributes) {
+export function svg(tag, attributes) {
   const node = document.createElementNS(NS, tag);
   for (const [name, value] of Object.entries(attributes)) {
     node.setAttribute(name, String(value));

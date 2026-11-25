@@ -51,6 +51,20 @@ mod tests {
     }
 
     #[test]
+    fn the_brand_files_are_embedded_with_their_types_and_etags() {
+        for (path, content_type) in [
+            ("assets/brand/favicon.svg", "image/svg+xml"),
+            ("assets/brand/favicon.ico", "image/x-icon"),
+            ("assets/brand/apple-touch-icon.png", "image/png"),
+        ] {
+            let asset = find(path).unwrap();
+            assert_eq!(asset.content_type, content_type, "{path}");
+            assert!(!asset.bytes.is_empty(), "{path}");
+            assert!(asset.etag.len() > 2, "{path}");
+        }
+    }
+
+    #[test]
     fn table_paths_are_unique_relative_and_made_of_safe_characters() {
         let mut seen = HashSet::new();
         for asset in assets() {
@@ -205,6 +219,8 @@ mod tests {
         ),
     ];
 
+    const SVG_NAMESPACE_ATTRIBUTE: &str = " xmlns=\"http://www.w3.org/2000/svg\"";
+
     const VENDOR_PREFIX: &str = "assets/vendor/";
     const ADDRESS_NEEDLES: &[&str] = &["http://", "https://"];
 
@@ -292,7 +308,19 @@ mod tests {
             "https://",
         ];
         for asset in assets() {
-            let source = text_of(asset.path);
+            let Ok(text) = std::str::from_utf8(asset.bytes) else {
+                assert!(
+                    asset.path.ends_with(".png") || asset.path.ends_with(".ico"),
+                    "{} is not text",
+                    asset.path
+                );
+                continue;
+            };
+            let source = &if asset.path.ends_with(".svg") {
+                text.replace(SVG_NAMESPACE_ATTRIBUTE, "")
+            } else {
+                text.to_owned()
+            };
             let pinned = is_pinned_vendored(asset.path, asset.bytes);
             for needle in forbidden {
                 if pinned && ADDRESS_NEEDLES.contains(&needle) {

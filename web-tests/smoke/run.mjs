@@ -272,6 +272,31 @@ async function navigationChecks(page, context, width) {
   }
 }
 
+const ICON_TYPES = { "/assets/brand/favicon.svg": "image/svg+xml", "/assets/brand/favicon.ico": "image/x-icon", "/assets/brand/apple-touch-icon.png": "image/png", "/favicon.ico": "image/x-icon" };
+
+async function iconChecks(page, context) {
+  const declared = await page.$$eval('link[rel~="icon"], link[rel="apple-touch-icon"]', (links) => links.map((link) => link.getAttribute("href")));
+  if (declared.join() !== "/assets/brand/favicon.ico,/assets/brand/favicon.svg,/assets/brand/apple-touch-icon.png") fail(context, "the page declares icons " + declared.join());
+  const themeColors = await page.$$eval('meta[name="theme-color"]', (metas) => metas.map((meta) => meta.getAttribute("media") + " " + meta.getAttribute("content")));
+  if (themeColors.length !== 2) fail(context, "theme-color metas: " + themeColors.join());
+  for (const [path, type] of Object.entries(ICON_TYPES)) {
+    const result = await page.evaluate(async (href) => {
+      const reply = await fetch(href);
+      const bytes = (await reply.arrayBuffer()).byteLength;
+      const loaded = await new Promise((resolve) => {
+        const image = new Image();
+        image.onload = () => resolve(true);
+        image.onerror = () => resolve(false);
+        image.src = href;
+      });
+      return { status: reply.status, type: reply.headers.get("content-type"), bytes, loaded };
+    }, path);
+    if (result.status !== 200 || result.type !== type || result.bytes === 0) fail(context, `${path} answered ${result.status} ${result.type} ${result.bytes} bytes`);
+    if (!result.loaded) fail(context, `${path} does not load as an image`);
+    if (process.env.SMOKE_VERBOSE_ICONS) console.log(`${context} ${path} ${result.status} ${result.type} ${result.bytes} bytes loaded=${result.loaded}`);
+  }
+}
+
 async function runMatrix(browser, stub, width, theme) {
   const context = `${theme}-${width}`;
   const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1 });
@@ -282,6 +307,7 @@ async function runMatrix(browser, stub, width, theme) {
     if (message.type() === "error" && !optional && !/status of (401|429)/.test(message.text())) problems.push("console: " + message.text());
   });
   page.on("pageerror", (error) => problems.push("pageerror: " + error.message));
+  if (process.env.SMOKE_VERBOSE_ICONS) page.on("response", (reply) => /brand|favicon/.test(reply.url()) && console.log(`${context} network ${reply.status()} ${reply.url()} ${reply.headers()["content-type"]}`));
   await page.addInitScript(() => {
     document.addEventListener("securitypolicyviolation", (event) => {
       console.error("csp violation " + event.violatedDirective + " " + event.blockedURI);
@@ -291,6 +317,7 @@ async function runMatrix(browser, stub, width, theme) {
   await page.goto(stub.origin + "/");
   await page.waitForSelector("a.btn-primary");
   await tokenContrast(page, context);
+  await iconChecks(page, context);
   await shot(page, "signin", context);
 
   await page.click("a.btn-primary");

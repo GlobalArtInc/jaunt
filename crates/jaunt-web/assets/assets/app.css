@@ -313,7 +313,7 @@ fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .brand:hover { color: var(--accent-hover); }
 .wordmark { display: inline-flex; align-items: center; gap: var(--space-3); }
 .wordmark-text { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; line-height: 1; }
-.brand-mark { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: var(--radius-md); background: var(--accent); color: var(--on-accent); font-size: var(--fs-md); font-weight: 700; }
+.brand-mark { display: block; flex: none; width: 28px; height: 28px; }
 .hamburger { display: none; }
 .bell-slot, .account-slot { display: inline-flex; align-items: center; }
 .bell-count {
@@ -616,6 +616,7 @@ pre.command { background: var(--surface-2); border: 1px solid var(--border); bor
 .solo-guided h1 { font-size: 28px; }
 .solo-guided .btn-primary { width: 100%; margin: var(--space-4) 0; }
 .brand-row { display: flex; align-items: center; margin-bottom: var(--space-5); color: var(--accent); }
+.brand-row .brand-mark { width: 40px; height: 40px; }
 
 .recording > * + * { margin-top: var(--space-4); }
 .recording-state { margin: 0; }

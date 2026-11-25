@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const ASSETS = resolve(process.env.JAUNT_ASSETS || fileURLToPath(new URL("../../crates/jaunt-web/assets", import.meta.url)));
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
-const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".png": "image/png" };
 const COOKIE = "jaunt_stub";
 
 function now() {
@@ -295,7 +295,7 @@ export async function startStub({ permissions }) {
   }
 
   async function serveStatic(response, url) {
-    const requested = url.pathname.startsWith("/assets/") ? url.pathname.slice(1) : "index.html";
+    const requested = url.pathname === "/favicon.ico" ? "assets/brand/favicon.ico" : url.pathname.startsWith("/assets/") ? url.pathname.slice(1) : "index.html";
     const file = normalize(join(ASSETS, requested));
     if (!file.startsWith(ASSETS + "/") && file !== ASSETS) {
       response.writeHead(404);

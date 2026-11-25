@@ -1,8 +1,17 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.svg">
+    <img src="docs/brand/lockup-light.svg" alt="Jaunt" height="64">
+  </picture>
+</p>
+
 # Jaunt
 
 Identity-aware access gateway for SSH and infrastructure, written in Rust.
 
 Jaunt issues short-lived certificates after a single sign-on, so people and machines reach servers without long-lived keys, bastion hosts or VPNs. Agents connect outward, so protected hosts need no inbound ports.
+
+The logo and brand rules are in [docs/brand](docs/brand/README.md).
 
 ## Status
 
