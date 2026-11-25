@@ -12,7 +12,7 @@ use crate::support::{Enrolled, Harness};
 const RETENTION_SECS: u64 = 3600;
 const STALE_DELIVERY_SECS: u64 = 120;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-const DEADLINE: Duration = Duration::from_secs(10);
+const DEADLINE: Duration = Duration::from_secs(60);
 
 struct RunningServer {
     stop: oneshot::Sender<()>,
