@@ -813,6 +813,7 @@ name = "jaunt-fuzz"
 version = "0.0.0"
 dependencies = [
  "http",
+ "jaunt-pgwire",
  "jaunt-policy",
  "jaunt-proto",
  "jaunt-ssh",
@@ -829,6 +830,15 @@ name = "jaunt-limits"
 version = "0.0.0"
 dependencies = [
  "ipnet",
+ "thiserror",
+]
+
+[[package]]
+name = "jaunt-pgwire"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "subtle",
  "thiserror",
 ]
 

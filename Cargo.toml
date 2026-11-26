@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde-saphyr = "2.2.0"
 jaunt-proto = { path = "crates/jaunt-proto" }
 jaunt-limits = { path = "crates/jaunt-limits" }
+jaunt-pgwire = { path = "crates/jaunt-pgwire" }
 jaunt-ca = { path = "crates/jaunt-ca" }
 jaunt-policy = { path = "crates/jaunt-policy" }
 jaunt-store = { path = "crates/jaunt-store" }

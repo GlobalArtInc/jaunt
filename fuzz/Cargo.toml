@@ -13,6 +13,7 @@ members = ["."]
 
 [dependencies]
 http = "1.5.0"
+jaunt-pgwire = { path = "../crates/jaunt-pgwire" }
 jaunt-policy = { path = "../crates/jaunt-policy" }
 jaunt-proto = { path = "../crates/jaunt-proto" }
 jaunt-ssh = { path = "../crates/jaunt-ssh" }
@@ -78,6 +79,27 @@ bench = false
 [[bin]]
 name = "control_requests"
 path = "fuzz_targets/control_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgwire_frontend"
+path = "fuzz_targets/pgwire_frontend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgwire_backend"
+path = "fuzz_targets/pgwire_backend.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgwire_startup"
+path = "fuzz_targets/pgwire_startup.rs"
 test = false
 doc = false
 bench = false

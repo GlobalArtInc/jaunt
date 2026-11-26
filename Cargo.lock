@@ -2412,6 +2412,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jaunt-pgwire"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "subtle",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "jaunt-policy"
 version = "0.0.0"
 dependencies = [
