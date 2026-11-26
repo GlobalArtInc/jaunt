@@ -1,0 +1,6 @@
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: teams }
+spec:
+  members: { groups: [ops] }
+  ssh: { nodes: { env: [prod] }, logins: ['{username}', 'team-{groups}', 'u.{email}', '{groups}'] }

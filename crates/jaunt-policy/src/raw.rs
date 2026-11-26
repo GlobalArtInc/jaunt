@@ -5,11 +5,13 @@ use serde::Deserialize;
 
 use crate::access_test::{AccessTest, Expect};
 use crate::model::{AdminPermission, NodeInfo};
-use crate::policy::{LabelRequirement, LoginSpec, Role, SshRule};
+use crate::policy::{
+    ANY_VALUE, DeniedLogins, LabelRequirement, NAME_PSEUDO_LABEL, Role, RoleDeny, SSH_LOGIN,
+    SelectorKey, SshDenyRule, SshRule,
+};
+use crate::template::{Parsed, TRAIT_FORMS, ValueSpec};
 
 pub(crate) const API_VERSION: &str = "jaunt/v1";
-pub(crate) const USERNAME_PLACEHOLDER: &str = "{username}";
-const NODE_NAME_KEY: &str = "name";
 
 #[derive(Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -49,6 +51,7 @@ struct RawMetadata {
 struct RawRoleSpec {
     members: Option<RawMembers>,
     ssh: Option<RawSsh>,
+    deny: Option<RawDeny>,
     admin: Option<Vec<AdminPermission>>,
 }
 
@@ -72,6 +75,23 @@ struct RawSsh {
     port_forwarding: bool,
     #[serde(default)]
     record_input: bool,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleDeny"))]
+#[serde(deny_unknown_fields)]
+struct RawDeny {
+    ssh: Option<RawDenySsh>,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "RoleDenySsh"))]
+#[serde(deny_unknown_fields)]
+struct RawDenySsh {
+    nodes: Option<BTreeMap<String, Vec<String>>>,
+    logins: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +169,11 @@ fn compile_role(raw: RawRole, errors: &mut Vec<String>) -> Role {
     };
 
     let ssh = raw.spec.ssh.and_then(|ssh| compile_ssh(&name, ssh, errors));
+    let deny = raw
+        .spec
+        .deny
+        .map(|deny| compile_deny(&name, deny, errors))
+        .unwrap_or_default();
     let admin = raw.spec.admin.unwrap_or_default().into_iter().collect();
 
     Role {
@@ -156,6 +181,7 @@ fn compile_role(raw: RawRole, errors: &mut Vec<String>) -> Role {
         users,
         groups,
         ssh,
+        deny,
         admin,
     }
 }
@@ -176,28 +202,44 @@ fn non_empty_set(
     set
 }
 
-fn compile_ssh(role: &str, raw: RawSsh, errors: &mut Vec<String>) -> Option<SshRule> {
+fn compile_selector(
+    context: &str,
+    block: &str,
+    raw: Option<BTreeMap<String, Vec<String>>>,
+    errors: &mut Vec<String>,
+) -> Vec<LabelRequirement> {
+    let path = format!("{context}{block}.nodes");
     let mut nodes = Vec::new();
-    match raw.nodes {
-        None => errors.push("spec.ssh.nodes is required when spec.ssh is set".to_owned()),
+    match raw {
+        None => errors.push(format!("{path} is required when {block} is set")),
         Some(selector) => {
             if selector.is_empty() {
-                errors.push("spec.ssh.nodes selector must not be empty".to_owned());
+                errors.push(format!("{path} selector must not be empty"));
             }
             for (key, values) in selector {
                 if key.is_empty() {
-                    errors.push("spec.ssh.nodes label key must not be empty".to_owned());
+                    errors.push(format!("{path} label key must not be empty"));
                 }
                 if values.is_empty() {
-                    errors.push(format!("spec.ssh.nodes.{key} must list at least one value"));
+                    errors.push(format!("{path}.{key} must list at least one value"));
                 }
                 if values.iter().any(String::is_empty) {
-                    errors.push(format!("spec.ssh.nodes.{key} values must not be empty"));
+                    errors.push(format!("{path}.{key} values must not be empty"));
                 }
+                let key = if key == NAME_PSEUDO_LABEL {
+                    SelectorKey::Name
+                } else {
+                    SelectorKey::Label(key)
+                };
                 nodes.push(LabelRequirement { key, values });
             }
         }
     }
+    nodes
+}
+
+fn compile_ssh(role: &str, raw: RawSsh, errors: &mut Vec<String>) -> Option<SshRule> {
+    let nodes = compile_selector("", "spec.ssh", raw.nodes, errors);
 
     let mut logins = Vec::new();
     let raw_logins = raw.logins.unwrap_or_default();
@@ -205,18 +247,14 @@ fn compile_ssh(role: &str, raw: RawSsh, errors: &mut Vec<String>) -> Option<SshR
         errors.push("spec.ssh.logins must list at least one login".to_owned());
     }
     for (index, login) in raw_logins.into_iter().enumerate() {
-        if login == USERNAME_PLACEHOLDER {
-            logins.push(LoginSpec::Username);
-        } else if login.contains('{') || login.contains('}') {
-            errors.push(format!(
-                "spec.ssh.logins[{index}] {login:?}: only a standalone {USERNAME_PLACEHOLDER} placeholder is supported"
-            ));
-        } else if !is_portable_login(&login) {
-            errors.push(format!(
-                "role {role:?}: spec.ssh.logins[{index}] {login:?} is not a valid login"
-            ));
-        } else {
-            logins.push(LoginSpec::Literal(login));
+        let path = format!("role {role:?}: spec.ssh.logins[{index}] {login:?}");
+        match ValueSpec::parse(&login, SSH_LOGIN) {
+            Parsed::Valid(spec) => logins.push(spec),
+            Parsed::InvalidLiteral => errors.push(format!("{path} is not a valid login")),
+            Parsed::MalformedTemplate => errors.push(format!("{path}: {TRAIT_FORMS}")),
+            Parsed::InvalidPrefix => errors.push(format!(
+                "{path}: the literal prefix cannot start a valid login"
+            )),
         }
     }
 
@@ -231,12 +269,59 @@ fn compile_ssh(role: &str, raw: RawSsh, errors: &mut Vec<String>) -> Option<SshR
     })
 }
 
+fn compile_deny(role: &str, raw: RawDeny, errors: &mut Vec<String>) -> RoleDeny {
+    RoleDeny {
+        ssh: raw.ssh.and_then(|ssh| compile_deny_ssh(role, ssh, errors)),
+    }
+}
+
+fn compile_deny_ssh(role: &str, raw: RawDenySsh, errors: &mut Vec<String>) -> Option<SshDenyRule> {
+    let context = format!("role {role:?}: ");
+    let nodes = compile_selector(&context, "spec.deny.ssh", raw.nodes, errors);
+    let logins = match raw.logins {
+        None => DeniedLogins::Any,
+        Some(raw_logins) => {
+            if raw_logins.is_empty() {
+                errors.push(format!(
+                    "{context}spec.deny.ssh.logins must list at least one login; omit it to deny every login"
+                ));
+            }
+            let mut any = false;
+            let mut listed = BTreeSet::new();
+            for (index, login) in raw_logins.into_iter().enumerate() {
+                let path = format!("{context}spec.deny.ssh.logins[{index}] {login:?}");
+                if login == ANY_VALUE {
+                    any = true;
+                } else if login.contains(['{', '}']) {
+                    errors.push(format!(
+                        "{path}: a deny rule lists literal logins or \"*\", not traits"
+                    ));
+                } else if !is_portable_login(&login) {
+                    errors.push(format!("{path} is not a valid login"));
+                } else {
+                    listed.insert(login);
+                }
+            }
+            if any {
+                DeniedLogins::Any
+            } else {
+                DeniedLogins::Listed(listed)
+            }
+        }
+    };
+
+    if nodes.is_empty() {
+        return None;
+    }
+    Some(SshDenyRule { nodes, logins })
+}
+
 fn compile_tests(raw: Vec<RawAccessTest>, source: &str) -> Vec<AccessTest> {
     raw.into_iter()
         .enumerate()
         .map(|(index, case)| {
             let mut labels = case.node;
-            let name = labels.remove(NODE_NAME_KEY).unwrap_or_default();
+            let name = labels.remove(NAME_PSEUDO_LABEL).unwrap_or_default();
             let username = case.username.unwrap_or_else(|| {
                 case.user
                     .split_once('@')

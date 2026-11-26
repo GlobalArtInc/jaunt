@@ -117,7 +117,7 @@ fn report_invalid(
             }
             writeln!(out, "policy invalid: {} errors", messages.len())?;
         }
-        Format::Json => write_json(out, false, None, &[], messages)?,
+        Format::Json => write_json(out, false, None, &[], &[], messages)?,
     }
     Ok(ExitCode::from(EXIT_FAILED))
 }
@@ -131,10 +131,14 @@ fn check(dir: &Path, format: Format, out: &mut impl Write) -> Result<ExitCode, P
     if set.is_empty() {
         return report_invalid(&[NO_DOCUMENTS.to_owned()], format, out);
     }
+    let warnings: Vec<String> = set.warnings().iter().map(ToString::to_string).collect();
     let reports = case_reports(&set);
     let failed = reports.iter().filter(|report| !report.passed).count();
     match format {
         Format::Text => {
+            for warning in &warnings {
+                writeln!(out, "WARN {warning}")?;
+            }
             for report in &reports {
                 let verdict = if report.passed { "PASS" } else { "FAIL" };
                 writeln!(out, "{verdict} {}: {}", report.source, report.detail)?;
@@ -148,7 +152,7 @@ fn check(dir: &Path, format: Format, out: &mut impl Write) -> Result<ExitCode, P
                 failed
             )?;
         }
-        Format::Json => write_json(out, true, Some(set.hash()), &reports, &[])?,
+        Format::Json => write_json(out, true, Some(set.hash()), &reports, &warnings, &[])?,
     }
     Ok(ExitCode::from(if failed == 0 {
         EXIT_OK
@@ -162,6 +166,7 @@ fn write_json(
     loaded: bool,
     hash: Option<&str>,
     reports: &[CaseReport],
+    warnings: &[String],
     errors: &[String],
 ) -> io::Result<()> {
     let tests: Vec<Value> = reports
@@ -179,6 +184,7 @@ fn write_json(
         "loaded": loaded,
         "hash": hash,
         "tests": tests,
+        "warnings": warnings,
         "errors": errors,
     });
     writeln!(out, "{document:#}")

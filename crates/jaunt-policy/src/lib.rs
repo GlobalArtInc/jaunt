@@ -6,13 +6,15 @@ mod policy;
 mod raw;
 #[cfg(feature = "schema")]
 mod schema;
+mod template;
 mod watch;
 
 pub use access_test::{AccessTest, AccessTestResult, Expect, run_access_tests};
 pub use handle::{LoadedPolicy, PolicyHandle, ReloadOutcome};
 pub use loader::{LoadError, LoadErrors, load_dir};
 pub use model::{
-    AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, UnknownAdminPermission,
+    AdminPermission, Identity, NodeInfo, PolicyWarning, RoleAccess, SshDecision,
+    UnknownAdminPermission,
 };
 pub use policy::PolicySet;
 #[cfg(feature = "schema")]

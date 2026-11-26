@@ -1,0 +1,7 @@
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: ops-limits }
+spec:
+  members: { groups: [ops] }
+  ssh: { nodes: { env: [prod] }, logins: [deploy, root] }
+  deny: { ssh: { nodes: { name: [db-1], env: ['*'] }, logins: [root, '*'] } }

@@ -180,6 +180,87 @@ fn node_without_the_labelled_key_never_matches() {
     }
 }
 
+fn named(name: &str, labels: &[(&str, &str)]) -> NodeInfo {
+    NodeInfo {
+        name: name.to_owned(),
+        ..node(labels)
+    }
+}
+
+#[test]
+fn the_name_pseudo_label_matches_the_node_name_and_a_real_label_cannot_forge_it() {
+    let set = alice_role("{ nodes: { name: [web-1, web-2], env: [prod] }, logins: [deploy] }");
+    let any_name = alice_role("{ nodes: { name: ['*'] }, logins: [deploy] }");
+    let who = identity(ALICE, &[]);
+    let cases = [
+        (named("web-1", &[("env", "prod")]), true),
+        (named("web-2", &[("env", "prod")]), true),
+        (named("web-3", &[("env", "prod")]), false),
+        (named("Web-1", &[("env", "prod")]), false),
+        (named("web-1", &[]), false),
+        (named("web-3", &[("env", "prod"), ("name", "web-1")]), false),
+        (named("web-1", &[("env", "prod"), ("name", "web-3")]), true),
+    ];
+    for (target, expected) in cases {
+        assert_eq!(
+            allowed(&set, &who, &target, "deploy"),
+            expected,
+            "{target:?}"
+        );
+        assert_eq!(set.route(&who, &target), expected, "route {target:?}");
+        assert!(allowed(&any_name, &who, &target, "deploy"), "{target:?}");
+    }
+
+    let denied_by_name = load_roles(&[
+        role(
+            "wide",
+            Some("{ users: [alice@example.com] }"),
+            "{ nodes: { env: ['*'] }, logins: [deploy] }",
+            "[]",
+        ),
+        format!(
+            "{}  deny: {{ ssh: {{ nodes: {{ name: [db-1] }} }} }}\n",
+            role("limits", Some("{ users: [alice@example.com] }"), "", "[]")
+        ),
+    ]);
+    for (target, expected) in [
+        (named("db-1", &[("env", "prod")]), false),
+        (named("db-1", &[("env", "prod"), ("name", "web-1")]), false),
+        (named("web-1", &[("env", "prod"), ("name", "db-1")]), true),
+    ] {
+        assert_eq!(
+            allowed(&denied_by_name, &who, &target, "deploy"),
+            expected,
+            "{target:?}"
+        );
+    }
+}
+
+#[test]
+fn access_tests_use_the_name_key_as_the_node_name() {
+    let tests = "apiVersion: jaunt/v1\nkind: AccessTest\nspec:\n  \
+        - { user: alice@example.com, node: { name: web-1, env: prod }, login: deploy, expect: allow }\n  \
+        - { user: alice@example.com, node: { name: web-2, env: prod }, login: deploy, expect: deny }\n  \
+        - { user: alice@example.com, node: { env: prod }, login: deploy, expect: deny }\n";
+    let set = load_ok(&[
+        (
+            "a.yaml",
+            &role(
+                "r",
+                Some("{ users: [alice@example.com] }"),
+                "{ nodes: { name: [web-1] }, logins: [deploy] }",
+                "[]",
+            ),
+        ),
+        ("b.yaml", tests),
+    ]);
+    let results = jaunt_policy::run_access_tests(&set);
+    assert_eq!(results.len(), 3);
+    for result in results {
+        assert!(result.passed, "{}", result.description);
+    }
+}
+
 #[test]
 fn membership_by_group_or_email_is_exact() {
     let set = load_roles(&[role(

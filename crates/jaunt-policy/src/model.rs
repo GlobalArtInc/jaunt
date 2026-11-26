@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-use jaunt_proto::is_portable_login;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,8 +102,19 @@ impl TryFrom<String> for AdminPermission {
     }
 }
 
-const FORBIDDEN_SUBSTITUTED_LOGIN: &str = "root";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyWarning {
+    pub role: String,
+    pub field: &'static str,
+    pub value: String,
+}
 
-pub(crate) fn is_valid_substituted_login(login: &str) -> bool {
-    is_portable_login(login) && login != FORBIDDEN_SUBSTITUTED_LOGIN
+impl fmt::Display for PolicyWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "role {:?}: {} grants the privileged literal {:?}; keep it only as a deliberate choice",
+            self.role, self.field, self.value
+        )
+    }
 }

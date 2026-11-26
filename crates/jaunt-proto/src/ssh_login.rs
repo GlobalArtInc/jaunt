@@ -1,4 +1,5 @@
 const MAX_SSH_LOGIN_BYTES: usize = 32;
+const FORBIDDEN_SUBSTITUTED_LOGIN: &str = "root";
 
 pub fn is_portable_login(login: &str) -> bool {
     let bytes = login.as_bytes();
@@ -12,9 +13,13 @@ pub fn is_portable_login(login: &str) -> bool {
         })
 }
 
+pub fn is_valid_substituted_login(login: &str) -> bool {
+    is_portable_login(login) && login != FORBIDDEN_SUBSTITUTED_LOGIN
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SSH_LOGIN_BYTES, is_portable_login};
+    use super::{MAX_SSH_LOGIN_BYTES, is_portable_login, is_valid_substituted_login};
 
     #[test]
     fn only_lowercase_portable_names_up_to_the_limit_are_logins() {
@@ -44,6 +49,23 @@ mod tests {
             ("\u{ff41}", false),
         ] {
             assert_eq!(is_portable_login(login), portable, "{login:?}");
+        }
+    }
+
+    #[test]
+    fn a_substituted_login_follows_the_login_grammar_and_is_never_root() {
+        for (login, valid) in [
+            ("alice", true),
+            ("rooter", true),
+            ("_root", true),
+            ("root", false),
+            ("Root", false),
+            ("ROOT", false),
+            ("root ", false),
+            ("", false),
+            ("alice@example.com", false),
+        ] {
+            assert_eq!(is_valid_substituted_login(login), valid, "{login:?}");
         }
     }
 }

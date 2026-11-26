@@ -29,6 +29,13 @@ fn schema_accepts_valid_documents_and_rejects_deviations() {
         &validator,
         &ROLE.replace("sessions.read", "audit.read")
     ));
+    let with_deny =
+        format!("{ROLE}  deny: {{ ssh: {{ nodes: {{ name: [db-1] }}, logins: [root, '*'] }} }}\n");
+    assert!(valid(&validator, &with_deny));
+    assert!(valid(
+        &validator,
+        &ROLE.replace("'{username}'", "'u-{groups}'")
+    ));
 
     let rejected = [
         ("unknown field", ROLE.replace("members:", "memberz:")),
@@ -49,6 +56,16 @@ fn schema_accepts_valid_documents_and_rejects_deviations() {
         (
             "unknown admin permission",
             ROLE.replace("sessions.read", "sessions.write"),
+        ),
+        (
+            "deny of an unknown kind",
+            format!("{ROLE}  deny: {{ kubernetes: {{ clusters: {{ env: [prod] }} }} }}\n"),
+        ),
+        (
+            "deny with an allow-only field",
+            format!(
+                "{ROLE}  deny: {{ ssh: {{ nodes: {{ env: [prod] }}, portForwarding: true }} }}\n"
+            ),
         ),
         ("bad expectation", TESTS.replace("allow", "maybe")),
         (
@@ -85,7 +102,13 @@ fn schema_definitions_have_public_names() {
     let schema = policy_schema();
     let definitions = schema["$defs"].as_object().expect("definitions");
     assert!(definitions.keys().all(|name| !name.starts_with("Raw")));
-    for name in ["RoleSpec", "AccessTestCase", "AdminPermission"] {
+    for name in [
+        "RoleSpec",
+        "RoleDeny",
+        "RoleDenySsh",
+        "AccessTestCase",
+        "AdminPermission",
+    ] {
         assert!(definitions.contains_key(name), "{name} is missing");
     }
 }

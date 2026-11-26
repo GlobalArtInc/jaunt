@@ -3,7 +3,9 @@ mod common;
 use std::fs;
 
 use common::{load_err, load_ok, write_dir};
-use jaunt_policy::{Expect, Identity, NodeInfo, PolicyHandle, PolicySet, run_access_tests};
+use jaunt_policy::{
+    Expect, Identity, NodeInfo, PolicyHandle, PolicySet, PolicyWarning, run_access_tests,
+};
 
 const VALID: [&str; 10] = [
     "a",
@@ -243,4 +245,26 @@ fn access_tests_see_the_same_rule_for_substituted_usernames() {
     for result in results {
         assert!(result.passed, "{}", result.description);
     }
+}
+
+#[test]
+fn only_a_literal_root_in_an_allow_rule_is_reported_as_a_warning() {
+    let with_root = format!(
+        "{}  deny: {{ ssh: {{ nodes: {{ env: [dev] }}, logins: [root] }} }}\n",
+        role_with_logins("deploy, root, '{username}', 'r{username}'")
+    );
+    let warnings = load_ok(&[("a.yaml", &with_root)]).warnings();
+    assert_eq!(
+        warnings,
+        [PolicyWarning {
+            role: "r".to_owned(),
+            field: "spec.ssh.logins",
+            value: "root".to_owned(),
+        }]
+    );
+    assert_eq!(
+        warnings[0].to_string(),
+        "role \"r\": spec.ssh.logins grants the privileged literal \"root\"; keep it only as a deliberate choice"
+    );
+    assert!(load_logins("deploy, '{username}'").warnings().is_empty());
 }

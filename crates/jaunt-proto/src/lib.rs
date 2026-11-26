@@ -1,8 +1,10 @@
 mod agent_trust;
 mod client;
+mod db_principal;
 mod device;
 mod enroll;
 mod error;
+mod kube_principal;
 mod login;
 mod plane;
 mod recording;
@@ -12,12 +14,16 @@ mod whoami;
 
 pub use agent_trust::{AgentTrust, AgentTrustV2};
 pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};
+pub use db_principal::{
+    is_db_name, is_db_user, is_valid_substituted_db_name, is_valid_substituted_db_user,
+};
 pub use device::{DevicePollRequest, DeviceStartRequest, DeviceStartResponse};
 pub use enroll::{
     EnrollRequest, EnrollResponse, EnrollmentApproved, NodeCertificates, PollRequest, PollResponse,
     RenewRequest, RenewResponse,
 };
 pub use error::ErrorBody;
+pub use kube_principal::{is_kube_principal, is_valid_substituted_kube_principal};
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
 pub use plane::{BoxFuture, ControlError, ControlPlane};
 pub use recording::{
@@ -29,7 +35,7 @@ pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
     RouteRequest, SessionEnd, SessionEndOutcome, SessionPermissions,
 };
-pub use ssh_login::is_portable_login;
+pub use ssh_login::{is_portable_login, is_valid_substituted_login};
 pub use whoami::WhoamiResponse;
 
 #[cfg(test)]

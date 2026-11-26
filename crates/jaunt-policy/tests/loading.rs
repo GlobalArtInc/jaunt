@@ -43,7 +43,7 @@ fn malformed_documents_are_rejected_with_file_and_document() {
     let empty_selector = format!("{HEAD}spec:\n  ssh: {{ nodes: {{}}, logins: [x] }}\n");
     let empty_values = format!("{HEAD}spec:\n  ssh: {{ nodes: {{ env: [] }}, logins: [x] }}\n");
     let embedded =
-        format!("{HEAD}spec:\n  ssh: {{ nodes: {{ env: [a] }}, logins: ['x-{{username}}'] }}\n");
+        format!("{HEAD}spec:\n  ssh: {{ nodes: {{ env: [a] }}, logins: ['{{username}}-x'] }}\n");
     let bad_login = format!("{HEAD}spec:\n  ssh: {{ nodes: {{ env: [a] }}, logins: ['a b'] }}\n");
     let bad_permission = format!("{HEAD}spec:\n  admin: [nodes.delete]\n");
     let numeric_label = format!("{HEAD}spec:\n  ssh: {{ nodes: {{ env: [1] }}, logins: [x] }}\n");
@@ -80,7 +80,7 @@ fn malformed_documents_are_rejected_with_file_and_document() {
             &empty_values,
             "must list at least one value",
         ),
-        ("embedded placeholder", &embedded, "standalone {username}"),
+        ("placeholder with a suffix", &embedded, "a trait must be"),
         ("invalid literal login", &bad_login, "not a valid login"),
         (
             "unknown permission",

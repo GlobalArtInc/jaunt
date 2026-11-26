@@ -128,3 +128,31 @@ fn empty_directory_exits_one_in_both_formats() {
     assert_eq!(report["loaded"], false);
     assert_eq!(report["errors"][0], "no policy documents found");
 }
+
+#[test]
+fn a_literal_root_login_is_a_warning_that_does_not_fail_the_check() {
+    let root_role = ROLE.replace("logins: [deploy]", "logins: [deploy, root]");
+    let text = check(&[("a.yaml", &root_role), ("b.yaml", PASSING)], &[]);
+    assert_eq!(text.status.code(), Some(0), "{}", stdout(&text));
+    let shown = stdout(&text);
+    assert!(
+        shown.contains("WARN role \"ops\": spec.ssh.logins grants the privileged literal \"root\""),
+        "{shown}"
+    );
+
+    let json = check(
+        &[("a.yaml", &root_role), ("b.yaml", PASSING)],
+        &["--format", "json"],
+    );
+    assert_eq!(json.status.code(), Some(0));
+    let report: Value = serde_json::from_str(&stdout(&json)).expect("stdout is JSON");
+    assert_eq!(report["warnings"].as_array().map(Vec::len), Some(1));
+
+    let quiet = check(
+        &[("a.yaml", ROLE), ("b.yaml", PASSING)],
+        &["--format", "json"],
+    );
+    let report: Value = serde_json::from_str(&stdout(&quiet)).expect("stdout is JSON");
+    assert_eq!(report["warnings"], Value::Array(Vec::new()));
+    assert!(!stdout(&check(&[("a.yaml", ROLE)], &[])).contains("WARN"));
+}
