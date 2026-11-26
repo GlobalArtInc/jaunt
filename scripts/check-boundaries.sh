@@ -43,6 +43,30 @@ jaunt-record jaunt-recording-s3
 jaunt-kube jaunt-recording-s3
 jaunt-pgwire jaunt-recording-s3
 jaunt-recording-s3 jaunt-ca jaunt-control jaunt-oidc jaunt-policy jaunt-tunnel jaunt-ssh jaunt-gate jaunt-agent jaunt-web
+jaunt-host-users jaunt jauntd jaunt-agent jaunt-audit jaunt-ca jaunt-control jaunt-fake-idp jaunt-gate jaunt-limits jaunt-oidc jaunt-policy jaunt-record jaunt-recording-s3 jaunt-ssh jaunt-store jaunt-tunnel jaunt-web tokio async-std smol async-executor futures-executor mio hyper h2 reqwest rustls openssl native-tls russh ssh-key
 RULES
+
+metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+
+while read -r package kind allowed; do
+  actual=$(python3 -I -c '
+import json, sys
+package, kind = sys.argv[1], sys.argv[2]
+packages = json.load(sys.stdin)["packages"]
+matches = [entry for entry in packages if entry["name"] == package]
+if len(matches) != 1:
+    sys.exit(f"package {package} not found exactly once in cargo metadata")
+wanted = None if kind == "normal" else kind
+print(",".join(sorted({dep["name"] for dep in matches[0]["dependencies"] if dep["kind"] == wanted})))
+' "$package" "$kind" <<<"$metadata")
+  if [ "$actual" != "${allowed#-}" ]; then
+    echo "boundary violation: $package $kind dependencies are [$actual], only [${allowed#-}] are allowed"
+    status=1
+  fi
+done <<'ALLOWED'
+jaunt-host-users normal jaunt-proto,rustix,serde,serde-saphyr,serde_json,thiserror
+jaunt-host-users dev rustix,tempfile
+jaunt-host-users build -
+ALLOWED
 
 exit "$status"
