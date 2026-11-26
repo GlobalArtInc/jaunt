@@ -53,6 +53,7 @@ struct NodeBody {
     revoked: bool,
     connected: bool,
     connected_since: Option<i64>,
+    creates_accounts: bool,
     agent_version: Option<String>,
     certificates: CertificatesBody,
     approved_by: String,
@@ -149,13 +150,16 @@ async fn facts(control: &Control, nodes: &[Node], now: i64) -> Result<Facts, Sto
 }
 
 fn node_body(control: &Control, node: Node, facts: &Facts) -> NodeBody {
-    let connected_since = match node.state {
-        NodeState::Active => control
-            .presence
-            .connected_since(&node.id)
-            .and_then(unix_secs),
+    let connected_at = match node.state {
+        NodeState::Active => control.presence.connected_since(&node.id),
         NodeState::Removed => None,
     };
+    let connected_since = connected_at.and_then(unix_secs);
+    let creates_accounts = connected_since.is_some()
+        && control
+            .host_accounts
+            .capabilities
+            .creates_accounts(&node.id, connected_at);
     let expiry = facts.expiry.get(&node.id).copied().unwrap_or_default();
     NodeBody {
         revoked: facts.revoked.contains(&node.id),
@@ -175,6 +179,7 @@ fn node_body(control: &Control, node: Node, facts: &Facts) -> NodeBody {
         },
         connected: connected_since.is_some(),
         connected_since,
+        creates_accounts,
         state: node.state.as_str(),
         id: node.id,
         name: node.name,

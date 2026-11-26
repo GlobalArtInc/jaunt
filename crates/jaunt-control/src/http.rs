@@ -7,17 +7,17 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use http_body_util::BodyExt;
-use jaunt_proto::ErrorBody;
+use jaunt_proto::{AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, ErrorBody};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::control::Control;
 use crate::recordings::{self, MAX_COMPLETE_BODY_BYTES};
 use crate::{
-    agent_trust, callback, client_config, device, enroll, finish, limits, nodes, poll, renew,
-    session_http, start, web, whoami,
+    agent_trust, callback, client_config, device, enroll, finish, host_accounts, limits, nodes,
+    poll, renew, session_http, start, web, whoami,
 };
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -51,6 +51,11 @@ pub(crate) fn agent_router(control: Control) -> Router {
         .route("/v1/agent/renew", post(renew::handle))
         .route("/v1/agent/authorize", post(session_http::authorize))
         .route("/v1/agent/session/end", post(session_http::end))
+        .route(AGENT_CAPABILITIES_PATH, put(host_accounts::capabilities))
+        .route(
+            AGENT_SESSION_ACCOUNT_PATH,
+            post(host_accounts::session_account),
+        )
         .route("/v1/agent/trust", get(agent_trust::handle))
         .route(
             "/v1/agent/recordings/{session_id}/chunks",

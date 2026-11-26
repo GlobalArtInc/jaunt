@@ -51,6 +51,7 @@ struct TargetBody {
     node: String,
     labels: BTreeMap<String, String>,
     connected: bool,
+    creates_accounts: bool,
     logins: Vec<String>,
 }
 
@@ -118,6 +119,7 @@ pub(crate) async fn ticket(
     let denial = |reason| Denial {
         user_id: &user_id,
         reason,
+        reference: None,
         node: &request.node,
         login: &request.login,
         client_addr: client
@@ -243,6 +245,7 @@ pub(crate) async fn open(State(control): State<Control>, request: Request) -> Re
     let denial = |reason| Denial {
         user_id: &user.id,
         reason,
+        reference: None,
         node: &query.node,
         login: &query.login,
         client_addr: Some(client_addr),
@@ -329,11 +332,18 @@ pub(crate) async fn targets(State(control): State<Control>, session: WebSession)
         .filter_map(|node| {
             let info = node_info(node);
             let logins = policy.ssh_logins(&identity, &info);
-            (!logins.is_empty()).then(|| TargetBody {
-                node: node.name.clone(),
-                labels: info.labels,
-                connected: control.presence.connected_since(&node.id).is_some(),
-                logins,
+            (!logins.is_empty()).then(|| {
+                let connected_since = control.presence.connected_since(&node.id);
+                TargetBody {
+                    node: node.name.clone(),
+                    labels: info.labels,
+                    connected: connected_since.is_some(),
+                    creates_accounts: control
+                        .host_accounts
+                        .capabilities
+                        .creates_accounts(&node.id, connected_since),
+                    logins,
+                }
             })
         })
         .collect();

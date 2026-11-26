@@ -4,6 +4,7 @@ mod db_principal;
 mod device;
 mod enroll;
 mod error;
+mod host_account;
 mod kube_principal;
 mod login;
 mod plane;
@@ -23,6 +24,11 @@ pub use enroll::{
     RenewRequest, RenewResponse,
 };
 pub use error::ErrorBody;
+pub use host_account::{
+    AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountEvent, AccountEventKind,
+    AccountReference, AccountRefusal, AccountReport, AccountStage, AgentCapabilities,
+    InvalidAccountReference, InvalidAccountReport, MAX_ACCOUNT_GROUPS, MAX_ACCOUNT_HOME_BYTES,
+};
 pub use kube_principal::{is_kube_principal, is_valid_substituted_kube_principal};
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};
 pub use plane::{BoxFuture, ControlError, ControlPlane};

@@ -47,6 +47,7 @@ const NAME: FieldKind = FieldKind::Text(128);
 const ADDR: FieldKind = FieldKind::Text(64);
 const HOST: FieldKind = FieldKind::Text(255);
 const LIST: FieldKind = FieldKind::Text(512);
+const ACCOUNT_GROUPS: FieldKind = FieldKind::Text(1100);
 const ERROR: FieldKind = FieldKind::Text(256);
 const INT: FieldKind = FieldKind::Int;
 const BOOL: FieldKind = FieldKind::Bool;
@@ -245,11 +246,18 @@ events! {
     TerminalClosed => ("terminal.closed", "terminal.closed", ActorRule::User("user_id"), NODE, SESSION, None,
         [("reason", NAME), ("bytes_in", INT), ("bytes_out", INT), ("duration_ms", INT), ("serial", INT)]),
     TerminalDenied => ("terminal.denied", "terminal.denied", ActorRule::User("user_id"), None, None, None,
-        [("reason", NAME), ("node", NAME), ("login", NAME), ("client_addr", ADDR), ("suppressed", INT)],
+        [("reason", NAME), ("node", NAME), ("login", NAME), ("client_addr", ADDR), ("suppressed", INT),
+         ("ref", SHORT)],
         Class::Noisy),
+    HostUserCreated => ("host_user.created", "host_user.created", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("login", NAME), ("uid", INT), ("home", NAME), ("groups", ACCOUNT_GROUPS), ("ref", SHORT)]),
+    HostUserRefused => ("host_user.refused", "host_user.refused", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("login", NAME), ("reason", SHORT), ("ref", SHORT), ("suppressed", INT)], Class::Noisy),
+    HostUserHelperFailed => ("host_user.helper_failed", "host_user.helper_failed", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("login", NAME), ("stage", SHORT), ("exit_status", INT), ("ref", SHORT)], Class::Noisy),
 }
 
-pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh."];
+pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh.", "agent.host_user."];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classified {
@@ -296,6 +304,8 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{Classified, EventType, FieldKind};
+    use crate::event::{AuditEvent, FieldValue, RawValue};
+    use crate::time::Timestamp;
 
     #[test]
     fn names_and_emitted_names_are_unique_and_fields_never_repeat_envelope_sources() {
@@ -389,7 +399,9 @@ mod tests {
                 "http.client_ip_header_ignored",
                 "gate.limited",
                 "agent.limited",
-                "terminal.denied"
+                "terminal.denied",
+                "host_user.refused",
+                "host_user.helper_failed"
             ]
         );
     }
@@ -401,6 +413,14 @@ mod tests {
             Classified::Mapped(EventType::GateAuth)
         );
         assert_eq!(EventType::classify("agent.ssh.end"), Classified::Ignored);
+        assert_eq!(
+            EventType::classify("agent.host_user.created"),
+            Classified::Ignored
+        );
+        assert_eq!(
+            EventType::classify("host_user.created"),
+            Classified::Mapped(EventType::HostUserCreated)
+        );
         assert_eq!(EventType::classify("revoke.thing"), Classified::Unknown);
         assert_eq!(EventType::classify(""), Classified::Unknown);
         assert_eq!(
@@ -408,5 +428,29 @@ mod tests {
             Some(EventType::LoginWebStarted)
         );
         assert_eq!(EventType::from_name("web.login.started"), None);
+    }
+
+    #[test]
+    fn the_groups_of_a_created_account_fit_whole_at_the_largest_list_the_agent_may_report() {
+        let names: Vec<String> = (0..jaunt_proto::MAX_ACCOUNT_GROUPS)
+            .map(|index| format!("g{index:0>31}"))
+            .collect();
+        assert!(names.iter().all(|name| name.len() == 32));
+        let joined = names.join(",");
+        let (event, report) = AuditEvent::from_raw(
+            EventType::HostUserCreated,
+            &[("groups", RawValue::Text(joined.clone()))],
+            "id-1".to_owned(),
+            Timestamp::from_millis(0).unwrap(),
+        );
+        assert_eq!(report.fields_dropped, 0);
+        assert_eq!(
+            event.fields().get("groups"),
+            Some(&FieldValue::Text(joined))
+        );
+        let Some(FieldValue::Text(stored)) = event.fields().get("groups") else {
+            panic!("the groups were not stored");
+        };
+        assert!(stored.ends_with(names.last().unwrap().as_str()));
     }
 }

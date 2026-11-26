@@ -24,6 +24,7 @@ impl Default for DenialLog {
 pub(crate) struct Denial<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) reason: &'a str,
+    pub(crate) reference: Option<&'a str>,
     pub(crate) node: &'a str,
     pub(crate) login: &'a str,
     pub(crate) client_addr: Option<SocketAddr>,
@@ -49,6 +50,7 @@ impl DenialLog {
             event = "terminal.denied",
             user_id = denial.user_id,
             reason = denial.reason,
+            "ref" = denial.reference,
             node = denial.node,
             login = denial.login,
             client_addr = client_addr.as_str(),
@@ -119,6 +121,7 @@ mod tests {
         let denial = |user_id| Denial {
             user_id,
             reason: "denied",
+            reference: None,
             node: "web-01",
             login: "deploy",
             client_addr: None,

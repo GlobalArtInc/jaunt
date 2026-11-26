@@ -92,11 +92,19 @@ pub(crate) fn parse_text(text: &str) -> Result<Command, Malformed> {
     }
 }
 
+pub(crate) const ACCOUNT_STAGE: &str = "account";
+
 #[derive(Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum Outgoing<'a> {
+    Progress {
+        stage: &'static str,
+    },
     Ready {
         session_id: &'a str,
+        account_created: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        home: Option<&'a str>,
     },
     Exit {
         status: Option<u32>,
@@ -104,6 +112,8 @@ enum Outgoing<'a> {
     },
     Error {
         code: &'static str,
+        #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+        reference: Option<&'a str>,
     },
     Pong,
 }
@@ -113,8 +123,16 @@ fn text(message: &Outgoing<'_>) -> String {
         .unwrap_or_else(|_| String::from("{\"t\":\"error\",\"code\":\"unavailable\"}"))
 }
 
-pub(crate) fn ready(session_id: &str) -> String {
-    text(&Outgoing::Ready { session_id })
+pub(crate) fn progress(stage: &'static str) -> String {
+    text(&Outgoing::Progress { stage })
+}
+
+pub(crate) fn ready(session_id: &str, created_home: Option<&str>) -> String {
+    text(&Outgoing::Ready {
+        session_id,
+        account_created: created_home.is_some(),
+        home: created_home,
+    })
 }
 
 pub(crate) fn exit(outcome: Option<&TerminalExit>) -> String {
@@ -126,8 +144,8 @@ pub(crate) fn exit(outcome: Option<&TerminalExit>) -> String {
     text(&Outgoing::Exit { status, signal })
 }
 
-pub(crate) fn error(code: &'static str) -> String {
-    text(&Outgoing::Error { code })
+pub(crate) fn error(code: &'static str, reference: Option<&str>) -> String {
+    text(&Outgoing::Error { code, reference })
 }
 
 pub(crate) fn pong() -> String {
@@ -161,6 +179,19 @@ pub(crate) const fn closing(end: End) -> Closing {
             "web_session_ended",
         ),
         End::Denied => (Some(POLICY), Some("denied"), "denied", "denied"),
+        End::AccountRefused => (
+            Some(POLICY),
+            Some("account_refused"),
+            "account refused",
+            "account_refused",
+        ),
+        End::AccountFailed => (
+            Some(POLICY),
+            Some("account_failed"),
+            "account failed",
+            "account_failed",
+        ),
+        End::NoAccount => (Some(POLICY), Some("no_account"), "no account", "no_account"),
         End::Limit => (Some(POLICY), Some("limit"), "limit", "limit"),
         End::Unavailable => (
             Some(INTERNAL),
@@ -199,8 +230,8 @@ mod tests {
     use jaunt_ssh::{TerminalDimensions, TerminalExit};
 
     use super::{
-        Command, Malformed, Offer, closing, dimensions, error, exit, offer, origin_is, parse_text,
-        ready,
+        ACCOUNT_STAGE, Command, Malformed, Offer, closing, dimensions, error, exit, offer,
+        origin_is, parse_text, progress, ready,
     };
     use crate::web::terminal::live::End;
 
@@ -305,7 +336,18 @@ mod tests {
 
     #[test]
     fn server_messages_have_the_documented_shape() {
-        assert_eq!(ready("s-1"), r#"{"t":"ready","session_id":"s-1"}"#);
+        assert_eq!(
+            ready("s-1", None),
+            r#"{"t":"ready","session_id":"s-1","account_created":false}"#
+        );
+        assert_eq!(
+            ready("s-1", Some("/home/alice")),
+            r#"{"t":"ready","session_id":"s-1","account_created":true,"home":"/home/alice"}"#
+        );
+        assert_eq!(
+            progress(ACCOUNT_STAGE),
+            r#"{"t":"progress","stage":"account"}"#
+        );
         assert_eq!(
             exit(Some(&TerminalExit::Status(3))),
             r#"{"t":"exit","status":3,"signal":null}"#
@@ -315,7 +357,15 @@ mod tests {
             r#"{"t":"exit","status":null,"signal":"TERM"}"#
         );
         assert_eq!(exit(None), r#"{"t":"exit","status":null,"signal":null}"#);
-        assert_eq!(error("denied"), r#"{"t":"error","code":"denied"}"#);
+        assert_eq!(error("denied", None), r#"{"t":"error","code":"denied"}"#);
+        assert_eq!(
+            error("account_refused", Some("H-9D0311FE")),
+            r#"{"t":"error","code":"account_refused","ref":"H-9D0311FE"}"#
+        );
+        assert_eq!(
+            error("no_account", Some("H-0000000D")),
+            r#"{"t":"error","code":"no_account","ref":"H-0000000D"}"#
+        );
     }
 
     #[test]
@@ -343,6 +393,19 @@ mod tests {
                 "web_session_ended",
             ),
             (End::Denied, Some(1008), Some("denied"), "denied"),
+            (
+                End::AccountRefused,
+                Some(1008),
+                Some("account_refused"),
+                "account_refused",
+            ),
+            (
+                End::AccountFailed,
+                Some(1008),
+                Some("account_failed"),
+                "account_failed",
+            ),
+            (End::NoAccount, Some(1008), Some("no_account"), "no_account"),
             (End::Limit, Some(1008), Some("limit"), "limit"),
             (
                 End::Unavailable,

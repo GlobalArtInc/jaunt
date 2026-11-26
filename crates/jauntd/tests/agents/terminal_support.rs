@@ -10,10 +10,11 @@ use axum::extract::ConnectInfo;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::{Method, Request, StatusCode, header};
-use jaunt_control::{Clock, Ticker, WebTerminalSettings};
+use jaunt_control::{AuthenticatedNode, Clock, Ticker, WebTerminalSettings};
 use jaunt_gate::DEFAULT_SSH_CLIENT_LIMITS;
 use jaunt_proto::{
-    AuthorizeDecision, AuthorizeRequest, ControlPlane, NodeCaller, SessionEnd, SessionPermissions,
+    AGENT_SESSION_ACCOUNT_PATH, AuthorizeDecision, AuthorizeRequest, ControlPlane, DenyReason,
+    NodeCaller, SessionEnd, SessionPermissions,
 };
 use jaunt_record::{Recorder, RecorderConfig, SessionKind, SessionManifest, SystemClock};
 use jaunt_ssh::{
@@ -584,9 +585,45 @@ impl ObserverFactory for CaptureFactory {
     }
 }
 
+#[derive(Default)]
+pub struct AccountScript {
+    planned: Mutex<Option<(Vec<Value>, bool)>>,
+    answers: Mutex<Vec<StatusCode>>,
+}
+
+impl AccountScript {
+    pub fn plan(&self, reports: Vec<Value>, refuse_login: bool) {
+        *self.planned.lock().unwrap() = Some((reports, refuse_login));
+        self.answers.lock().unwrap().clear();
+    }
+
+    pub fn answers(&self) -> Vec<StatusCode> {
+        self.answers.lock().unwrap().clone()
+    }
+}
+
 struct ControlAuthority {
     control: jaunt_control::Control,
     node_id: String,
+    accounts: Arc<AccountScript>,
+}
+
+impl ControlAuthority {
+    async fn report(&self, session_id: &str, login: &str, mut report: Value) -> StatusCode {
+        report["session_id"] = json!(session_id);
+        report["login"] = json!(login);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(AGENT_SESSION_ACCOUNT_PATH)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(report.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedNode(self.node_id.clone()));
+        let response = self.control.agent_router().oneshot(request).await.unwrap();
+        response.status()
+    }
 }
 
 impl SessionAuthority for ControlAuthority {
@@ -595,10 +632,29 @@ impl SessionAuthority for ControlAuthority {
         request: AuthorizeRequest,
     ) -> BoxFuture<'a, Result<AuthorizeDecision, AuthorityError>> {
         Box::pin(async move {
-            self.control
+            let session_id = request.session_id.clone();
+            let login = request.login.clone();
+            let decision = self
+                .control
                 .authorize(NodeCaller(self.node_id.clone()), request)
                 .await
-                .map_err(|_| AuthorityError::Unavailable)
+                .map_err(|_| AuthorityError::Unavailable)?;
+            let planned = self.accounts.planned.lock().unwrap().take();
+            let (AuthorizeDecision::Allow { .. }, Some((reports, refuse_login))) =
+                (&decision, planned)
+            else {
+                return Ok(decision);
+            };
+            for report in reports {
+                let status = self.report(&session_id, &login, report).await;
+                self.accounts.answers.lock().unwrap().push(status);
+            }
+            if refuse_login {
+                return Ok(AuthorizeDecision::Deny {
+                    reason: DenyReason::PolicyDenied,
+                });
+            }
+            Ok(decision)
         })
     }
 
@@ -654,6 +710,7 @@ fn terminal_agent(
     enrolled: &EnrolledAgent,
     sshd: &FakeSshd,
     capture: &Arc<Capture>,
+    accounts: &Arc<AccountScript>,
     foreign: bool,
 ) -> TestAgent {
     let certificate = if foreign {
@@ -678,6 +735,7 @@ fn terminal_agent(
         Arc::new(ControlAuthority {
             control: harness.control.clone(),
             node_id: enrolled.node_id.clone(),
+            accounts: Arc::clone(accounts),
         }),
         AgentLimits::default(),
         Arc::new(CaptureFactory(Arc::clone(capture))),
@@ -726,6 +784,7 @@ pub struct TerminalStand {
     pub sshd: FakeSshd,
     pub capture: Arc<Capture>,
     pub keys: Arc<Keys>,
+    pub accounts: Arc<AccountScript>,
     pub node_id: String,
     pub http: SocketAddr,
     pub alice: Browser,
@@ -760,11 +819,13 @@ impl TerminalStand {
         let enrolled = harness.enroll(NODE).await;
         let sshd = FakeSshd::start().await;
         let capture = Arc::new(Capture::default());
+        let accounts = Arc::new(AccountScript::default());
         let agent = terminal_agent(
             &harness,
             &enrolled,
             &sshd,
             &capture,
+            &accounts,
             options.foreign_host_certificate,
         );
         let registry = harness.server.registry().clone();
@@ -837,6 +898,7 @@ impl TerminalStand {
             sshd,
             capture,
             keys,
+            accounts,
             node_id: enrolled.node_id,
             http,
             alice,

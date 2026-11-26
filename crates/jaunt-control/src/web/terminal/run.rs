@@ -8,17 +8,19 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use jaunt_ca::ssh_key::PublicKey;
+use jaunt_proto::{AccountEvent, AccountReference, AccountRefusal};
 use jaunt_ssh::{
     ForwardRefusal, HostAuthorities, JumpError, JumpRequest, TerminalDimensions, TerminalEvent,
     TerminalExit, TerminalInput, TerminalOutput, WindowGrant, open_terminal,
 };
 use jaunt_store::{Node, Subjects, User};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::authorize::DEFAULT_MAX_SESSION_SECS;
 use crate::control::Control;
+use crate::host_accounts::AccountNotice;
 use crate::principal::{self, Channel, Refusal};
 use crate::revocation::revoked;
 use crate::serve::SocketWrites;
@@ -26,14 +28,14 @@ use crate::user_cert::{self, CertOrigin};
 
 use super::audit::{self, Denial};
 use super::live::{Admission, End, Refused, Stop};
-use super::protocol::{self, Command};
+use super::protocol::{self, ACCOUNT_STAGE, Command};
 use super::{
     GateEvent, GateEvents, GateRequest, Installed, TERMINAL_DEAD_PEER_TIMEOUT,
     TERMINAL_MAX_FRAME_BYTES, TERMINAL_PING_INTERVAL, TERMINAL_WEDGE_TIMEOUT,
     WEB_CERTIFICATE_VALIDITY,
 };
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(50);
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 const GATE_GRACE: Duration = Duration::from_secs(3);
@@ -241,7 +243,7 @@ impl Writer {
         Writer { tx, task }
     }
 
-    async fn finish(self, end: End, exit: Option<&TerminalExit>) {
+    async fn finish(self, end: End, exit: Option<&TerminalExit>, reference: Option<&str>) {
         let closing = protocol::closing(end);
         let Some(code) = closing.code else {
             self.task.abort();
@@ -253,7 +255,7 @@ impl Writer {
             messages.push(Out::Text(protocol::exit(exit)));
         }
         if let Some(error) = closing.error {
-            messages.push(Out::Text(protocol::error(error)));
+            messages.push(Out::Text(protocol::error(error, reference)));
         }
         messages.push(Out::Close(Some(CloseFrame {
             code,
@@ -319,6 +321,68 @@ struct Attempt {
     detail: Option<&'static str>,
 }
 
+#[derive(Default)]
+struct AccountWatch {
+    receiver: OnceLock<watch::Receiver<AccountNotice>>,
+    subscribed: Notify,
+}
+
+impl AccountWatch {
+    fn subscribe(&self, control: &Control, session_id: &str) {
+        if self.receiver.get().is_some() {
+            return;
+        }
+        let receiver = control
+            .host_accounts
+            .notices
+            .subscribe(session_id, control.tick());
+        if self.receiver.set(receiver).is_ok() {
+            self.subscribed.notify_one();
+        }
+    }
+
+    fn latest(&self) -> AccountNotice {
+        self.receiver
+            .get()
+            .map(|receiver| receiver.borrow().clone())
+            .unwrap_or_default()
+    }
+}
+
+async fn account_changed(watching: &mut Option<watch::Receiver<AccountNotice>>) {
+    if let Some(receiver) = watching
+        && receiver.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
+fn account_end(end: End, notice: &AccountNotice) -> (End, Option<&AccountReference>) {
+    if !matches!(end, End::Denied | End::Unavailable) {
+        return (end, None);
+    }
+    match &notice.outcome {
+        Some(
+            AccountEvent::Refused {
+                reference,
+                reason: AccountRefusal::RateLimit,
+            }
+            | AccountEvent::Failed { reference, .. },
+        ) => (End::AccountFailed, Some(reference)),
+        Some(AccountEvent::Refused { reference, .. }) => (End::AccountRefused, Some(reference)),
+        Some(AccountEvent::Missing { reference }) => (End::NoAccount, Some(reference)),
+        Some(AccountEvent::Creating { .. } | AccountEvent::Created { .. }) | None => (end, None),
+    }
+}
+
+fn created_home(notice: &AccountNotice) -> Option<&str> {
+    match &notice.outcome {
+        Some(AccountEvent::Created { home, .. }) => Some(home.as_str()),
+        _ => None,
+    }
+}
+
 fn denial_end(error: &JumpError, refused: Option<ForwardRefusal>) -> End {
     match error {
         JumpError::ForwardRefused => match refused {
@@ -382,6 +446,7 @@ async fn setup(
     control: &Control,
     plan: &Plan,
     stop: &Arc<Stop>,
+    account: &Arc<AccountWatch>,
     attempt: &mut Attempt,
 ) -> Result<Opened, End> {
     let (key, certificate, authorities, serial) = issue_certificate(control, plan, stop).await?;
@@ -390,8 +455,13 @@ async fn setup(
     let events: GateEvents = {
         let stop = Arc::clone(stop);
         let refused = Arc::clone(&refused);
+        let account = Arc::clone(account);
+        let control = control.clone();
         Arc::new(move |event| match event {
-            GateEvent::Routed { session_id } => stop.routed(&session_id),
+            GateEvent::Routed { session_id } => {
+                stop.routed(&session_id);
+                account.subscribe(&control, &session_id);
+            }
             GateEvent::Refused(refusal) => {
                 refused.get_or_init(|| refusal);
             }
@@ -476,16 +546,28 @@ fn read_end(error: &axum::Error) -> End {
     }
 }
 
+struct Waiting<'a> {
+    stop: &'a Arc<Stop>,
+    tx: &'a mpsc::Sender<Out>,
+    account: &'a Arc<AccountWatch>,
+}
+
 async fn wait_for_setup(
     control: &Control,
     plan: &Plan,
-    stop: &Arc<Stop>,
+    waiting: &Waiting<'_>,
     stream: &mut SplitStream<WebSocket>,
     early: &mut Vec<Message>,
     attempt: &mut Attempt,
 ) -> Result<Opened, End> {
+    let stop = waiting.stop;
     let mut early_bytes = 0_usize;
-    let started = tokio::time::timeout(SETUP_TIMEOUT, setup(control, plan, stop, attempt));
+    let mut watching = None;
+    let mut progressed = false;
+    let started = tokio::time::timeout(
+        SETUP_TIMEOUT,
+        setup(control, plan, stop, waiting.account, attempt),
+    );
     tokio::pin!(started);
     loop {
         tokio::select! {
@@ -497,6 +579,10 @@ async fn wait_for_setup(
                     Err(_) => Err(End::Unavailable),
                 };
             }
+            () = waiting.account.subscribed.notified(), if watching.is_none() => {
+                watching = waiting.account.receiver.get().cloned();
+            }
+            () = account_changed(&mut watching) => {}
             message = stream.next() => match message {
                 None | Some(Ok(Message::Close(_))) => return Err(End::ClientClosed),
                 Some(Err(error)) => return Err(read_end(&error)),
@@ -509,6 +595,14 @@ async fn wait_for_setup(
                     early.push(message);
                 }
             },
+        }
+        let creating = watching
+            .as_ref()
+            .is_some_and(|receiver| receiver.borrow().creating.is_some());
+        if creating && !progressed {
+            progressed = true;
+            let progress = Out::Text(protocol::progress(ACCOUNT_STAGE));
+            send_or_stop(waiting.tx, stop, progress).await;
         }
     }
 }
@@ -882,11 +976,12 @@ async fn settle<T>(task: JoinHandle<T>) -> Option<T> {
     }
 }
 
-fn record_denial(control: &Control, plan: &Plan, reason: &str) {
+fn record_denial(control: &Control, plan: &Plan, reason: &str, reference: Option<&str>) {
     control.web.terminals.denials.record(
         &Denial {
             user_id: &plan.user.id,
             reason,
+            reference,
             node: &plan.node.name,
             login: &plan.login,
             client_addr: Some(plan.client_addr),
@@ -911,12 +1006,13 @@ pub(crate) async fn run(
                 Refused::Full => End::Limit,
                 Refused::Closing => End::Shutdown,
             };
-            record_denial(&control, &plan, setup_reason(end));
-            writer.finish(end, None).await;
+            record_denial(&control, &plan, setup_reason(end), None);
+            writer.finish(end, None, None).await;
             return;
         }
     };
     let stop = Arc::clone(&admission.stop);
+    let account = Arc::new(AccountWatch::default());
     let mut early = Vec::new();
     let mut attempt = Attempt {
         serial: None,
@@ -926,23 +1022,29 @@ pub(crate) async fn run(
     let opened = wait_for_setup(
         &control,
         &plan,
-        &stop,
+        &Waiting {
+            stop: &stop,
+            tx: &writer.tx,
+            account: &account,
+        },
         &mut stream,
         &mut early,
         &mut attempt,
     )
     .await;
+    let notice = account.latest();
     let opened = match opened {
         Ok(opened) => opened,
         Err(end) => {
             stop.stop(end);
-            let end = stop.end().unwrap_or(end);
+            let (end, reference) = account_end(stop.end().unwrap_or(end), &notice);
             let reason = match (end, attempt.detail) {
                 (End::Unavailable, Some(detail)) => detail,
                 _ => setup_reason(end),
             };
-            record_denial(&control, &plan, reason);
-            writer.finish(end, None).await;
+            let reference = reference.map(AccountReference::as_str);
+            record_denial(&control, &plan, reason, reference);
+            writer.finish(end, None, reference).await;
             if let Some(gate) = attempt.gate.take() {
                 gate.finish().await;
             }
@@ -955,7 +1057,7 @@ pub(crate) async fn run(
     send_or_stop(
         &writer.tx,
         &stop,
-        Out::Text(protocol::ready(&opened.session_id)),
+        Out::Text(protocol::ready(&opened.session_id, created_home(&notice))),
     )
     .await;
     flow.touch(control.tick());
@@ -993,7 +1095,7 @@ pub(crate) async fn run(
     if settle(inputs).await.is_none() {
         tracing::debug!(target: "jaunt::web", "the input pump of a web terminal was stopped");
     }
-    writer.finish(end, exit.as_ref()).await;
+    writer.finish(end, exit.as_ref(), None).await;
     if tokio::time::timeout(PUMP_GRACE, opened.input.disconnect())
         .await
         .is_err()
@@ -1028,7 +1130,13 @@ mod tests {
 
     use jaunt_ssh::TerminalExit;
 
-    use super::{Flow, STORE_DEADLINE, abrupt_cause, observe, output_end, recheck_cause, verdict};
+    use jaunt_proto::{AccountEvent, AccountReference, AccountRefusal, AccountStage};
+
+    use super::{
+        Flow, SETUP_TIMEOUT, STORE_DEADLINE, abrupt_cause, account_end, created_home, observe,
+        output_end, recheck_cause, verdict,
+    };
+    use crate::host_accounts::AccountNotice;
     use crate::principal::Refusal;
     use crate::serve::SocketWrites;
     use crate::web::terminal::live::End;
@@ -1130,6 +1238,91 @@ mod tests {
         assert_eq!(output_end(None, true), Some(End::NodeViolation));
         assert_eq!(output_end(Some(&exit), false), Some(End::Exited));
         assert_eq!(output_end(None, false), None);
+    }
+
+    #[test]
+    fn the_setup_timeout_covers_every_step_of_a_first_login_inside_the_agent_deadline() {
+        let authorize = at(10);
+        let account_lookup = at(2);
+        let reports = at(4);
+        let helper = at(10);
+        let inner_login = at(10);
+        let agent_auth_deadline = at(45);
+        assert!(authorize + account_lookup + reports + helper + inner_login <= agent_auth_deadline);
+        assert!(agent_auth_deadline < SETUP_TIMEOUT);
+        assert_eq!(SETUP_TIMEOUT, at(50));
+    }
+
+    #[test]
+    fn a_reported_account_outcome_names_the_refusal_only_when_setup_was_refused() {
+        let reference = AccountReference::parse("H-9D0311FE").unwrap();
+        let notice = |outcome| AccountNotice {
+            creating: Some(reference.clone()),
+            outcome: Some(outcome),
+        };
+        let refused = |reason| AccountEvent::Refused {
+            reference: reference.clone(),
+            reason,
+        };
+        let created = AccountEvent::Created {
+            reference: reference.clone(),
+            uid: 30_000,
+            home: "/home/alice".to_owned(),
+            groups: Vec::new(),
+        };
+        let failed = AccountEvent::Failed {
+            reference: reference.clone(),
+            stage: AccountStage::Useradd,
+            exit_code: Some(12),
+        };
+        let h_ref = Some(&reference);
+        for (end, outcome, expected) in [
+            (
+                End::Denied,
+                Some(refused(AccountRefusal::NameRule)),
+                (End::AccountRefused, h_ref),
+            ),
+            (
+                End::Denied,
+                Some(refused(AccountRefusal::UidRange)),
+                (End::AccountRefused, h_ref),
+            ),
+            (
+                End::Denied,
+                Some(refused(AccountRefusal::RateLimit)),
+                (End::AccountFailed, h_ref),
+            ),
+            (
+                End::Unavailable,
+                Some(failed.clone()),
+                (End::AccountFailed, h_ref),
+            ),
+            (
+                End::Denied,
+                Some(AccountEvent::Missing {
+                    reference: reference.clone(),
+                }),
+                (End::NoAccount, h_ref),
+            ),
+            (End::Denied, Some(created.clone()), (End::Denied, None)),
+            (End::Denied, None, (End::Denied, None)),
+            (End::Revoked, Some(failed), (End::Revoked, None)),
+            (
+                End::Limit,
+                Some(AccountEvent::Missing {
+                    reference: reference.clone(),
+                }),
+                (End::Limit, None),
+            ),
+        ] {
+            let notice = match outcome {
+                Some(outcome) => notice(outcome),
+                None => AccountNotice::default(),
+            };
+            assert_eq!(account_end(end, &notice), expected, "{end:?} {notice:?}");
+        }
+        assert_eq!(created_home(&notice(created)), Some("/home/alice"));
+        assert_eq!(created_home(&AccountNotice::default()), None);
     }
 
     #[tokio::test(start_paused = true)]

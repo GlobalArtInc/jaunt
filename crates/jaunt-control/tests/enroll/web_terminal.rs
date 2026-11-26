@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use jaunt_control::{
-    GateLink, GateRefusal, GateRequest, Labels, RevokeRequest, TerminalGate, WebTerminalSettings,
+    AgentPresence, AuthenticatedNode, GateLink, GateRefusal, GateRequest, Labels, RevokeRequest,
+    TerminalGate, WebTerminalSettings,
 };
 use jaunt_store::RevocationKind;
 use serde_json::{Value, json};
@@ -446,19 +448,19 @@ async fn targets_list_the_active_nodes_the_current_policy_reaches_with_their_log
     assert_eq!(
         reply.json(),
         json!([
-            {"node": "dev-01", "labels": {"env": "dev"}, "connected": false, "logins": ["app"]},
-            {"node": "web-01", "labels": {"env": "prod"}, "connected": false, "logins": ["alice", "deploy"]},
+            {"node": "dev-01", "labels": {"env": "dev"}, "connected": false, "creates_accounts": false, "logins": ["app"]},
+            {"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["alice", "deploy"]},
         ])
     );
     let reply = targets(harness, Some(&stand.bob)).await;
     assert_eq!(
         reply.json(),
-        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "logins": ["bob", "deploy"]}])
+        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["bob", "deploy"]}])
     );
     let dave = browser(harness, "Dave", &["ops"]).await;
     assert_eq!(
         targets(harness, Some(&dave)).await.json(),
-        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "logins": ["deploy"]}])
+        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["deploy"]}])
     );
     assert_eq!(targets(harness, Some(&stand.carol)).await.json(), json!([]));
     assert_eq!(
@@ -490,4 +492,73 @@ async fn the_terminal_routes_are_absent_until_a_terminal_is_installed() {
         .send(&harness, None)
         .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+struct Switchable(Mutex<Option<SystemTime>>);
+
+impl AgentPresence for Switchable {
+    fn connected_since(&self, _node_id: &str) -> Option<SystemTime> {
+        *self.0.lock().unwrap()
+    }
+}
+
+fn creates_accounts(reply: &Reply) -> Vec<(String, bool)> {
+    reply
+        .json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| {
+            (
+                target["node"].as_str().unwrap().to_owned(),
+                target["creates_accounts"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn targets_show_creates_accounts_only_while_the_announcing_connection_lives() {
+    let stand = stand().await;
+    let harness = &stand.harness;
+    let web = harness
+        .store
+        .nodes()
+        .get_active_by_name("web-01")
+        .await
+        .unwrap()
+        .unwrap();
+    let presence = Arc::new(Switchable(Mutex::new(Some(
+        SystemTime::now() - Duration::from_secs(3600),
+    ))));
+    harness.control.install_agent_presence(presence.clone());
+    let mut announce = Request::builder()
+        .method(Method::PUT)
+        .uri("/v1/agent/capabilities")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"creates_accounts":true}"#))
+        .unwrap();
+    announce.extensions_mut().insert(AuthenticatedNode(web.id));
+    let announced = send(harness.agent_router.clone(), announce).await;
+    assert_eq!(announced.status, StatusCode::NO_CONTENT);
+
+    let listed = targets(harness, Some(&stand.alice)).await;
+    assert_eq!(
+        creates_accounts(&listed),
+        [
+            ("dev-01".to_owned(), false),
+            ("web-01".to_owned(), true),
+            ("web-02".to_owned(), false)
+        ]
+    );
+    *presence.0.lock().unwrap() = None;
+    let listed = targets(harness, Some(&stand.alice)).await;
+    assert_eq!(
+        creates_accounts(&listed),
+        [
+            ("dev-01".to_owned(), false),
+            ("web-01".to_owned(), false),
+            ("web-02".to_owned(), false)
+        ]
+    );
 }

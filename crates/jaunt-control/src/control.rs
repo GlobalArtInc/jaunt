@@ -22,6 +22,7 @@ use crate::ca_snapshot::CaSnapshot;
 use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
+use crate::host_accounts::HostAccounts;
 use crate::http;
 use crate::join_tokens::JoinTokenAdmin;
 use crate::killer::{KillerSlot, SessionKiller};
@@ -93,6 +94,7 @@ pub struct Inner {
     pub(crate) recordings: Option<Uploads>,
     pub(crate) recording_rejections: RejectionLog,
     pub(crate) presence: PresenceSlot,
+    pub(crate) host_accounts: HostAccounts,
 }
 
 #[derive(Clone)]
@@ -186,6 +188,7 @@ impl Control {
                 recordings: parts.recordings.map(Uploads::new),
                 recording_rejections: RejectionLog::default(),
                 presence: PresenceSlot::default(),
+                host_accounts: HostAccounts::default(),
             }),
         })
     }
