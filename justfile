@@ -47,6 +47,9 @@ e2e-web:
 e2e-down:
     python3 e2e/run.py --down
 
+kube-stand command="up" *args:
+    scripts/kube-stand.sh {{command}} {{args}}
+
 s3-tests:
     scripts/test-s3.sh
 
