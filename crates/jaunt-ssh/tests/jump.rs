@@ -626,3 +626,36 @@ async fn input_waits_for_a_tunnel_that_stopped_moving_instead_of_piling_up() {
         assert!(sent < 64 << 20, "the input never waited");
     }
 }
+
+#[tokio::test]
+async fn a_far_side_that_stops_reading_while_messages_pile_up_toward_it_is_a_violation() {
+    let outcome = attempt_with(Setup::presenting(
+        Presented::Certified,
+        Presented::Certified,
+    ))
+    .await;
+    let (input, mut output) = outcome.opened.unwrap().split();
+    assert!(!output.violated());
+    outcome.stalled.store(true, Ordering::SeqCst);
+    let size = TerminalDimensions { cols: 80, rows: 24 };
+    let mut sent = 0_usize;
+    loop {
+        match tokio::time::timeout(STEP, input.resize(size)).await {
+            Ok(Ok(())) => sent += 1,
+            Ok(Err(_)) => break,
+            Err(_) => panic!("a resize waited after {sent}"),
+        }
+        assert!(
+            sent < 1 << 20,
+            "the messages toward a stalled far side were never cut"
+        );
+    }
+    loop {
+        match tokio::time::timeout(STEP, output.next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => panic!("the cut terminal never ended its output"),
+        }
+    }
+    assert!(output.violated());
+}

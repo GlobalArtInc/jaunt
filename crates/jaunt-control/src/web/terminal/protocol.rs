@@ -16,6 +16,7 @@ pub(crate) const TOO_BIG: u16 = 1009;
 pub(crate) const INTERNAL: u16 = 1011;
 pub(crate) const REVOKED: u16 = 4001;
 pub(crate) const IDLE: u16 = 4002;
+pub(crate) const STALLED: u16 = 4003;
 
 pub(crate) fn dimensions(cols: u32, rows: u32) -> Option<TerminalDimensions> {
     ((1..=MAX_COLS).contains(&cols) && (1..=MAX_ROWS).contains(&rows))
@@ -169,8 +170,14 @@ pub(crate) const fn closing(end: End) -> Closing {
         ),
         End::Malformed => (Some(POLICY), None, "bad message", "malformed"),
         End::TooBig => (Some(TOO_BIG), None, "message too big", "too_big"),
+        End::NodeViolation => (
+            Some(INTERNAL),
+            Some("unavailable"),
+            "unavailable",
+            "node_violation",
+        ),
         End::DeadPeer => (None, None, "", "dead_peer"),
-        End::Wedged => (Some(INTERNAL), Some("unavailable"), "unavailable", "wedged"),
+        End::Wedged => (Some(STALLED), Some("stalled"), "stalled", "wedged"),
         End::Shutdown => (
             Some(GOING_AWAY),
             Some("unavailable"),
@@ -312,25 +319,55 @@ mod tests {
     }
 
     #[test]
-    fn every_end_maps_to_its_close_code_and_generic_error() {
-        for (end, code, error) in [
-            (End::Exited, Some(1000), None),
-            (End::ClientClosed, Some(1000), None),
-            (End::Revoked, Some(4001), Some("revoked")),
-            (End::IdleTimeout, Some(4002), Some("timeout")),
-            (End::MaxDuration, Some(1008), Some("timeout")),
-            (End::WebSessionEnded, Some(1008), Some("timeout")),
-            (End::Denied, Some(1008), Some("denied")),
-            (End::Limit, Some(1008), Some("limit")),
-            (End::Unavailable, Some(1011), Some("unavailable")),
-            (End::Malformed, Some(1008), None),
-            (End::TooBig, Some(1009), None),
-            (End::DeadPeer, None, None),
-            (End::Wedged, Some(1011), Some("unavailable")),
-            (End::Shutdown, Some(1001), Some("unavailable")),
+    fn every_end_maps_to_its_close_code_generic_error_and_audit_reason() {
+        for (end, code, error, audit) in [
+            (End::Exited, Some(1000), None, "exit"),
+            (End::ClientClosed, Some(1000), None, "client_closed"),
+            (End::Revoked, Some(4001), Some("revoked"), "revoked"),
+            (
+                End::IdleTimeout,
+                Some(4002),
+                Some("timeout"),
+                "idle_timeout",
+            ),
+            (
+                End::MaxDuration,
+                Some(1008),
+                Some("timeout"),
+                "max_duration",
+            ),
+            (
+                End::WebSessionEnded,
+                Some(1008),
+                Some("timeout"),
+                "web_session_ended",
+            ),
+            (End::Denied, Some(1008), Some("denied"), "denied"),
+            (End::Limit, Some(1008), Some("limit"), "limit"),
+            (
+                End::Unavailable,
+                Some(1011),
+                Some("unavailable"),
+                "unavailable",
+            ),
+            (
+                End::NodeViolation,
+                Some(1011),
+                Some("unavailable"),
+                "node_violation",
+            ),
+            (End::Malformed, Some(1008), None, "malformed"),
+            (End::TooBig, Some(1009), None, "too_big"),
+            (End::DeadPeer, None, None, "dead_peer"),
+            (End::Wedged, Some(4003), Some("stalled"), "wedged"),
+            (End::Shutdown, Some(1001), Some("unavailable"), "shutdown"),
         ] {
             let closing = closing(end);
-            assert_eq!((closing.code, closing.error), (code, error), "{end:?}");
+            assert_eq!(
+                (closing.code, closing.error, closing.audit),
+                (code, error, audit),
+                "{end:?}"
+            );
             assert!(closing.reason.len() <= 123);
         }
     }

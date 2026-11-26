@@ -21,8 +21,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::recorder::{Captured, capture_everything, everything_logged};
 use crate::support::{APPROVER, PUBLIC_ORIGIN, audited, eventually, field};
 use crate::terminal_support::{
-    BROWSER_ADDR, Browser, HOSTILE, ManualTime, NODE, PLAIN_LOGIN, RECORDED_LOGIN, Received,
-    SSHD_WINDOW, StandOptions, TerminalStand, Ws,
+    BROWSER_ADDR, Browser, HOSTILE, ManualTime, NODE, PLAIN_LOGIN, RECORDED_LOGIN, RawBrowser,
+    Received, SSHD_WINDOW, StandOptions, TerminalStand, Ws,
 };
 
 const BOUND: u64 = 64 << 20;
@@ -667,12 +667,85 @@ async fn a_terminal_whose_input_waits_without_progress_either_way_is_closed_as_w
         seen.closed.load(Ordering::SeqCst)
     })
     .await;
-    assert_eq!(*seen.close_code.lock().unwrap(), Some(1011));
+    assert_eq!(*seen.close_code.lock().unwrap(), Some(4003));
     assert_eq!(
         seen.texts.lock().unwrap().last(),
-        Some(&json!({"t": "error", "code": "unavailable"}))
+        Some(&json!({"t": "error", "code": "stalled"}))
     );
     typist.abort();
+}
+
+fn socket_progress(stand: &TerminalStand) -> u64 {
+    stand
+        .harness
+        .control
+        .web_terminal_counters()
+        .socket_progress
+}
+
+async fn flood(raw: &mut RawBrowser) {
+    raw.send(b"flood\r").await;
+    let seen = Arc::clone(&raw.seen);
+    eventually("the flood to reach the browser", || {
+        seen.output.load(Ordering::SeqCst) > 1 << 20
+    })
+    .await;
+}
+
+async fn stop_reading(stand: &TerminalStand, raw: &RawBrowser) {
+    raw.read_output(false);
+    let log = Arc::clone(&stand.sshd.log);
+    settled("the flood", || log.flooded.load(Ordering::SeqCst)).await;
+}
+
+#[tokio::test]
+async fn a_browser_that_reads_between_short_stalls_is_not_closed_as_stalled() {
+    let time = ManualTime::default();
+    let stand = TerminalStand::start_with(StandOptions {
+        time: Some(time.clone()),
+        ..StandOptions::default()
+    })
+    .await;
+    let (mut raw, _) = stand.raw(&stand.alice, RECORDED_LOGIN).await;
+    flood(&mut raw).await;
+    for _ in 0..4 {
+        stop_reading(&stand, &raw).await;
+        time.advance_ticker(Duration::from_secs(45));
+        raw.pong().await;
+        let before = socket_progress(&stand);
+        raw.read_output(true);
+        eventually("the socket to take more output", || {
+            socket_progress(&stand) > before
+        })
+        .await;
+    }
+    assert_eq!(stand.harness.control.web_terminal_counters().open, 1);
+    assert!(!raw.seen.closed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_browser_that_stops_reading_output_is_closed_as_stalled_at_the_threshold() {
+    let time = ManualTime::default();
+    let stand = TerminalStand::start_with(StandOptions {
+        time: Some(time.clone()),
+        ..StandOptions::default()
+    })
+    .await;
+    let (mut raw, session_id) = stand.raw(&stand.alice, RECORDED_LOGIN).await;
+    flood(&mut raw).await;
+    stop_reading(&stand, &raw).await;
+    time.advance_ticker(Duration::from_secs(50));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(stand.harness.control.web_terminal_counters().open, 1);
+    time.advance_ticker(Duration::from_secs(11));
+    let closed = audited("terminal.closed", closed_event(&session_id)).await;
+    assert_eq!(field(&closed, "reason"), "wedged");
+    raw.read_output(true);
+    let seen = Arc::clone(&raw.seen);
+    eventually("the stalled terminal to close", || {
+        seen.closed.load(Ordering::SeqCst)
+    })
+    .await;
 }
 
 fn ticks(output: &[u8]) -> usize {
@@ -880,6 +953,13 @@ async fn a_flooding_node_stalls_while_the_browser_does_not_read() {
             .max_pending_output
             <= u64::from(WEB_WINDOW)
     );
+    assert!(log.tasks.load(Ordering::SeqCst) > 0);
+    drop(ws);
+    eventually(
+        "the fake sshd to end the tasks of the closed terminal",
+        || log.tasks.load(Ordering::SeqCst) == 0,
+    )
+    .await;
 }
 
 const PASTES: [usize; 3] = [2 << 20, 4 << 20, 16 << 20];

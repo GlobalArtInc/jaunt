@@ -272,6 +272,7 @@ test("the shell exit and every close code or error code end the session with its
     [[{ t: "error", code: "revoked" }], 4001, /Access revoked/],
     [[], 4001, /Access revoked/],
     [[], 4002, /Closed for inactivity/],
+    [[{ t: "error", code: "stalled" }], 4003, /server closed the session/],
     [[], 1001, /node became unavailable/],
     [[], 1011, /node became unavailable/],
     [[{ t: "error", code: "unavailable" }], 1011, /connection to the node was lost/],

@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -103,7 +103,23 @@ pub struct SshdLog {
     pub logins: AtomicUsize,
     pub flooded: AtomicU64,
     pub input: AtomicU64,
+    pub tasks: AtomicUsize,
     sinking: AtomicBool,
+}
+
+struct Running(Arc<SshdLog>);
+
+impl Running {
+    fn start(log: &Arc<SshdLog>) -> Running {
+        log.tasks.fetch_add(1, Ordering::SeqCst);
+        Running(Arc::clone(log))
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.tasks.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 enum ShellInput {
@@ -114,6 +130,7 @@ enum ShellInput {
 
 struct SshdConnection {
     log: Arc<SshdLog>,
+    connected: watch::Sender<()>,
     channels: HashMap<ChannelId, Channel<Msg>>,
     shells: HashMap<ChannelId, mpsc::UnboundedSender<ShellInput>>,
     sizes: HashMap<ChannelId, (u32, u32)>,
@@ -186,7 +203,9 @@ impl server::Handler for SshdConnection {
         let (_read, write) = opened.split();
         let (sender, receiver) = mpsc::unbounded_channel();
         let size = self.sizes.get(&channel).copied().unwrap_or((80, 24));
-        tokio::spawn(shell(
+        let running = Running::start(&self.log);
+        let mut connection = self.connected.subscribe();
+        let program = shell(
             Shell {
                 write,
                 handle: session.handle(),
@@ -195,7 +214,14 @@ impl server::Handler for SshdConnection {
             receiver,
             size,
             Arc::clone(&self.log),
-        ));
+        );
+        tokio::spawn(async move {
+            let _running = running;
+            tokio::select! {
+                () = program => {}
+                _ = connection.changed() => {}
+            }
+        });
         self.shells.insert(channel, sender);
         Ok(())
     }
@@ -363,13 +389,16 @@ impl FakeSshd {
             while let Ok((tcp, _)) = listener.accept().await {
                 let handler = SshdConnection {
                     log: Arc::clone(&shared),
+                    connected: watch::channel(()).0,
                     channels: HashMap::new(),
                     shells: HashMap::new(),
                     sizes: HashMap::new(),
                     lines: HashMap::new(),
                 };
                 let config = Arc::clone(&config);
+                let connection = Running::start(&shared);
                 tokio::spawn(async move {
+                    let _connection = connection;
                     if let Ok(running) = server::run_stream(config, tcp, handler).await {
                         drop(running.await);
                     }
@@ -946,7 +975,8 @@ impl TerminalStand {
         let (read, write) = self.upgrade_raw(who, login).await.into_split();
         let seen = Arc::new(RawSeen::default());
         let (texts, mut ready) = mpsc::unbounded_channel();
-        let reader = tokio::spawn(read_frames(read, Arc::clone(&seen), texts));
+        let (reading, allowed) = watch::channel(true);
+        let reader = tokio::spawn(read_frames(read, Arc::clone(&seen), texts, allowed));
         let first = tokio::time::timeout(STEP, ready.recv())
             .await
             .expect("the raw terminal sent nothing in time")
@@ -958,6 +988,7 @@ impl TerminalStand {
             RawBrowser {
                 write,
                 seen,
+                reading,
                 reader,
             },
             session_id,
@@ -977,6 +1008,7 @@ pub struct RawSeen {
 pub struct RawBrowser {
     write: OwnedWriteHalf,
     pub seen: Arc<RawSeen>,
+    reading: watch::Sender<bool>,
     reader: JoinHandle<()>,
 }
 
@@ -988,9 +1020,24 @@ impl RawBrowser {
         );
     }
 
+    pub fn read_output(&self, reading: bool) {
+        self.reading.send_replace(reading);
+    }
+
+    pub async fn pong(&mut self) {
+        assert!(
+            self.try_send_frame(0x8a, b"").await,
+            "the raw terminal stopped taking frames"
+        );
+    }
+
     pub async fn try_send(&mut self, data: &[u8]) -> bool {
+        self.try_send_frame(0x82, data).await
+    }
+
+    async fn try_send_frame(&mut self, head: u8, data: &[u8]) -> bool {
         const MASK: [u8; 4] = [0x5a, 0x17, 0xc3, 0x81];
-        let mut frame = vec![0x82];
+        let mut frame = vec![head];
         match u16::try_from(data.len()) {
             Ok(short) if short < 126 => frame.push(0x80 | u8::try_from(short).unwrap()),
             Ok(medium) => {
@@ -1043,8 +1090,12 @@ async fn read_frames(
     mut read: OwnedReadHalf,
     seen: Arc<RawSeen>,
     texts: mpsc::UnboundedSender<String>,
+    mut allowed: watch::Receiver<bool>,
 ) {
-    while let Some((opcode, payload)) = read_frame(&mut read).await {
+    while allowed.wait_for(|reading| *reading).await.is_ok() {
+        let Some((opcode, payload)) = read_frame(&mut read).await else {
+            break;
+        };
         match opcode {
             0x1 => {
                 let text = String::from_utf8_lossy(&payload).into_owned();

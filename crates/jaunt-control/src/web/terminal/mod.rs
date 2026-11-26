@@ -90,6 +90,7 @@ pub struct WebTerminalCounters {
     pub max_pending_input: u64,
     pub max_node_ahead: u64,
     pub pings: u64,
+    pub socket_progress: u64,
 }
 
 pub(crate) type KeySource = Arc<dyn Fn() -> Result<EphemeralKey, JumpError> + Send + Sync>;
@@ -106,6 +107,7 @@ pub(crate) struct Counters {
     max_pending_input: AtomicU64,
     max_node_ahead: AtomicU64,
     pings: AtomicU64,
+    socket_progress: AtomicU64,
 }
 
 impl Counters {
@@ -124,6 +126,10 @@ impl Counters {
 
     pub(crate) fn pinged(&self) {
         self.pings.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn socket_progressed(&self) {
+        self.socket_progress.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -181,6 +187,7 @@ impl TerminalState {
             max_pending_input: self.counters.max_pending_input.load(Ordering::Relaxed),
             max_node_ahead: self.counters.max_node_ahead.load(Ordering::Relaxed),
             pings: self.counters.pings.load(Ordering::Relaxed),
+            socket_progress: self.counters.socket_progress.load(Ordering::Relaxed),
         }
     }
 

@@ -31,6 +31,7 @@ struct State {
     queued: usize,
     written: u64,
     ending: Option<Ending>,
+    overflowed: bool,
     reader: Option<Waker>,
 }
 
@@ -57,6 +58,7 @@ impl Spool {
                 queued: 0,
                 written: 0,
                 ending: None,
+                overflowed: false,
                 reader: None,
             }),
             progress: Notify::new(),
@@ -99,6 +101,7 @@ impl Spool {
             return Ok(());
         }
         if state.queued.saturating_add(data.len()) > self.limit {
+            state.overflowed = true;
             drop(state);
             self.end(Ending::Broken);
             return Err(Refused::Overflow);
@@ -116,6 +119,10 @@ impl Spool {
 
     pub(super) fn break_off(&self) {
         self.end(Ending::Broken);
+    }
+
+    pub(super) fn overflowed(&self) -> bool {
+        self.lock().overflowed
     }
 
     #[cfg(test)]
@@ -413,7 +420,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
-    use super::{Grants, Refused, Spool, Tunnel, carry_down};
+    use super::{Grants, Inlet, Refused, Spool, Tunnel, carry_down};
     use crate::jump::inbox::Window;
 
     const PATIENCE: Duration = Duration::from_secs(10);
@@ -473,9 +480,73 @@ mod tests {
     async fn a_spool_over_its_limit_breaks_and_keeps_nothing() {
         let spool = Spool::new(LIMIT);
         spool.push(bytes(LIMIT)).unwrap();
+        assert!(!spool.overflowed());
         assert_eq!(spool.push(bytes(1)), Err(Refused::Overflow));
+        assert!(spool.overflowed());
         assert_eq!(spool.queued(), 0);
         assert_eq!(spool.take(LIMIT).await, Err(Refused::Closed));
+        let cut = Spool::new(LIMIT);
+        cut.break_off();
+        assert_eq!(cut.push(bytes(LIMIT + 1)), Err(Refused::Closed));
+        assert!(!cut.overflowed());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_inlet_frees_what_its_spool_still_holds() {
+        let spool = Arc::new(Spool::new(LIMIT));
+        let inlet = Inlet::new(Arc::clone(&spool), tokio::io::sink());
+        spool.push(bytes(LIMIT / 2)).unwrap();
+        drop(inlet);
+        assert_eq!(spool.queued(), 0);
+        assert_eq!(spool.take(LIMIT).await, Err(Refused::Closed));
+        assert_eq!(spool.push(bytes(1)), Err(Refused::Closed));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_tunnel_ends_the_way_up_after_its_data_and_cuts_the_way_down() {
+        let (mut tunnel, down, up, _window, _granted) = tunnel(1024);
+        tunnel.write_all(b"last words").await.unwrap();
+        down.push(bytes(16)).unwrap();
+        drop(tunnel);
+        assert_eq!(
+            up.take(LIMIT).await,
+            Ok(Some(Bytes::from_static(b"last words")))
+        );
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, up.take(LIMIT))
+                .await
+                .expect("the way up never ended"),
+            Ok(None)
+        );
+        assert_eq!(down.queued(), 0);
+        assert_eq!(down.take(LIMIT).await, Err(Refused::Closed));
+    }
+
+    #[tokio::test]
+    async fn extended_data_from_the_gate_cuts_the_tunnel_and_drops_what_it_held() {
+        let window = 4 * u32::try_from(STEP).unwrap();
+        let (mut tunnel, down, _up, allowance, _granted) = tunnel(window);
+        let (sender, receiver) = mpsc::channel(2);
+        let carried = tokio::spawn(carry_down(receiver, Arc::clone(&down), allowance));
+        sender
+            .send(ChannelMsg::Data { data: bytes(STEP) })
+            .await
+            .unwrap();
+        sender
+            .send(ChannelMsg::ExtendedData {
+                data: bytes(1),
+                ext: 1,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(PATIENCE, carried)
+            .await
+            .expect("the tunnel kept going after extended data")
+            .unwrap();
+        assert_eq!(down.queued(), 0);
+        let mut buffer = vec![0; STEP];
+        assert!(tunnel.read(&mut buffer).await.is_err());
+        drop(sender);
     }
 
     #[tokio::test]

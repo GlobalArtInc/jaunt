@@ -19,6 +19,7 @@ pub(crate) enum End {
     Denied,
     Limit,
     Unavailable,
+    NodeViolation,
     Malformed,
     TooBig,
     DeadPeer,

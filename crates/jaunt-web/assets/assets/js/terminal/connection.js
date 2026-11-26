@@ -83,7 +83,7 @@ function closeCause({ code, exit, errorCode, ready }) {
   if (code === 4002) {
     return "idle";
   }
-  if (code === 1000) {
+  if (code === 1000 || code === 4003) {
     return "closed";
   }
   if (code === 1001 || code === 1011) {

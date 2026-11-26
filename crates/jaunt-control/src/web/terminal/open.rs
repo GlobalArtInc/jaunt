@@ -20,6 +20,7 @@ use crate::identity::policy_identity;
 use crate::naming::is_dns_label;
 use crate::nodes::MAX_NODES;
 use crate::plane::node_info;
+use crate::serve::SocketWrites;
 use crate::web::session::WebSession;
 
 use super::audit::Denial;
@@ -237,6 +238,7 @@ pub(crate) async fn open(State(control): State<Control>, request: Request) -> Re
         tracing::error!(target: "jaunt::control", "the peer address of a terminal request is unknown");
         return server_error();
     };
+    let socket_writes = parts.extensions.get::<SocketWrites>().cloned();
     let user = session.user().clone();
     let denial = |reason| Denial {
         user_id: &user.id,
@@ -295,6 +297,7 @@ pub(crate) async fn open(State(control): State<Control>, request: Request) -> Re
             rows: query.rows,
         },
         client_addr,
+        socket_writes,
         installed,
     };
     let running = control.clone();

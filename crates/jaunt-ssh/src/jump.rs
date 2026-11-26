@@ -483,11 +483,12 @@ pub async fn open_terminal<S: TunnelStream>(
     Ok(WebTerminal {
         input: TerminalInput {
             write,
-            up,
+            up: Arc::clone(&up),
             link: Arc::clone(&link),
         },
         output: TerminalOutput {
             inbox,
+            up,
             grant: WindowGrant {
                 link,
                 channel: id,
@@ -739,6 +740,7 @@ impl WindowGrant {
 
 pub struct TerminalOutput {
     inbox: Arc<Inbox>,
+    up: Arc<Spool>,
     grant: WindowGrant,
     _reader: Task,
 }
@@ -749,7 +751,7 @@ impl TerminalOutput {
     }
 
     pub fn violated(&self) -> bool {
-        self.inbox.violated()
+        self.inbox.violated() || self.up.overflowed()
     }
 
     pub async fn next(&mut self) -> Option<TerminalEvent> {

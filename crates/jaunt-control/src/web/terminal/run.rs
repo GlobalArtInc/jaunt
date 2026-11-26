@@ -21,6 +21,7 @@ use crate::authorize::DEFAULT_MAX_SESSION_SECS;
 use crate::control::Control;
 use crate::principal::{self, Channel, Refusal};
 use crate::revocation::revoked;
+use crate::serve::SocketWrites;
 use crate::user_cert::{self, CertOrigin};
 
 use super::audit::{self, Denial};
@@ -49,6 +50,7 @@ pub(crate) struct Plan {
     pub(crate) login: String,
     pub(crate) size: TerminalDimensions,
     pub(crate) client_addr: SocketAddr,
+    pub(crate) socket_writes: Option<SocketWrites>,
     pub(crate) installed: Arc<Installed>,
 }
 
@@ -71,6 +73,8 @@ struct Flow {
     heard_ms: AtomicU64,
     unanswered_ms: AtomicU64,
     writing_ms: AtomicU64,
+    socket_written: AtomicU64,
+    socket_ms: AtomicU64,
     reading_blocked: AtomicBool,
     ping_due: AtomicBool,
     ping_wanted: Notify,
@@ -92,6 +96,8 @@ impl Flow {
             heard_ms: AtomicU64::new(0),
             unanswered_ms: AtomicU64::new(NOT_PINGED),
             writing_ms: AtomicU64::new(NOT_WRITING),
+            socket_written: AtomicU64::new(0),
+            socket_ms: AtomicU64::new(millis(now)),
             reading_blocked: AtomicBool::new(false),
             ping_due: AtomicBool::new(false),
             ping_wanted: Notify::new(),
@@ -126,11 +132,6 @@ impl Flow {
         }
     }
 
-    fn pending(&self) -> bool {
-        self.pending_input.load(Ordering::Relaxed) > 0
-            || self.pending_output.load(Ordering::Relaxed) > 0
-    }
-
     fn writing(&self, now: Duration) {
         self.writing_ms.store(millis(now), Ordering::Relaxed);
     }
@@ -139,11 +140,38 @@ impl Flow {
         self.writing_ms.store(NOT_WRITING, Ordering::Relaxed);
     }
 
-    fn writing_for(&self, now: Duration) -> Duration {
+    fn socket_wrote(&self, total: u64, now: Duration) -> bool {
+        if self.socket_written.swap(total, Ordering::Relaxed) == total {
+            return false;
+        }
+        self.socket_ms.store(millis(now), Ordering::Relaxed);
+        true
+    }
+
+    fn since_socket_or(&self, mark: u64, now: Duration) -> Duration {
+        let latest = mark.max(self.socket_ms.load(Ordering::Relaxed));
+        Duration::from_millis(millis(now).saturating_sub(latest))
+    }
+
+    fn stuck_writing_for(&self, now: Duration) -> Duration {
         match self.writing_ms.load(Ordering::Relaxed) {
             NOT_WRITING => Duration::ZERO,
-            since => Duration::from_millis(millis(now).saturating_sub(since)),
+            since => self.since_socket_or(since, now),
         }
+    }
+
+    fn output_stalled_for(&self, now: Duration) -> Duration {
+        if self.pending_output.load(Ordering::Relaxed) == 0 {
+            return Duration::ZERO;
+        }
+        self.since_socket_or(self.activity_ms.load(Ordering::Relaxed), now)
+    }
+
+    fn input_stalled_for(&self, now: Duration) -> Duration {
+        if self.pending_input.load(Ordering::Relaxed) == 0 {
+            return Duration::ZERO;
+        }
+        self.idle_for(now)
     }
 
     fn idle_for(&self, now: Duration) -> Duration {
@@ -536,6 +564,14 @@ async fn abrupt_end(control: &Control, stop: &Stop) -> End {
     .await
 }
 
+fn output_end(exit: Option<&TerminalExit>, violated: bool) -> Option<End> {
+    match (exit, violated) {
+        (_, true) => Some(End::NodeViolation),
+        (Some(_), false) => Some(End::Exited),
+        (None, false) => None,
+    }
+}
+
 async fn send_or_stop(tx: &mpsc::Sender<Out>, stop: &Stop, out: Out) -> bool {
     tokio::select! {
         biased;
@@ -587,18 +623,18 @@ impl Pump {
                 }
                 Some(TerminalEvent::Exit(outcome)) => exit = Some(outcome),
                 None => {
-                    let end = match (&exit, output.violated()) {
-                        (_, true) => {
-                            tracing::info!(
-                                target: "jaunt::web",
-                                reason = "node_violation",
-                                node_id = self.stop.node_id(),
-                                "a web terminal was cut off from a node that broke the ssh flow control"
-                            );
-                            End::Unavailable
-                        }
-                        (Some(_), false) => End::Exited,
-                        (None, false) => abrupt_end(&self.control, &self.stop).await,
+                    let violated = output.violated();
+                    if violated {
+                        tracing::info!(
+                            target: "jaunt::web",
+                            reason = "node_violation",
+                            node_id = self.stop.node_id(),
+                            "a web terminal was cut off from a node that broke the ssh flow control"
+                        );
+                    }
+                    let end = match output_end(exit.as_ref(), violated) {
+                        Some(end) => end,
+                        None => abrupt_end(&self.control, &self.stop).await,
                     };
                     self.stop.stop(end);
                     return exit;
@@ -745,8 +781,9 @@ fn verdict(flow: &Flow, tick: Duration, idle_timeout: Duration) -> Option<End> {
     if flow.idle_for(tick) >= idle_timeout {
         return Some(End::IdleTimeout);
     }
-    if flow.writing_for(tick) >= TERMINAL_WEDGE_TIMEOUT
-        || (flow.pending() && flow.idle_for(tick) >= TERMINAL_WEDGE_TIMEOUT)
+    if flow.stuck_writing_for(tick) >= TERMINAL_WEDGE_TIMEOUT
+        || flow.output_stalled_for(tick) >= TERMINAL_WEDGE_TIMEOUT
+        || flow.input_stalled_for(tick) >= TERMINAL_WEDGE_TIMEOUT
     {
         return Some(End::Wedged);
     }
@@ -757,6 +794,10 @@ fn verdict(flow: &Flow, tick: Duration, idle_timeout: Duration) -> Option<End> {
         return Some(End::DeadPeer);
     }
     None
+}
+
+fn observe(flow: &Flow, writes: &SocketWrites, tick: Duration) -> bool {
+    flow.socket_wrote(writes.total(), tick)
 }
 
 async fn watch(
@@ -780,6 +821,11 @@ async fn watch(
             _ = interval.tick() => {}
         }
         let tick = control.tick();
+        if let Some(writes) = &plan.socket_writes
+            && observe(flow, writes, tick)
+        {
+            control.web.terminals.counters.socket_progressed();
+        }
         control.web.terminals.counters.node_ahead(
             window
                 .kept()
@@ -980,8 +1026,11 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
-    use super::{Flow, STORE_DEADLINE, abrupt_cause, recheck_cause, verdict};
+    use jaunt_ssh::TerminalExit;
+
+    use super::{Flow, STORE_DEADLINE, abrupt_cause, observe, output_end, recheck_cause, verdict};
     use crate::principal::Refusal;
+    use crate::serve::SocketWrites;
     use crate::web::terminal::live::End;
 
     const PATIENCE: Duration = Duration::from_secs(10);
@@ -1026,6 +1075,61 @@ mod tests {
         flow.wrote();
         assert_eq!(verdict(&flow, at(660), IDLE), None);
         assert_eq!(verdict(&flow, at(1830), IDLE), Some(End::IdleTimeout));
+    }
+
+    #[test]
+    fn a_socket_taking_a_byte_every_20_seconds_stays_and_a_stopped_one_goes_at_the_threshold() {
+        let flow = Flow::starting(at(0));
+        flow.pending_output.store(32 * 1024, Ordering::Relaxed);
+        flow.writing(at(0));
+        let mut taken = 0;
+        for second in 1..=600 {
+            if second % 20 == 0 {
+                taken += 1;
+                assert!(flow.socket_wrote(taken, at(second)));
+            }
+            assert_eq!(verdict(&flow, at(second), IDLE), None, "{second}");
+        }
+        assert!(!flow.socket_wrote(taken, at(601)));
+        assert_eq!(verdict(&flow, at(659), IDLE), None);
+        assert_eq!(verdict(&flow, at(660), IDLE), Some(End::Wedged));
+    }
+
+    #[test]
+    fn only_bytes_the_socket_took_move_the_progress_mark() {
+        let flow = Flow::starting(at(0));
+        flow.pending_output.store(1, Ordering::Relaxed);
+        flow.bytes_out.store(4096, Ordering::Relaxed);
+        let writes = SocketWrites::default();
+        assert!(!observe(&flow, &writes, at(30)));
+        assert_eq!(verdict(&flow, at(60), IDLE), Some(End::Wedged));
+        writes.add(5);
+        assert!(observe(&flow, &writes, at(40)));
+        assert_eq!(verdict(&flow, at(99), IDLE), None);
+        assert!(!observe(&flow, &writes, at(50)));
+        assert_eq!(verdict(&flow, at(100), IDLE), Some(End::Wedged));
+    }
+
+    #[test]
+    fn socket_progress_keeps_waiting_output_alive_but_never_stuck_input() {
+        let output = Flow::starting(at(0));
+        output.pending_output.store(1, Ordering::Relaxed);
+        assert!(output.socket_wrote(10, at(50)));
+        assert_eq!(verdict(&output, at(109), IDLE), None);
+        assert_eq!(verdict(&output, at(110), IDLE), Some(End::Wedged));
+        let input = Flow::starting(at(0));
+        input.pending_input.store(1, Ordering::Relaxed);
+        assert!(input.socket_wrote(10, at(50)));
+        assert_eq!(verdict(&input, at(60), IDLE), Some(End::Wedged));
+    }
+
+    #[test]
+    fn output_cut_by_a_node_violation_ends_as_one_even_after_an_exit_status() {
+        let exit = TerminalExit::Status(0);
+        assert_eq!(output_end(Some(&exit), true), Some(End::NodeViolation));
+        assert_eq!(output_end(None, true), Some(End::NodeViolation));
+        assert_eq!(output_end(Some(&exit), false), Some(End::Exited));
+        assert_eq!(output_end(None, false), None);
     }
 
     #[tokio::test(start_paused = true)]
