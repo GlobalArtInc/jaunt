@@ -1,5 +1,6 @@
 use std::fmt;
 
+use jaunt_proto::is_portable_login;
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::{Builder, CertType};
 use russh::keys::{Algorithm, Certificate, HashAlg, PrivateKey};
@@ -10,7 +11,6 @@ use crate::error::SshError;
 const BACKDATE_SECS: u64 = 5;
 const VALIDITY_SECS: u64 = 60;
 const SOURCE_ADDRESS: &str = "127.0.0.1/32,::1/128";
-const MAX_LOGIN_LEN: usize = 32;
 
 pub struct InnerCa {
     key: PrivateKey,
@@ -96,18 +96,6 @@ impl fmt::Debug for InnerCa {
             .field("private_key", &"<redacted>")
             .finish()
     }
-}
-
-pub(crate) fn is_portable_login(login: &str) -> bool {
-    let bytes = login.as_bytes();
-    let Some((first, rest)) = bytes.split_first() else {
-        return false;
-    };
-    bytes.len() <= MAX_LOGIN_LEN
-        && (first.is_ascii_lowercase() || *first == b'_')
-        && rest.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
-        })
 }
 
 #[cfg(test)]

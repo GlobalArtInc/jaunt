@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use jaunt_proto::is_portable_login;
 use serde::Deserialize;
 
 use crate::access_test::{AccessTest, Expect};
-use crate::model::{AdminPermission, NodeInfo, is_valid_login};
+use crate::model::{AdminPermission, NodeInfo};
 use crate::policy::{LabelRequirement, LoginSpec, Role, SshRule};
 
 pub(crate) const API_VERSION: &str = "jaunt/v1";
@@ -147,7 +148,7 @@ fn compile_role(raw: RawRole, errors: &mut Vec<String>) -> Role {
         None => (BTreeSet::new(), BTreeSet::new()),
     };
 
-    let ssh = raw.spec.ssh.and_then(|ssh| compile_ssh(ssh, errors));
+    let ssh = raw.spec.ssh.and_then(|ssh| compile_ssh(&name, ssh, errors));
     let admin = raw.spec.admin.unwrap_or_default().into_iter().collect();
 
     Role {
@@ -175,7 +176,7 @@ fn non_empty_set(
     set
 }
 
-fn compile_ssh(raw: RawSsh, errors: &mut Vec<String>) -> Option<SshRule> {
+fn compile_ssh(role: &str, raw: RawSsh, errors: &mut Vec<String>) -> Option<SshRule> {
     let mut nodes = Vec::new();
     match raw.nodes {
         None => errors.push("spec.ssh.nodes is required when spec.ssh is set".to_owned()),
@@ -210,9 +211,9 @@ fn compile_ssh(raw: RawSsh, errors: &mut Vec<String>) -> Option<SshRule> {
             errors.push(format!(
                 "spec.ssh.logins[{index}] {login:?}: only a standalone {USERNAME_PLACEHOLDER} placeholder is supported"
             ));
-        } else if !is_valid_login(&login) {
+        } else if !is_portable_login(&login) {
             errors.push(format!(
-                "spec.ssh.logins[{index}] {login:?} is not a valid login"
+                "role {role:?}: spec.ssh.logins[{index}] {login:?} is not a valid login"
             ));
         } else {
             logins.push(LoginSpec::Literal(login));

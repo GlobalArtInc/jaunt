@@ -1,13 +1,14 @@
 mod common;
 
-use common::{load_err, load_ok};
-use jaunt_policy::{Identity, NodeInfo, PolicySet};
+use std::fs;
 
-const VALID: [&str; 11] = [
+use common::{load_err, load_ok, write_dir};
+use jaunt_policy::{Expect, Identity, NodeInfo, PolicyHandle, PolicySet, run_access_tests};
+
+const VALID: [&str; 10] = [
     "a",
     "_a",
-    "A9",
-    "0abc",
+    "a9",
     "a.b",
     "a-b",
     "a_b",
@@ -17,8 +18,12 @@ const VALID: [&str; 11] = [
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 ];
 
-const INVALID: [&str; 23] = [
+const INVALID: [&str; 27] = [
     "",
+    "A9",
+    "0abc",
+    "Rozmarin",
+    "aliCe",
     "ro\u{200b}ot",
     "\u{202e}toor",
     "-oProxyCommand=x",
@@ -155,4 +160,87 @@ fn substituted_root_is_ignored_while_a_literal_root_works() {
             .authorize_ssh(&who("alice"), &prod(), "root")
             .allowed
     );
+}
+
+#[test]
+fn a_role_with_a_literal_login_outside_the_grammar_is_refused_and_the_last_good_set_stays() {
+    let dir = write_dir(&[("a.yaml", &role_with_logins("deploy"))]);
+    let handle = PolicyHandle::empty();
+    assert!(handle.reload(dir.path()).applied);
+    let good_hash = handle.snapshot().hash().to_owned();
+
+    fs::write(
+        dir.path().join("a.yaml"),
+        role_with_logins("deploy, Deploy"),
+    )
+    .unwrap();
+    let rejected = handle.reload(dir.path());
+    assert!(!rejected.applied);
+    assert_eq!(
+        rejected.errors,
+        ["a.yaml: document 1: role \"r\": spec.ssh.logins[1] \"Deploy\" is not a valid login"]
+    );
+    let active = handle.snapshot();
+    assert_eq!(active.hash(), good_hash);
+    assert!(
+        active
+            .authorize_ssh(&who("alice"), &prod(), "deploy")
+            .allowed
+    );
+    assert!(
+        !active
+            .authorize_ssh(&who("alice"), &prod(), "Deploy")
+            .allowed
+    );
+}
+
+#[test]
+fn a_username_outside_the_grammar_yields_no_login_and_is_never_folded() {
+    let set = load_logins("deploy, '{username}'");
+    for (username, logins) in [
+        ("alice", vec!["alice", "deploy"]),
+        ("Alice", vec!["deploy"]),
+        ("9lives", vec!["deploy"]),
+    ] {
+        assert_eq!(
+            set.ssh_logins(&who(username), &prod()),
+            logins,
+            "{username:?}"
+        );
+    }
+
+    let upper = who("Alice");
+    for (login, allowed) in [("Alice", false), ("alice", false), ("deploy", true)] {
+        assert_eq!(
+            set.authorize_ssh(&upper, &prod(), login).allowed,
+            allowed,
+            "{login:?}"
+        );
+    }
+    assert!(set.authorize_ssh(&who("alice"), &prod(), "alice").allowed);
+}
+
+#[test]
+fn access_tests_see_the_same_rule_for_substituted_usernames() {
+    let tests = "apiVersion: jaunt/v1\nkind: AccessTest\nspec:\n  \
+        - { user: alice@example.com, username: Alice, node: { env: prod }, login: Alice, expect: deny }\n  \
+        - { user: alice@example.com, username: Alice, node: { env: prod }, login: alice, expect: deny }\n  \
+        - { user: alice@example.com, username: alice, node: { env: prod }, login: alice, expect: allow }\n";
+    let set = load_ok(&[
+        ("a.yaml", &role_with_logins("'{username}'")),
+        ("b.yaml", tests),
+    ]);
+    let expected = [Expect::Deny, Expect::Deny, Expect::Allow];
+    assert_eq!(
+        set.tests()
+            .iter()
+            .map(|case| case.expect)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let results = run_access_tests(&set);
+    assert_eq!(results.len(), 3);
+    for result in results {
+        assert!(result.passed, "{}", result.description);
+    }
 }

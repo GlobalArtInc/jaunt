@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use jaunt_proto::is_portable_login;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,19 +103,8 @@ impl TryFrom<String> for AdminPermission {
     }
 }
 
-const MAX_LOGIN_BYTES: usize = 32;
 const FORBIDDEN_SUBSTITUTED_LOGIN: &str = "root";
 
-pub fn is_valid_login(login: &str) -> bool {
-    let mut chars = login.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    login.len() <= MAX_LOGIN_BYTES
-        && (first.is_ascii_alphanumeric() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 pub(crate) fn is_valid_substituted_login(login: &str) -> bool {
-    is_valid_login(login) && login != FORBIDDEN_SUBSTITUTED_LOGIN
+    is_portable_login(login) && login != FORBIDDEN_SUBSTITUTED_LOGIN
 }

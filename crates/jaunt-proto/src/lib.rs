@@ -7,6 +7,7 @@ mod login;
 mod plane;
 mod recording;
 mod session;
+mod ssh_login;
 mod whoami;
 
 pub use agent_trust::{AgentTrust, AgentTrustV2};
@@ -28,6 +29,7 @@ pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
     RouteRequest, SessionEnd, SessionEndOutcome, SessionPermissions,
 };
+pub use ssh_login::is_portable_login;
 pub use whoami::WhoamiResponse;
 
 #[cfg(test)]

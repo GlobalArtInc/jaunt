@@ -13,7 +13,6 @@ pub use handle::{LoadedPolicy, PolicyHandle, ReloadOutcome};
 pub use loader::{LoadError, LoadErrors, load_dir};
 pub use model::{
     AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, UnknownAdminPermission,
-    is_valid_login,
 };
 pub use policy::PolicySet;
 #[cfg(feature = "schema")]

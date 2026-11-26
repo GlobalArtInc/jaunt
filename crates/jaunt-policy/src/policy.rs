@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 
+use jaunt_proto::is_portable_login;
+
 use crate::access_test::AccessTest;
 use crate::model::{
-    AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, is_valid_login,
-    is_valid_substituted_login,
+    AdminPermission, Identity, NodeInfo, RoleAccess, SshDecision, is_valid_substituted_login,
 };
 use crate::raw::USERNAME_PLACEHOLDER;
 
@@ -48,7 +49,7 @@ impl SshRule {
 
     fn resolved_logins<'a>(&'a self, identity: &'a Identity) -> impl Iterator<Item = &'a str> {
         self.logins.iter().filter_map(move |spec| match spec {
-            LoginSpec::Literal(login) => Some(login.as_str()).filter(|l| is_valid_login(l)),
+            LoginSpec::Literal(login) => Some(login.as_str()).filter(|l| is_portable_login(l)),
             LoginSpec::Username => {
                 Some(identity.username.as_str()).filter(|l| is_valid_substituted_login(l))
             }
@@ -102,7 +103,7 @@ impl PolicySet {
 
     pub fn authorize_ssh(&self, identity: &Identity, node: &NodeInfo, login: &str) -> SshDecision {
         let mut decision = SshDecision::default();
-        if !is_valid_login(login) {
+        if !is_portable_login(login) {
             return decision;
         }
         for role in &self.roles {

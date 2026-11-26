@@ -8,7 +8,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use jaunt_proto::{AuthorizeDecision, AuthorizeRequest, BoxFuture, SessionEnd, SessionPermissions};
+use jaunt_proto::{
+    AuthorizeDecision, AuthorizeRequest, BoxFuture, SessionEnd, SessionPermissions,
+    is_portable_login,
+};
 use russh::keys::Certificate;
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, Pty, Sig, client};
@@ -24,7 +27,7 @@ use crate::cert::{CertRejection, UserCaSource, UserIdentity, verify_user_certifi
 use crate::config::ServerConfigCell;
 use crate::forward::{ForwardBridge, ForwardOpen, Originator, loopback_destination};
 use crate::inner::{self, InnerClient, InnerSession, InnerTarget};
-use crate::inner_ca::{InnerCa, InnerCertRequest, is_portable_login};
+use crate::inner_ca::{InnerCa, InnerCertRequest};
 use crate::intake::IntakeError;
 use crate::observer::{
     ChannelProgram, ObserverCell, ObserverFactory, Recording, SessionInfo, Terminal, TerminalSize,

@@ -9,7 +9,7 @@ use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use jaunt_policy::is_valid_login;
+use jaunt_proto::is_portable_login;
 use jaunt_store::Node;
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +107,7 @@ pub(crate) async fn ticket(
         Ok(request) => request,
         Err(failure) => return failure.into_response(),
     };
-    if !is_dns_label(&request.node) || !is_valid_login(&request.login) {
+    if !is_dns_label(&request.node) || !is_portable_login(&request.login) {
         return error_response(StatusCode::BAD_REQUEST, "invalid_request");
     }
     let Some(now) = control.now() else {
@@ -183,7 +183,7 @@ impl TerminalQuery {
             }
         }
         let node = node.filter(|node| is_dns_label(node))?;
-        let login = login.filter(|login| is_valid_login(login))?;
+        let login = login.filter(|login| is_portable_login(login))?;
         let cols = cols?.parse().ok()?;
         let rows = rows?.parse().ok()?;
         protocol::dimensions(cols, rows)?;

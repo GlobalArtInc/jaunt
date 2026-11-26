@@ -206,6 +206,7 @@ async fn a_ticket_is_issued_only_for_a_reachable_node_and_login_and_every_other_
         json!({"node": "Web-01", "login": LOGIN}),
         json!({"node": "web-01.jaunt.test", "login": LOGIN}),
         json!({"node": "web-01", "login": "-oProxyCommand=x"}),
+        json!({"node": "web-01", "login": "Alice"}),
     ] {
         let reply = ticket_reply(harness, &stand.alice, &body).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
@@ -307,6 +308,15 @@ async fn every_handshake_refusal_happens_before_the_upgrade_and_leaves_the_ticke
             },
             None,
             StatusCode::FORBIDDEN,
+        ),
+        (
+            "a login outside the grammar",
+            Handshake {
+                query: "node=web-01&login=Alice&cols=80&rows=24",
+                ..alice()
+            },
+            None,
+            StatusCode::BAD_REQUEST,
         ),
         (
             "another web session",
@@ -444,6 +454,11 @@ async fn targets_list_the_active_nodes_the_current_policy_reaches_with_their_log
     assert_eq!(
         reply.json(),
         json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "logins": ["bob", "deploy"]}])
+    );
+    let dave = browser(harness, "Dave", &["ops"]).await;
+    assert_eq!(
+        targets(harness, Some(&dave)).await.json(),
+        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "logins": ["deploy"]}])
     );
     assert_eq!(targets(harness, Some(&stand.carol)).await.json(), json!([]));
     assert_eq!(
