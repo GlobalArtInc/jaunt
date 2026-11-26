@@ -425,7 +425,32 @@ impl Control {
         listener: TcpListener,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ControlError> {
-        let sweeper = tokio::spawn(sweep_forever(self.clone()));
+        self.serve_sweeping_every(listener, shutdown, SWEEP_INTERVAL)
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn serve_with_sweep_interval(
+        self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        sweep_interval: Duration,
+    ) -> Result<(), ControlError> {
+        self.serve_sweeping_every(listener, shutdown, sweep_interval)
+            .await
+    }
+
+    async fn serve_sweeping_every(
+        self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+        sweep_interval: Duration,
+    ) -> Result<(), ControlError> {
+        if sweep_interval.is_zero() {
+            return Err(ControlError::ZeroSweepInterval);
+        }
+        let sweeper = tokio::spawn(sweep_forever(self.clone(), sweep_interval));
         serve::serve(
             self.router(),
             listener,
@@ -454,8 +479,8 @@ impl Control {
     }
 }
 
-async fn sweep_forever(control: Control) {
-    let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+async fn sweep_forever(control: Control, sweep_interval: Duration) {
+    let mut ticker = tokio::time::interval(sweep_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;

@@ -55,6 +55,8 @@ pub enum ControlError {
     Sessions(#[source] StoreError),
     #[error("every recording limit must be positive")]
     RecordingLimits,
+    #[error("the sweep interval must be positive")]
+    ZeroSweepInterval,
     #[error("recovering the recordings interrupted by the last stop failed: {0}")]
     RecoverRecordings(#[source] StoreError),
 }

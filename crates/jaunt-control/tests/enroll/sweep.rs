@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use jaunt_control::ControlError;
 use jaunt_store::EnrollmentState;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -11,43 +12,32 @@ use crate::support::{Enrolled, Harness};
 
 const RETENTION_SECS: u64 = 3600;
 const STALE_DELIVERY_SECS: u64 = 120;
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-const DEADLINE: Duration = Duration::from_secs(60);
+const SWEEP_INTERVAL: Duration = Duration::from_millis(20);
+const POLL_EVERY: Duration = Duration::from_millis(10);
+const DEADLINE: Duration = Duration::from_secs(30);
 
 struct RunningServer {
     stop: oneshot::Sender<()>,
-    server: JoinHandle<Result<(), jaunt_control::ControlError>>,
-    spinner: JoinHandle<()>,
+    server: JoinHandle<Result<(), ControlError>>,
 }
 
-async fn serve_with_paused_time(harness: &Harness) -> RunningServer {
-    tokio::time::pause();
-    let spinner = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
+async fn serve_sweeping_often(harness: &Harness) -> RunningServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(harness.control.clone().serve(listener, async move {
-        let _ = stopped.await;
-    }));
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(SWEEP_INTERVAL).await;
-    RunningServer {
-        stop,
-        server,
-        spinner,
-    }
+    let server = tokio::spawn(harness.control.clone().serve_with_sweep_interval(
+        listener,
+        async move {
+            let _ = stopped.await;
+        },
+        SWEEP_INTERVAL,
+    ));
+    RunningServer { stop, server }
 }
 
 impl RunningServer {
     async fn shut_down(self) {
         self.stop.send(()).unwrap();
         self.server.await.unwrap().unwrap();
-        self.spinner.abort();
     }
 }
 
@@ -120,27 +110,32 @@ async fn a_delivery_stuck_for_more_than_two_minutes_goes_back_to_approved_and_ca
     assert_eq!(harness.control.recover_stale_deliveries().await.unwrap(), 0);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn the_background_sweeper_purges_stored_enrollments() {
+async fn wait_until_purged(harness: &Harness, enrolled: &Enrolled, what: &str) {
+    let started = Instant::now();
+    while harness.poll(&enrolled.handle).await.status != StatusCode::NOT_FOUND {
+        assert!(started.elapsed() < DEADLINE, "{what} was not purged");
+        tokio::time::sleep(POLL_EVERY).await;
+    }
+}
+
+#[tokio::test]
+async fn the_background_sweeper_purges_stored_enrollments_on_every_pass() {
     let harness = Harness::new().await;
-    let stale = harness.enroll("web-01").await;
+    let first = harness.enroll("web-01").await;
     harness.clock.advance(900 + RETENTION_SECS + 1);
 
-    let running = serve_with_paused_time(&harness).await;
+    let running = serve_sweeping_often(&harness).await;
+    wait_until_purged(&harness, &first, "the enrollment stale before serving").await;
 
-    let started = Instant::now();
-    while harness.poll(&stale.handle).await.status != StatusCode::NOT_FOUND {
-        assert!(
-            started.elapsed() < DEADLINE,
-            "the enrollment was not purged"
-        );
-        tokio::time::advance(SWEEP_INTERVAL).await;
-        tokio::task::yield_now().await;
-    }
+    let second = harness.enroll("web-02").await;
+    assert_eq!(harness.poll(&second.handle).await.state(), "pending");
+    harness.clock.advance(900 + RETENTION_SECS + 1);
+    wait_until_purged(&harness, &second, "the enrollment gone stale while serving").await;
+
     running.shut_down().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn the_background_sweeper_recovers_interrupted_deliveries() {
     let harness = Harness::new().await;
     let enrolled = harness.enroll("web-01").await;
@@ -148,7 +143,7 @@ async fn the_background_sweeper_recovers_interrupted_deliveries() {
     begin_delivery_directly(&harness, &enrolled).await;
     harness.clock.advance(STALE_DELIVERY_SECS + 1);
 
-    let running = serve_with_paused_time(&harness).await;
+    let running = serve_sweeping_often(&harness).await;
 
     let started = Instant::now();
     while state_of(&harness, &enrolled).await != EnrollmentState::Approved {
@@ -156,19 +151,18 @@ async fn the_background_sweeper_recovers_interrupted_deliveries() {
             started.elapsed() < DEADLINE,
             "the delivery was not recovered"
         );
-        tokio::time::advance(SWEEP_INTERVAL).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(POLL_EVERY).await;
     }
     running.shut_down().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn the_background_sweeper_purges_stale_routed_sessions() {
     let s = scenario().await;
     let session_id = routed(&s.harness, &s.alice).await;
     s.harness.clock.advance(60 + RETENTION_SECS + 1);
 
-    let running = serve_with_paused_time(&s.harness).await;
+    let running = serve_sweeping_often(&s.harness).await;
 
     let started = Instant::now();
     while stored(&s.harness, &session_id).await.is_some() {
@@ -176,8 +170,29 @@ async fn the_background_sweeper_purges_stale_routed_sessions() {
             started.elapsed() < DEADLINE,
             "the routed session was not purged"
         );
-        tokio::time::advance(SWEEP_INTERVAL).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(POLL_EVERY).await;
     }
     running.shut_down().await;
+}
+
+#[tokio::test]
+async fn serving_with_a_zero_sweep_interval_is_refused() {
+    let harness = Harness::new().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let served = tokio::time::timeout(
+        DEADLINE,
+        harness.control.clone().serve_with_sweep_interval(
+            listener,
+            std::future::ready(()),
+            Duration::ZERO,
+        ),
+    )
+    .await
+    .expect("serving with a zero sweep interval neither returned nor refused");
+
+    assert!(
+        matches!(served, Err(ControlError::ZeroSweepInterval)),
+        "a zero sweep interval was not refused"
+    );
 }
