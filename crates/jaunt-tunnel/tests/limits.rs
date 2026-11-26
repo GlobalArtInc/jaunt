@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use http::{Method, StatusCode};
 use jaunt_tunnel::{
-    ClientError, ClientEvent, ConnectFailure, IncomingStream, SessionId, TunnelClient,
-    TunnelClientConfig, agent_client_config,
+    ClientError, ClientEvent, ConnectFailure, IncomingStream, ServedKinds, SessionId, StreamKind,
+    TunnelClient, TunnelClientConfig, agent_client_config,
 };
 use support::*;
 use tokio::io::AsyncReadExt;
@@ -22,8 +22,7 @@ fn headers(session: &[u8], kind: &[u8], client: &[u8]) -> Headers {
     ]
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_agent_rejects_bad_requests_before_they_reach_the_handler() {
+async fn expect_statuses(served_kinds: Option<ServedKinds>, cases: Vec<Case>) {
     let pki = Pki::new("ca");
     let leaf = pki.client_leaf("node-a");
     let (addr, gate_rx) = start_fake_gate(&pki).await;
@@ -32,9 +31,33 @@ async fn the_agent_rejects_bad_requests_before_they_reach_the_handler() {
         let mut byte = [0_u8; 1];
         drop(io.read(&mut byte).await);
     });
-    let agent = spawn_agent(addr, &pki, &leaf, waiting, AgentOptions::default());
+    let options = AgentOptions {
+        served_kinds,
+        ..AgentOptions::default()
+    };
+    let agent = spawn_agent(addr, &pki, &leaf, waiting, options);
     let mut gate = gate_rx.await.unwrap();
+    for (name, method, path, request_headers, expected) in cases {
+        let borrowed: Vec<(&str, &[u8])> = request_headers
+            .iter()
+            .map(|(key, value)| (*key, value.as_slice()))
+            .collect();
+        let (status, _send) = gate.request(method, path, &borrowed, true).await;
+        assert_eq!(status, expected, "{name}");
+    }
+    agent.stop().await;
+}
 
+fn with_service(kind: &[u8], session: &[u8], services: &[&[u8]]) -> Headers {
+    let mut list = headers(session, kind, b"203.0.113.9:1");
+    for service in services {
+        list.push(("x-jaunt-service", service.to_vec()));
+    }
+    list
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_rejects_bad_requests_before_they_reach_the_handler() {
     let mut doubled = headers(b"s1", b"ssh", b"203.0.113.9:1");
     doubled.push(("x-jaunt-session", b"s2".to_vec()));
     let mut without_session = headers(b"s1", b"ssh", b"203.0.113.9:1");
@@ -81,7 +104,21 @@ async fn the_agent_rejects_bad_requests_before_they_reach_the_handler() {
             "unknown kind",
             Method::POST,
             "/v1/stream",
-            headers(b"s1", b"tcp", b"203.0.113.9:1"),
+            headers(b"s1", b"mail", b"203.0.113.9:1"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "kube with a service on an ssh-only agent",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"kube", b"s1", &[b"main-cluster"]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "ssh with a service",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"ssh", b"s1", &[b"main-cluster"]),
             StatusCode::BAD_REQUEST,
         ),
         (
@@ -113,15 +150,43 @@ async fn the_agent_rejects_bad_requests_before_they_reach_the_handler() {
             StatusCode::NOT_FOUND,
         ),
     ];
-    for (name, method, path, request_headers, expected) in cases {
-        let borrowed: Vec<(&str, &[u8])> = request_headers
-            .iter()
-            .map(|(key, value)| (*key, value.as_slice()))
-            .collect();
-        let (status, _send) = gate.request(method, path, &borrowed, true).await;
-        assert_eq!(status, expected, "{name}");
-    }
-    agent.stop().await;
+    expect_statuses(None, cases).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_agent_serving_kube_requires_exactly_one_service_header() {
+    let served = ServedKinds::new([StreamKind::Ssh, StreamKind::Kube]).unwrap();
+    let cases: Vec<Case> = vec![
+        (
+            "kube with a service",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"kube", b"k-1", &[b"main-cluster"]),
+            StatusCode::OK,
+        ),
+        (
+            "kube without a service",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"kube", b"k-2", &[]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "kube with a repeated service",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"kube", b"k-3", &[b"main-cluster", b"main-cluster"]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "db on an agent that does not serve it",
+            Method::POST,
+            "/v1/stream",
+            with_service(b"db", b"k-4", &[b"main-db"]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    expect_statuses(Some(served), cases).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2,8 +2,8 @@
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use jaunt_tunnel::{
-    HEADER_CLIENT, HEADER_KIND, HEADER_SESSION, MAX_CLIENT_ADDRESS_LEN, MAX_SESSION_ID_LEN,
-    StreamMeta,
+    HEADER_CLIENT, HEADER_KIND, HEADER_SERVICE, HEADER_SESSION, MAX_CLIENT_ADDRESS_LEN,
+    MAX_SESSION_ID_LEN, StreamMeta,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -29,7 +29,12 @@ fn headers_of(meta: &StreamMeta) -> HeaderMap {
         (HEADER_SESSION, meta.session().as_str()),
         (HEADER_KIND, meta.kind().as_str()),
         (HEADER_CLIENT, meta.client()),
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        meta.service()
+            .map(|service| (HEADER_SERVICE, service.as_str())),
+    ) {
         headers.insert(
             HeaderName::from_static(name),
             HeaderValue::from_str(value).expect("a parsed value is a valid header value"),

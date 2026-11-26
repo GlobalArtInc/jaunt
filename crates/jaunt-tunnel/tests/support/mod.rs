@@ -21,9 +21,9 @@ use http::Request;
 use jaunt_tunnel::{
     AcceptorConfig, AgentApiConnection, AgentRegistry, BackoffPolicy, BoxFuture, ClientError,
     ClientEvent, Gate, GateAcceptor, GateStats, H2Io, Handover, IncomingStream, MainConnection,
-    NodeId, PeerAuthenticator, RejectReason, Rejection, SessionId, SessionRegistry, StreamHandler,
-    StreamKind, StreamMeta, TunnelClient, TunnelClientConfig, TunnelOptions, agent_client_config,
-    agent_server_config, main_server_config,
+    NodeId, PeerAuthenticator, RejectReason, Rejection, ServedKinds, SessionId, SessionRegistry,
+    StreamHandler, StreamKind, StreamMeta, TunnelClient, TunnelClientConfig, TunnelOptions,
+    agent_client_config, agent_server_config, main_server_config,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -286,6 +286,7 @@ impl TestGate {
 pub struct AgentOptions {
     pub tunnel: TunnelOptions,
     pub backoff: BackoffPolicy,
+    pub served_kinds: Option<ServedKinds>,
 }
 
 impl Default for AgentOptions {
@@ -297,6 +298,7 @@ impl Default for AgentOptions {
                 max: Duration::from_millis(200),
                 reset_after: Duration::from_secs(30),
             },
+            served_kinds: None,
         }
     }
 }
@@ -327,6 +329,9 @@ pub fn spawn_agent(
         TunnelClientConfig::new(Arc::new(tls), addr.to_string(), AGENT_SNI, "test-agent/1");
     config.options = options.tunnel;
     config.backoff = options.backoff;
+    if let Some(served_kinds) = options.served_kinds {
+        config.served_kinds = served_kinds;
+    }
     let events = config.subscribe();
     let sessions = config.sessions.clone();
     let shutdown = CancellationToken::new();

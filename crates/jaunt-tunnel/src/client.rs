@@ -25,7 +25,9 @@ use crate::backoff::{Backoff, BackoffPolicy};
 use crate::control::{AgentMessage, ControlChannel, ServerMessage, agent_version_is_valid};
 use crate::h2io::H2Io;
 use crate::options::{OptionsError, TunnelOptions, keepalive};
-use crate::proto::{ALPN_TUNNEL, CONTROL_VERSION, PATH_CONTROL, PATH_STREAM, StreamMeta};
+use crate::proto::{
+    ALPN_TUNNEL, CONTROL_VERSION, PATH_CONTROL, PATH_STREAM, StreamKind, StreamMeta,
+};
 use crate::session::SessionRegistry;
 
 const EVENT_BACKLOG: usize = 64;
@@ -131,6 +133,43 @@ async fn dial(server_addr: &str) -> Result<TcpStream, ConnectFailure> {
     Err(failure)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("an agent must serve at least one stream kind")]
+pub struct NoServedKinds;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedKinds(Vec<StreamKind>);
+
+impl ServedKinds {
+    pub fn new(kinds: impl IntoIterator<Item = StreamKind>) -> Result<Self, NoServedKinds> {
+        let mut served = Vec::new();
+        for kind in kinds {
+            if !served.contains(&kind) {
+                served.push(kind);
+            }
+        }
+        if served.is_empty() {
+            Err(NoServedKinds)
+        } else {
+            Ok(Self(served))
+        }
+    }
+
+    pub fn contains(&self, kind: StreamKind) -> bool {
+        self.0.contains(&kind)
+    }
+
+    pub fn as_slice(&self) -> &[StreamKind] {
+        &self.0
+    }
+}
+
+impl Default for ServedKinds {
+    fn default() -> Self {
+        Self(vec![StreamKind::Ssh])
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientEvent {
     ConnectFailed(ConnectFailure),
@@ -146,6 +185,7 @@ pub struct TunnelClientConfig {
     pub options: TunnelOptions,
     pub backoff: BackoffPolicy,
     pub sessions: SessionRegistry,
+    pub served_kinds: ServedKinds,
     events: broadcast::Sender<ClientEvent>,
 }
 
@@ -165,6 +205,7 @@ impl TunnelClientConfig {
             options: TunnelOptions::default(),
             backoff: BackoffPolicy::default(),
             sessions: SessionRegistry::new(),
+            served_kinds: ServedKinds::default(),
             events,
         }
     }
@@ -181,6 +222,7 @@ struct Context {
     agent_version: String,
     options: TunnelOptions,
     sessions: SessionRegistry,
+    served_kinds: ServedKinds,
     handler: Arc<dyn StreamHandler>,
     events: broadcast::Sender<ClientEvent>,
 }
@@ -215,6 +257,7 @@ impl TunnelClient {
             agent_version: config.agent_version,
             options: config.options,
             sessions: config.sessions,
+            served_kinds: config.served_kinds,
             handler,
             events: config.events,
         };
@@ -357,7 +400,10 @@ impl Context {
             ));
             return;
         }
-        let Ok(meta) = StreamMeta::from_headers(&parts.headers) else {
+        let Some(meta) = StreamMeta::from_headers(&parts.headers)
+            .ok()
+            .filter(|meta| self.served_kinds.contains(meta.kind()))
+        else {
             refuse(respond, StatusCode::BAD_REQUEST);
             return;
         };
@@ -499,6 +545,35 @@ mod tests {
             ConnectFailure::Http2
         );
         assert_eq!(ConnectFailure::from_http2(None), ConnectFailure::Http2);
+    }
+
+    #[test]
+    fn a_new_client_config_serves_only_ssh() {
+        let tls =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+        let config =
+            TunnelClientConfig::new(Arc::new(tls), "127.0.0.1:1", "agents.test", "agent/1");
+        assert_eq!(config.served_kinds.as_slice(), [StreamKind::Ssh]);
+    }
+
+    #[test]
+    fn served_kinds_drop_duplicates_and_refuse_an_empty_set() {
+        assert_eq!(ServedKinds::default().as_slice(), [StreamKind::Ssh]);
+        let served = ServedKinds::new([
+            StreamKind::Ssh,
+            StreamKind::Kube,
+            StreamKind::Ssh,
+            StreamKind::Kube,
+        ])
+        .unwrap();
+        assert_eq!(served.as_slice(), [StreamKind::Ssh, StreamKind::Kube]);
+        assert!(served.contains(StreamKind::Kube));
+        assert!(!served.contains(StreamKind::Db));
+        assert_eq!(ServedKinds::new([]), Err(NoServedKinds));
     }
 
     #[test]

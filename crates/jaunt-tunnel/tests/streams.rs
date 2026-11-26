@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use jaunt_tunnel::{
-    DEFAULT_STREAM_WINDOW, H2Io, IncomingStream, OpenError, StreamAborted, TunnelOptions,
+    DEFAULT_STREAM_WINDOW, H2Io, IncomingStream, OpenError, ServedKinds, ServiceName, SessionId,
+    StreamAborted, StreamKind, StreamMeta, TunnelOptions,
 };
 use sha2::{Digest, Sha256};
 use support::*;
@@ -468,5 +469,97 @@ async fn an_active_session_id_cannot_be_opened_twice() {
         .await
         .unwrap();
     assert_eq!(&echoed, b"still mine");
+    harness.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kube_stream_reaches_the_agent_with_its_service() {
+    let (meta_tx, mut meta_rx) = mpsc::unbounded_channel::<StreamMeta>();
+    let agent_side = handler(move |stream: IncomingStream| {
+        meta_tx.send(stream.meta.clone()).unwrap();
+        async move { drop(stream) }
+    });
+    let agent_options = AgentOptions {
+        served_kinds: Some(ServedKinds::new([StreamKind::Ssh, StreamKind::Kube]).unwrap()),
+        ..AgentOptions::default()
+    };
+    let harness = connect(agent_side, GateOptions::default(), agent_options).await;
+    let sent = StreamMeta::with_service(
+        SessionId::new("k-0123456789abcdef0123456789abcdef").unwrap(),
+        StreamKind::Kube,
+        ServiceName::new("main-cluster").unwrap(),
+        "203.0.113.5:40000",
+    )
+    .unwrap();
+    let io = harness
+        .gate
+        .registry
+        .open_stream(&node("node-a"), &sent)
+        .await
+        .unwrap();
+    let received = soon("the kube stream meta", meta_rx.recv()).await.unwrap();
+    assert_eq!(received, sent);
+    assert_eq!(received.kind(), StreamKind::Kube);
+    assert_eq!(
+        received.service().map(ServiceName::as_str),
+        Some("main-cluster")
+    );
+    drop(io);
+    harness.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ssh_only_agent_refuses_a_kube_stream_and_keeps_serving_ssh() {
+    let harness = connect(
+        echo_handler(),
+        GateOptions::default(),
+        AgentOptions::default(),
+    )
+    .await;
+    let kube = StreamMeta::with_service(
+        SessionId::new("k-0123456789abcdef0123456789abcdef").unwrap(),
+        StreamKind::Kube,
+        ServiceName::new("main-cluster").unwrap(),
+        "203.0.113.5:40000",
+    )
+    .unwrap();
+    let refused = harness
+        .gate
+        .registry
+        .open_stream(&node("node-a"), &kube)
+        .await;
+    assert_eq!(refused.unwrap_err(), OpenError::Refused(400));
+    assert!(harness.agent.sessions.active().is_empty());
+
+    let mut ssh = harness.open("still-ssh").await;
+    ssh.write_all(b"ping").await.unwrap();
+    let mut echoed = [0_u8; 4];
+    soon("the echo", ssh.read_exact(&mut echoed)).await.unwrap();
+    assert_eq!(&echoed, b"ping");
+    harness.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unserved_kind_is_refused_before_its_session_is_checked() {
+    let harness = connect(
+        echo_handler(),
+        GateOptions::default(),
+        AgentOptions::default(),
+    )
+    .await;
+    let _ssh = harness.open("shared-id").await;
+    let kube = StreamMeta::with_service(
+        SessionId::new("shared-id").unwrap(),
+        StreamKind::Kube,
+        ServiceName::new("main-cluster").unwrap(),
+        "203.0.113.5:40000",
+    )
+    .unwrap();
+    let refused = harness
+        .gate
+        .registry
+        .open_stream(&node("node-a"), &kube)
+        .await;
+    assert_eq!(refused.unwrap_err(), OpenError::Refused(400));
     harness.finish().await;
 }

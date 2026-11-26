@@ -1,0 +1,4 @@
+x-jaunt-session:k-1
+x-jaunt-kind:kube
+x-jaunt-service:main-cluster
+x-jaunt-client:203.0.113.9:40000

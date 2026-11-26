@@ -18,8 +18,8 @@ mod tls;
 
 pub use backoff::{Backoff, BackoffPolicy};
 pub use client::{
-    ClientError, ClientEvent, ConnectFailure, IncomingStream, StreamHandler, TunnelClient,
-    TunnelClientConfig,
+    ClientError, ClientEvent, ConnectFailure, IncomingStream, NoServedKinds, ServedKinds,
+    StreamHandler, TunnelClient, TunnelClientConfig,
 };
 pub use control::ControlError;
 pub use gate::{AgentApiConnection, Gate, GateError, GateObserver, Handover, MainConnection};
@@ -30,9 +30,10 @@ pub use options::{
     MAX_STREAM_LIMIT, MAX_TIMER, MAX_WINDOW, MIN_HEADER_LIST_SIZE, OptionsError, TunnelOptions,
 };
 pub use proto::{
-    ALPN_AGENT_API, ALPN_TUNNEL, CONTROL_VERSION, HEADER_CLIENT, HEADER_KIND, HEADER_SESSION,
-    InvalidNodeId, MAX_CLIENT_ADDRESS_LEN, MAX_CONTROL_MESSAGE_BYTES, MAX_NODE_ID_LEN,
-    MAX_SESSION_ID_LEN, MetaError, NodeId, SessionId, StreamKind, StreamMeta,
+    ALPN_AGENT_API, ALPN_TUNNEL, CONTROL_VERSION, HEADER_CLIENT, HEADER_KIND, HEADER_SERVICE,
+    HEADER_SESSION, InvalidNodeId, MAX_CLIENT_ADDRESS_LEN, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_NODE_ID_LEN, MAX_SERVICE_NAME_LEN, MAX_SESSION_ID_LEN, MetaError, NodeId, ServiceName,
+    SessionId, StreamKind, StreamMeta,
 };
 pub use registry::{
     AgentRegistry, DisconnectReason, RegisterError, RegistryEvent, RegistryObserver, TrustBroadcast,
