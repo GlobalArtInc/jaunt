@@ -5,6 +5,7 @@ pub mod ca_reload;
 pub mod ca_rotation;
 pub mod config;
 pub mod gate_ssh;
+pub mod join_token;
 pub mod killer;
 mod limits;
 pub mod logging;

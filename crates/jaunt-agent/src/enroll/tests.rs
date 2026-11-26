@@ -49,6 +49,7 @@ fn options(control: &FakeControl, dir: &Path) -> EnrollOptions {
         state_dir: dir.to_path_buf(),
         hostname: "web-01.example.com".to_owned(),
         timeout: Duration::from_secs(900),
+        join_token: None,
     }
 }
 
@@ -508,7 +509,7 @@ async fn a_temporary_server_error_while_polling_is_retried() {
 async fn codes_that_cannot_be_shown_safely_print_nothing() {
     for code in ["ABCD\u{1b}[2J-2345".to_owned(), "A".repeat(33)] {
         let mut script = ControlScript::new(&[PollStep::Approve(Approval::Valid)]);
-        script.code = code.clone();
+        script.code = Some(code.clone());
         let (_pki, control) = control(script).await;
         let dir = tempfile::tempdir().unwrap();
         let outcome = run_enroll(&options(&control, dir.path())).await;
@@ -665,4 +666,161 @@ fn the_production_environment_is_privileged_exactly_when_running_as_root() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let env = system_env(&mut jitter, &mut out, &mut err);
     assert_eq!(env.privileged, rustix::process::geteuid().is_root());
+}
+
+const JOIN_TOKEN: &str = "jt1.0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
+
+fn token_file(dir: &Path, mode: u32) -> std::path::PathBuf {
+    let path = dir.join("join-token");
+    fs::write(&path, format!("{JOIN_TOKEN}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+fn with_token(control: &FakeControl, state_dir: &Path, token_dir: &Path) -> EnrollOptions {
+    let mut options = options(control, state_dir);
+    let path = token_file(token_dir, 0o600);
+    options.join_token =
+        Some(super::token::read_token_file(&path, crate::fsio::effective_uid()).unwrap());
+    options
+}
+
+#[tokio::test]
+async fn a_join_token_enrols_without_a_code_and_never_appears_in_the_output() {
+    let mut script = ControlScript::new(&[PollStep::Approve(Approval::Valid)]);
+    script.join_token = Some(JOIN_TOKEN.to_owned());
+    let (_pki, control) = control(script).await;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+
+    let outcome = run_enroll(&with_token(&control, &state_dir, dir.path())).await;
+
+    outcome.result.unwrap();
+    let request = control.enrolls().pop().unwrap();
+    assert_eq!(request.join_token.as_deref(), Some(JOIN_TOKEN));
+    assert!(!format!("{request:?}").contains(JOIN_TOKEN));
+    assert_eq!(control.polls(), [HANDLE]);
+    let spki = STANDARD.decode(&request.tls_public_key).unwrap();
+    let ssh_fingerprint = PublicKey::from_openssh(&request.ssh_host_public_key)
+        .unwrap()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
+    assert_eq!(
+        outcome.out,
+        format!(
+            "tls key:      sha256:{}\nssh host key: {ssh_fingerprint}\nexpires at:   {}\n",
+            sha256_hex(&spki),
+            format_utc(EXPIRES_AT)
+        )
+    );
+    for text in [&outcome.out, &outcome.err] {
+        assert!(!text.contains(JOIN_TOKEN), "{text}");
+        assert!(!text.contains(HANDLE));
+    }
+    assert!(
+        outcome.err.contains("join token was accepted"),
+        "{}",
+        outcome.err
+    );
+    assert_eq!(entries(&state_dir), {
+        let mut sorted = FILES.map(str::to_owned).to_vec();
+        sorted.sort();
+        sorted
+    });
+}
+
+#[tokio::test]
+async fn a_refused_join_token_is_explained_without_showing_it_and_nothing_is_stored() {
+    let mut script = ControlScript::new(&[PollStep::Approve(Approval::Valid)]);
+    script.join_token = Some("jt1.another".to_owned());
+    let (_pki, control) = control(script).await;
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+
+    let outcome = run_enroll(&with_token(&control, &state_dir, dir.path())).await;
+
+    let error = outcome.result.unwrap_err();
+    assert!(matches!(error, EnrollError::TokenRefused), "{error}");
+    assert!(!error.to_string().contains(JOIN_TOKEN));
+    assert!(outcome.out.is_empty());
+    assert!(!outcome.err.contains(JOIN_TOKEN));
+    assert!(control.polls().is_empty());
+    assert!(entries(&state_dir).is_empty());
+}
+
+#[tokio::test]
+async fn a_server_that_answers_a_codeless_enrolment_without_a_token_is_not_trusted() {
+    let mut script = ControlScript::new(&[PollStep::Approve(Approval::Valid)]);
+    script.code = None;
+    let (_pki, control) = control(script).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let outcome = run_enroll(&options(&control, dir.path())).await;
+
+    assert!(matches!(outcome.result, Err(EnrollError::BadCode)));
+    assert!(outcome.out.is_empty());
+    assert!(control.polls().is_empty());
+}
+
+#[test]
+fn the_join_token_comes_only_from_a_private_file_named_on_the_command_line() {
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: super::EnrollArgs,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let private = token_file(dir.path(), 0o600);
+    let parse = |path: &Path| {
+        Wrapper::try_parse_from([
+            "enroll".as_ref(),
+            "--server".as_ref(),
+            "https://jaunt.example.com".as_ref(),
+            "--name".as_ref(),
+            "web-01".as_ref(),
+            "--token-file".as_ref(),
+            path.as_os_str(),
+        ])
+        .unwrap()
+    };
+    let parsed = parse(&private);
+    let options = EnrollOptions::from_args(&parsed.args, || Ok("web-01".into())).unwrap();
+    assert_eq!(
+        options.join_token.as_ref().map(|token| token.expose()),
+        Some(JOIN_TOKEN)
+    );
+
+    let shared = dir.path().join("shared");
+    fs::write(&shared, JOIN_TOKEN).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
+    let refused = EnrollOptions::from_args(&parse(&shared).args, || Ok("web-01".into()));
+    let Err(error) = refused else {
+        panic!("a readable token file was accepted");
+    };
+    assert!(matches!(error, EnrollError::TokenFile(_)), "{error}");
+    assert!(!error.to_string().contains(JOIN_TOKEN));
+
+    for flag in ["--token", "--join-token"] {
+        assert!(
+            Wrapper::try_parse_from([
+                "enroll",
+                "--server",
+                "https://jaunt.example.com",
+                "--name",
+                "web-01",
+                flag,
+                JOIN_TOKEN,
+            ])
+            .is_err(),
+            "{flag}"
+        );
+    }
+    assert!(
+        Wrapper::command()
+            .get_arguments()
+            .all(|arg| arg.get_env().is_none())
+    );
 }

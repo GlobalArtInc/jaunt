@@ -41,6 +41,12 @@ pub struct EnrollArgs {
         value_parser = clap::value_parser!(u64).range(1..=MAX_TIMEOUT_SECS)
     )]
     pub timeout_secs: u64,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Enrol without an approval code using the join token in this file (a regular file owned by this user with mode 0600 or stricter)"
+    )]
+    pub token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

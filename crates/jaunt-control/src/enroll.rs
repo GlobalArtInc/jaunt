@@ -13,6 +13,7 @@ use crate::control::Control;
 use crate::device::net::ClientAddress;
 use crate::enroll_secrets;
 use crate::http::{error_response, json_body, json_response, server_error};
+use crate::join_enroll;
 use crate::labels::Labels;
 use crate::limits;
 use crate::naming::is_dns_label;
@@ -61,14 +62,14 @@ impl Invalid {
     }
 }
 
-struct ValidEnroll {
-    name: String,
-    labels: Labels,
-    hostname: String,
-    tls: TlsKey,
-    ssh: SshHostKey,
-    replace: bool,
-    agent_version: String,
+pub(crate) struct ValidEnroll {
+    pub(crate) name: String,
+    pub(crate) labels: Labels,
+    pub(crate) hostname: String,
+    pub(crate) tls: TlsKey,
+    pub(crate) ssh: SshHostKey,
+    pub(crate) replace: bool,
+    pub(crate) agent_version: String,
 }
 
 fn is_visible_ascii(text: &str) -> bool {
@@ -120,10 +121,11 @@ pub(crate) async fn handle(
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return server_error();
     };
-    let request = match json_body::<EnrollRequest>(&headers, body) {
+    let mut request = match json_body::<EnrollRequest>(&headers, body) {
         Ok(request) => request,
         Err(failure) => return failure.into_response(),
     };
+    let join_token = request.join_token.take();
     let valid = match validate(request) {
         Ok(valid) => valid,
         Err(invalid) => return invalid.into_response(),
@@ -136,6 +138,9 @@ pub(crate) async fn handle(
             tracing::error!(target: "jaunt::control", error = %err, "looking up the node name failed");
             return server_error();
         }
+    }
+    if let Some(presented) = join_token {
+        return join_enroll::enroll(&control, &valid, &source, now, &presented).await;
     }
 
     let Ok(handle) = enroll_secrets::issue_handle() else {
@@ -184,7 +189,7 @@ pub(crate) async fn handle(
                     StatusCode::OK,
                     &EnrollResponse {
                         handle: handle.secret,
-                        code: code.shown,
+                        code: Some(code.shown),
                         expires_at: enrollment.expires_at,
                         poll_interval: POLL_INTERVAL_SECS,
                     },

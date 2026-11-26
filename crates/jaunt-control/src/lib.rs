@@ -19,6 +19,10 @@ mod holder;
 mod http;
 mod identity;
 mod issuance;
+mod join_enroll;
+mod join_secrets;
+mod join_token_audit;
+mod join_tokens;
 mod killer;
 mod labels;
 mod limits;
@@ -63,6 +67,10 @@ pub use clock::{Clock, system_clock};
 pub use control::{Control, ControlParts, PENDING_CAPACITY};
 pub use device::DeviceSettings;
 pub use error::ControlError;
+pub use join_tokens::{
+    CreatedJoinToken, DEFAULT_JOIN_TOKEN_TTL, JoinTokenAdmin, JoinTokenError, JoinTokenRequest,
+    JoinTokenSecret, MAX_JOIN_TOKEN_TTL, MAX_JOIN_TOKEN_USES,
+};
 pub use killer::{KillOrder, KillReason, KillScope, KilledSession, SessionKiller};
 pub use labels::{LabelError, Labels, MAX_LABELS};
 pub use limits::{

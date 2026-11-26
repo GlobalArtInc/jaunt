@@ -23,6 +23,7 @@ use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
 use crate::http;
+use crate::join_tokens::JoinTokenAdmin;
 use crate::killer::{KillerSlot, SessionKiller};
 use crate::limits::{NoiseLog, RequestLimiters, RequestLimits};
 use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
@@ -42,6 +43,7 @@ pub const PENDING_CAPACITY: usize = 10_000;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STORED_REQUEST_RETENTION_SECS: i64 = 3600;
 const STORED_ENROLLMENT_RETENTION_SECS: i64 = 3600;
+const EXPIRED_JOIN_TOKEN_RETENTION_SECS: i64 = 3600;
 const STALE_DELIVERY_SECS: i64 = 120;
 const STALE_SESSION_RETENTION_SECS: i64 = 3600;
 const CLOSE_POLL: Duration = Duration::from_millis(20);
@@ -221,6 +223,10 @@ impl Control {
         NodeAdmin::new(self.store.clone(), self.clock.clone())
     }
 
+    pub fn join_tokens(&self) -> JoinTokenAdmin {
+        JoinTokenAdmin::new(self.store.clone(), self.clock.clone())
+    }
+
     pub fn revocations(&self) -> RevocationAdmin {
         RevocationAdmin::shared(
             self.store.clone(),
@@ -342,6 +348,15 @@ impl Control {
         Ok(u64::try_from(purged.len()).unwrap_or(u64::MAX))
     }
 
+    pub async fn purge_join_tokens(&self) -> Result<u64, ControlError> {
+        let now = self.now().ok_or(ControlError::Clock)?;
+        self.store
+            .join_tokens()
+            .purge_expired(now.secs.saturating_sub(EXPIRED_JOIN_TOKEN_RETENTION_SECS))
+            .await
+            .map_err(ControlError::PurgeJoinTokens)
+    }
+
     pub async fn purge_stale_sessions(&self) -> Result<u64, ControlError> {
         let now = self.now().ok_or(ControlError::Clock)?;
         self.store
@@ -453,6 +468,9 @@ async fn sweep_forever(control: Control) {
         }
         if let Err(err) = control.purge_stored_enrollments().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired enrollments failed");
+        }
+        if let Err(err) = control.purge_join_tokens().await {
+            tracing::warn!(target: "jaunt::control", error = %err, "purging expired join tokens failed");
         }
         if let Err(err) = control.purge_stale_sessions().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging stale sessions failed");

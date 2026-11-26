@@ -5,11 +5,12 @@ mod storage;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use jaunt_ca::CaKind;
 use jaunt_store::RevocationKind;
-use jauntd::{ca, ca_rotation, node, recordings, revoke};
+use jauntd::{ca, ca_rotation, join_token, node, recordings, revoke};
 
 #[derive(Parser)]
 #[command(version, about = "Jaunt control daemon")]
@@ -39,6 +40,11 @@ enum Command {
     Node {
         #[command(subcommand)]
         command: NodeCommand,
+    },
+    #[command(about = "Join tokens that let agents enrol without an approval code")]
+    JoinToken {
+        #[command(subcommand)]
+        command: JoinTokenCommand,
     },
     #[command(about = "Database commands")]
     Db {
@@ -231,6 +237,103 @@ impl From<NodeCommand> for node::NodeAction {
 }
 
 #[derive(Subcommand)]
+enum JoinTokenCommand {
+    #[command(
+        about = "Create a join token and print it once",
+        long_about = "Create a join token that lets agents enrol without an approval code. The \
+                      token is printed once on stdout and only its SHA-256 hash is stored; its id \
+                      and expiry go to stderr. An agent enrols with it by reading it from a file: \
+                      `jaunt-agent enroll --token-file <file>`. The node name must equal --name or \
+                      start with --name-prefix, and the node gets exactly the labels given here. \
+                      Each accepted enrolment uses one use at the moment the enrolment is \
+                      created; a use is not given back if the agent never finishes enrolling."
+    )]
+    Create {
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with = "name_prefix",
+            required_unless_present = "name_prefix",
+            help = "The only node name the token accepts"
+        )]
+        name: Option<String>,
+        #[arg(
+            long,
+            value_name = "PREFIX",
+            help = "Accept node names that start with this prefix"
+        )]
+        name_prefix: Option<String>,
+        #[arg(
+            long = "label",
+            value_name = "K=V",
+            help = "A label every node enrolled with the token gets; repeat for more"
+        )]
+        labels: Vec<String>,
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 1,
+            help = "How many enrolments the token allows"
+        )]
+        uses: u32,
+        #[arg(
+            long,
+            value_name = "DURATION",
+            default_value = "1h",
+            value_parser = join_token::parse_ttl,
+            help = "How long the token is valid, at most 7d (s, m, h or d)"
+        )]
+        ttl: Duration,
+        #[arg(
+            long,
+            help = "Let an agent that enrols with --replace replace the active node with its name"
+        )]
+        allow_replace: bool,
+    },
+    #[command(about = "List join tokens without the tokens themselves")]
+    List,
+    #[command(
+        about = "Revoke a join token by its id",
+        long_about = "Revoke a join token by its id: no new enrolment is accepted with it. \
+                      Revoking does not remove the nodes already enrolled with the token, nor \
+                      their enrolments whose certificates were not collected yet; those nodes \
+                      show `join-token:<id>` as APPROVED BY in `jauntd node list`, remove them \
+                      with `jauntd node rm` if needed."
+    )]
+    Rm {
+        #[arg(
+            value_name = "ID",
+            help = "The join token id, as shown by `jauntd join-token list`"
+        )]
+        id: String,
+    },
+}
+
+impl From<JoinTokenCommand> for join_token::JoinTokenAction {
+    fn from(command: JoinTokenCommand) -> join_token::JoinTokenAction {
+        match command {
+            JoinTokenCommand::Create {
+                name,
+                name_prefix,
+                labels,
+                uses,
+                ttl,
+                allow_replace,
+            } => join_token::JoinTokenAction::Create(join_token::CreateOptions {
+                name,
+                name_prefix,
+                labels,
+                uses,
+                ttl,
+                allow_replace,
+            }),
+            JoinTokenCommand::List => join_token::JoinTokenAction::List,
+            JoinTokenCommand::Rm { id } => join_token::JoinTokenAction::Remove { id },
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum DbCommand {
     #[command(about = "Copy the database")]
     Copy,
@@ -242,6 +345,7 @@ fn main() -> ExitCode {
         Command::Run => run(&cli.config),
         Command::Ca { command } => ca_command(&cli.config, command),
         Command::Node { command } => node::run(&cli.config, command.into()),
+        Command::JoinToken { command } => join_token::run(&cli.config, command.into()),
         Command::Db {
             command: DbCommand::Copy,
         } => not_implemented("db copy"),
@@ -297,5 +401,66 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn join_token_create_says_that_unfinished_enrolments_keep_their_use_and_takes_no_token_input() {
+        let mut command = Cli::command();
+        let create = command
+            .find_subcommand_mut("join-token")
+            .unwrap()
+            .find_subcommand_mut("create")
+            .unwrap();
+        let help = create.render_long_help().to_string();
+        assert!(help.contains("a use is not given back"), "{help}");
+        assert!(help.contains("--name-prefix") && help.contains("--allow-replace"));
+        assert!(create.get_arguments().all(|arg| arg.get_env().is_none()));
+    }
+
+    #[test]
+    fn join_token_rm_says_that_nodes_already_enrolled_stay() {
+        let mut command = Cli::command();
+        let rm = command
+            .find_subcommand_mut("join-token")
+            .unwrap()
+            .find_subcommand_mut("rm")
+            .unwrap();
+        let help = rm.render_long_help().to_string();
+        assert!(
+            help.contains("does not remove the nodes already enrolled with the token"),
+            "{help}"
+        );
+        assert!(help.contains("join-token:<id>") && help.contains("node list"));
+    }
+
+    #[test]
+    fn join_token_create_needs_exactly_one_of_name_and_prefix_and_a_bounded_ttl() {
+        use clap::Parser;
+        let base = ["jauntd", "join-token", "create"];
+        for extra in [
+            &[][..],
+            &["--name", "web-01", "--name-prefix", "web-"],
+            &["--name", "web-01", "--ttl", "8d"],
+            &["--name", "web-01", "--ttl", "0s"],
+            &["--name", "web-01", "--ttl", "1w"],
+            &["--name", "web-01", "--uses", "-1"],
+            &["--name", "web-01", "--token", "x"],
+        ] {
+            let args: Vec<&str> = base.iter().chain(extra).copied().collect();
+            let error = Cli::try_parse_from(&args).err().unwrap();
+            assert_eq!(error.exit_code(), 2, "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "jauntd",
+                "join-token",
+                "create",
+                "--name-prefix",
+                "web-",
+                "--ttl",
+                "7d"
+            ])
+            .is_ok()
+        );
     }
 }

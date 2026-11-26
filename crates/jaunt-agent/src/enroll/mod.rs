@@ -2,6 +2,7 @@ mod args;
 mod client;
 #[cfg(test)]
 mod tests;
+mod token;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -10,20 +11,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-use jaunt_proto::{EnrollRequest, EnrollResponse, EnrollmentApproved, PollRequest, PollResponse};
+use jaunt_proto::{EnrollRequest, EnrollmentApproved, PollRequest, PollResponse};
+use zeroize::Zeroize;
 
 pub use args::EnrollArgs;
 
 use crate::AGENT_VERSION;
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::AgentEndpoint;
-use crate::fsio::running_as_root;
+use crate::fsio::{effective_uid, running_as_root};
 use crate::keys::{HostKey, KeyError, TlsKey};
 use crate::pin::CaPin;
 use crate::state::{EnrollmentFiles, EnrollmentRecord, StateDir, StateError, StoreFailure};
 use crate::verify::{self, Checked, Expected, VerifyError};
 use args::{ServerUrl, parse_hostname};
 use client::{CallError, EnrollClient};
+use token::{JoinToken, TokenFileError, read_token_file};
 
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -38,6 +41,8 @@ pub enum EnrollError {
     AlreadyEnrolled { dir: String },
     #[error("cannot determine the system hostname ({reason}); pass --hostname")]
     Hostname { reason: &'static str },
+    #[error("cannot use the join token file: {0}")]
+    TokenFile(#[source] TokenFileError),
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] io::Error),
     #[error("cannot prepare the state directory: {0}")]
@@ -52,6 +57,10 @@ pub enum EnrollError {
     NameTaken,
     #[error("the server is rate limiting enrollment requests from this address; try again later")]
     RateLimited,
+    #[error(
+        "the server refused the join token: it is unknown, expired, used up or revoked, or it does not allow this name, these labels or --replace"
+    )]
+    TokenRefused,
     #[error("the server sent an enrollment code that cannot be shown safely")]
     BadCode,
     #[error("polling the enrollment failed: {0}")]
@@ -97,6 +106,7 @@ pub struct EnrollOptions {
     pub state_dir: PathBuf,
     pub hostname: String,
     pub timeout: Duration,
+    pub join_token: Option<JoinToken>,
 }
 
 impl EnrollOptions {
@@ -118,6 +128,12 @@ impl EnrollOptions {
                 })?
             }
         };
+        let join_token = args
+            .token_file
+            .as_deref()
+            .map(|path| read_token_file(path, effective_uid()))
+            .transpose()
+            .map_err(EnrollError::TokenFile)?;
         Ok(Self {
             server: args.server.clone(),
             name: args.name.clone(),
@@ -127,6 +143,7 @@ impl EnrollOptions {
             state_dir: args.state_dir.clone(),
             hostname,
             timeout: Duration::from_secs(args.timeout_secs),
+            join_token,
         })
     }
 }
@@ -184,7 +201,7 @@ pub async fn enroll(options: &EnrollOptions, env: &mut EnrollEnv<'_>) -> Result<
         .now()
         .checked_add(options.timeout)
         .unwrap_or_else(|| env.clock.now());
-    let request = EnrollRequest {
+    let mut request = EnrollRequest {
         name: options.name.clone(),
         labels: options.labels.clone(),
         hostname: options.hostname.clone(),
@@ -192,23 +209,48 @@ pub async fn enroll(options: &EnrollOptions, env: &mut EnrollEnv<'_>) -> Result<
         ssh_host_public_key: host_key.public_line()?,
         replace: options.replace,
         agent_version: AGENT_VERSION.to_owned(),
+        join_token: options
+            .join_token
+            .as_ref()
+            .map(|token| token.expose().to_owned()),
     };
-    let response = client.enroll(&request).await.map_err(|error| match error {
+    let answered = client.enroll(&request).await;
+    if let Some(mut sent) = request.join_token.take() {
+        sent.zeroize();
+    }
+    let response = answered.map_err(|error| match error {
         CallError::TooManyRequests => EnrollError::RateLimited,
         CallError::Status { status: 409, code } if code == "name_taken" => EnrollError::NameTaken,
+        CallError::Status { status: 403, code } if code == "join_token_refused" => {
+            EnrollError::TokenRefused
+        }
         other => EnrollError::Request(other),
     })?;
-    if !is_showable_code(&response.code) {
-        return Err(EnrollError::BadCode);
+    match (&response.code, &options.join_token) {
+        (Some(code), _) => {
+            if !is_showable_code(code) {
+                return Err(EnrollError::BadCode);
+            }
+            show_request(env.out, code, response.expires_at, &tls_key, &host_key)
+                .map_err(EnrollError::Output)?;
+            note(
+                env.err,
+                format_args!(
+                    "waiting up to {} seconds for an administrator to approve the request",
+                    options.timeout.as_secs()
+                ),
+            );
+        }
+        (None, Some(_)) => {
+            show_keys(env.out, response.expires_at, &tls_key, &host_key)
+                .map_err(EnrollError::Output)?;
+            note(
+                env.err,
+                format_args!("the join token was accepted; collecting the certificates"),
+            );
+        }
+        (None, None) => return Err(EnrollError::BadCode),
     }
-    show_request(env.out, &response, &tls_key, &host_key).map_err(EnrollError::Output)?;
-    note(
-        env.err,
-        format_args!(
-            "waiting up to {} seconds for an administrator to approve the request",
-            options.timeout.as_secs()
-        ),
-    );
     let interval = poll_interval(response.poll_interval);
     let poll = PollRequest {
         handle: response.handle.clone(),
@@ -277,19 +319,29 @@ fn is_showable_code(code: &str) -> bool {
 
 fn show_request(
     out: &mut (dyn Write + Send),
-    response: &EnrollResponse,
+    code: &str,
+    expires_at: i64,
     tls_key: &TlsKey,
     host_key: &HostKey,
 ) -> io::Result<()> {
-    writeln!(out, "code:         {}", response.code)?;
-    writeln!(out, "tls key:      {}", tls_key.fingerprint())?;
-    writeln!(out, "ssh host key: {}", host_key.fingerprint())?;
-    writeln!(out, "expires at:   {}", format_utc(response.expires_at))?;
+    writeln!(out, "code:         {code}")?;
+    show_keys(out, expires_at, tls_key, host_key)?;
     writeln!(
         out,
-        "An administrator must run `jauntd node approve {}` on the server and check that both fingerprints match.",
-        response.code
+        "An administrator must run `jauntd node approve {code}` on the server and check that both fingerprints match."
     )?;
+    out.flush()
+}
+
+fn show_keys(
+    out: &mut (dyn Write + Send),
+    expires_at: i64,
+    tls_key: &TlsKey,
+    host_key: &HostKey,
+) -> io::Result<()> {
+    writeln!(out, "tls key:      {}", tls_key.fingerprint())?;
+    writeln!(out, "ssh host key: {}", host_key.fingerprint())?;
+    writeln!(out, "expires at:   {}", format_utc(expires_at))?;
     out.flush()
 }
 

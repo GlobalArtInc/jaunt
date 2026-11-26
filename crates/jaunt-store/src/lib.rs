@@ -4,6 +4,7 @@ mod ca_counters;
 mod certificates;
 mod enrollments;
 mod error;
+mod join_tokens;
 mod login_requests;
 mod nodes;
 mod recordings;
@@ -30,6 +31,10 @@ pub use enrollments::{
     EnrollmentLimits, EnrollmentState, Enrollments, NewEnrollment, PurgedEnrollment, RejectOutcome,
 };
 pub use error::StoreError;
+pub use join_tokens::{
+    JoinEnrollment, JoinOutcome, JoinToken, JoinTokens, Joined, NameScope, NewJoinToken,
+    TokenFailure, TokenRevokeOutcome, Unusable,
+};
 pub use login_requests::{
     LoginRequest, LoginRequestState, LoginRequests, NewDeviceLoginRequest, NewLoginRequest,
 };
@@ -115,6 +120,10 @@ impl Store {
 
     pub fn enrollments(&self) -> Enrollments {
         Enrollments::new(self.pool.clone())
+    }
+
+    pub fn join_tokens(&self) -> JoinTokens {
+        JoinTokens::new(self.pool.clone())
     }
 
     pub fn recordings(&self) -> Recordings {

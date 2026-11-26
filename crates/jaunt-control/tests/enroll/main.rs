@@ -7,6 +7,7 @@ mod ca_rotation;
 mod client_api;
 mod enroll;
 mod flow;
+mod join_token;
 mod recording_support;
 mod recordings;
 mod recordings_s3;

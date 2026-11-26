@@ -146,6 +146,8 @@ macro_rules! enrollment_columns {
     };
 }
 
+pub(crate) use enrollment_columns;
+
 const CREATE: &str = concat!(
     "INSERT INTO enrollments (",
     enrollment_columns!(),
@@ -191,7 +193,7 @@ const REJECT_BY_CODE: &str = concat!(
     enrollment_columns!()
 );
 
-const REPLACE_ACTIVE_NODE: &str = concat!(
+pub(crate) const REPLACE_ACTIVE_NODE: &str = concat!(
     "UPDATE nodes SET state = 'removed', removed_at = ? WHERE name = ? AND state = 'active' \
      RETURNING ",
     node_columns!()
@@ -199,7 +201,7 @@ const REPLACE_ACTIVE_NODE: &str = concat!(
 
 const ACTIVE_NODE_NAME_TAKEN: &str = "SELECT id FROM nodes WHERE name = ? AND state = 'active'";
 
-const INSERT_NODE: &str = concat!(
+pub(crate) const INSERT_NODE: &str = concat!(
     "INSERT INTO nodes (",
     node_columns!(),
     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?) RETURNING ",
@@ -589,7 +591,7 @@ impl Enrollments {
     }
 }
 
-fn is_unique_violation(err: &sqlx::Error) -> bool {
+pub(crate) fn is_unique_violation(err: &sqlx::Error) -> bool {
     err.as_database_error()
         .is_some_and(|database| database.is_unique_violation())
 }
@@ -604,7 +606,7 @@ fn single_pending(rows: &[SqliteRow]) -> Result<Option<Enrollment>, StoreError> 
     }
 }
 
-fn enrollment_from_row(row: &SqliteRow) -> Result<Enrollment, StoreError> {
+pub(crate) fn enrollment_from_row(row: &SqliteRow) -> Result<Enrollment, StoreError> {
     let labels: String = row.try_get("labels")?;
     let labels = serde_json::from_str(&labels)
         .map_err(|err| StoreError::Corrupt(format!("enrollments.labels: {err}")))?;

@@ -445,7 +445,8 @@ pub struct ControlScript {
     pub enroll_status: StatusCode,
     pub enroll_error: &'static str,
     pub redirect_to: Option<String>,
-    pub code: String,
+    pub code: Option<String>,
+    pub join_token: Option<String>,
     pub polls: VecDeque<PollStep>,
     pub agent_endpoint: String,
     pub create_on_first_poll: Option<PathBuf>,
@@ -457,7 +458,8 @@ impl ControlScript {
             enroll_status: StatusCode::OK,
             enroll_error: "",
             redirect_to: None,
-            code: CODE.to_owned(),
+            code: Some(CODE.to_owned()),
+            join_token: None,
             polls: polls.iter().copied().collect(),
             agent_endpoint: "agents.jaunt.test:443".to_owned(),
             create_on_first_poll: None,
@@ -531,6 +533,7 @@ fn error_reply(status: StatusCode, code: &str) -> Response {
 
 async fn fake_enroll(State(inner): State<Arc<ControlInner>>, body: Bytes) -> Response {
     let request: EnrollRequest = serde_json::from_slice(&body).unwrap();
+    let presented = request.join_token.clone();
     inner.enrolls.lock().unwrap().push(request);
     let script = inner.script.lock().unwrap();
     if let Some(target) = &script.redirect_to {
@@ -539,11 +542,16 @@ async fn fake_enroll(State(inner): State<Arc<ControlInner>>, body: Bytes) -> Res
     if script.enroll_status != StatusCode::OK {
         return error_reply(script.enroll_status, script.enroll_error);
     }
+    let code = match presented {
+        None => script.code.clone(),
+        Some(token) if script.join_token.as_ref() == Some(&token) => None,
+        Some(_) => return error_reply(StatusCode::FORBIDDEN, "join_token_refused"),
+    };
     json_reply(
         StatusCode::OK,
         &EnrollResponse {
             handle: HANDLE.to_owned(),
-            code: script.code.clone(),
+            code,
             expires_at: EXPIRES_AT,
             poll_interval: 3,
         },

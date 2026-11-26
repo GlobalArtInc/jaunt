@@ -322,7 +322,7 @@ async fn enroll(State(stand): State<Arc<Stand>>, body: Bytes) -> Response {
                 .unwrap_or_else(PoisonError::into_inner) = Some(request);
             let response = EnrollResponse {
                 handle: HANDLE.to_owned(),
-                code: "STND-0001".to_owned(),
+                code: Some("STND-0001".to_owned()),
                 expires_at: signed(now() + 3600),
                 poll_interval: 1,
             };

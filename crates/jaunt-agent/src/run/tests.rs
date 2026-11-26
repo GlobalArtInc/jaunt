@@ -338,6 +338,7 @@ async fn an_enrolled_agent_serves_ssh_on_its_tunnel_and_survives_drops_and_resta
         state_dir: dir.path().to_path_buf(),
         hostname: "web-01.example.com".to_owned(),
         timeout: Duration::from_secs(60),
+        join_token: None,
     };
     let enroll_clock = ManualClock::auto(SystemTime::now());
     let mut jitter = || 0.5;
