@@ -6,7 +6,6 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::server::WebPkiClientVerifier;
 use rustls::{CertificateError, Error as TlsError, RootCertStore};
 use uuid::Uuid;
 use x509_parser::certificate::X509Certificate;
@@ -18,6 +17,7 @@ use super::{
 };
 use crate::cert::window;
 use crate::error::CaError;
+use crate::test_support::verify_client;
 use crate::x509::{
     DEFAULT_SERVER_VALIDITY, MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, ROOT_VALIDITY,
     parse_node_identity,
@@ -33,17 +33,7 @@ fn roots(root_der: &[u8]) -> Arc<RootCertStore> {
     Arc::new(store)
 }
 
-fn verify_client(root_der: &[u8], cert_der: &[u8], seconds: u64) -> Result<(), TlsError> {
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(roots(root_der), Arc::new(default_provider()))
-            .build()
-            .unwrap();
-    verifier
-        .verify_client_cert(&CertificateDer::from(cert_der), &[], at(seconds))
-        .map(drop)
-}
-
-fn verify_server(
+pub(super) fn verify_server(
     root_der: &[u8],
     cert_der: &[u8],
     name: &str,
@@ -65,7 +55,7 @@ fn verify_server(
         .map(drop)
 }
 
-fn is_expired(err: &TlsError) -> bool {
+pub(super) fn is_expired(err: &TlsError) -> bool {
     matches!(
         err,
         TlsError::InvalidCertificate(
@@ -74,7 +64,7 @@ fn is_expired(err: &TlsError) -> bool {
     )
 }
 
-fn is_not_yet_valid(err: &TlsError) -> bool {
+pub(super) fn is_not_yet_valid(err: &TlsError) -> bool {
     matches!(
         err,
         TlsError::InvalidCertificate(
@@ -83,7 +73,7 @@ fn is_not_yet_valid(err: &TlsError) -> bool {
     )
 }
 
-fn is_wrong_name(err: &TlsError) -> bool {
+pub(super) fn is_wrong_name(err: &TlsError) -> bool {
     matches!(
         err,
         TlsError::InvalidCertificate(
@@ -92,7 +82,7 @@ fn is_wrong_name(err: &TlsError) -> bool {
     )
 }
 
-fn subject_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
+pub(super) fn subject_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
     certificate
         .iter_extensions()
         .find_map(|ext| match ext.parsed_extension() {
@@ -102,7 +92,7 @@ fn subject_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
         .unwrap()
 }
 
-fn authority_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
+pub(super) fn authority_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
     certificate
         .iter_extensions()
         .find_map(|ext| match ext.parsed_extension() {
@@ -114,7 +104,7 @@ fn authority_key_id(certificate: &X509Certificate<'_>) -> Vec<u8> {
         .unwrap()
 }
 
-fn usages(certificate: &X509Certificate<'_>) -> (bool, bool, bool) {
+pub(super) fn usages(certificate: &X509Certificate<'_>) -> (bool, bool, bool) {
     let usage = certificate.extended_key_usage().unwrap().unwrap().value;
     let others = usage.any
         || usage.code_signing
@@ -125,7 +115,7 @@ fn usages(certificate: &X509Certificate<'_>) -> (bool, bool, bool) {
     (usage.client_auth, usage.server_auth, others)
 }
 
-fn sans(certificate: &X509Certificate<'_>) -> Vec<String> {
+pub(super) fn sans(certificate: &X509Certificate<'_>) -> Vec<String> {
     certificate
         .subject_alternative_name()
         .unwrap()

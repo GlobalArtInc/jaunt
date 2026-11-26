@@ -14,20 +14,28 @@ const RETIRE_FIRST: &str = "retire the previous key first";
 pub enum RotationKind {
     User,
     Host,
+    UserX509,
+    DbClient,
 }
 
 impl RotationKind {
+    pub const ALL: [RotationKind; 4] = [
+        RotationKind::User,
+        RotationKind::Host,
+        RotationKind::UserX509,
+        RotationKind::DbClient,
+    ];
+
     pub const fn as_str(self) -> &'static str {
-        match self {
-            RotationKind::User => "user",
-            RotationKind::Host => "host",
-        }
+        self.ca_kind().as_str()
     }
 
     pub const fn ca_kind(self) -> CaKind {
         match self {
             RotationKind::User => CaKind::User,
             RotationKind::Host => CaKind::Host,
+            RotationKind::UserX509 => CaKind::UserX509,
+            RotationKind::DbClient => CaKind::DbClient,
         }
     }
 }
@@ -104,6 +112,7 @@ pub async fn gather(
             counters.host_trusts = source.certificates_by_host_trust(now).await?;
             counters.node_host = source.latest_node_host_certificates().await?;
         }
+        RotationKind::UserX509 | RotationKind::DbClient => {}
     }
     Ok(counters)
 }
@@ -185,6 +194,7 @@ pub fn summarize(kind: RotationKind, counters: &Counters, now: i64) -> Summary {
                 }
             }
         }
+        RotationKind::UserX509 | RotationKind::DbClient => {}
     }
     summary
 }
@@ -195,6 +205,7 @@ pub enum BlockReason {
     OldCertificates(Unexpired),
     OldHostTrust(Unexpired),
     NodesOnOldHostKey(Vec<String>),
+    NotMeasured,
 }
 
 impl fmt::Display for BlockReason {
@@ -219,6 +230,7 @@ impl fmt::Display for BlockReason {
                 nodes(names.len()),
                 listed(names)
             ),
+            BlockReason::NotMeasured => f.write_str("use of this authority is not measured yet"),
         }
     }
 }
@@ -296,6 +308,7 @@ pub fn verdict(kind: RotationKind, step: RotationStep, counters: &Counters, now:
             .then_some(BlockReason::OldHostTrust(summary.old_host_trust)),
         (RotationKind::Host, RotationStep::Retire) => (!summary.nodes_on_old_host_key.is_empty())
             .then(|| BlockReason::NodesOnOldHostKey(summary.nodes_on_old_host_key.clone())),
+        (RotationKind::UserX509 | RotationKind::DbClient, _) => Some(BlockReason::NotMeasured),
     };
     match reason {
         Some(reason) => Verdict::Blocked(vec![reason]),
@@ -351,10 +364,15 @@ impl StepReport {
 }
 
 pub fn read_listings(ca_dir: &Path) -> Result<Vec<(RotationKind, SlotListing)>, CaError> {
-    [RotationKind::User, RotationKind::Host]
-        .into_iter()
-        .map(|kind| Ok((kind, FileBackend::read_slot(ca_dir, kind.ca_kind())?)))
-        .collect()
+    let mut listings = Vec::with_capacity(RotationKind::ALL.len());
+    for kind in RotationKind::ALL {
+        let ca_kind = kind.ca_kind();
+        if ca_kind.is_x509_client() && !FileBackend::is_initialized(ca_dir, ca_kind)? {
+            continue;
+        }
+        listings.push((kind, FileBackend::read_slot(ca_dir, ca_kind)?));
+    }
+    Ok(listings)
 }
 
 pub async fn reports(
@@ -461,6 +479,7 @@ pub fn status_json(reports: &[SlotReport]) -> Value {
                     }),
                 );
             }
+            RotationKind::UserX509 | RotationKind::DbClient => {}
         }
         let steps: Vec<Value> = report
             .steps
@@ -579,7 +598,7 @@ mod tests {
 
     #[test]
     fn every_rule_of_the_verdict_table_decides_its_own_row() {
-        use RotationKind::{Host, User};
+        use RotationKind::{DbClient, Host, User, UserX509};
         use RotationStep::{Promote, Retire};
 
         let behind = || Verdict::Blocked(vec![BlockReason::NodesBehind(vec!["web-01".to_owned()])]);
@@ -601,6 +620,7 @@ mod tests {
                 "db-01".to_owned(),
             ])])
         };
+        let not_measured = || Verdict::Blocked(vec![BlockReason::NotMeasured]);
         let fresh = NOW - 60;
         let rows: Vec<(&str, RotationKind, RotationStep, Counters, Verdict)> = vec![
             ("no nodes", User, Promote, counters(), Verdict::Allowed),
@@ -807,6 +827,34 @@ mod tests {
                 with_node_host(host_certificate(None, NOW + 60)),
                 Verdict::Allowed,
             ),
+            (
+                "the user X.509 slot is not measured before promote",
+                UserX509,
+                Promote,
+                with_node(node(Some(CURRENT), Some(fresh))),
+                not_measured(),
+            ),
+            (
+                "the user X.509 slot is not measured before retire",
+                UserX509,
+                Retire,
+                counters(),
+                not_measured(),
+            ),
+            (
+                "the database client slot is not measured before promote",
+                DbClient,
+                Promote,
+                counters(),
+                not_measured(),
+            ),
+            (
+                "the database client slot is not measured before retire",
+                DbClient,
+                Retire,
+                with_signer(group(Some(ACTIVE), NOW + 60)),
+                not_measured(),
+            ),
         ];
         for (name, kind, step, counters, expected) in rows {
             assert_eq!(verdict(kind, step, &counters, NOW), expected, "{name}");
@@ -868,6 +916,10 @@ mod tests {
             one.line(RotationStep::Retire),
             "retire: blocked: 1 unexpired user certificate signed by a previous key or before \
              rotation tracking"
+        );
+        assert_eq!(
+            Verdict::Blocked(vec![BlockReason::NotMeasured]).line(RotationStep::Promote),
+            "promote: blocked: use of this authority is not measured yet"
         );
         let escaped = BlockReason::NodesOnOldHostKey(vec!["web\n01\u{1b}".to_owned()]).to_string();
         assert_eq!(escaped, "1 node on a previous host key (web\\n01\\u{1b})");

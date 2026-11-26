@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, Fingerprint, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
@@ -15,16 +16,17 @@ use crate::identity::{AgeIdentity, AgeRecipient, encrypt};
 use crate::kind::CaKind;
 use crate::signer::Signer;
 use crate::trust::TrustSet;
+use crate::x509::{ClientCa, IssuedCertificate};
 
 pub(crate) const ACTIVE_FILE: &str = "active";
 pub(crate) const NEXT_FILE: &str = "next";
 pub(crate) const RETIRED_DIR: &str = "retired";
 pub(crate) const PUBLIC_SUFFIX: &str = ".pub";
 pub(crate) const ENCRYPTED_SUFFIX: &str = ".age";
-const ROOT_SUFFIX: &str = ".root.der";
+pub(crate) const ROOT_SUFFIX: &str = ".root.der";
 
 const MAX_ACTIVE_LEN: u64 = 128;
-const MAX_ROOT_LEN: u64 = 16 * 1024;
+pub(crate) const MAX_ROOT_LEN: u64 = 16 * 1024;
 const MAX_PUBLIC_LEN: u64 = 4096;
 const MAX_ENCRYPTED_LEN: u64 = 64 * 1024;
 pub(crate) const MAX_PRIVATE_LEN: usize = 8 * 1024;
@@ -57,44 +59,46 @@ impl FileBackend {
         recipient: &AgeRecipient,
         after_link: &dyn Fn(&Path) -> io::Result<()>,
     ) -> Result<PublicKey, CaError> {
+        if kind.is_x509_client() {
+            return Err(CaError::RootRequired(kind));
+        }
         let dir = kind_dir(root, kind);
         if exists(&dir.join(ACTIVE_FILE))? {
             return Err(CaError::AlreadyInitialized(kind));
         }
         ensure_private_dir(root, false).map_err(CaError::io("create directory", root))?;
         ensure_private_dir(&dir, true).map_err(CaError::io("create directory", &dir))?;
+        let (public_key, _) = write_slot(&dir, kind, recipient, None, after_link)?;
+        Ok(public_key)
+    }
 
+    pub(crate) fn generate(kind: CaKind) -> Result<FileBackend, CaError> {
         let private_key =
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(CaError::SshKey)?;
         let public_key = PublicKey::from(private_key.public_key().key_data().clone());
-        let hex = fingerprint_hex(&public_key);
+        Ok(FileBackend {
+            kind,
+            private_key,
+            public_key,
+        })
+    }
 
-        let pem = private_key
+    pub(crate) fn private_pem(&self) -> Result<zeroize::Zeroizing<String>, CaError> {
+        self.private_key
             .to_openssh(LineEnding::LF)
-            .map_err(CaError::SshKey)?;
-        let encrypted = encrypt(recipient, pem.as_bytes())?;
-        let public_line = format!("{}\n", public_key.to_openssh().map_err(CaError::SshKey)?);
+            .map_err(CaError::SshKey)
+    }
 
-        let mut created: Vec<PathBuf> = Vec::new();
-        let outcome = write_key_files(
-            &dir,
-            KeyFiles {
-                hex: &hex,
-                encrypted: &encrypted,
-                public_line: public_line.as_bytes(),
-                pointer: ACTIVE_FILE,
-                pointer_taken: CaError::AlreadyInitialized(kind),
-            },
-            after_link,
-            &mut created,
-        );
-        if let Err(err) = outcome {
-            for path in &created {
-                drop(fs::remove_file(path));
-            }
-            return Err(err);
+    pub(crate) fn root_certificate(
+        &self,
+        root_at: Option<SystemTime>,
+    ) -> Result<Option<IssuedCertificate>, CaError> {
+        match (self.kind.is_x509_client(), root_at) {
+            (true, Some(now)) => ClientCa::create_root(self, now).map(Some),
+            (true, None) => Err(CaError::RootRequired(self.kind)),
+            (false, None) => Ok(None),
+            (false, Some(_)) => Err(CaError::NotAClientAuthority(self.kind)),
         }
-        Ok(public_key)
     }
 
     pub fn load(
@@ -208,9 +212,50 @@ pub(crate) fn kind_dir(root: &Path, kind: CaKind) -> PathBuf {
 pub(crate) struct KeyFiles<'a> {
     pub(crate) hex: &'a str,
     pub(crate) encrypted: &'a [u8],
+    pub(crate) root: Option<&'a [u8]>,
     pub(crate) public_line: &'a [u8],
     pub(crate) pointer: &'static str,
     pub(crate) pointer_taken: CaError,
+}
+
+pub(crate) fn write_slot(
+    dir: &Path,
+    kind: CaKind,
+    recipient: &AgeRecipient,
+    root_at: Option<SystemTime>,
+    after_link: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<(PublicKey, Option<IssuedCertificate>), CaError> {
+    let backend = FileBackend::generate(kind)?;
+    let root = backend.root_certificate(root_at)?;
+    let hex = fingerprint_hex(&backend.public_key);
+    let pem = backend.private_pem()?;
+    let encrypted = encrypt(recipient, pem.as_bytes())?;
+    let public_line = format!(
+        "{}\n",
+        backend.public_key.to_openssh().map_err(CaError::SshKey)?
+    );
+
+    let mut created: Vec<PathBuf> = Vec::new();
+    let outcome = write_key_files(
+        dir,
+        KeyFiles {
+            hex: &hex,
+            encrypted: &encrypted,
+            root: root.as_ref().map(|root| root.certificate_der.as_slice()),
+            public_line: public_line.as_bytes(),
+            pointer: ACTIVE_FILE,
+            pointer_taken: CaError::AlreadyInitialized(kind),
+        },
+        after_link,
+        &mut created,
+    );
+    if let Err(err) = outcome {
+        for path in &created {
+            drop(fs::remove_file(path));
+        }
+        return Err(err);
+    }
+    Ok((backend.public_key.clone(), root))
 }
 
 pub(crate) fn write_key_files(
@@ -223,6 +268,12 @@ pub(crate) fn write_key_files(
     write_new_with(&encrypted_path, files.encrypted, after_link)
         .map_err(CaError::io("write", &encrypted_path))?;
     created.push(encrypted_path);
+
+    if let Some(root) = files.root {
+        let root_path = dir.join(format!("{}{ROOT_SUFFIX}", files.hex));
+        write_new_with(&root_path, root, after_link).map_err(CaError::io("write", &root_path))?;
+        created.push(root_path);
+    }
 
     let public_path = dir.join(format!("{}{PUBLIC_SUFFIX}", files.hex));
     write_new_with(&public_path, files.public_line, after_link)
@@ -283,7 +334,7 @@ fn read_pointer(path: &Path, not_text: &'static str) -> Result<String, CaError> 
     Ok(text.strip_suffix('\n').unwrap_or(text).to_owned())
 }
 
-fn list_fingerprints(dir: &Path, suffix: &str) -> Result<Vec<String>, CaError> {
+pub(crate) fn list_fingerprints(dir: &Path, suffix: &str) -> Result<Vec<String>, CaError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

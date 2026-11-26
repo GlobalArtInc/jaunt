@@ -144,7 +144,7 @@ fn require_ed25519(signer: &dyn Signer) -> Result<(), CaError> {
     }
 }
 
-fn validate_email(email: &str) -> Result<(), CaError> {
+pub(crate) fn validate_email(email: &str) -> Result<(), CaError> {
     let acceptable = !email.is_empty()
         && email.len() <= MAX_EMAIL_LEN
         && email
@@ -183,6 +183,15 @@ pub(crate) fn window(
     validity: Duration,
     max: Duration,
 ) -> Result<Window, CaError> {
+    window_backdated(now, validity, max, BACKDATE)
+}
+
+pub(crate) fn window_backdated(
+    now: SystemTime,
+    validity: Duration,
+    max: Duration,
+    backdate: Duration,
+) -> Result<Window, CaError> {
     if !(MIN_VALIDITY..=max).contains(&validity) {
         return Err(CaError::InvalidValidity { max });
     }
@@ -191,7 +200,7 @@ pub(crate) fn window(
         .map_err(|_| CaError::InvalidTime)?
         .as_secs();
     let valid_after = now_secs
-        .checked_sub(BACKDATE.as_secs())
+        .checked_sub(backdate.as_secs())
         .ok_or(CaError::InvalidTime)?;
     let valid_before = now_secs
         .checked_add(validity.as_secs())

@@ -5,6 +5,8 @@ pub enum CaKind {
     User,
     Host,
     Internal,
+    UserX509,
+    DbClient,
 }
 
 impl CaKind {
@@ -13,7 +15,13 @@ impl CaKind {
             CaKind::User => "user",
             CaKind::Host => "host",
             CaKind::Internal => "internal",
+            CaKind::UserX509 => "user-x509",
+            CaKind::DbClient => "db-client",
         }
+    }
+
+    pub const fn is_x509_client(self) -> bool {
+        matches!(self, CaKind::UserX509 | CaKind::DbClient)
     }
 }
 

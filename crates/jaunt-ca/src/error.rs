@@ -13,6 +13,8 @@ pub enum CaError {
     },
     InvalidEmail,
     InvalidUserId,
+    InvalidSerial,
+    InvalidDatabaseRole,
     InvalidHostnames,
     InvalidNodeId,
     InvalidSubjectKey,
@@ -29,6 +31,8 @@ pub enum CaError {
     WrongAuthorityKind {
         expected: CaKind,
     },
+    NotAClientAuthority(CaKind),
+    RootRequired(CaKind),
     InvalidTime,
     UnsupportedKeyAlgorithm,
     SshKey(ssh_key::Error),
@@ -88,9 +92,21 @@ impl fmt::Display for CaError {
                 "email must be 1 to 254 printable ASCII characters without ':' and '\"'",
             ),
             CaError::InvalidUserId => f.write_str("the user id must not be the nil UUID"),
+            CaError::InvalidSerial => f.write_str("the certificate serial must be positive"),
+            CaError::InvalidDatabaseRole => f.write_str(
+                "the database role must be 1 to 63 printable ASCII characters without spaces",
+            ),
             CaError::WrongAuthorityKind { expected } => write!(
                 f,
                 "this certificate type must be signed by the {expected} certificate authority"
+            ),
+            CaError::NotAClientAuthority(kind) => write!(
+                f,
+                "the {kind} certificate authority does not issue X.509 client certificates"
+            ),
+            CaError::RootRequired(kind) => write!(
+                f,
+                "every key of the {kind} certificate authority needs its own root certificate"
             ),
             CaError::InvalidHostnames => {
                 f.write_str("hostnames must be 1 to 64 distinct exact names of at most 253 bytes without whitespace, control or pattern characters")

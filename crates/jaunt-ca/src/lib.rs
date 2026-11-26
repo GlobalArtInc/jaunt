@@ -1,4 +1,5 @@
 mod cert;
+mod client_slot;
 mod error;
 mod file;
 mod fsutil;
@@ -21,6 +22,7 @@ pub use cert::{
     MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, sign_host_certificate,
     sign_user_certificate, sign_web_user_certificate,
 };
+pub use client_slot::{ClientInitialized, ClientKeyAdded, ClientSlot, TrustedRoot};
 pub use error::CaError;
 pub use file::{FileBackend, SlotListing};
 pub use fsutil::fingerprint_hex;
@@ -31,7 +33,9 @@ pub use signer::Signer;
 pub use staging::{Committed, StagingDir};
 pub use trust::{KeyRole, TrustSet};
 pub use x509::{
-    DEFAULT_NODE_VALIDITY, DEFAULT_SERVER_VALIDITY, InternalCa, IssuedCertificate,
-    MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, NodeCertParams, NodeIdentity, ROOT_VALIDITY,
-    ServerCertParams, SubjectPublicKey, parse_node_identity,
+    CLIENT_ROOT_VALIDITY, ClientCa, DB_CLIENT_BACKDATE, DB_CLIENT_VALIDITY, DEFAULT_NODE_VALIDITY,
+    DEFAULT_SERVER_VALIDITY, DEFAULT_SERVICE_VALIDITY, DbClientParams, InternalCa,
+    IssuedCertificate, MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, MAX_USER_X509_VALIDITY,
+    NodeCertParams, NodeIdentity, ROOT_VALIDITY, ServerCertParams, SubjectPublicKey,
+    UserX509Params, parse_node_identity,
 };

@@ -2,23 +2,25 @@ use std::fs::{self, File, TryLockError};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rustix::fs::{Mode, OFlags, open};
 use rustix::io::Errno;
 use rustix::process::geteuid;
-use ssh_key::rand_core::OsRng;
-use ssh_key::{Algorithm, Fingerprint, HashAlg, LineEnding, PrivateKey, PublicKey};
+use ssh_key::{Algorithm, Fingerprint, HashAlg, PrivateKey, PublicKey};
 
 use crate::error::CaError;
 use crate::file::{
     ACTIVE_FILE, ENCRYPTED_SUFFIX, FileBackend, KeyFiles, MAX_PRIVATE_LEN, NEXT_FILE,
-    PUBLIC_SUFFIX, RETIRED_DIR, kind_dir, read_trust, write_key_files,
+    PUBLIC_SUFFIX, RETIRED_DIR, ROOT_SUFFIX, kind_dir, list_fingerprints, read_trust,
+    write_key_files,
 };
 use crate::fsutil::{
     create_private_dir_with, exists, fingerprint_hex, move_with, remove_with, replace_with,
 };
 use crate::identity::{AgeIdentity, AgeRecipient, encrypt};
 use crate::kind::CaKind;
+use crate::x509::{ClientCa, IssuedCertificate};
 
 const LOCK_FILE: &str = ".lock";
 
@@ -94,6 +96,9 @@ impl FileBackend {
         kind: CaKind,
         identity: &AgeIdentity,
     ) -> Result<PublicKey, CaError> {
+        if kind.is_x509_client() {
+            return Err(CaError::RootRequired(kind));
+        }
         Self::add_next_with(lock, kind, identity, &|_| Ok(()))
     }
 
@@ -113,6 +118,17 @@ impl FileBackend {
         seal: &Seal<'_>,
         after_step: &dyn Fn(&Path) -> io::Result<()>,
     ) -> Result<PublicKey, CaError> {
+        Self::add_next_rooted(lock, kind, identity, seal, None, after_step).map(|(key, _)| key)
+    }
+
+    pub(crate) fn add_next_rooted(
+        lock: &CaLock,
+        kind: CaKind,
+        identity: &AgeIdentity,
+        seal: &Seal<'_>,
+        root_at: Option<SystemTime>,
+        after_step: &dyn Fn(&Path) -> io::Result<()>,
+    ) -> Result<(PublicKey, Option<IssuedCertificate>), CaError> {
         ensure_rotatable(kind)?;
         let root = lock.root();
         let (trust, _) = Self::load(root, kind, identity)?;
@@ -125,13 +141,11 @@ impl FileBackend {
             remove_with(&stale_next, after_step).map_err(CaError::io("remove", &stale_next))?;
         }
 
-        let private_key =
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(CaError::SshKey)?;
-        let public_key = PublicKey::from(private_key.public_key().key_data().clone());
+        let backend = FileBackend::generate(kind)?;
+        let root = backend.root_certificate(root_at)?;
+        let public_key = crate::signer::Signer::public_key(&backend).clone();
         let hex = fingerprint_hex(&public_key);
-        let pem = private_key
-            .to_openssh(LineEnding::LF)
-            .map_err(CaError::SshKey)?;
+        let pem = backend.private_pem()?;
         let encrypted = seal(&identity.recipient(), pem.as_bytes())?;
         verify_round_trip(&encrypted, identity, &hex)?;
         let public_line = format!("{}\n", public_key.to_openssh().map_err(CaError::SshKey)?);
@@ -142,6 +156,7 @@ impl FileBackend {
             KeyFiles {
                 hex: &hex,
                 encrypted: &encrypted,
+                root: root.as_ref().map(|root| root.certificate_der.as_slice()),
                 public_line: public_line.as_bytes(),
                 pointer: NEXT_FILE,
                 pointer_taken: CaError::NextKeyExists(kind),
@@ -158,7 +173,7 @@ impl FileBackend {
             }
             return Err(err);
         }
-        Ok(public_key)
+        Ok((public_key, root))
     }
 
     pub fn promote(
@@ -188,6 +203,9 @@ impl FileBackend {
             return Err(CaError::SlotChanged(kind));
         }
         let dir = kind_dir(root, kind);
+        if kind.is_x509_client() {
+            ClientCa::read_roots(root, kind)?;
+        }
         let active_path = dir.join(ACTIVE_FILE);
         replace_with(
             &active_path,
@@ -244,6 +262,7 @@ impl FileBackend {
             let retired_path = retired_dir.join(format!("{hex}{PUBLIC_SUFFIX}"));
             move_with(&public_path, &retired_path, after_step)
                 .map_err(CaError::io("move", &public_path))?;
+            retire_root(&dir, &hex, after_step)?;
             remove_private_key(&dir, &hex, after_step)?;
         }
         Ok(previous)
@@ -261,6 +280,12 @@ impl FileBackend {
         ensure_rotatable(kind)?;
         let listing = Self::read_slot(lock.root(), kind)?;
         let dir = kind_dir(lock.root(), kind);
+        for hex in list_fingerprints(&dir, ROOT_SUFFIX)?
+            .iter()
+            .filter(|hex| listing.retired.contains(hex))
+        {
+            retire_root(&dir, hex, after_step)?;
+        }
         let mut finished = Vec::new();
         for hex in listing
             .stray
@@ -276,9 +301,22 @@ impl FileBackend {
 
 fn ensure_rotatable(kind: CaKind) -> Result<(), CaError> {
     match kind {
-        CaKind::User | CaKind::Host => Ok(()),
+        CaKind::User | CaKind::Host | CaKind::UserX509 | CaKind::DbClient => Ok(()),
         CaKind::Internal => Err(CaError::RotationUnsupported(kind)),
     }
+}
+
+fn retire_root(
+    dir: &Path,
+    hex: &str,
+    after_step: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<(), CaError> {
+    let root_path = dir.join(format!("{hex}{ROOT_SUFFIX}"));
+    if !exists(&root_path)? {
+        return Ok(());
+    }
+    let retired_path = dir.join(RETIRED_DIR).join(format!("{hex}{ROOT_SUFFIX}"));
+    move_with(&root_path, &retired_path, after_step).map_err(CaError::io("move", &root_path))
 }
 
 fn verify_round_trip(

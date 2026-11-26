@@ -272,6 +272,9 @@ impl Harness {
             CaKind::User => Arc::new(user_authority),
             CaKind::Host => Arc::new(host_authority),
             CaKind::Internal => Arc::new(internal_authority),
+            CaKind::UserX509 | CaKind::DbClient => {
+                panic!("the harness signs only with the user, host or internal authority")
+            }
         };
         let authority = match options.sign_hook {
             Some(hook) => hook.wrap(authority),

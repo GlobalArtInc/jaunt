@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::error::CaError;
 use crate::fsutil::{create_new_private_dir, ensure_private_dir, random_hex, sync_dir};
 
-const SUFFIX_BYTES: usize = 8;
+pub(crate) const SUFFIX_BYTES: usize = 8;
 
 #[derive(Debug)]
 pub struct Committed {

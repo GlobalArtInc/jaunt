@@ -590,6 +590,8 @@ mod tests {
             host_trust,
             host,
             internal: InternalCa::new(Arc::new(internal), certificate.certificate_der).unwrap(),
+            user_x509: None,
+            db_client: None,
         }
     }
 

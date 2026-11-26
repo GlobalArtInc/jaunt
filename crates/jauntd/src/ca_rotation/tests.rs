@@ -9,7 +9,8 @@ use jaunt_audit::{
     AuditEvent, AuditTap, keep_callsites_enabled_for_scoped_capture, system_clock as audit_clock,
 };
 use jaunt_ca::ssh_key::PrivateKey;
-use jaunt_ca::{CaKind, CaLock, FileBackend, IDENTITY_FILE_VAR, fingerprint_hex};
+use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
+use jaunt_ca::{CaKind, CaLock, ClientCa, FileBackend, IDENTITY_FILE_VAR, fingerprint_hex};
 use jaunt_store::{AuditQuery, Store};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -782,4 +783,192 @@ fn a_blocked_retire_reports_the_interrupted_retire_it_finished_on_its_own_line()
             .collect::<Vec<_>>(),
         [extra]
     );
+}
+
+#[test]
+fn client_authorities_rotate_through_the_commands_at_the_ca_level() {
+    let fixture = fixture();
+    for kind in [CaKind::UserX509, CaKind::DbClient] {
+        let shown = section(&status(&fixture), kind);
+        assert!(shown.starts_with("  active    "), "{shown}");
+        assert!(shown.contains("  trust id  "), "{shown}");
+        assert!(
+            !shown.contains("nodes") && !shown.contains("certificates"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("  add-next: ready"), "{shown}");
+
+        let added = run_audited(&fixture, change(kind, ChangeStep::AddNext));
+        assert_applied(&added, "add-next");
+        let next = fs::read_to_string(fixture.slot(kind).join("next")).unwrap();
+        let next = next.trim_end().to_owned();
+        assert_eq!(
+            added.stdout.lines().next(),
+            Some(format!("{kind} key {next} added as next").as_str())
+        );
+        let (_, roots) = ClientCa::read_roots(&fixture.ca_dir(), kind).unwrap();
+        assert_eq!(roots.len(), 2);
+        let next_root: String = Sha256::digest(&roots[1].certificate_der)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            added.stdout.lines().nth(1),
+            Some(format!("{kind} root sha256:{next_root}").as_str())
+        );
+        let event = audit_events(&fixture)
+            .into_iter()
+            .find(|event| event.text("fp") == Some(next.as_str()))
+            .unwrap();
+        assert_eq!(event.kind().name(), "ca.key.added");
+        assert_eq!(event.text("kind"), Some(kind.as_str()));
+        let shown = section(&status(&fixture), kind);
+        assert!(shown.contains(&format!("  next      {next}")), "{shown}");
+        assert!(
+            shown.ends_with(&format!("  {}", not_measured("promote"))),
+            "{shown}"
+        );
+
+        let active = fingerprint_hex(
+            FileBackend::read_slot(&fixture.ca_dir(), kind)
+                .unwrap()
+                .trust
+                .active(),
+        );
+        assert_not_measured(
+            &fixture,
+            kind,
+            ChangeStep::Promote { force: false },
+            "promote",
+        );
+        let forced = run_audited(&fixture, change(kind, ChangeStep::Promote { force: true }));
+        assert_applied(&forced, "promote --force");
+        assert_eq!(
+            forced.stdout.lines().take(2).collect::<Vec<_>>(),
+            [not_measured("promote").as_str(), "forced past the check"]
+        );
+        assert_forced_event(&fixture, "ca.key.promoted", &next);
+        let authorities = load_authorities(&fixture.data_dir, &no_env).unwrap();
+        let slot = match kind {
+            CaKind::UserX509 => authorities.user_x509.unwrap(),
+            _ => authorities.db_client.unwrap(),
+        };
+        assert_eq!(fingerprint_hex(slot.trust.active()), next);
+        assert_eq!(
+            slot.ca.root_der(),
+            fs::read(fixture.slot(kind).join(format!("{next}.root.der"))).unwrap()
+        );
+        let shown = section(&status(&fixture), kind);
+        assert!(
+            shown.ends_with(&format!("  {}", not_measured("retire"))),
+            "{shown}"
+        );
+
+        assert_not_measured(
+            &fixture,
+            kind,
+            ChangeStep::Retire { force: false },
+            "retire",
+        );
+        let retired = run_audited(&fixture, change(kind, ChangeStep::Retire { force: true }));
+        assert_applied(&retired, "retire --force");
+        assert_forced_event(&fixture, "ca.key.retired", &active);
+        let shown = section(&status(&fixture), kind);
+        assert!(shown.contains("  retired   "), "{shown}");
+        assert!(shown.ends_with("  add-next: ready"), "{shown}");
+        let retired_dir = fixture.slot(kind).join("retired");
+        let mut names: Vec<String> = fs::read_dir(&retired_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].ends_with(".pub") && names[1].ends_with(".root.der"));
+        assert_eq!(
+            ClientCa::read_roots(&fixture.ca_dir(), kind)
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+    }
+
+    let outcome = run(&fixture, RotationAction::Status { json: true });
+    let value: serde_json::Value = serde_json::from_str(&outcome.stdout).unwrap();
+    for kind in ["user-x509", "db-client"] {
+        assert_eq!(value[kind]["keys"][0]["state"], "active");
+        assert_eq!(value[kind]["trust_id"].as_str().unwrap().len(), 64);
+        assert_eq!(value[kind]["steps"][0]["line"], "add-next: ready");
+        assert!(value[kind]["nodes"].is_null());
+    }
+}
+
+#[test]
+fn status_of_an_installation_without_the_client_authorities_skips_them() {
+    let fixture = fixture();
+    for kind in [CaKind::UserX509, CaKind::DbClient] {
+        fs::remove_dir_all(fixture.slot(kind)).unwrap();
+    }
+
+    let text = status(&fixture);
+    let json = run(&fixture, RotationAction::Status { json: true });
+    let refused = run(&fixture, change(CaKind::DbClient, ChangeStep::AddNext));
+
+    assert!(
+        !text.contains("user-x509") && !text.contains("db-client"),
+        "{text}"
+    );
+    assert!(section(&text, CaKind::User).ends_with("  add-next: ready"));
+    let value: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    assert!(value["user-x509"].is_null() && value["db-client"].is_null());
+    assert!(value["host"]["keys"].is_array());
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused
+            .stderr
+            .contains("the db-client certificate authority is not initialized"),
+        "{}",
+        refused.stderr
+    );
+}
+
+fn not_measured(step: &str) -> String {
+    format!("{step}: blocked: use of this authority is not measured yet")
+}
+
+fn assert_not_measured(fixture: &Fixture, kind: CaKind, step: ChangeStep, name: &str) {
+    let before = snapshot_slot(fixture, kind);
+    let blocked = run(fixture, change(kind, step));
+    assert_eq!(blocked.code, 3, "{name}: {}", blocked.stderr);
+    assert_eq!(blocked.stdout, format!("{}\n", not_measured(name)));
+    assert!(
+        blocked.stderr.contains("so it was not applied"),
+        "{}",
+        blocked.stderr
+    );
+    assert_eq!(snapshot_slot(fixture, kind), before, "{name}");
+}
+
+fn snapshot_slot(fixture: &Fixture, kind: CaKind) -> Vec<(String, Vec<u8>)> {
+    let dir = fixture.slot(kind);
+    let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, fs::read(&path).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn assert_forced_event(fixture: &Fixture, name: &str, fp: &str) {
+    let event = audit_events(fixture)
+        .into_iter()
+        .find(|event| event.kind().name() == name && event.text("fp") == Some(fp))
+        .unwrap_or_else(|| panic!("no {name} event for {fp}"));
+    assert_eq!(event.flag("forced"), Some(true));
+    assert_eq!(event.flag("blocked"), Some(true));
 }

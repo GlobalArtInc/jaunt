@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ed25519_dalek::{Signature as RawSignature, VerifyingKey};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyUsagePurpose};
@@ -7,23 +7,32 @@ use x509_parser::parse_x509_certificate;
 
 use super::key::{ED25519_KEY_LEN, SignerKey};
 use super::{
-    IssuedCertificate, ROOT_COMMON_NAME, ROOT_VALIDITY, common_name, key_identifier, random_serial,
-    serial_number, set_window,
+    IssuedCertificate, common_name, key_identifier, random_serial, serial_number, set_window,
 };
 use crate::cert::window;
 use crate::error::CaError;
 use crate::kind::CaKind;
 use crate::signer::Signer;
 
-pub(super) fn create(signer: &dyn Signer, now: SystemTime) -> Result<IssuedCertificate, CaError> {
-    let key = SignerKey::new(signer, CaKind::Internal)?;
-    let window = window(now, ROOT_VALIDITY, ROOT_VALIDITY)?;
+pub(super) struct RootProfile {
+    pub(super) kind: CaKind,
+    pub(super) common_name: &'static str,
+    pub(super) validity: Duration,
+}
+
+pub(super) fn create(
+    signer: &dyn Signer,
+    now: SystemTime,
+    profile: &RootProfile,
+) -> Result<IssuedCertificate, CaError> {
+    let key = SignerKey::new(signer, profile.kind)?;
+    let window = window(now, profile.validity, profile.validity)?;
     let serial = random_serial()?;
 
     let mut params = CertificateParams::default();
     let (not_before, not_after) = set_window(&mut params, &window)?;
     params.serial_number = Some(serial_number(serial));
-    params.distinguished_name = common_name(ROOT_COMMON_NAME);
+    params.distinguished_name = common_name(profile.common_name);
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.key_identifier_method = key_identifier(key.raw());

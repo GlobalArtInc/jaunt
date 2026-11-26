@@ -1,8 +1,12 @@
+mod client;
 mod identity;
 mod issuance;
 mod keys;
 mod root;
+mod service;
 
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, SanType};
@@ -105,4 +109,55 @@ fn uri(text: &str) -> SanType {
 
 fn dns(text: &str) -> SanType {
     SanType::DnsName(text.to_owned().try_into().unwrap())
+}
+
+fn openssl() -> Option<&'static str> {
+    let version = match Command::new("openssl").arg("version").output() {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(_) | Err(_) => {
+            eprintln!("skipped: no openssl binary on PATH");
+            return None;
+        }
+    };
+    if String::from_utf8_lossy(&version).starts_with("LibreSSL") {
+        eprintln!("skipped: the openssl on PATH is LibreSSL, which cannot verify Ed25519 chains");
+        return None;
+    }
+    Some("openssl")
+}
+
+fn pem(openssl: &str, dir: &Path, name: &str, der: &[u8]) -> String {
+    let der_path = dir.join(format!("{name}.der"));
+    let pem_path = dir.join(format!("{name}.pem"));
+    std::fs::write(&der_path, der).unwrap();
+    let converted = Command::new(openssl)
+        .args(["x509", "-inform", "DER", "-in"])
+        .arg(&der_path)
+        .arg("-out")
+        .arg(&pem_path)
+        .output()
+        .unwrap();
+    assert!(converted.status.success(), "{converted:?}");
+    pem_path.to_str().unwrap().to_owned()
+}
+
+fn openssl_verify(openssl: &str, root: &str, leaf: &str, purpose: &str, at: u64) -> bool {
+    openssl_verify_with(openssl, root, leaf, purpose, at, &["-x509_strict"])
+}
+
+fn openssl_verify_with(
+    openssl: &str,
+    root: &str,
+    leaf: &str,
+    purpose: &str,
+    at: u64,
+    extra: &[&str],
+) -> bool {
+    let output = Command::new(openssl)
+        .args(["verify", "-attime", &at.to_string(), "-purpose", purpose])
+        .args(extra)
+        .args(["-CAfile", root, leaf])
+        .output()
+        .unwrap();
+    output.status.success()
 }

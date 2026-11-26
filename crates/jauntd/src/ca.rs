@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use jaunt_ca::{
-    AgeIdentity, CaKind, Committed, FileBackend, IDENTITY_FILE_VAR, IDENTITY_VAR, InternalCa,
-    StagingDir, TrustSet,
+    AgeIdentity, CaError, CaKind, CaLock, ClientCa, ClientSlot, Committed, FileBackend,
+    IDENTITY_FILE_VAR, IDENTITY_VAR, InternalCa, StagingDir, TrustSet,
 };
 
 use crate::config::{self, EnvLookup};
@@ -15,6 +15,8 @@ use crate::config::{self, EnvLookup};
 pub const CA_DIR: &str = "ca";
 const STAGING_PREFIX: &str = "ca.staging";
 const IDENTITY_FILE: &str = "age-identity.txt";
+const LEGACY_KINDS: [CaKind; 3] = [CaKind::User, CaKind::Host, CaKind::Internal];
+const CLIENT_KINDS: [CaKind; 2] = [CaKind::UserX509, CaKind::DbClient];
 
 #[derive(Clone, Copy)]
 enum IdentitySource {
@@ -26,7 +28,15 @@ struct Initialized {
     user_ca: String,
     host_ca: String,
     internal_ca: String,
+    client_cas: Vec<String>,
     identity_file: Option<PathBuf>,
+    warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct Added {
+    lines: Vec<String>,
+    notes: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -42,6 +52,8 @@ pub struct Authorities {
     pub host_trust: TrustSet,
     pub host: FileBackend,
     pub internal: InternalCa,
+    pub user_x509: Option<ClientSlot>,
+    pub db_client: Option<ClientSlot>,
 }
 
 pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authorities, String> {
@@ -62,7 +74,22 @@ pub fn load_authorities(data_dir: &Path, env: EnvLookup<'_>) -> Result<Authoriti
         host_trust,
         host,
         internal,
+        user_x509: load_client(&ca_dir, CaKind::UserX509, &identity)?,
+        db_client: load_client(&ca_dir, CaKind::DbClient, &identity)?,
     })
+}
+
+fn load_client(
+    ca_dir: &Path,
+    kind: CaKind,
+    identity: &AgeIdentity,
+) -> Result<Option<ClientSlot>, String> {
+    if !FileBackend::is_initialized(ca_dir, kind).map_err(|err| err.to_string())? {
+        return Ok(None);
+    }
+    ClientCa::load(ca_dir, kind, identity)
+        .map(Some)
+        .map_err(|err| format!("the {kind} certificate authority: {err}"))
 }
 
 pub(crate) fn resolve_identity(ca_dir: &Path, env: EnvLookup<'_>) -> Result<AgeIdentity, String> {
@@ -146,14 +173,129 @@ fn render(initialized: &Initialized) -> Output {
             path.display()
         ));
     }
+    let mut stdout = format!(
+        "user-ca {}\nhost-ca {}\ninternal-ca sha256:{}\n",
+        initialized.user_ca, initialized.host_ca, initialized.internal_ca
+    );
+    for line in &initialized.client_cas {
+        stdout.push_str(line);
+        stdout.push('\n');
+    }
     Output {
         code: 0,
-        stdout: format!(
-            "user-ca {}\nhost-ca {}\ninternal-ca sha256:{}\n",
-            initialized.user_ca, initialized.host_ca, initialized.internal_ca
-        ),
+        stdout,
         stderr,
     }
+}
+
+pub fn add_missing(config_path: &Path) -> ExitCode {
+    let config = match config::load(config_path) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let output = run_add_missing(
+        &config.data_dir,
+        &|name| std::env::var_os(name),
+        SystemTime::now(),
+    );
+    emit(&output)
+}
+
+pub fn run_add_missing(data_dir: &Path, env: EnvLookup<'_>, now: SystemTime) -> Output {
+    let mut added = Added::default();
+    let outcome = add_missing_authorities(&data_dir.join(CA_DIR), env, now, &mut added);
+    let mut stdout = String::new();
+    for line in &added.lines {
+        stdout.push_str(line);
+        stdout.push('\n');
+    }
+    let mut stderr = String::new();
+    for note in added.notes.iter().chain(&added.warnings) {
+        stderr.push_str(note);
+        stderr.push('\n');
+    }
+    match outcome {
+        Ok(()) => {
+            if added.lines.is_empty() && added.notes.is_empty() {
+                stderr.push_str(
+                    "every certificate authority is already initialized, nothing was changed\n",
+                );
+            } else if added.lines.is_empty() {
+                stderr.push_str("every certificate authority is already initialized\n");
+            }
+            Output {
+                code: 0,
+                stdout,
+                stderr,
+            }
+        }
+        Err(err) => {
+            stderr.push_str(&err);
+            if !added.lines.is_empty() {
+                stderr.push_str(
+                    "; the authorities printed above were added, run the command again to add the rest",
+                );
+            }
+            stderr.push('\n');
+            Output {
+                code: 1,
+                stdout,
+                stderr,
+            }
+        }
+    }
+}
+
+fn add_missing_authorities(
+    ca_dir: &Path,
+    env: EnvLookup<'_>,
+    now: SystemTime,
+    added: &mut Added,
+) -> Result<(), String> {
+    for kind in LEGACY_KINDS {
+        if !FileBackend::is_initialized(ca_dir, kind).map_err(|err| err.to_string())? {
+            return Err(format!(
+                "{}: the {kind} certificate authority is not initialized: run `jauntd ca init` \
+                 first, nothing was changed",
+                ca_dir.display()
+            ));
+        }
+    }
+    let lock = CaLock::acquire(ca_dir).map_err(|err| err.to_string())?;
+    let identity = resolve_identity(lock.root(), env)?;
+    for kind in LEGACY_KINDS {
+        FileBackend::load(lock.root(), kind, &identity).map_err(|err| {
+            format!("the {kind} certificate authority: {err}, nothing was changed")
+        })?;
+    }
+    for kind in CLIENT_KINDS {
+        for path in ClientCa::remove_stale_staging(&lock, kind).map_err(|err| err.to_string())? {
+            added.notes.push(format!(
+                "removed {}, left behind by an interrupted run",
+                path.display()
+            ));
+        }
+    }
+    let recipient = identity.recipient();
+    for kind in CLIENT_KINDS {
+        if FileBackend::is_initialized(lock.root(), kind).map_err(|err| err.to_string())? {
+            continue;
+        }
+        let initialized =
+            ClientCa::init(lock.root(), kind, &recipient, now).map_err(|err| err.to_string())?;
+        added.lines.push(format!(
+            "{kind}-ca sha256:{}",
+            initialized.root.sha256_hex()
+        ));
+        added
+            .warnings
+            .extend(sync_warning(initialized.sync_failure));
+    }
+    drop(lock);
+    Ok(())
 }
 
 fn init_authorities(
@@ -190,12 +332,30 @@ fn reject_identity_in_environment(env: EnvLookup<'_>) -> Result<(), String> {
 }
 
 fn ensure_not_initialized(ca_dir: &Path) -> Result<(), String> {
-    for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
-        let initialized =
-            FileBackend::is_initialized(ca_dir, kind).map_err(|err| err.to_string())?;
-        if initialized {
+    let initialized =
+        |kind: CaKind| FileBackend::is_initialized(ca_dir, kind).map_err(|err| err.to_string());
+    let mut missing = Vec::new();
+    for kind in CLIENT_KINDS {
+        if !initialized(kind)? {
+            missing.push(kind.as_str());
+        }
+    }
+    let mut legacy_complete = true;
+    for kind in LEGACY_KINDS {
+        legacy_complete &= initialized(kind)?;
+    }
+    for kind in LEGACY_KINDS.into_iter().chain(CLIENT_KINDS) {
+        if initialized(kind)? {
+            let hint = if missing.is_empty() || !legacy_complete {
+                String::new()
+            } else {
+                format!(
+                    "; to add the missing {} authorities run `jauntd ca init --add-missing`",
+                    missing.join(" and ")
+                )
+            };
             return Err(format!(
-                "{}: the {kind} certificate authority is already initialized, nothing was changed",
+                "{}: the {kind} certificate authority is already initialized, nothing was changed{hint}",
                 ca_dir.display()
             ));
         }
@@ -226,7 +386,7 @@ fn install(
 ) -> Result<Initialized, String> {
     let built = populate(staging.path(), provided, now).and_then(|mut initialized| {
         let committed = staging.commit(ca_dir).map_err(|err| err.to_string())?;
-        initialized.warnings = commit_warnings(committed);
+        initialized.warnings.extend(commit_warnings(committed));
         if initialized.identity_file.is_some() {
             initialized.identity_file = Some(ca_dir.join(IDENTITY_FILE));
         }
@@ -242,8 +402,11 @@ fn install(
 }
 
 fn commit_warnings(committed: Committed) -> Vec<String> {
-    committed
-        .sync_failure
+    sync_warning(committed.sync_failure)
+}
+
+fn sync_warning(failure: Option<CaError>) -> Vec<String> {
+    failure
         .map(|err| {
             format!(
                 "warning: {err}; the certificate authority is in place but may not be durable on disk"
@@ -276,12 +439,24 @@ fn populate(
     let host =
         FileBackend::init(staging, CaKind::Host, &recipient).map_err(|err| err.to_string())?;
     let internal_ca = create_internal_authority(staging, &identity, now)?;
+    let mut client_cas = Vec::new();
+    let mut warnings = Vec::new();
+    for kind in CLIENT_KINDS {
+        let initialized =
+            ClientCa::init(staging, kind, &recipient, now).map_err(|err| err.to_string())?;
+        client_cas.push(format!(
+            "{kind}-ca sha256:{}",
+            initialized.root.sha256_hex()
+        ));
+        warnings.extend(sync_warning(initialized.sync_failure));
+    }
     Ok(Initialized {
         user_ca: user.to_openssh().map_err(|err| err.to_string())?,
         host_ca: host.to_openssh().map_err(|err| err.to_string())?,
         internal_ca,
+        client_cas,
         identity_file,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -312,15 +487,20 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
+    use std::cell::Cell;
+
     use jaunt_ca::{
-        AgeIdentity, CaError, CaKind, Committed, FileBackend, IDENTITY_FILE_VAR, IDENTITY_VAR,
-        InternalCa, Signer, StagingDir,
+        AgeIdentity, CaError, CaKind, CaLock, ClientCa, Committed, FileBackend, IDENTITY_FILE_VAR,
+        IDENTITY_VAR, InternalCa, Signer, StagingDir,
     };
 
     use super::{
-        CA_DIR, IDENTITY_FILE, IdentitySource, Initialized, Output, STAGING_PREFIX,
-        commit_warnings, init_authorities, install, load_authorities, render, run,
+        CA_DIR, CLIENT_KINDS, IDENTITY_FILE, IdentitySource, Initialized, LEGACY_KINDS, Output,
+        STAGING_PREFIX, commit_warnings, init_authorities, install, load_authorities, render, run,
+        run_add_missing,
     };
+
+    const ALL_SLOTS: [&str; 5] = ["db-client", "host", "internal", "user", "user-x509"];
 
     fn entries(path: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(path)
@@ -333,6 +513,39 @@ mod tests {
 
     fn no_env(_: &str) -> Option<OsString> {
         None
+    }
+
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            for entry in fs::read_dir(&current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let contents = fs::read(&path).unwrap();
+                    found.push((path.strip_prefix(dir).unwrap().to_path_buf(), contents));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    fn old_layout(data_dir: &Path) -> AgeIdentity {
+        let ca_dir = data_dir.join(CA_DIR);
+        let identity = AgeIdentity::generate();
+        for kind in LEGACY_KINDS {
+            FileBackend::init(&ca_dir, kind, &identity.recipient()).unwrap();
+        }
+        let (_, internal) = FileBackend::load(&ca_dir, CaKind::Internal, &identity).unwrap();
+        let root = InternalCa::create_root(&internal, now()).unwrap();
+        FileBackend::store_root_certificate(&ca_dir, &root.certificate_der).unwrap();
+        identity
+            .write_new_file(&ca_dir.join(IDENTITY_FILE))
+            .unwrap();
+        identity
     }
 
     fn now() -> SystemTime {
@@ -356,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_identity_initializes_all_three_authorities() {
+    fn generated_identity_initializes_every_authority() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let initialized =
@@ -370,11 +583,21 @@ mod tests {
         assert_eq!(entries(&data_dir), [CA_DIR]);
         assert_eq!(
             entries(&ca_dir),
-            ["age-identity.txt", "host", "internal", "user"]
+            [
+                "age-identity.txt",
+                "db-client",
+                "host",
+                "internal",
+                "user",
+                "user-x509"
+            ]
         );
         let identity = AgeIdentity::read_file(&ca_dir.join(IDENTITY_FILE)).unwrap();
-        for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
+        for kind in LEGACY_KINDS {
             assert!(FileBackend::load(&ca_dir, kind, &identity).is_ok());
+        }
+        for kind in CLIENT_KINDS {
+            assert!(ClientCa::load(&ca_dir, kind, &identity).is_ok());
         }
     }
 
@@ -408,20 +631,15 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         init_authorities(&data_dir, IdentitySource::Generate, &no_env, now()).unwrap();
         let ca_dir = data_dir.join(CA_DIR);
-        let identity_before = fs::read(ca_dir.join(IDENTITY_FILE)).unwrap();
-        let before = ["user", "host", "internal"].map(|kind| entries(&ca_dir.join(kind)));
+        let before = snapshot(&ca_dir);
 
         let err = init_authorities(&data_dir, IdentitySource::Generate, &no_env, now())
             .err()
             .unwrap();
         assert!(err.contains("already initialized"));
+        assert!(!err.contains("--add-missing"), "{err}");
         assert_eq!(entries(&data_dir), [CA_DIR]);
-        assert_eq!(
-            fs::read(ca_dir.join(IDENTITY_FILE)).unwrap(),
-            identity_before
-        );
-        let after = ["user", "host", "internal"].map(|kind| entries(&ca_dir.join(kind)));
-        assert_eq!(after, before);
+        assert_eq!(snapshot(&ca_dir), before);
     }
 
     #[test]
@@ -437,6 +655,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("the internal certificate authority is already initialized"));
+        assert!(!err.contains("--add-missing"), "{err}");
         assert_eq!(entries(&data_dir), [CA_DIR]);
         assert_eq!(entries(&ca_dir), ["internal"]);
         assert_eq!(entries(&ca_dir.join("internal")), before);
@@ -444,7 +663,7 @@ mod tests {
 
     #[test]
     fn failure_on_any_later_authority_leaves_nothing_behind() {
-        for blocked in ["host", "internal"] {
+        for blocked in ["host", "internal", "user-x509", "db-client"] {
             let dir = tempfile::tempdir().unwrap();
             let data_dir = dir.path().to_path_buf();
             let ca_dir = data_dir.join(CA_DIR);
@@ -476,9 +695,12 @@ mod tests {
         let staging = StagingDir::create(&data_dir, STAGING_PREFIX).unwrap();
         let initialized = install(staging, &ca_dir, Some(provided), now()).unwrap();
         assert!(initialized.identity_file.is_none());
-        assert_eq!(entries(&ca_dir), ["host", "internal", "user"]);
-        for kind in [CaKind::User, CaKind::Host, CaKind::Internal] {
+        assert_eq!(entries(&ca_dir), ALL_SLOTS);
+        for kind in LEGACY_KINDS {
             assert!(FileBackend::load(&ca_dir, kind, &identity).is_ok());
+        }
+        for kind in CLIENT_KINDS {
+            assert!(ClientCa::load(&ca_dir, kind, &identity).is_ok());
         }
     }
 
@@ -504,10 +726,9 @@ mod tests {
         let data_dir = dir.path().to_path_buf();
         fs::create_dir(data_dir.join(CA_DIR)).unwrap();
         init_authorities(&data_dir, IdentitySource::Generate, &no_env, now()).unwrap();
-        assert_eq!(
-            entries(&data_dir.join(CA_DIR)),
-            ["age-identity.txt", "host", "internal", "user"]
-        );
+        let mut expected = vec!["age-identity.txt"];
+        expected.extend(ALL_SLOTS);
+        assert_eq!(entries(&data_dir.join(CA_DIR)), expected);
     }
 
     #[test]
@@ -529,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn output_lists_the_user_key_the_host_key_and_the_internal_root_hash() {
+    fn output_lists_the_ssh_keys_and_the_hash_of_every_root() {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let (identity, identity_path) = operator_identity(dir.path());
@@ -539,7 +760,7 @@ mod tests {
         assert!(output.stderr.is_empty());
 
         let lines: Vec<&str> = output.stdout.lines().collect();
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         assert!(output.stdout.ends_with('\n'));
         let user = lines[0].strip_prefix("user-ca ").unwrap();
         let host = lines[1].strip_prefix("host-ca ").unwrap();
@@ -558,6 +779,13 @@ mod tests {
             .collect();
         assert_eq!(expected.len(), 64);
         assert_eq!(lines[2], format!("internal-ca sha256:{expected}"));
+        for (line, kind) in lines[3..].iter().zip(CLIENT_KINDS) {
+            let slot = ClientCa::load(&ca_dir, kind, &identity).unwrap();
+            assert_eq!(
+                *line,
+                format!("{kind}-ca sha256:{}", slot.ca.root_sha256_hex())
+            );
+        }
     }
 
     #[test]
@@ -606,13 +834,15 @@ mod tests {
             user_ca: "ssh-ed25519 USER".to_owned(),
             host_ca: "ssh-ed25519 HOST".to_owned(),
             internal_ca: "0123abcd".to_owned(),
+            client_cas: vec!["user-x509-ca sha256:4567".to_owned()],
             identity_file: Some(PathBuf::from("/data/ca/age-identity.txt")),
             warnings,
         });
         assert_eq!(output.code, 0);
         assert_eq!(
             output.stdout,
-            "user-ca ssh-ed25519 USER\nhost-ca ssh-ed25519 HOST\ninternal-ca sha256:0123abcd\n"
+            "user-ca ssh-ed25519 USER\nhost-ca ssh-ed25519 HOST\ninternal-ca sha256:0123abcd\n\
+             user-x509-ca sha256:4567\n"
         );
         let stderr: Vec<&str> = output.stderr.lines().collect();
         assert_eq!(stderr.len(), 2);
@@ -642,6 +872,17 @@ mod tests {
         assert_eq!(
             authorities.host_trust.to_authorized_lines().unwrap(),
             [initialized.host_ca]
+        );
+        let user_x509 = authorities.user_x509.unwrap();
+        let db_client = authorities.db_client.unwrap();
+        assert_eq!(user_x509.ca.kind(), CaKind::UserX509);
+        assert_eq!(db_client.ca.kind(), CaKind::DbClient);
+        assert_eq!(
+            initialized.client_cas,
+            [
+                format!("user-x509-ca sha256:{}", user_x509.ca.root_sha256_hex()),
+                format!("db-client-ca sha256:{}", db_client.ca.root_sha256_hex())
+            ]
         );
     }
 
@@ -682,5 +923,288 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let uninitialized = load_authorities(empty.path(), &no_env).err().unwrap();
         assert!(uninitialized.contains("no age identity"));
+    }
+
+    #[test]
+    fn an_old_directory_loads_without_the_new_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        old_layout(dir.path());
+        let before = snapshot(&dir.path().join(CA_DIR));
+
+        let authorities = load_authorities(dir.path(), &no_env).unwrap();
+
+        assert!(authorities.user_x509.is_none());
+        assert!(authorities.db_client.is_none());
+        assert_eq!(authorities.user.kind(), CaKind::User);
+        assert_eq!(snapshot(&dir.path().join(CA_DIR)), before);
+    }
+
+    #[test]
+    fn add_missing_adds_only_the_new_authorities_and_a_second_run_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let ca_dir = data_dir.join(CA_DIR);
+        old_layout(data_dir);
+        let legacy = |ca_dir: &Path| {
+            let mut kept = snapshot(ca_dir);
+            kept.retain(|(path, _)| {
+                !path.starts_with("user-x509")
+                    && !path.starts_with("db-client")
+                    && path != Path::new(".lock")
+            });
+            kept
+        };
+        let before = legacy(&ca_dir);
+
+        let first = run_add_missing(data_dir, &no_env, now());
+
+        assert_eq!(first.code, 0, "{}", first.stderr);
+        assert!(first.stderr.is_empty(), "{}", first.stderr);
+        let lines: Vec<&str> = first.stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", first.stdout);
+        assert_eq!(legacy(&ca_dir), before);
+        let mut expected = vec![".lock", "age-identity.txt"];
+        expected.extend(ALL_SLOTS);
+        assert_eq!(entries(&ca_dir), expected);
+        let authorities = load_authorities(data_dir, &no_env).unwrap();
+        for (line, slot) in lines
+            .iter()
+            .zip([authorities.user_x509, authorities.db_client])
+        {
+            let slot = slot.unwrap();
+            assert_eq!(
+                *line,
+                format!("{}-ca sha256:{}", slot.ca.kind(), slot.ca.root_sha256_hex())
+            );
+        }
+
+        let after_first = snapshot(&ca_dir);
+        let second = run_add_missing(data_dir, &no_env, now());
+        assert_eq!(second.code, 0, "{}", second.stderr);
+        assert!(second.stdout.is_empty());
+        assert!(
+            second.stderr.contains("nothing was changed"),
+            "{}",
+            second.stderr
+        );
+        assert_eq!(snapshot(&ca_dir), after_first);
+    }
+
+    #[test]
+    fn add_missing_creates_only_the_slot_that_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join(CA_DIR);
+        let identity = old_layout(dir.path());
+        ClientCa::init(&ca_dir, CaKind::UserX509, &identity.recipient(), now()).unwrap();
+        let existing = snapshot(&ca_dir.join("user-x509"));
+
+        let output = run_add_missing(dir.path(), &no_env, now());
+
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout.lines().count(), 1);
+        assert!(output.stdout.starts_with("db-client-ca sha256:"));
+        assert_eq!(snapshot(&ca_dir.join("user-x509")), existing);
+        assert!(ClientCa::load(&ca_dir, CaKind::DbClient, &identity).is_ok());
+    }
+
+    #[test]
+    fn plain_init_refuses_old_and_complete_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let ca_dir = data_dir.join(CA_DIR);
+        old_layout(data_dir);
+        let before = snapshot(&ca_dir);
+
+        let old = run(data_dir, true, &no_env, now());
+        assert_eq!(old.code, 1);
+        assert!(old.stdout.is_empty());
+        assert!(old.stderr.contains("already initialized"), "{}", old.stderr);
+        assert!(
+            old.stderr.contains(
+                "missing user-x509 and db-client authorities run `jauntd ca init --add-missing`"
+            ),
+            "{}",
+            old.stderr
+        );
+        assert_eq!(snapshot(&ca_dir), before);
+
+        assert_eq!(run_add_missing(data_dir, &no_env, now()).code, 0);
+        let complete = snapshot(&ca_dir);
+        let again = run(data_dir, true, &no_env, now());
+        assert_eq!(again.code, 1);
+        assert!(again.stderr.contains("already initialized"));
+        assert!(!again.stderr.contains("--add-missing"), "{}", again.stderr);
+        assert_eq!(snapshot(&ca_dir), complete);
+    }
+
+    #[test]
+    fn add_missing_refuses_a_foreign_identity_and_an_uninitialized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let ca_dir = data_dir.join(CA_DIR);
+        old_layout(&data_dir);
+        let before = snapshot(&ca_dir);
+        let (_, stranger) = operator_identity(dir.path());
+
+        let foreign = run_add_missing(
+            &data_dir,
+            &|name| (name == IDENTITY_FILE_VAR).then(|| stranger.as_os_str().to_owned()),
+            now(),
+        );
+        assert_eq!(foreign.code, 1);
+        assert!(foreign.stdout.is_empty());
+        assert!(
+            foreign.stderr.contains("could not decrypt"),
+            "{}",
+            foreign.stderr
+        );
+        assert!(
+            foreign.stderr.contains("nothing was changed"),
+            "{}",
+            foreign.stderr
+        );
+        let mut after = snapshot(&ca_dir);
+        after.retain(|(path, _)| path != Path::new(".lock"));
+        assert_eq!(after, before);
+
+        let empty = dir.path().join("empty");
+        let uninitialized = run_add_missing(&empty, &no_env, now());
+        assert_eq!(uninitialized.code, 1);
+        assert!(
+            uninitialized
+                .stderr
+                .contains("not initialized: run `jauntd ca init` first"),
+            "{}",
+            uninitialized.stderr
+        );
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn add_missing_waits_for_no_one_and_holds_the_lock_for_its_whole_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join(CA_DIR);
+        old_layout(dir.path());
+
+        let held = CaLock::acquire(&ca_dir).unwrap();
+        let before = snapshot(&ca_dir);
+        let refused = run_add_missing(dir.path(), &no_env, now());
+        assert_eq!(refused.code, 1);
+        assert!(refused.stdout.is_empty());
+        assert!(
+            refused
+                .stderr
+                .contains("another certificate authority command is running, nothing was changed"),
+            "{}",
+            refused.stderr
+        );
+        assert_eq!(snapshot(&ca_dir), before);
+        drop(held);
+
+        let busy_while_running = Cell::new(None);
+        let probe = |name: &str| {
+            if busy_while_running.get().is_none() {
+                let busy = matches!(CaLock::acquire(&ca_dir), Err(CaError::LockBusy));
+                busy_while_running.set(Some(busy));
+            }
+            no_env(name)
+        };
+        let added = run_add_missing(dir.path(), &probe, now());
+        assert_eq!(added.code, 0, "{}", added.stderr);
+        assert_eq!(busy_while_running.get(), Some(true));
+    }
+
+    #[test]
+    fn a_damaged_client_slot_stops_loading_and_names_the_slot() {
+        for kind in CLIENT_KINDS {
+            for damage in ["truncated", "deleted"] {
+                let dir = tempfile::tempdir().unwrap();
+                init_authorities(dir.path(), IdentitySource::Generate, &no_env, now()).unwrap();
+                let slot_dir = dir.path().join(CA_DIR).join(kind.as_str());
+                let active = fs::read_to_string(slot_dir.join("active")).unwrap();
+                let root = slot_dir.join(format!("{}.root.der", active.trim_end()));
+                if damage == "truncated" {
+                    let der = fs::read(&root).unwrap();
+                    fs::write(&root, &der[..der.len() / 2]).unwrap();
+                } else {
+                    fs::remove_file(&root).unwrap();
+                }
+
+                let err = load_authorities(dir.path(), &no_env).err().unwrap();
+
+                assert!(
+                    err.contains(&format!("the {kind} certificate authority: ")),
+                    "{kind} {damage}: {err}"
+                );
+                assert!(err.contains(".root.der"), "{kind} {damage}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn add_missing_removes_only_the_staging_directories_it_left_behind() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join(CA_DIR);
+        old_layout(dir.path());
+        let ours = [
+            ".user-x509.staging-0123456789abcdef",
+            ".db-client.staging-fedcba9876543210",
+        ];
+        let foreign = [
+            ".user-x509.staging-0123",
+            ".user-x509.staging-ABCDEF0123456789",
+            ".host.staging-0123456789abcdef",
+            "user-x509.staging-0123456789abcdef",
+        ];
+        for name in ours.iter().chain(&foreign) {
+            fs::create_dir(ca_dir.join(name)).unwrap();
+            fs::write(ca_dir.join(name).join("key.age"), b"sealed").unwrap();
+        }
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        let linked = ca_dir.join(".db-client.staging-1111111111111111");
+        symlink(&outside, &linked).unwrap();
+        let plain_file = ca_dir.join(".user-x509.staging-2222222222222222");
+        fs::write(&plain_file, b"file").unwrap();
+
+        let first = run_add_missing(dir.path(), &no_env, now());
+
+        assert_eq!(first.code, 0, "{}", first.stderr);
+        assert_eq!(first.stdout.lines().count(), 2);
+        for name in ours {
+            assert!(!ca_dir.join(name).exists(), "{name}");
+            assert!(first.stderr.contains(name), "{}", first.stderr);
+        }
+        for name in foreign {
+            assert!(ca_dir.join(name).join("key.age").exists(), "{name}");
+        }
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(outside.join("keep").exists());
+        assert!(plain_file.is_file());
+
+        let late = ca_dir.join(".user-x509.staging-abcdefabcdefabcd");
+        fs::create_dir(&late).unwrap();
+        let second = run_add_missing(dir.path(), &no_env, now());
+        assert_eq!(second.code, 0, "{}", second.stderr);
+        assert!(second.stdout.is_empty());
+        assert!(!late.exists());
+        assert!(
+            second.stderr.contains("already initialized"),
+            "{}",
+            second.stderr
+        );
+        assert!(
+            !second.stderr.contains("nothing was changed"),
+            "{}",
+            second.stderr
+        );
     }
 }

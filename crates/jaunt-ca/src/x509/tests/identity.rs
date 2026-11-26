@@ -40,7 +40,7 @@ fn node_identity_requires_exactly_one_canonical_uri() {
     let ca = fixture.ca();
     let key = subject();
     let good = format!("urn:jaunt:node:{NODE_ID}");
-    let sign = |san: Vec<SanType>| ca.sign(&crafted(san), &key).unwrap();
+    let sign = |san: Vec<SanType>| ca.issuer.sign(&crafted(san), &key).unwrap();
 
     let accepted = parse_node_identity(&sign(vec![uri(&good)])).unwrap();
     assert_eq!(accepted.node_id.to_string(), NODE_ID);

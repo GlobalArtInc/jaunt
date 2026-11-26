@@ -158,8 +158,16 @@ enum CaCommand {
             help = "Create a new age identity in <data_dir>/ca instead of reading one from the environment"
         )]
         generate_identity: bool,
+        #[arg(
+            long,
+            conflicts_with = "generate_identity",
+            help = "Only add the authorities an existing installation lacks; existing keys are never touched"
+        )]
+        add_missing: bool,
     },
-    #[command(about = "Show the user and host keys and whether the next rotation step is safe")]
+    #[command(
+        about = "Show the keys of every authority and whether the next rotation step is safe"
+    )]
     Status {
         #[arg(long, help = "Print JSON instead of text")]
         json: bool,
@@ -185,6 +193,10 @@ enum Authority {
     User,
     Host,
     Internal,
+    #[value(name = "user-x509")]
+    UserX509,
+    #[value(name = "db-client")]
+    DbClient,
 }
 
 impl From<Authority> for CaKind {
@@ -193,6 +205,8 @@ impl From<Authority> for CaKind {
             Authority::User => CaKind::User,
             Authority::Host => CaKind::Host,
             Authority::Internal => CaKind::Internal,
+            Authority::UserX509 => CaKind::UserX509,
+            Authority::DbClient => CaKind::DbClient,
         }
     }
 }
@@ -364,7 +378,12 @@ fn ca_command(config: &Path, command: CaCommand) -> ExitCode {
         step,
     };
     let action = match command {
-        CaCommand::Init { generate_identity } => return ca::init(config, generate_identity),
+        CaCommand::Init {
+            add_missing: true, ..
+        } => return ca::add_missing(config),
+        CaCommand::Init {
+            generate_identity, ..
+        } => return ca::init(config, generate_identity),
         CaCommand::Status { json } => RotationAction::Status { json },
         CaCommand::AddNext { authority } => change(authority, ChangeStep::AddNext),
         CaCommand::Promote { authority, force } => change(authority, ChangeStep::Promote { force }),
@@ -394,9 +413,10 @@ fn not_implemented(command: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
+    use jaunt_ca::CaKind;
 
-    use super::Cli;
+    use super::{CaCommand, Cli, Command};
 
     #[test]
     fn cli_definition_is_valid() {
@@ -462,5 +482,32 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn the_new_authorities_are_named_on_the_command_line() {
+        for (name, expected) in [
+            ("user-x509", CaKind::UserX509),
+            ("db-client", CaKind::DbClient),
+        ] {
+            let parsed = Cli::try_parse_from(["jauntd", "ca", "add-next", name]).unwrap();
+            let Command::Ca {
+                command: CaCommand::AddNext { authority },
+            } = parsed.command
+            else {
+                panic!("{name}: not parsed as add-next");
+            };
+            assert_eq!(CaKind::from(authority), expected);
+            assert_eq!(expected.as_str(), name);
+        }
+        let both = Cli::try_parse_from([
+            "jauntd",
+            "ca",
+            "init",
+            "--add-missing",
+            "--generate-identity",
+        ]);
+        assert!(both.is_err());
+        assert!(Cli::try_parse_from(["jauntd", "ca", "init", "--add-missing"]).is_ok());
     }
 }

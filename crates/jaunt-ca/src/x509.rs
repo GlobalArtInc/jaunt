@@ -1,3 +1,4 @@
+mod client;
 mod identity;
 mod key;
 mod root;
@@ -21,6 +22,10 @@ use ssh_key::sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub use client::{
+    CLIENT_ROOT_VALIDITY, ClientCa, DB_CLIENT_BACKDATE, DB_CLIENT_VALIDITY, DbClientParams,
+    MAX_USER_X509_VALIDITY, UserX509Params,
+};
 pub use identity::{NodeIdentity, parse_node_identity};
 pub use key::SubjectPublicKey;
 
@@ -29,15 +34,21 @@ use crate::error::CaError;
 use crate::kind::CaKind;
 use crate::signer::Signer;
 use key::SignerKey;
-use root::RootValidity;
+use root::{RootProfile, RootValidity};
 
 pub const DEFAULT_NODE_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const MAX_NODE_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const DEFAULT_SERVER_VALIDITY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const MAX_SERVER_VALIDITY: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+pub const DEFAULT_SERVICE_VALIDITY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const ROOT_VALIDITY: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 
 const ROOT_COMMON_NAME: &str = "Jaunt Internal CA";
+const INTERNAL_ROOT: RootProfile = RootProfile {
+    kind: CaKind::Internal,
+    common_name: ROOT_COMMON_NAME,
+    validity: ROOT_VALIDITY,
+};
 const MAX_SERVER_NAMES: usize = 8;
 const MAX_COMMON_NAME_LEN: usize = 64;
 const KEY_IDENTIFIER_LEN: usize = 20;
@@ -64,33 +75,33 @@ pub struct IssuedCertificate {
     pub not_after: SystemTime,
 }
 
+impl IssuedCertificate {
+    pub fn sha256_hex(&self) -> String {
+        sha256_hex(&self.certificate_der)
+    }
+}
+
 pub struct InternalCa {
-    signer: Arc<dyn Signer>,
-    root_der: Vec<u8>,
-    root_validity: RootValidity,
+    issuer: LeafIssuer,
 }
 
 impl InternalCa {
     pub fn new(signer: Arc<dyn Signer>, root_der: Vec<u8>) -> Result<Self, CaError> {
-        let key = SignerKey::new(signer.as_ref(), CaKind::Internal)?;
-        let root_validity = root::validate(&root_der, key.raw())?;
         Ok(Self {
-            signer,
-            root_der,
-            root_validity,
+            issuer: LeafIssuer::new(signer, root_der, CaKind::Internal)?,
         })
     }
 
     pub fn create_root(signer: &dyn Signer, now: SystemTime) -> Result<IssuedCertificate, CaError> {
-        root::create(signer, now)
+        root::create(signer, now, &INTERNAL_ROOT)
     }
 
     pub fn root_der(&self) -> &[u8] {
-        &self.root_der
+        self.issuer.root_der()
     }
 
     pub fn root_sha256_hex(&self) -> String {
-        sha256_hex(&self.root_der)
+        self.issuer.root_sha256_hex()
     }
 
     pub fn issue_node_certificate(
@@ -102,7 +113,7 @@ impl InternalCa {
             return Err(CaError::InvalidNodeId);
         }
         let window = window(now, params.validity, MAX_NODE_VALIDITY)?;
-        self.check_window(now, &window)?;
+        self.issuer.check_window(now, &window)?;
         let node_id = params.node_id.hyphenated().to_string();
         let uri = Ia5String::try_from(identity::node_urn(params.node_id)).map_err(CaError::X509)?;
         self.issue_leaf(
@@ -127,12 +138,8 @@ impl InternalCa {
         validate_server_names(&dns_names)?;
         let first_name = dns_names.first().ok_or(CaError::InvalidHostnames)?;
         let window = window(now, params.validity, MAX_SERVER_VALIDITY)?;
-        self.check_window(now, &window)?;
-        let names = dns_names
-            .iter()
-            .map(|name| Ia5String::try_from(name.as_str()).map(SanType::DnsName))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(CaError::X509)?;
+        self.issuer.check_window(now, &window)?;
+        let names = dns_sans(&dns_names)?;
         self.issue_leaf(
             &params.subject_public_key,
             &window,
@@ -142,12 +149,27 @@ impl InternalCa {
         )
     }
 
-    fn check_window(&self, now: SystemTime, window: &Window) -> Result<(), CaError> {
-        let now_seconds = now
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| CaError::InvalidTime)?
-            .as_secs();
-        self.root_validity.check(now_seconds, window.valid_before)
+    pub fn issue_service_certificate(
+        &self,
+        params: ServerCertParams,
+        now: SystemTime,
+    ) -> Result<IssuedCertificate, CaError> {
+        let dns_names: Vec<String> = params
+            .dns_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        validate_dns_names(&dns_names)?;
+        let window = window(now, params.validity, MAX_SERVER_VALIDITY)?;
+        self.issuer.check_window(now, &window)?;
+        self.issuer.issue(Leaf {
+            subject: &params.subject_public_key,
+            window: &window,
+            common_name: None,
+            usage: ExtendedKeyUsagePurpose::ServerAuth,
+            names: dns_sans(&dns_names)?,
+            serial: random_serial()?,
+        })
     }
 
     fn issue_leaf(
@@ -158,21 +180,94 @@ impl InternalCa {
         usage: ExtendedKeyUsagePurpose,
         names: Vec<SanType>,
     ) -> Result<IssuedCertificate, CaError> {
-        let serial = random_serial()?;
+        self.issuer.issue(Leaf {
+            subject,
+            window,
+            common_name: Some(subject_name),
+            usage,
+            names,
+            serial: random_serial()?,
+        })
+    }
+}
+
+impl fmt::Debug for InternalCa {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InternalCa")
+            .field("kind", &self.issuer.kind())
+            .field("root_sha256", &format_args!("{}", self.root_sha256_hex()))
+            .finish_non_exhaustive()
+    }
+}
+
+struct LeafIssuer {
+    kind: CaKind,
+    signer: Arc<dyn Signer>,
+    root_der: Vec<u8>,
+    root_validity: RootValidity,
+}
+
+struct Leaf<'a> {
+    subject: &'a SubjectPublicKey,
+    window: &'a Window,
+    common_name: Option<&'a str>,
+    usage: ExtendedKeyUsagePurpose,
+    names: Vec<SanType>,
+    serial: u128,
+}
+
+impl LeafIssuer {
+    fn new(signer: Arc<dyn Signer>, root_der: Vec<u8>, kind: CaKind) -> Result<Self, CaError> {
+        let key = SignerKey::new(signer.as_ref(), kind)?;
+        let root_validity = root::validate(&root_der, key.raw())?;
+        Ok(Self {
+            kind,
+            signer,
+            root_der,
+            root_validity,
+        })
+    }
+
+    fn kind(&self) -> CaKind {
+        self.kind
+    }
+
+    fn root_der(&self) -> &[u8] {
+        &self.root_der
+    }
+
+    fn root_sha256_hex(&self) -> String {
+        sha256_hex(&self.root_der)
+    }
+
+    fn check_window(&self, now: SystemTime, window: &Window) -> Result<(), CaError> {
+        let now_seconds = now
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| CaError::InvalidTime)?
+            .as_secs();
+        self.root_validity.check(now_seconds, window.valid_before)
+    }
+
+    fn issue(&self, leaf: Leaf<'_>) -> Result<IssuedCertificate, CaError> {
+        if leaf.serial == 0 {
+            return Err(CaError::InvalidSerial);
+        }
         let mut params = CertificateParams::default();
-        let (not_before, not_after) = set_window(&mut params, window)?;
-        params.serial_number = Some(serial_number(serial));
-        params.distinguished_name = common_name(subject_name);
+        let (not_before, not_after) = set_window(&mut params, leaf.window)?;
+        params.serial_number = Some(serial_number(leaf.serial));
+        params.distinguished_name = leaf
+            .common_name
+            .map_or_else(DistinguishedName::new, common_name);
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![usage];
-        params.subject_alt_names = names;
+        params.extended_key_usages = vec![leaf.usage];
+        params.subject_alt_names = leaf.names;
         params.use_authority_key_identifier_extension = true;
-        params.key_identifier_method = key_identifier(subject.raw());
-        let certificate_der = self.sign(&params, subject)?;
+        params.key_identifier_method = key_identifier(leaf.subject.raw());
+        let certificate_der = self.sign(&params, leaf.subject)?;
         Ok(IssuedCertificate {
             certificate_der,
-            serial,
+            serial: leaf.serial,
             not_before,
             not_after,
         })
@@ -183,7 +278,7 @@ impl InternalCa {
         params: &CertificateParams,
         subject: &SubjectPublicKey,
     ) -> Result<Vec<u8>, CaError> {
-        let key = SignerKey::new(self.signer.as_ref(), CaKind::Internal)?;
+        let key = SignerKey::new(self.signer.as_ref(), self.kind)?;
         if subject.raw() == key.raw() {
             return Err(CaError::InvalidSubjectKey);
         }
@@ -196,27 +291,37 @@ impl InternalCa {
     }
 }
 
-impl fmt::Debug for InternalCa {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InternalCa")
-            .field("kind", &self.signer.kind())
-            .field("root_sha256", &format_args!("{}", self.root_sha256_hex()))
-            .finish_non_exhaustive()
-    }
+pub(crate) fn validate_root(root_der: &[u8], key: &SubjectPublicKey) -> Result<(), CaError> {
+    root::validate(root_der, key.raw()).map(drop)
 }
 
 fn validate_server_names(names: &[String]) -> Result<(), CaError> {
-    validate_hostnames(names)?;
-    let acceptable = names.len() <= MAX_SERVER_NAMES
-        && names
-            .first()
-            .is_some_and(|name| name.len() <= MAX_COMMON_NAME_LEN)
-        && names.iter().all(|name| is_dns_name(name));
-    if acceptable {
+    validate_dns_names(names)?;
+    if names
+        .first()
+        .is_some_and(|name| name.len() <= MAX_COMMON_NAME_LEN)
+    {
         Ok(())
     } else {
         Err(CaError::InvalidHostnames)
     }
+}
+
+fn validate_dns_names(names: &[String]) -> Result<(), CaError> {
+    validate_hostnames(names)?;
+    if names.len() <= MAX_SERVER_NAMES && names.iter().all(|name| is_dns_name(name)) {
+        Ok(())
+    } else {
+        Err(CaError::InvalidHostnames)
+    }
+}
+
+fn dns_sans(names: &[String]) -> Result<Vec<SanType>, CaError> {
+    names
+        .iter()
+        .map(|name| Ia5String::try_from(name.as_str()).map(SanType::DnsName))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CaError::X509)
 }
 
 fn is_dns_name(name: &str) -> bool {

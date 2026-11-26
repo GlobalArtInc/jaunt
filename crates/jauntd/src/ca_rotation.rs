@@ -1,11 +1,11 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::ssh_key::{Fingerprint, HashAlg};
-use jaunt_ca::{CaError, CaKind, CaLock, FileBackend, TrustSet, fingerprint_hex};
+use jaunt_ca::{CaError, CaKind, CaLock, ClientCa, FileBackend, TrustSet, fingerprint_hex};
 use jaunt_control::ca_rotation::{
     self, Counters, RotationKind, RotationStep, SlotReport, Summary, Unexpired, Verdict,
 };
@@ -236,6 +236,8 @@ fn rotation_kind(kind: CaKind) -> Result<RotationKind, CaError> {
     match kind {
         CaKind::User => Ok(RotationKind::User),
         CaKind::Host => Ok(RotationKind::Host),
+        CaKind::UserX509 => Ok(RotationKind::UserX509),
+        CaKind::DbClient => Ok(RotationKind::DbClient),
         CaKind::Internal => Err(CaError::RotationUnsupported(kind)),
     }
 }
@@ -261,8 +263,15 @@ impl Change<'_> {
         let identity = resolve_identity(self.lock.root(), self.context.env)
             .map_err(RotationError::Identity)?;
         let had_next = self.read_back()?.next().is_some();
-        let fp = match FileBackend::add_next(self.lock, self.kind.ca_kind(), &identity) {
-            Ok(key) => fingerprint_hex(&key),
+        let ca_kind = self.kind.ca_kind();
+        let added = if ca_kind.is_x509_client() {
+            ClientCa::add_next(self.lock, ca_kind, &identity, self.issued_at())
+                .map(|added| (added.public_key, Some(added.root.sha256_hex())))
+        } else {
+            FileBackend::add_next(self.lock, ca_kind, &identity).map(|key| (key, None))
+        };
+        let (fp, root) = match added {
+            Ok((key, root)) => (fingerprint_hex(&key), root),
             Err(error) => {
                 let after = self.read_back_after(error)?;
                 return match after.trust.next().filter(|_| !had_next) {
@@ -275,12 +284,13 @@ impl Change<'_> {
             }
         };
         self.audit_added(&fp);
+        let kind = self.kind.as_str();
+        let root_line = root
+            .map(|sha| format!("{kind} root sha256:{sha}\n"))
+            .unwrap_or_default();
         say(
             streams,
-            &format!(
-                "{} key {fp} added as next\n{LAST_LINE}\n",
-                self.kind.as_str()
-            ),
+            &format!("{kind} key {fp} added as next\n{root_line}{LAST_LINE}\n"),
         )?;
         Ok(EXIT_OK)
     }
@@ -303,6 +313,7 @@ impl Change<'_> {
         let (nodes_behind, old_unexpired) = match self.kind {
             RotationKind::User => (Some(count(summary.nodes_behind.len())), None),
             RotationKind::Host => (None, Some(summary.old_host_trust.count)),
+            RotationKind::UserX509 | RotationKind::DbClient => (None, None),
         };
         let fp = fingerprint_hex(next);
         let audit = || {
@@ -400,6 +411,10 @@ impl Change<'_> {
         Ok(EXIT_OK)
     }
 
+    fn issued_at(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.now.unsigned_abs())
+    }
+
     fn read_back(&self) -> Result<TrustSet, RotationError> {
         Ok(FileBackend::read_slot(self.lock.root(), self.kind.ca_kind())?.trust)
     }
@@ -428,6 +443,7 @@ impl Change<'_> {
         let (old_unexpired, nodes_old) = match self.kind {
             RotationKind::User => (Some(summary.old_certificates.count), None),
             RotationKind::Host => (None, Some(count(summary.nodes_on_old_host_key.len()))),
+            RotationKind::UserX509 | RotationKind::DbClient => (None, None),
         };
         tracing::info!(
             target: "jaunt::audit",
@@ -558,6 +574,7 @@ fn render_text(reports: &[SlotReport]) -> String {
                 }
                 text.push('\n');
             }
+            RotationKind::UserX509 | RotationKind::DbClient => {}
         }
         for step in &report.steps {
             text.push_str(&format!("  {}\n", step.line));
