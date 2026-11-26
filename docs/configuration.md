@@ -177,7 +177,7 @@ Command-line flags:
 
 | Command | Flags |
 |---|---|
-| `jaunt-agent enroll` | `--server <URL>` and `--name <NAME>` (required), `--labels k=v,...`, `--replace`, `--ca-pin sha256:<hex>`, `--state-dir <DIR>` (default `/var/lib/jaunt`), `--hostname <NAME>`, `--timeout-secs <N>` (default 900) |
+| `jaunt-agent enroll` | `--server <URL>` and `--name <NAME>` (required), `--labels k=v,...`, `--replace`, `--ca-pin sha256:<hex>`, `--state-dir <DIR>` (default `/var/lib/jaunt`), `--hostname <NAME>`, `--timeout-secs <N>` (default 900), `--token-file <PATH>` (enrol with a join token from this file, without an approval code; see [operations.md](operations.md#enrol-many-nodes-with-join-tokens)) |
 | `jaunt-agent install` | `--user` (default `jaunt`), `--binary` (default `/usr/local/bin/jaunt-agent`), `--config`, `--state-dir`, `--root` (default `/`), `--no-service`, `--dry-run` |
 | `jaunt-agent uninstall` | `--purge`, `--config`, `--state-dir`, `--root`, `--no-service`, `--dry-run` |
 | `jaunt-agent run` | `--config <PATH>`, `--state-dir <DIR>` |

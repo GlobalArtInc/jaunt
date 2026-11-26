@@ -8,7 +8,7 @@ alias jd='sudo -u jauntd jauntd --config /etc/jaunt/jauntd.yaml'
 
 The outputs below were captured from a real run of [quickstart.md](quickstart.md). Values such as fingerprints and ids differ in your installation.
 
-Contents: [Revocation](#revocation), [CA rotation](#ca-rotation), [Internal CA pin](#internal-ca-pin), [Recordings](#recordings), [Backup and restore](#backup-and-restore), [Upgrade and rollback](#upgrade-and-rollback), [Limits](#limits), [Audit](#audit), [Troubleshooting](#troubleshooting), [Web terminal](#web-terminal).
+Contents: [Revocation](#revocation), [CA rotation](#ca-rotation), [Internal CA pin](#internal-ca-pin), [Enrol many nodes with join tokens](#enrol-many-nodes-with-join-tokens), [Recordings](#recordings), [Backup and restore](#backup-and-restore), [Upgrade and rollback](#upgrade-and-rollback), [Limits](#limits), [Audit](#audit), [Troubleshooting](#troubleshooting), [Web terminal](#web-terminal).
 
 ## Revocation
 
@@ -124,6 +124,178 @@ sudo sh -c 'sha256sum /var/lib/jauntd/ca/internal/*.root.der'
 ```
 
 The output is `<64 hex digits>  <file>`; the pin is `sha256:<64 hex digits>`. This is the same value `ca init` printed (checked on the test stand). If the data directory is lost together with all backups, the pin is lost with it; but then the CA keys are lost too and the previous section applies. Without `--ca-pin` the agent takes the root the server hands over during enrolment, so a first enrolment over a hostile network could be fooled. Use the pin.
+
+## Enrol many nodes with join tokens
+
+**Trigger:** you bring in many hosts at once (a fleet, a rebuild, a scaling group) and typing a code for each one is too slow, or no person is at the host.
+
+A join token pre-approves a bounded number of enrolments. The agent reads the token from a file, and the server creates its enrolment already approved. No one types a code and no one compares fingerprints. The token is a bearer credential: whoever holds it can enrol a host inside its scope until it expires or runs out.
+
+### What a token can and cannot do
+
+| Property | Rule |
+|---|---|
+| node name | exactly one of `--name` (the only name accepted) and `--name-prefix` (any name that starts with it). A name is 1 to 63 lowercase letters, digits or `-`, starting and ending with a letter or digit; a prefix has the same characters, starts with a letter or digit and may end with `-`. Write `web-`, not `web`: `web` also matches `website` |
+| labels | the node gets exactly the `--label k=v` pairs of the token, at most 16, repeated once per label (rules as for `--labels` of `enroll`: the key matches `[a-z][a-z0-9_.-]{0,62}`, the value `[A-Za-z0-9._-]{0,63}`). The agent's own `--labels` may only repeat pairs the token has; any other label is refused. An agent that gives no labels still gets all pinned ones |
+| uses | `--uses`, 1 to 1000, default 1 |
+| lifetime | `--ttl`, a whole number and one of `s`, `m`, `h`, `d` (`30m`, `2d`); at least 1 second, at most `7d`, default `1h` |
+| replacing a node | only when the token has `--allow-replace` and the agent runs `enroll --replace` |
+
+A token cannot widen its scope, be extended, or be shown again: the server keeps only its SHA-256 hash. It does not identify the host that uses it, so keep the scope as narrow as the job allows. A node that enrols with a token gets a name inside the token's scope and exactly the token's labels. Policy gives access by labels, so a token that pins `env=prod` gives the new host every access that `env=prod` nodes have.
+
+### 1. Create the token
+
+On the control host:
+
+```sh
+jd join-token create --name-prefix web- --label env=prod --label role=web --uses 5 --ttl 2h
+```
+
+Exactly one of `--name` and `--name-prefix` is required. The token is the only thing printed on stdout (47 characters: `jt1.` and 43 more). The id and the expiry go to stderr:
+
+```text
+jt1.<43 characters>
+```
+
+```text
+created join token 5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90 for node names starting with web-; 5 uses; labels env=prod,role=web; expires at 2026-11-26T14:00:00Z
+the token above is shown only this once: put it in a file with mode 0600 owned by the agent's user and run `jaunt-agent enroll --token-file <file>`
+```
+
+Because stdout carries only the token, you can write it to a file that nobody else can read, and keep the terminal free of it:
+
+```sh
+(umask 077 && jd join-token create --name-prefix web- --label env=prod --label role=web --uses 5 --ttl 2h > join-token.txt)
+```
+
+That file lives on the control host and is owned by you. Deliver the token to the node through your own secret channel, then delete the file at once (`shred -u join-token.txt` or `rm -- join-token.txt`).
+
+Exit codes: 0 done, 1 failed, 2 a usage error (a bad name, prefix, label, `--uses` or `--ttl`, or both or neither of `--name` and `--name-prefix`). The command needs the database, so start `jauntd` once before the first token. Creating a token is audited (`join_token.created`).
+
+### 2. Put the token on the node
+
+The token must not appear in a command line, so type or paste it into a file. On the node:
+
+```sh
+sudo sh -c 'umask 077 && cat > /root/jaunt-join-token'
+```
+
+Paste the token, press Enter, then Ctrl-D. Or let your configuration management or secret store write the file. The agent refuses the file unless all of these hold:
+
+- the mode is 0600 or stricter (no bit outside `rw` for the owner);
+- the owner is the user that runs `jaunt-agent enroll` (under `sudo`, root);
+- it is a regular file, and the last part of the path is not a symbolic link;
+- it is at most 4 KiB, and it holds the token and nothing else (blanks and line ends around it are ignored).
+
+### 3. Install, enrol, start
+
+Keep the order from [install.md](install.md): install the service, then enrol, then start. `install` refuses a state directory that `enroll` has already filled.
+
+```sh
+sudo jaunt-agent install
+sudo jaunt-agent enroll --server https://<host> --name web-01 --labels env=prod,role=web --ca-pin sha256:<hash> --token-file /root/jaunt-join-token
+sudo systemctl start jaunt-agent
+sudo rm -- /root/jaunt-join-token
+```
+
+Keep `--ca-pin` ([Internal CA pin](#internal-ca-pin)): the agent sends the token to the server it is talking to. The agent prints no code. It shows the fingerprints of its keys and the time by which it must collect its certificates (15 minutes), and then it enrols:
+
+```text
+tls key:      sha256:...
+ssh host key: SHA256:...
+expires at:   2026-11-26T12:15:00Z
+```
+
+```text
+the join token was accepted; collecting the certificates
+enrolled as node 3f9a... (web-01); certificates valid until 2026-12-03T12:00:00Z; start the agent with `jaunt-agent run`
+```
+
+On the control host the node appears with the token as its approver. The trail has `node.enroll.requested`, `join_token.used` (it takes the place of `node.enroll.approved`, which a join does not write) and, when the agent collects its certificates, `node.enroll.delivered`:
+
+```sh
+jd node list
+jd join-token list
+```
+
+```text
+NAME    STATE   CERT       LABELS             APPROVED BY                                      CREATED
+web-01  active  delivered  env=prod,role=web  join-token:5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90  2026-11-26T12:00:00Z
+```
+
+```text
+ID                                    NAME   LABELS             USES  EXPIRES               REVOKED               REPLACE
+5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90  web-*  env=prod,role=web  4/5   2026-11-26T14:00:00Z  -                     no
+a4e1d7c2-0b35-4f68-8e19-72c5b9d03a16  db-01  -                  1/1   2026-11-26T13:30:00Z  2026-11-26T12:40:00Z  yes
+```
+
+`USES` is the uses left and the uses allowed. The list never shows a token. An expired token stays in the list for about an hour and is then deleted; its audit events stay.
+
+### Uses
+
+A use is consumed in the same database transaction that creates the node and its approved enrolment. A refused attempt (wrong name, wrong labels, a name that is taken) consumes nothing.
+
+A use is not given back once it is consumed. If the agent stops before it collects its certificates, the node stays: `jd node list` shows it `active` with `CERT` `pending`, and `none` after the 15 minutes, and the name is taken. To try again, remove the node and enrol again with a token that has a use left, or use `--replace` with a token that has `--allow-replace`:
+
+```sh
+jd node rm web-01
+```
+
+### Replacing an existing node
+
+Replacing needs both sides: the agent runs `enroll --replace` and the token was created with `--allow-replace`. The old node is removed in the same transaction that consumes the use (`node.removed` with `reason: replaced` and the token as the actor), its open sessions are closed at once, and the new host takes the name. If closing the sessions fails the log says so and the periodic session sweep closes them. With `--replace` but without `--allow-replace`, an active name is refused (`replace_not_allowed`); `--replace` on a name that is free just enrols.
+
+Note: `--allow-replace` lets whoever holds the token take over the name of a running node with a new host and new keys, and the policy that matches that name or its labels then reaches the new host. Use it only with `--name`, `--uses 1` and a short `--ttl`, and never with a prefix that covers production hosts.
+
+### Revoke a token
+
+```sh
+jd join-token rm 5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90
+```
+
+```text
+revoked join token 5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90 (4 of 5 uses were left)
+```
+
+Revoking stops new enrolments at once. It does not remove nodes that already enrolled with the token, nor enrolments whose certificates were not collected yet. Find those nodes by `join-token:<id>` in the `APPROVED BY` column and remove the ones you do not trust:
+
+```sh
+jd node list | grep 'join-token:5b0c0a3e-8d4f-4b1a-9c27-3f6e1d2a7b90'
+jd node rm web-03
+```
+
+Revoking an unknown id or a revoked token exits with 1 (`no join token has this id`, `the join token is already revoked`). `join_token.revoked` records the operator and the uses left.
+
+### When a token is refused
+
+The agent always sees the same refusal, whatever the reason, so that someone who guesses tokens learns nothing:
+
+```text
+the server refused the join token: it is unknown, expired, used up or revoked, or it does not allow this name, these labels or --replace
+```
+
+The cause is in the audit event `join_token.refused`: `reason`, `join_id` (absent when the token is unknown or malformed), the requested `name`, `source_ip` and `source_network`. Refusals are noisy events without a `suppressed` count: each one is a separate event, and when the noisy audit queue is full the newest are dropped (see Limits), so a flood of guesses can hide some refusals from the trail. The reasons:
+
+| `reason` | Cause | What to do |
+|---|---|---|
+| `malformed` | the text is not shaped like a join token (an agent never sends this) | look at `source_ip`: this is a hand-made request |
+| `unknown` | no token has this hash: a mistyped or truncated token, a token of another server, or a token deleted an hour after its expiry | create a new token |
+| `revoked` | the token was revoked | create a new token if the revocation was a mistake |
+| `expired` | past its `--ttl` | create a new token |
+| `used_up` | all uses are consumed | create a new token, or look for a node that was enrolled and never finished (see Uses) |
+| `name_mismatch` | the node name is not the token's name or does not start with its prefix | fix `--name` on the agent, or create a token for that name |
+| `label_mismatch` | the agent asked for a label that the token does not pin, or with another value | remove the label from the agent or create a token with it |
+| `replace_not_allowed` | the agent used `--replace`, the name is active and the token has no `--allow-replace` | read the Note above before you create such a token |
+
+When several of `revoked`, `expired` and `used_up` hold, the first of them in this order is reported. One answer is different on purpose: if the name is active and the agent did not pass `--replace`, the server answers `409` and the agent prints `the server refused the request: the name is already used by an active node; run again with --replace to replace that node`. That check runs before the token is read and writes no `join_token.refused` event. Attempts count against the `http.enroll` rate limit (429, see Limits).
+
+### Do not
+
+- Do not put a token in a command line, an environment variable, a chat message or a ticket. The agent and `jauntd` have no option for it, on purpose: arguments show up in the process list and in shell history.
+- Do not create long-lived tokens. The limit is 7 days and the default is 1 hour. Create the token when you start the roll-out and revoke it when you finish.
+- Do not reuse one token across environments. Make one token per environment and role, with its labels pinned, so that a leak in staging does not enrol a production host.
+- Do not leave the token file on the node after enrolment, and do not copy it into an image or a backup.
+- Do not give a prefix token more uses than the number of hosts you are bringing in.
 
 ## Recordings
 
@@ -242,7 +414,7 @@ Defaults are in [configuration.md](configuration.md#limits). What you see when o
 | recording memory on the node (`recording.*`) | recording data is dropped and the session is marked incomplete | agent log `agent.ssh.recording_dropped`; session `recording_incomplete: true` |
 | recording uploads and sizes on the server (`recordings.*`) | the upload is refused | audit `recording.rejected` with `reason` |
 
-All noisy events are summarised: the first occurrence is logged and later ones are counted into `suppressed`.
+Noisy events are the connection-level and flood-driven ones (the `(noisy)` rows in the [Audit](#audit) table). Eight of them carry a `suppressed` field: the first occurrence is logged and later ones are counted into it (`recording.rejected`, `login.callback_refused`, `http.rate_limited`, `http.connection_limited`, `http.client_ip_header_ignored`, `gate.limited`, `agent.limited`, `terminal.denied`). The other six have no such field and are written one by one: `login.device.code_failed`, `gate.connect`, `gate.session_refused`, `gate.disconnect`, `agent.rejected` and `join_token.refused`. Noisy events wait in their own queue, a quarter of `audit.queue` (256 with the default of 1024). Critical events have their own queue and are written first, so a flood of noisy events never displaces them. When the noisy queue is full, the newest noisy events are dropped, not the old ones. The daemon logs `the noisy audit queue is full, the newest noisy events were dropped` with the number dropped, at most once a minute, and the daemon log is the only place that says so.
 
 ## Audit
 
@@ -254,7 +426,7 @@ sudo journalctl -u jauntd -o cat | grep '^{"v":1' | jq -c 'select(.type | starts
 
 The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
 
-Types and fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
+The 64 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
 
 | Type | Actor | Fields |
 |---|---|---|
@@ -299,6 +471,10 @@ Types and fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields a
 | `node.enroll.delivered` | node | `enrollment_id`, `name`, `x509_serial`, `ssh_serial`; envelope: node |
 | `node.removed` | user | `name`, `reason`; envelope: node |
 | `node.cert.renewed` | node | `name`, `x509_serial`, `ssh_serial`, `rotated`; envelope: node |
+| `join_token.created` | user | `join_id`, `name`, `name_prefix`, `labels`, `max_uses`, `expires_at`, `allow_replace` |
+| `join_token.used` | anonymous | `join_id`, `enrollment_id`, `name`, `uses_left`, `replaced_node_id`, `source_ip`, `source_network`; envelope: node |
+| `join_token.refused` (noisy) | anonymous | `reason`, `join_id`, `name`, `source_ip`, `source_network` |
+| `join_token.revoked` | user | `join_id`, `uses_left` |
 | `recording.completed` | node | `chunks`, `raw_bytes`, `incomplete`, `input_recorded`; envelope: node, session_id |
 | `recording.rejected` (noisy) | node | `reason`, `suppressed`; envelope: node, session_id |
 | `recording.viewed` | user | `kind`; envelope: session_id |
@@ -319,7 +495,7 @@ Types and fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields a
 | `terminal.closed` | user | `reason`, `bytes_in`, `bytes_out`, `duration_ms`, `serial`; envelope: node, session_id |
 | `terminal.denied` (noisy) | user | `reason`, `node`, `login`, `client_addr`, `suppressed` |
 
-What is **not** audited: terminal output and keystrokes (that is the recording); individual SFTP file operations; the contents of commands run with `ssh host command` beyond what the metadata recording holds; reads of the console pages other than recordings; and the agent-side events listed under `agent.ssh.*` (they are in the agent's log, not in the server's trail). The `jauntd` subcommands that change state (`revoke`, `node approve`, `node rm`, `ca ...`) are audited; `node list`, `ca status` and `recordings verify` are not. With `audit.database: false` the console and the API see nothing; with `audit.jsonl: off` the trail exists only in the database, which an administrator with access to the host can alter.
+What is **not** audited: terminal output and keystrokes (that is the recording); individual SFTP file operations; the contents of commands run with `ssh host command` beyond what the metadata recording holds; reads of the console pages other than recordings; and the agent-side events listed under `agent.ssh.*` (they are in the agent's log, not in the server's trail). The `jauntd` subcommands that change state (`revoke`, `node approve`, `node rm`, `join-token create`, `join-token rm`, `ca ...`) are audited; `node list`, `join-token list`, `ca status` and `recordings verify` are not. With `audit.database: false` the console and the API see nothing; with `audit.jsonl: off` the trail exists only in the database, which an administrator with access to the host can alter.
 
 ## Troubleshooting
 
@@ -347,10 +523,12 @@ Enrolment:
 | Message | Cause |
 |---|---|
 | the code is rejected as unknown or expired | the request lives 15 minutes; start `jaunt-agent enroll` again |
-| `name_taken` | a node of that name is active. Choose another name, or use `--replace` and approve: the old node is removed |
+| `name_taken` | a node of that name is active. Choose another name, or use `--replace` and approve: the old node is removed. After a join-token enrolment that did not finish, the half-enrolled node holds the name: see [Uses](#uses) |
 | the agent refuses the server (pin mismatch) | `--ca-pin` is not the `internal-ca` value of this server; see [Internal CA pin](#internal-ca-pin) |
 | `refusing to use the state directory ... it exists, is not empty and has no inner-ca.pub` from `install` | `install` ran after `enroll`; run `install` first |
 | 429 on enrol | a rate limit |
+| `the server refused the join token: it is unknown, expired, used up or revoked, or it does not allow this name, these labels or --replace` | the one answer the agent gets for every join-token refusal. Where to look: audit `join_token.refused` with `reason` `malformed`, `unknown`, `revoked`, `expired`, `used_up`, `name_mismatch`, `label_mismatch` or `replace_not_allowed`; the table in [When a token is refused](#when-a-token-is-refused) |
+| `cannot use the join token file: ...` | the agent checked the file before it sent anything: `cannot open`, `is a symbolic link`, `is not a regular file`, `is not owned by the user running the agent`, `has mode 0644; it must be 0600 or stricter`, `does not hold a join token` (also for a file over 4 KiB). Where to look: the file rules in [Put the token on the node](#2-put-the-token-on-the-node); under `sudo` the owner must be root |
 | the agent cannot connect with TLS errors | `agent_endpoint` host does not resolve to the control host from the node, or port 8444 is blocked, or a load balancer terminates TLS (it must pass it through) |
 
 Agent log lines (structured JSON; `target` `jaunt::agent`):

@@ -193,6 +193,9 @@ NAME    STATE   CERT       LABELS    APPROVED BY  CREATED
 web-01  active  delivered  env=eval  cli:jauntd   2026-11-26T18:39:22Z
 {"v":1,"id":"...","type":"agent.connected","time":"2026-11-26T18:39:25.338Z","actor":"node:...","fields":{"alpn":"jaunt-tunnel/1",...}}
 ```
+
+To enrol many hosts without typing codes, see [Enrol many nodes with join tokens](operations.md#enrol-many-nodes-with-join-tokens).
+
 ## 5. Sign in and connect
 
 On the laptop, install `jaunt` (step 1), then sign in. A browser opens on your identity provider. `--accept-ssh-config` lets `jaunt` add one `Include` line to `~/.ssh/config`; without it `jaunt` asks first.

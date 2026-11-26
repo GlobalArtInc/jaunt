@@ -43,6 +43,8 @@ The agent then logs in to the local `sshd` with an **inner certificate** that li
 
 **Web terminal.** The browser terminal is an SSH client run by the server. The server sees the terminal bytes in clear text; the end-to-end property holds for `ssh` from a laptop only. The terminal uses a certificate that the server signs for the user for 120 seconds. A browser open on the console can open a terminal wherever the policy allows; use short sessions (the cookie lasts 8 hours) for sensitive nodes.
 
+**Join tokens.** A join token ([operations.md](operations.md#enrol-many-nodes-with-join-tokens)) is a bearer credential: a host that holds it joins without a person approving the request or comparing fingerprints. The server stores only its SHA-256 hash and shows it once. What limits a leak is the scope pinned in the token, because policy gives access by node name and labels: an exact name or a name prefix, the labels the node gets (the agent cannot ask for others), a use count and a lifetime of at most 7 days. Replacing a running node needs the token's `--allow-replace` as well as the agent's `--replace`. Every refusal looks the same to the agent and carries a reason in the audit event `join_token.refused`.
+
 **Group membership** is read at sign-in. Removing a user from a group at the identity provider takes effect at the next sign-in (at most one certificate lifetime) or at once if you revoke the user.
 
 ## What is logged and recorded
@@ -83,6 +85,7 @@ The agent then logs in to the local `sshd` with an **inner certificate** that li
 
 - One `jauntd` process per database. No high availability.
 - The internal CA cannot be rotated without enrolling every node again.
+- A join token does not identify the host that uses it, and revoking it does not remove nodes that already enrolled. The answer `409 name_taken` is not the generic refusal: it is given before the token is looked at, so anyone who can reach the enrolment endpoint can learn that an active node has a given name (this was already so for enrolment by code).
 - No `deny` rules, no second factor per session, no live view of a session, no agent forwarding, `-R` or X11.
 - The gate is not isolated from the control role: both run in the `jauntd` process. A code execution bug in the SSH listener reaches the CA keys in memory.
 - Web sessions, including the browser terminal, pass through the gate and the server in clear text. This is an accepted risk of the design; use `ssh` from a laptop where end-to-end protection matters.
