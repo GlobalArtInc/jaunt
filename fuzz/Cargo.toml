@@ -13,9 +13,11 @@ members = ["."]
 
 [dependencies]
 http = "1.5.0"
+jaunt-kube = { path = "../crates/jaunt-kube" }
 jaunt-pgwire = { path = "../crates/jaunt-pgwire" }
 jaunt-policy = { path = "../crates/jaunt-policy" }
 jaunt-proto = { path = "../crates/jaunt-proto" }
+jaunt-record = { path = "../crates/jaunt-record" }
 jaunt-ssh = { path = "../crates/jaunt-ssh" }
 jaunt-tunnel = { path = "../crates/jaunt-tunnel" }
 libfuzzer-sys = "0.4.13"
@@ -79,6 +81,20 @@ bench = false
 [[bin]]
 name = "control_requests"
 path = "fuzz_targets/control_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kube_path"
+path = "fuzz_targets/kube_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kube_frames"
+path = "fuzz_targets/kube_frames.rs"
 test = false
 doc = false
 bench = false

@@ -34,6 +34,7 @@ jaunt-ssh = { path = "crates/jaunt-ssh" }
 jaunt-control = { path = "crates/jaunt-control" }
 jaunt-gate = { path = "crates/jaunt-gate" }
 jaunt-web = { path = "crates/jaunt-web" }
+jaunt-kube = { path = "crates/jaunt-kube" }
 
 [profile.dist]
 inherits = "release"

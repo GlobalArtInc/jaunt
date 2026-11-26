@@ -23,6 +23,7 @@ jaunt-record jaunt-ca jaunt-store jaunt-audit jaunt-control jaunt-oidc jaunt-pol
 jaunt-gate jaunt-ca jaunt-store
 jaunt-agent jaunt-ca jaunt-store jaunt-control jaunt-oidc jaunt-audit
 jaunt jaunt-ca jaunt-store jaunt-control jaunt-audit
+jaunt-kube jaunt-ca jaunt-store jaunt-control jaunt-gate
 jaunt-pgwire jaunt-ca jaunt-store jaunt-control jaunt-gate
 jaunt-agent jaunt-recording-s3
 jaunt jaunt-recording-s3
@@ -39,6 +40,7 @@ jaunt-proto jaunt-recording-s3
 jaunt-ca jaunt-recording-s3
 jaunt-store jaunt-recording-s3
 jaunt-record jaunt-recording-s3
+jaunt-kube jaunt-recording-s3
 jaunt-pgwire jaunt-recording-s3
 jaunt-recording-s3 jaunt-ca jaunt-control jaunt-oidc jaunt-policy jaunt-tunnel jaunt-ssh jaunt-gate jaunt-agent jaunt-web
 RULES

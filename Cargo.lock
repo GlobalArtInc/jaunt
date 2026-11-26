@@ -2382,6 +2382,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jaunt-kube"
+version = "0.0.0"
+dependencies = [
+ "http",
+ "jaunt-record",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "zstd",
+]
+
+[[package]]
 name = "jaunt-limits"
 version = "0.0.0"
 dependencies = [

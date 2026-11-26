@@ -1,0 +1,1 @@
+/api/v1/namespaces/default/pods/web/exec?command=sh&stdin=true&tty=true
