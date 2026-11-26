@@ -1,0 +1,2 @@
+# The binary is a static musl build on purpose: it runs on any Linux node without depending on the host libc.
+{{package}}: statically-linked-binary [usr/bin/{{package}}]

@@ -99,6 +99,50 @@ xattr -d com.apple.quarantine /usr/local/bin/jaunt
 
 `curl` does not set that flag, so it is usually not needed when you download from a terminal.
 
+## Install from the apt repository
+
+For Debian 12 and 13. The repository holds two packages, `jaunt-agent` and `jaunt`, built from the same static binaries as the release archives for amd64 and arm64. The address of the repository (`<repository-url>`) and the fingerprint of its signing key come from whoever publishes the repository. Check the fingerprint before you add the key.
+
+Download the public signing key and print its fingerprint:
+
+```sh
+sudo apt-get install -y curl gnupg
+repo=<repository-url>
+curl -fsSL -o jaunt.asc "$repo/jaunt-archive-keyring.asc"
+gpg --show-keys --with-fingerprint jaunt.asc
+```
+
+Continue only if the fingerprint is the one you were given. The key is downloaded from the same host as the packages, so the comparison is what ties it to the publisher. Then put the key in `/etc/apt/keyrings` and add the repository; the `signed-by` option limits the key to this repository only:
+
+```sh
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo install -m 0644 jaunt.asc /etc/apt/keyrings/jaunt.asc
+echo "deb [signed-by=/etc/apt/keyrings/jaunt.asc] $repo ./" | sudo tee /etc/apt/sources.list.d/jaunt.list
+sudo apt-get update
+```
+
+Install the packages you need:
+
+```sh
+sudo apt-get install jaunt-agent
+sudo apt-get install jaunt
+```
+
+The packages install files only: `/usr/bin/jaunt-agent` (or `/usr/bin/jaunt`) and, for the agent, the unit file `/usr/lib/systemd/system/jaunt-agent.service`. They do not enrol the node, create the `jaunt` account, change the sshd configuration or start anything. Set the node up yourself, in this order: run the installer first, enrol second, start the service last. The installer needs to know where the packaged binary is, and `jaunt-agent install` refuses to run on a node that is already enrolled. The `enroll` options are described in [Install the node agent](#install-the-node-agent).
+
+```sh
+sudo jaunt-agent install --dry-run --binary /usr/bin/jaunt-agent
+sudo jaunt-agent install --binary /usr/bin/jaunt-agent
+sudo jaunt-agent enroll --server https://<host> --name <node> --ca-pin sha256:<hash>
+sudo systemctl start jaunt-agent
+```
+
+If an earlier tarball install left `/usr/local/bin/jaunt-agent` on the node, delete it: it comes first in `PATH` and would shadow the packaged binary.
+
+To upgrade, run `sudo apt-get update && sudo apt-get install --only-upgrade jaunt-agent jaunt`. The package does not restart the service, so run `sudo systemctl restart jaunt-agent` afterwards. To remove the agent, run `sudo jaunt-agent uninstall` first (see [Uninstall](#uninstall)), then `sudo apt-get remove jaunt-agent`. The package does not stop the service or remove the sshd drop-in itself.
+
+Pre-release versions such as `1.2.0-rc.1` are written `1.2.0~rc.1` in the package, so that they sort before `1.2.0`.
+
 ## Upgrade
 
 Download and verify the new archive, then replace the binary and restart the service:
