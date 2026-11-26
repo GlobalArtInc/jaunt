@@ -1,0 +1,32 @@
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: operators }
+spec:
+  members:
+    groups: [infra-admins]
+    users: [alice@example.com]
+  ssh:
+    nodes: { env: [staging, prod] }
+    logins: [deploy, "{username}"]
+    portForwarding: false
+    recordInput: false
+  admin: [nodes.approve, sessions.read, recordings.read, revocations.write, audit.read]
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: staging-developers }
+spec:
+  members:
+    groups: [developers]
+  ssh:
+    nodes: { env: [staging] }
+    logins: ["{username}"]
+    portForwarding: true
+---
+apiVersion: jaunt/v1
+kind: AccessTest
+spec:
+  - { user: alice@example.com, node: { name: web-01, env: prod }, login: deploy, expect: allow }
+  - { user: alice@example.com, node: { name: web-01, env: prod }, login: root, expect: deny }
+  - { user: bob@example.com, groups: [developers], username: bob, node: { name: web-01, env: staging }, login: bob, expect: allow }
+  - { user: bob@example.com, groups: [developers], username: bob, node: { name: db-01, env: prod }, login: bob, expect: deny }

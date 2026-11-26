@@ -49,7 +49,16 @@ tar -xzf "jaunt-agent-$version-$target.tar.gz"
 sudo install -m 0755 "jaunt-agent-$version-$target/jaunt-agent" /usr/local/bin/jaunt-agent
 ```
 
-Enrol the node. The `--ca-pin` value is the hash of the server's internal CA root, in the form `sha256:<64 hex digits>`. With it the agent refuses a server that presents any other CA. The server prints it as the `internal-ca sha256:...` line when the authorities are created with `jauntd ca init`, so keep that output. If `ca init` ran in a one-off container or job, the line is in that job's log for as long as the log is kept. There is no command yet that shows the pin again later (`jauntd ca status` lists only the user and host authorities), so a lost pin cannot be recomputed from the CLI today; a follow-up change to the daemon will add it to `ca status`. Without `--ca-pin` the agent accepts the root the server hands over during enrolment, relying only on the TLS connection to the server, so use the pin whenever you have it.
+Install the service and the `sshd` drop-in first, then enrol. `install` creates the `jaunt` service account, the state directory `/var/lib/jaunt`, the systemd unit, `/etc/jaunt/agent.yaml` and an sshd drop-in that trusts only the node's own internal CA, and only for connections from loopback. It checks the effective `sshd` configuration, reloads sshd and enables the unit. It does not start the service, and it refuses a state directory that `enroll` has already filled.
+
+```sh
+sudo jaunt-agent install --dry-run
+sudo jaunt-agent install
+```
+
+`--dry-run` shows what would change without touching the system. Use `--no-service` to skip systemd.
+
+Enrol the node. The `--ca-pin` value is the hash of the server's internal CA root, in the form `sha256:<64 hex digits>`. With it the agent refuses a server that presents any other CA. The server prints it as the `internal-ca sha256:...` line when the authorities are created with `jauntd ca init`, so keep that output. `jauntd ca status` does not show it, but the root certificate is public and stored as a file, so the pin can be recomputed on the server at any time: `sudo sh -c 'sha256sum /var/lib/jauntd/ca/internal/*.root.der'` prints the 64 hex digits (adjust the path to your `data_dir`). Without `--ca-pin` the agent accepts the root the server hands over during enrolment, relying only on the TLS connection to the server, so use the pin whenever you have it.
 
 ```sh
 sudo jaunt-agent enroll \
@@ -65,22 +74,11 @@ The command prints a short code and waits (15 minutes by default). An administra
 jauntd node approve <code>
 ```
 
-Approval can replace the proposed labels (`--labels`). When the node is approved the agent stores its identity under `/var/lib/jaunt` and exits.
-
-Then install the service and the sshd drop-in:
-
-```sh
-sudo jaunt-agent install --dry-run
-sudo jaunt-agent install
-```
-
-`--dry-run` shows what would change without touching the system. `install` creates the `jaunt` service account, the systemd unit, `/etc/jaunt/agent.yaml` and an sshd drop-in that trusts the Jaunt user CA, reloads sshd and enables the unit. The installer does not start the service; start it yourself:
+Approval can replace the proposed labels (`--labels`). When the node is approved the agent stores its identity under `/var/lib/jaunt` and exits. Then start the service:
 
 ```sh
 sudo systemctl start jaunt-agent
 ```
-
-Use `--no-service` to skip systemd.
 
 ## Install the command-line client
 

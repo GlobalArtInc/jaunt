@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jaunt-ca-init
+  namespace: jaunt
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ca-init
+          image: registry.example.com/jaunt/jaunt:0.0.0
+          args: ["ca", "init", "--generate-identity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/jaunt
+            - name: config
+              mountPath: /etc/jaunt/jauntd.yaml
+              subPath: jauntd.yaml
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: jaunt-data
+        - name: config
+          configMap:
+            name: jaunt-config
