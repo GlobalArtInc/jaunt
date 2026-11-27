@@ -92,6 +92,19 @@ impl ValueSpec {
         }
     }
 
+    pub(crate) fn dropped(&self, identity: &Identity, target: Target) -> Vec<String> {
+        match self {
+            ValueSpec::Literal(_) => Vec::new(),
+            ValueSpec::Template { prefix, source } => source
+                .values(identity)
+                .iter()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{prefix}{value}"))
+                .filter(|value| !(target.substituted)(value))
+                .collect(),
+        }
+    }
+
     pub(crate) fn as_literal(&self) -> Option<&str> {
         match self {
             ValueSpec::Literal(value) => Some(value),

@@ -233,6 +233,8 @@ mod tests {
             recording_incomplete: None,
             end_reason: None,
             max_duration_secs: None,
+            origin: jaunt_store::SessionOrigin::Ssh,
+            record_input: None,
         }
     }
 

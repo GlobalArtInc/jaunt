@@ -22,11 +22,11 @@ mod signed;
 pub(crate) mod terminal;
 mod tokens;
 #[cfg(feature = "test-support")]
-pub use self::terminal::WebTerminalCounters;
+pub use self::terminal::{HeldTerminal, WebTerminalCounters};
 
 use axum::Router;
 use axum::middleware;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 
 use crate::control::Control;
 
@@ -149,9 +149,19 @@ pub(crate) fn mount(
         .route("/v1/admin/services/{id}/reject", post(services::reject))
         .route("/v1/admin/sessions", get(admin_sessions::list))
         .route("/v1/admin/sessions/{id}", get(admin_sessions::detail))
+        .route(
+            "/v1/admin/sessions/{id}/terminate",
+            post(admin_sessions::terminate),
+        )
         .route("/v1/web/terminal", get(terminal::open))
         .route("/v1/web/terminal/ticket", post(terminal::ticket))
         .route("/v1/web/terminal/targets", get(terminal::targets))
+        .route("/v1/web/terminal/recent", get(terminal::recent))
+        .route("/v1/web/terminal/limits", get(terminal::limits))
+        .route(
+            "/v1/web/pins/{node}",
+            put(terminal::pin).delete(terminal::unpin),
+        )
         .merge(extra)
         .fallback(assets::serve)
         .layer(middleware::from_fn_with_state(

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::Extension;
@@ -9,8 +9,9 @@ use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use jaunt_policy::{Identity, PolicySet};
 use jaunt_proto::is_portable_login;
-use jaunt_store::Node;
+use jaunt_store::{Node, SessionOrigin};
 use serde::{Deserialize, Serialize};
 
 use crate::control::Control;
@@ -32,6 +33,9 @@ use super::{TERMINAL_MAX_FRAME_BYTES, TERMINAL_SUBPROTOCOL, TERMINAL_TICKET_TTL_
 
 const WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_WRITE_BUFFER_BYTES: usize = 4 * TERMINAL_MAX_FRAME_BYTES;
+pub(crate) const MAX_HIDDEN_LOGINS: usize = 8;
+pub(crate) const MAX_RECENT: usize = 5;
+const RECENT_SCAN: u32 = 50;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,19 +57,89 @@ struct TargetBody {
     connected: bool,
     creates_accounts: bool,
     logins: Vec<String>,
+    hidden_logins: Vec<String>,
+    pinned: bool,
+}
+
+#[derive(Serialize)]
+struct LimitsBody {
+    max_per_user: usize,
+    idle_timeout_secs: u64,
+}
+
+#[derive(Serialize)]
+struct RecentBody {
+    node: String,
+    login: String,
+    last_at: i64,
+}
+
+#[derive(Serialize)]
+struct RefusalBody<'a> {
+    error: &'static str,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    reference: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LimitBody<'a> {
+    error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<usize>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    reference: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeLogins {
+    pub(crate) logins: Vec<String>,
+    pub(crate) hidden: Vec<String>,
+}
+
+pub(crate) fn node_logins(policy: &PolicySet, identity: &Identity, node: &Node) -> NodeLogins {
+    let info = node_info(node);
+    let logins = policy
+        .ssh_logins(identity, &info)
+        .into_iter()
+        .filter(|login| is_portable_login(login))
+        .collect();
+    let mut hidden = policy.ssh_hidden_logins(identity, &info);
+    hidden.truncate(MAX_HIDDEN_LOGINS);
+    NodeLogins { logins, hidden }
+}
+
+pub(crate) fn is_visible(logins: &NodeLogins) -> bool {
+    !logins.logins.is_empty() || !logins.hidden.is_empty()
 }
 
 fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found")
 }
 
-fn denied() -> Response {
-    error_response(StatusCode::FORBIDDEN, "denied")
+fn deny(control: &Control, denial: &Denial<'_>) -> Response {
+    let reference = control.web.terminals.denials.record(denial, control.tick());
+    json_response(
+        StatusCode::FORBIDDEN,
+        &RefusalBody {
+            error: "denied",
+            reference: reference.as_deref(),
+        },
+    )
 }
 
-fn deny(control: &Control, denial: &Denial<'_>) -> Response {
-    control.web.terminals.denials.record(denial, control.tick());
-    denied()
+fn limited(control: &Control, denial: &Denial<'_>, counts: Option<(usize, usize)>) -> Response {
+    let reference = control.web.terminals.denials.record(denial, control.tick());
+    json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        &LimitBody {
+            error: "limit",
+            open: counts.map(|(open, _)| open),
+            max: counts.map(|(_, max)| max),
+            reference: reference.as_deref(),
+        },
+    )
 }
 
 struct StoreFailed;
@@ -131,6 +205,11 @@ pub(crate) async fn ticket(
         Ok(None) => return deny(&control, &denial("denied")),
         Err(StoreFailed) => return server_error(),
     }
+    let max = installed.settings.max_per_user;
+    let open = control.web.terminals.live.open_for(&user_id);
+    if open >= max {
+        return limited(&control, &denial("limit"), Some((open, max)));
+    }
     let binding = Binding {
         web_session: session.0.session.id_hash.clone(),
         user_id: user_id.clone(),
@@ -145,14 +224,7 @@ pub(crate) async fn ticket(
                 expires_in: TERMINAL_TICKET_TTL_SECS,
             },
         ),
-        Err(IssueProblem::Full) => {
-            control
-                .web
-                .terminals
-                .denials
-                .record(&denial("tickets_full"), control.tick());
-            error_response(StatusCode::TOO_MANY_REQUESTS, "limit")
-        }
+        Err(IssueProblem::Full) => limited(&control, &denial("tickets_full"), None),
         Err(IssueProblem::Entropy) => {
             tracing::error!(target: "jaunt::control", "the system entropy source failed");
             server_error()
@@ -324,25 +396,34 @@ pub(crate) async fn targets(State(control): State<Control>, session: WebSession)
             return server_error();
         }
     };
+    let pinned: HashSet<String> = match control.store.user_pins().node_ids(&session.user().id).await
+    {
+        Ok(pinned) => pinned.into_iter().collect(),
+        Err(err) => {
+            tracing::error!(target: "jaunt::control", error = %err, "listing the pinned nodes failed");
+            return server_error();
+        }
+    };
     let policy = control.policy_snapshot();
     let identity = policy_identity(session.user());
     let mut listed: Vec<TargetBody> = nodes
         .iter()
         .filter(|node| is_ssh_target(node))
         .filter_map(|node| {
-            let info = node_info(node);
-            let logins = policy.ssh_logins(&identity, &info);
-            (!logins.is_empty()).then(|| {
+            let logins = node_logins(&policy, &identity, node);
+            is_visible(&logins).then(|| {
                 let connected_since = control.presence.connected_since(&node.id);
                 TargetBody {
                     node: node.name.clone(),
-                    labels: info.labels,
+                    labels: node_info(node).labels,
                     connected: connected_since.is_some(),
                     creates_accounts: control
                         .host_accounts
                         .capabilities
                         .creates_accounts(&node.id, connected_since),
-                    logins,
+                    logins: logins.logins,
+                    hidden_logins: logins.hidden,
+                    pinned: pinned.contains(&node.id),
                 }
             })
         })
@@ -350,6 +431,73 @@ pub(crate) async fn targets(State(control): State<Control>, session: WebSession)
     listed.sort_by(|left, right| left.node.cmp(&right.node));
     listed.truncate(MAX_NODES);
     json_response(StatusCode::OK, &listed)
+}
+
+pub(crate) async fn limits(State(control): State<Control>, _session: WebSession) -> Response {
+    let Some(installed) = control.web.terminals.installed() else {
+        return not_found();
+    };
+    json_response(
+        StatusCode::OK,
+        &LimitsBody {
+            max_per_user: installed.settings.max_per_user,
+            idle_timeout_secs: installed.settings.idle_timeout.as_secs(),
+        },
+    )
+}
+
+pub(crate) async fn recent(State(control): State<Control>, session: WebSession) -> Response {
+    if control.web.terminals.installed().is_none() {
+        return not_found();
+    }
+    let user = session.user();
+    let pairs = match control
+        .store
+        .sessions()
+        .recent_pairs(&user.id, SessionOrigin::Web, RECENT_SCAN)
+        .await
+    {
+        Ok(pairs) => pairs,
+        Err(err) => {
+            tracing::error!(target: "jaunt::control", error = %err, "listing the recent terminals failed");
+            return server_error();
+        }
+    };
+    let nodes = match control.store.nodes().list().await {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            tracing::error!(target: "jaunt::control", error = %err, "listing the terminal targets failed");
+            return server_error();
+        }
+    };
+    let targets: HashMap<&str, &Node> = nodes
+        .iter()
+        .filter(|node| is_ssh_target(node))
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    let policy = control.policy_snapshot();
+    let identity = policy_identity(user);
+    let mut allowed: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut recent = Vec::new();
+    for pair in &pairs {
+        let Some(node) = targets.get(pair.node_id.as_str()) else {
+            continue;
+        };
+        let logins = allowed
+            .entry(node.id.as_str())
+            .or_insert_with(|| node_logins(&policy, &identity, node).logins);
+        if logins.contains(&pair.login) {
+            recent.push(RecentBody {
+                node: node.name.clone(),
+                login: pair.login.clone(),
+                last_at: pair.last_at,
+            });
+        }
+        if recent.len() == MAX_RECENT {
+            break;
+        }
+    }
+    json_response(StatusCode::OK, &recent)
 }
 
 #[cfg(test)]

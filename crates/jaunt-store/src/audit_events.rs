@@ -1,6 +1,8 @@
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
+use jaunt_proto::is_audit_reference;
+
 use crate::StoreError;
 
 pub const MAX_AUDIT_PAGE: u32 = 1000;
@@ -31,6 +33,7 @@ pub struct AuditQuery {
     pub actor: Option<String>,
     pub node: Option<String>,
     pub session_id: Option<String>,
+    pub reference: Option<String>,
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
     pub after: Option<AuditCursor>,
@@ -44,6 +47,7 @@ impl AuditQuery {
             actor: None,
             node: None,
             session_id: None,
+            reference: None,
             from_ms: None,
             to_ms: None,
             after: None,
@@ -53,8 +57,10 @@ impl AuditQuery {
 }
 
 const INSERT: &str = "INSERT INTO audit_events \
-    (id, time_ms, event_type, actor, node, session_id, policy_hash, payload, v) \
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+    (id, time_ms, event_type, actor, node, session_id, policy_hash, payload, v, reference) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+
+const REFERENCE_FIELD: &str = "ref";
 
 const SELECT: &str = "SELECT id, time_ms, event_type, actor, node, session_id, policy_hash, \
     payload, v FROM audit_events WHERE 1 = 1";
@@ -98,6 +104,7 @@ impl AuditEvents {
                 .bind(&record.policy_hash)
                 .bind(&record.payload)
                 .bind(record.v)
+                .bind(reference_of(&record.payload))
                 .execute(&mut *transaction)
                 .await?;
             inserted += result.rows_affected();
@@ -181,6 +188,13 @@ fn select_builder(prefix: &str, query: &AuditQuery) -> Result<QueryBuilder<Sqlit
         builder.push(" AND session_id = ");
         builder.push_bind(session_id);
     }
+    if let Some(reference) = &query.reference {
+        if !is_audit_reference(reference) {
+            return Err(StoreError::InvalidInput("the audit reference is not valid"));
+        }
+        builder.push(" AND reference = ");
+        builder.push_bind(reference);
+    }
     if let Some(from_ms) = query.from_ms {
         builder.push(" AND time_ms >= ");
         builder.push_bind(from_ms);
@@ -199,6 +213,12 @@ fn select_builder(prefix: &str, query: &AuditQuery) -> Result<QueryBuilder<Sqlit
     builder.push(" ORDER BY time_ms DESC, id DESC LIMIT ");
     builder.push_bind(i64::from(query.limit));
     Ok(builder)
+}
+
+fn reference_of(payload: &str) -> Option<String> {
+    let fields: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let reference = fields.get(REFERENCE_FIELD)?.as_str()?;
+    is_audit_reference(reference).then(|| reference.to_owned())
 }
 
 fn count_from(row: &SqliteRow) -> Result<u64, StoreError> {

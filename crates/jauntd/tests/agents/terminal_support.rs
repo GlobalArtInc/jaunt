@@ -68,7 +68,9 @@ const ROLES: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: recorde
      members: { users: [alice@example.com, bob@example.com, carol@example.com] }\n  \
      ssh: { nodes: { env: [test] }, logins: [deploy], recordInput: true }\n---\n\
      apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: plain }\nspec:\n  \
-     members: { users: [alice@example.com] }\n  ssh: { nodes: { env: [test] }, logins: [plain] }\n";
+     members: { users: [alice@example.com] }\n  ssh: { nodes: { env: [test] }, logins: [plain] }\n---\n\
+     apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: terminators }\nspec:\n  \
+     members: { users: [carol@example.com] }\n  admin: [sessions.read, sessions.terminate]\n";
 const ROLES_WITHOUT_DEPLOY: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: plain }\nspec:\n  \
      members: { users: [alice@example.com] }\n  ssh: { nodes: { env: [test] }, logins: [plain] }\n";
 
@@ -998,6 +1000,7 @@ impl TerminalStand {
                 Ok(Ws {
                     socket,
                     output: Vec::new(),
+                    stages: Vec::new(),
                 })
             }
             Err(tungstenite::Error::Http(response)) => Err(response.status()),
@@ -1039,11 +1042,17 @@ impl TerminalStand {
         let (texts, mut ready) = mpsc::unbounded_channel();
         let (reading, allowed) = watch::channel(true);
         let reader = tokio::spawn(read_frames(read, Arc::clone(&seen), texts, allowed));
-        let first = tokio::time::timeout(STEP, ready.recv())
-            .await
-            .expect("the raw terminal sent nothing in time")
-            .expect("the raw terminal closed before it was ready");
-        let first: Value = serde_json::from_str(&first).unwrap();
+        let deadline = tokio::time::Instant::now() + STEP;
+        let first = loop {
+            let text = tokio::time::timeout_at(deadline, ready.recv())
+                .await
+                .expect("the raw terminal sent nothing in time")
+                .expect("the raw terminal closed before it was ready");
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["t"] != "progress" {
+                break frame;
+            }
+        };
         assert_eq!(first["t"], "ready", "{first}");
         let session_id = first["session_id"].as_str().unwrap().to_owned();
         (
@@ -1234,6 +1243,20 @@ pub enum Received {
 pub struct Ws {
     pub socket: WebSocketStream<TcpStream>,
     pub output: Vec<u8>,
+    pub stages: Vec<String>,
+}
+
+pub fn without_reference(frame: &Value, prefix: &str) -> Value {
+    let reference = frame["ref"].as_str().unwrap_or_default();
+    assert!(
+        reference.starts_with(prefix) && jaunt_proto::is_audit_reference(reference),
+        "{frame}"
+    );
+    let mut stripped = frame.clone();
+    if let Some(object) = stripped.as_object_mut() {
+        object.remove("ref");
+    }
+    stripped
 }
 
 impl Ws {
@@ -1249,7 +1272,13 @@ impl Ws {
             match message {
                 Some(Ok(Message::Binary(data))) => return Received::Output(data.to_vec()),
                 Some(Ok(Message::Text(text))) => {
-                    return Received::Json(serde_json::from_str(text.as_str()).unwrap());
+                    let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                    if frame["t"] == "progress" {
+                        self.stages
+                            .push(frame["stage"].as_str().unwrap_or_default().to_owned());
+                        continue;
+                    }
+                    return Received::Json(frame);
                 }
                 Some(Ok(Message::Close(frame))) => {
                     return Received::Closed(frame.map(|frame| u16::from(frame.code)));

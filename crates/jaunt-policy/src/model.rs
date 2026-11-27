@@ -150,6 +150,7 @@ pub struct RoleAccess {
 pub enum AdminPermission {
     NodesApprove,
     SessionsRead,
+    SessionsTerminate,
     RecordingsRead,
     RevocationsWrite,
     AuditRead,
@@ -157,9 +158,10 @@ pub enum AdminPermission {
 }
 
 impl AdminPermission {
-    pub const ALL: [AdminPermission; 6] = [
+    pub const ALL: [AdminPermission; 7] = [
         AdminPermission::NodesApprove,
         AdminPermission::SessionsRead,
+        AdminPermission::SessionsTerminate,
         AdminPermission::RecordingsRead,
         AdminPermission::RevocationsWrite,
         AdminPermission::AuditRead,
@@ -170,6 +172,7 @@ impl AdminPermission {
         match self {
             AdminPermission::NodesApprove => "nodes.approve",
             AdminPermission::SessionsRead => "sessions.read",
+            AdminPermission::SessionsTerminate => "sessions.terminate",
             AdminPermission::RecordingsRead => "recordings.read",
             AdminPermission::RevocationsWrite => "revocations.write",
             AdminPermission::AuditRead => "audit.read",

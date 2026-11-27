@@ -319,9 +319,21 @@ There is no key for pseudo-terminals, session length or command filtering. A rol
 |---|---|
 | `nodes.approve` | `GET /v1/admin/whoami`; `GET /v1/admin/nodes`, `GET`/`DELETE /v1/admin/nodes/{id}`; `POST /v1/admin/enrolments/lookup`, `/v1/admin/enrolments/{id}/approve` and `/reject`; `GET /v1/admin/services`, `POST /v1/admin/services/{id}/approve` and `/reject`, `DELETE /v1/admin/services/{id}` |
 | `sessions.read` | `GET /v1/admin/sessions`, `GET /v1/admin/sessions/{id}`, `GET /v1/admin/nodes/{id}/access` (who may reach a node), `GET /v1/admin/revocations` |
+| `sessions.terminate` | `POST /v1/admin/sessions/{id}/terminate` (ends one session; the user can connect again) |
 | `recordings.read` | `GET /v1/admin/sessions/{id}/recording` and `/recording/manifest` |
 | `revocations.write` | `POST /v1/admin/revocations`, `DELETE /v1/admin/revocations/{id}` |
 | `audit.read` | `GET /v1/admin/audit`, `GET /v1/admin/ca` |
+
+Answers of `POST /v1/admin/sessions/{id}/terminate` (body `{"reason": "..."}` is optional, at most 200 printable characters):
+
+| Status | Meaning |
+|---|---|
+| 204 | the session is ended and the order reached its node |
+| 202 `{"delivered": false}` | the session is ended but the order did not reach the node; call again: a repeated call for a session ended this way only sends the order again |
+| 409 `already_ended` | the session had ended for another reason |
+| 404 | no such session |
+| 401 / 403 | no session or signature, or no `sessions.terminate` |
+| 503 `unavailable` | the server runs no session killer; nothing was changed |
 
 Opening a terminal needs no admin permission: the policy must allow the user to log in to the node (`/v1/web/terminal*`). The `jauntd` commands on the server need no permission; whoever can run them can read the database.
 

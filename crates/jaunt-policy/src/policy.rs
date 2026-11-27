@@ -258,6 +258,18 @@ impl PolicySet {
         logins
     }
 
+    pub fn ssh_hidden_logins(&self, identity: &Identity, node: &NodeInfo) -> Vec<String> {
+        let mut hidden: Vec<String> = self
+            .ssh_rules_reaching(identity, node)
+            .flat_map(|(_, rule)| rule.logins.iter())
+            .flat_map(|spec| spec.dropped(identity, SSH_LOGIN))
+            .filter(|login| !is_portable_login(login))
+            .collect();
+        hidden.sort();
+        hidden.dedup();
+        hidden
+    }
+
     pub fn roles_reaching(&self, node: &NodeInfo) -> Vec<RoleAccess> {
         self.roles_reaching_resource(ResourceKind::Node, node)
             .allows

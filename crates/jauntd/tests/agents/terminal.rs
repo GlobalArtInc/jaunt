@@ -22,7 +22,7 @@ use crate::recorder::{Captured, capture_everything, everything_logged};
 use crate::support::{APPROVER, PUBLIC_ORIGIN, audited, eventually, field};
 use crate::terminal_support::{
     BROWSER_ADDR, Browser, HOSTILE, ManualTime, NODE, PLAIN_LOGIN, RECORDED_LOGIN, RawBrowser,
-    Received, SSHD_WINDOW, StandOptions, TerminalStand, Ws,
+    Received, SSHD_WINDOW, STEP, StandOptions, TerminalStand, Ws, without_reference,
 };
 
 const BOUND: u64 = 64 << 20;
@@ -45,7 +45,11 @@ async fn ended_with(ws: &mut Ws, error: Option<&str>, code: u16) -> Vec<Value> {
     let (messages, closed) = ws.ending().await;
     assert_eq!(closed, Some(code), "{messages:?}");
     if let Some(error) = error {
-        assert_eq!(messages, [json!({"t": "error", "code": error})]);
+        let stripped: Vec<Value> = messages
+            .iter()
+            .map(|message| without_reference(message, "D-"))
+            .collect();
+        assert_eq!(stripped, [json!({"t": "error", "code": error})]);
     }
     messages
 }
@@ -56,6 +60,30 @@ async fn pong(ws: &mut Ws) {
         match ws.next().await {
             Received::Output(data) => ws.output.extend_from_slice(&data),
             Received::Json(value) if value == json!({"t": "pong"}) => return,
+            other => panic!("no pong: {other:?}"),
+        }
+    }
+}
+
+async fn pong_after_a_probe_interval(ws: &mut Ws) -> Option<u64> {
+    ws.send_text(r#"{"t":"ping"}"#).await;
+    loop {
+        match ws.next().await {
+            Received::Output(data) => ws.output.extend_from_slice(&data),
+            Received::Json(value) if value["t"] == "pong" => {
+                let fields: Vec<&String> = value.as_object().unwrap().keys().collect();
+                assert!(
+                    fields
+                        .iter()
+                        .all(|field| *field == "t" || *field == "node_ms"),
+                    "{value}"
+                );
+                return value.get("node_ms").map(|node_ms| {
+                    let measured = node_ms.as_u64().expect("node_ms is not a whole number");
+                    assert!(measured <= 20_000, "{value}");
+                    measured
+                });
+            }
             other => panic!("no pong: {other:?}"),
         }
     }
@@ -83,6 +111,7 @@ async fn a_browser_opens_a_terminal_types_resizes_and_sees_the_exit_status() {
     capture_everything();
     let stand = TerminalStand::start().await;
     let (mut ws, session_id) = stand.ready(&stand.alice, RECORDED_LOGIN).await;
+    assert_eq!(ws.stages, ["node", "shell"]);
     ws.send(b"size\r").await;
     ws.output_until(b"80x24\r\n").await;
     ws.send_text(r#"{"t":"resize","cols":120,"rows":40}"#).await;
@@ -240,7 +269,7 @@ async fn a_login_the_roles_stop_allowing_is_denied_without_any_sshd_login() {
         )
         .await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
-    assert_eq!(body, json!({"error": "denied"}));
+    assert_eq!(without_reference(&body, "D-"), json!({"error": "denied"}));
 }
 
 #[tokio::test]
@@ -327,8 +356,18 @@ async fn the_fifth_terminal_of_a_user_and_one_past_the_global_cap_are_refused_wi
     for _ in 0..4 {
         open.push(stand.ready(&stand.alice, RECORDED_LOGIN).await.0);
     }
-    let mut fifth = stand.open(&stand.alice, RECORDED_LOGIN).await;
-    ended_with(&mut fifth, Some("limit"), 1008).await;
+    let (status, body) = stand
+        .post(
+            &stand.alice,
+            "/v1/web/terminal/ticket",
+            &json!({"node": NODE, "login": RECORDED_LOGIN}),
+        )
+        .await;
+    assert_eq!(status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        without_reference(&body, "D-"),
+        json!({"error": "limit", "open": 4, "max": 4})
+    );
     open.push(stand.ready(&stand.bob, RECORDED_LOGIN).await.0);
     let mut sixth = stand.open(&stand.carol, RECORDED_LOGIN).await;
     ended_with(&mut sixth, Some("limit"), 1008).await;
@@ -423,8 +462,8 @@ async fn without_any_hook_the_recheck_closes_terminals_of_a_gone_web_session_or_
     pool.close().await;
 
     time.advance_ticker(Duration::from_secs(30));
-    pong(&mut signed_out).await;
-    pong(&mut revoked).await;
+    pong_after_a_probe_interval(&mut signed_out).await;
+    pong_after_a_probe_interval(&mut revoked).await;
     time.advance_ticker(Duration::from_secs(31));
     ended_with(&mut signed_out, Some("timeout"), 1008).await;
     ended_with(&mut revoked, Some("revoked"), 4001).await;
@@ -668,9 +707,10 @@ async fn a_terminal_whose_input_waits_without_progress_either_way_is_closed_as_w
     })
     .await;
     assert_eq!(*seen.close_code.lock().unwrap(), Some(4003));
+    let last = seen.texts.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
-        seen.texts.lock().unwrap().last(),
-        Some(&json!({"t": "error", "code": "stalled"}))
+        without_reference(&last, "D-"),
+        json!({"t": "error", "code": "stalled"})
     );
     typist.abort();
 }
@@ -781,7 +821,7 @@ async fn output_alone_keeps_a_terminal_open_past_the_idle_timeout() {
     for _ in 0..PAST_IDLE_STEPS {
         time.advance_ticker(STEP_UNDER_DEAD_PEER);
         next_tick(&mut ws).await;
-        pong(&mut ws).await;
+        pong_after_a_probe_interval(&mut ws).await;
     }
     while ticks(&ws.output) < 45 {
         next_tick(&mut ws).await;
@@ -806,7 +846,7 @@ async fn input_alone_keeps_a_terminal_open_past_the_idle_timeout() {
     for _ in 0..PAST_IDLE_STEPS {
         time.advance_ticker(STEP_UNDER_DEAD_PEER);
         ws.send(b"k").await;
-        pong(&mut ws).await;
+        pong_after_a_probe_interval(&mut ws).await;
     }
     time.advance_ticker(Duration::from_secs(31 * 60));
     ended_with(&mut ws, Some("timeout"), 4002).await;
@@ -887,7 +927,10 @@ async fn a_silent_browser_is_dropped_as_a_dead_peer_while_a_responsive_one_stays
                 Message::Ping(_) => {
                     seen_pings.fetch_add(1, Ordering::SeqCst);
                 }
-                Message::Text(text) if text.as_str() == r#"{"t":"pong"}"# => {
+                Message::Text(text)
+                    if serde_json::from_str::<Value>(text.as_str())
+                        .is_ok_and(|frame| frame["t"] == "pong") =>
+                {
                     seen_pongs.fetch_add(1, Ordering::SeqCst);
                 }
                 _ => {}
@@ -1095,4 +1138,139 @@ async fn a_browser_gone_during_the_handshake_leaves_nothing_open_and_its_ticket_
         stand.keys.all_released()
     })
     .await;
+}
+
+async fn quiet_for(ws: &mut Ws, span: Duration) {
+    let deadline = tokio::time::Instant::now() + span;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.socket.next()).await {
+            Err(_) => return,
+            Ok(Some(Ok(Message::Text(text)))) => panic!("the terminal sent {text} too early"),
+            Ok(Some(Ok(Message::Binary(data)))) => ws.output.extend_from_slice(&data),
+            Ok(Some(Ok(Message::Close(frame)))) => panic!("the terminal closed early: {frame:?}"),
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("the terminal failed: {error}"),
+            Ok(None) => panic!("the terminal ended early"),
+        }
+    }
+}
+
+async fn idle_warning(ws: &mut Ws) -> u64 {
+    loop {
+        match ws.next().await {
+            Received::Output(data) => ws.output.extend_from_slice(&data),
+            Received::Json(value) if value["t"] == "idle" => {
+                assert_eq!(value.as_object().unwrap().len(), 2, "{value}");
+                return value["seconds_left"].as_u64().unwrap();
+            }
+            other => panic!("no idle warning: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_idle_warning_comes_once_active_postpones_the_close_and_ping_does_not() {
+    let time = ManualTime::default();
+    let stand = TerminalStand::start_with(StandOptions {
+        settings: WebTerminalSettings {
+            idle_timeout: Duration::from_secs(300),
+            ..WebTerminalSettings::default()
+        },
+        time: Some(time.clone()),
+        ..StandOptions::default()
+    })
+    .await;
+    let (mut ws, session_id) = stand.ready(&stand.alice, RECORDED_LOGIN).await;
+
+    time.advance_ticker(Duration::from_secs(175));
+    quiet_for(&mut ws, Duration::from_millis(1500)).await;
+    time.advance_ticker(Duration::from_secs(5));
+    let left = idle_warning(&mut ws).await;
+    assert!((115..=120).contains(&left), "{left}");
+    quiet_for(&mut ws, Duration::from_millis(2500)).await;
+
+    ws.send_text(r#"{"t":"active"}"#).await;
+    quiet_for(&mut ws, Duration::from_secs(1)).await;
+    time.advance_ticker(Duration::from_secs(8));
+    ws.send_text(r#"{"t":"active"}"#).await;
+    quiet_for(&mut ws, Duration::from_millis(1500)).await;
+    time.advance_ticker(Duration::from_secs(282));
+    let left = idle_warning(&mut ws).await;
+    assert!(left <= 15, "{left}");
+    pong_after_a_probe_interval(&mut ws).await;
+    time.advance_ticker(Duration::from_secs(12));
+    tokio::time::timeout(
+        Duration::from_millis(3500),
+        ended_with(&mut ws, Some("timeout"), 4002),
+    )
+    .await
+    .expect("the close came late: the second active inside ten seconds was counted");
+    let closed = audited("terminal.closed", closed_event(&session_id)).await;
+    assert_eq!(field(&closed, "reason"), "idle_timeout");
+}
+
+#[tokio::test]
+async fn pong_carries_the_node_round_trip_only_after_the_first_probe_answered() {
+    let time = ManualTime::default();
+    let stand = TerminalStand::start_with(StandOptions {
+        time: Some(time.clone()),
+        ..StandOptions::default()
+    })
+    .await;
+    let (mut ws, _) = stand.ready(&stand.alice, RECORDED_LOGIN).await;
+    pong(&mut ws).await;
+    time.advance_ticker(Duration::from_secs(21));
+    let deadline = Instant::now() + STEP;
+    let measured = loop {
+        if let Some(measured) = pong_after_a_probe_interval(&mut ws).await {
+            break measured;
+        }
+        assert!(Instant::now() < deadline, "no pong carried node_ms");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(measured < 5_000, "{measured}");
+}
+
+#[tokio::test]
+async fn an_administrator_terminate_sends_terminated_with_a_reference_and_closes_with_4004() {
+    let stand = TerminalStand::start().await;
+    let (mut ws, session_id) = stand.ready(&stand.alice, RECORDED_LOGIN).await;
+    let started = Instant::now();
+
+    let (status, body) = stand
+        .post(
+            &stand.carol,
+            &format!("/v1/admin/sessions/{session_id}/terminate"),
+            &json!({"reason": "end of shift"}),
+        )
+        .await;
+
+    assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
+    let messages = ended_with(&mut ws, Some("terminated"), 4004).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let reference = messages[0]["ref"].as_str().unwrap().to_owned();
+    let closed = audited("terminal.closed", closed_event(&session_id)).await;
+    assert_eq!(field(&closed, "reason"), "terminated");
+    assert_eq!(field(&closed, "ref"), reference);
+    let terminated = audited("session.terminated", |event| {
+        field(event, "event") == "session.terminated" && field(event, "session_id") == session_id
+    })
+    .await;
+    assert_eq!(
+        field(&terminated, "by"),
+        format!("web:{}", stand.carol.user_id)
+    );
+    assert_eq!(field(&terminated, "reason"), "end of shift");
+    let (status, _) = stand
+        .post(
+            &stand.alice,
+            &format!("/v1/admin/sessions/{session_id}/terminate"),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(status, http::StatusCode::FORBIDDEN);
 }

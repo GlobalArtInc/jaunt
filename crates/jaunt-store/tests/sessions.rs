@@ -1,8 +1,8 @@
 use jaunt_store::{
     ActivateSession, EndOutcome, EndRejection, EndSession, NewCertificate, NewRevocation,
-    NewSession, NewUser, NodeSessionCounts, OpenSessions, RevocationKind, Session, SessionCursor,
-    SessionEndReason, SessionQuery, SessionRecording, SessionState, Store, StoreError,
-    StoredRecording,
+    NewSession, NewUser, NodeSessionCounts, OpenSessions, PinOutcome, RevocationKind, Session,
+    SessionCursor, SessionEndReason, SessionOrigin, SessionQuery, SessionRecording, SessionState,
+    Store, StoreError, StoredRecording,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -1045,4 +1045,318 @@ impl StoredRecordingOwned {
             now: NOW + 1,
         }
     }
+}
+
+impl Fixture {
+    async fn second_user(&self) -> (String, i64) {
+        let user = self
+            .store
+            .users()
+            .upsert(
+                &NewUser {
+                    issuer: "https://idp.example".to_owned(),
+                    subject: "bob".to_owned(),
+                    email: "bob@example.com".to_owned(),
+                    username: "bob".to_owned(),
+                    display_name: None,
+                    groups: Vec::new(),
+                },
+                NOW,
+            )
+            .await
+            .expect("user");
+        let serial = self.store.certificates().allocate_serial().await.unwrap();
+        self.store
+            .certificates()
+            .record(&NewCertificate {
+                serial,
+                user_id: user.id.clone(),
+                kind: "user".to_owned(),
+                key_id: format!("jaunt:bob@example.com:{serial}"),
+                valid_after: NOW - 120,
+                valid_before: NOW + 3600,
+                issued_at: NOW,
+                ca_fingerprint: None,
+                host_trust_id: None,
+                subject_fingerprint: None,
+            })
+            .await
+            .unwrap();
+        (user.id, serial)
+    }
+
+    async fn activated_as(
+        &self,
+        node_id: &str,
+        login: &str,
+        created: i64,
+        origin: SessionOrigin,
+    ) -> Session {
+        let session = self.routed_at(node_id, created).await;
+        self.store
+            .sessions()
+            .activate_as(
+                ActivateSession {
+                    node_id,
+                    login,
+                    ..self.activation(&session, created + 1)
+                },
+                origin,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn activation_records_the_origin_and_the_listing_filters_by_it() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let ssh = fixture.active().await;
+    let web = fixture
+        .activated_as(NODE, "deploy", NOW + 5, SessionOrigin::Web)
+        .await;
+    let routed = fixture.routed_at(NODE, NOW + 6).await;
+
+    assert_eq!(
+        (ssh.origin, web.origin, routed.origin),
+        (SessionOrigin::Ssh, SessionOrigin::Web, SessionOrigin::Ssh)
+    );
+    assert_eq!(web.record_input, Some(false));
+    assert_eq!(routed.record_input, None);
+    for (origin, expected) in [
+        (Some(SessionOrigin::Web), vec![web.id.clone()]),
+        (
+            Some(SessionOrigin::Ssh),
+            vec![routed.id.clone(), ssh.id.clone()],
+        ),
+    ] {
+        let page = sessions
+            .page(&SessionQuery {
+                origin,
+                ..page_query(10)
+            })
+            .await
+            .unwrap();
+        assert_eq!(page_ids(&page), expected, "{origin:?}");
+    }
+    let listed = sessions.listing(&web.id).await.unwrap().unwrap();
+    assert_eq!(listed.session.origin, SessionOrigin::Web);
+    assert_eq!(
+        (SessionOrigin::parse("web"), SessionOrigin::parse("Web")),
+        (Some(SessionOrigin::Web), None)
+    );
+}
+
+#[tokio::test]
+async fn closing_one_session_by_id_leaves_the_others_open_and_says_terminated() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    let target = fixture.active().await;
+    let other = fixture.active().await;
+
+    let closed = sessions
+        .close(
+            OpenSessions::OfId(&target.id),
+            SessionEndReason::Terminated,
+            NOW + 9,
+        )
+        .await
+        .unwrap();
+    let again = sessions
+        .close(
+            OpenSessions::OfId(&target.id),
+            SessionEndReason::Terminated,
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].id, target.id);
+    assert_eq!(closed[0].end_reason, Some(SessionEndReason::Terminated));
+    assert!(again.is_empty());
+    let untouched = sessions.get(&other.id).await.unwrap().unwrap();
+    assert_eq!(untouched.state, SessionState::Active);
+}
+
+#[tokio::test]
+async fn recent_pairs_are_distinct_newest_first_and_only_the_users_own_web_sessions() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.sessions();
+    fixture
+        .activated_as(NODE, "deploy", NOW, SessionOrigin::Web)
+        .await;
+    fixture
+        .activated_as(OTHER_NODE, "deploy", NOW + 10, SessionOrigin::Web)
+        .await;
+    fixture
+        .activated_as(NODE, "deploy", NOW + 20, SessionOrigin::Web)
+        .await;
+    fixture
+        .activated_as(NODE, "app", NOW + 30, SessionOrigin::Ssh)
+        .await;
+    fixture.routed_at(NODE, NOW + 40).await;
+    let (bob, bob_serial) = fixture.second_user().await;
+    let foreign = sessions
+        .create(
+            &NewSession {
+                user_id: bob.clone(),
+                serial: bob_serial,
+                node_id: NODE.to_owned(),
+                ttl_secs: TTL,
+            },
+            NOW + 50,
+        )
+        .await
+        .unwrap();
+    sessions
+        .activate_as(
+            ActivateSession {
+                id: &foreign.id,
+                node_id: NODE,
+                user_id: &bob,
+                serial: bob_serial,
+                login: "root",
+                max_duration_secs: MAX_DURATION,
+                pty: true,
+                record_input: true,
+                now: NOW + 51,
+            },
+            SessionOrigin::Web,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let recent = sessions
+        .recent_pairs(&fixture.user_id, SessionOrigin::Web, 10)
+        .await
+        .unwrap();
+    let shown: Vec<(&str, &str, i64)> = recent
+        .iter()
+        .map(|pair| (pair.node_id.as_str(), pair.login.as_str(), pair.last_at))
+        .collect();
+    assert_eq!(
+        shown,
+        [(NODE, "deploy", NOW + 20), (OTHER_NODE, "deploy", NOW + 10)]
+    );
+    let first = sessions
+        .recent_pairs(&fixture.user_id, SessionOrigin::Web, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    for limit in [0, 201] {
+        assert!(
+            sessions
+                .recent_pairs(&fixture.user_id, SessionOrigin::Web, limit)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn pins_are_idempotent_bounded_per_user_and_skip_removed_nodes() {
+    let fixture = fixture().await;
+    let pins = fixture.store.user_pins();
+    let (bob, _) = fixture.second_user().await;
+
+    assert_eq!(
+        pins.pin(&fixture.user_id, NODE, NOW, 1).await.unwrap(),
+        PinOutcome::Pinned
+    );
+    assert_eq!(
+        pins.pin(&fixture.user_id, NODE, NOW + 1, 1).await.unwrap(),
+        PinOutcome::AlreadyPinned
+    );
+    assert_eq!(
+        pins.pin(&fixture.user_id, OTHER_NODE, NOW, 1)
+            .await
+            .unwrap(),
+        PinOutcome::Full
+    );
+    assert_eq!(
+        pins.pin(&bob, OTHER_NODE, NOW, 1).await.unwrap(),
+        PinOutcome::Pinned
+    );
+    assert_eq!(pins.node_ids(&fixture.user_id).await.unwrap(), [NODE]);
+    assert_eq!(pins.node_ids(&bob).await.unwrap(), [OTHER_NODE]);
+
+    sqlx::query("UPDATE nodes SET state = 'removed' WHERE id = ?")
+        .bind(NODE)
+        .execute(&fixture.raw)
+        .await
+        .unwrap();
+    assert!(pins.node_ids(&fixture.user_id).await.unwrap().is_empty());
+    assert_eq!(
+        pins.pin(&fixture.user_id, OTHER_NODE, NOW, 1)
+            .await
+            .unwrap(),
+        PinOutcome::Pinned
+    );
+    assert!(pins.unpin(&fixture.user_id, OTHER_NODE).await.unwrap());
+    assert!(!pins.unpin(&fixture.user_id, OTHER_NODE).await.unwrap());
+    assert!(pins.is_pinned(&bob, OTHER_NODE).await.unwrap());
+    assert!(!pins.is_pinned(&fixture.user_id, OTHER_NODE).await.unwrap());
+}
+
+#[tokio::test]
+async fn the_origin_migration_marks_sessions_with_a_terminal_opened_event_as_web() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jaunt.db");
+    let raw = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    let mut before = sqlx::migrate!("./migrations");
+    before.migrations = std::borrow::Cow::Owned(
+        before
+            .migrations
+            .iter()
+            .filter(|migration| migration.version < 18)
+            .cloned()
+            .collect(),
+    );
+    before.run(&raw).await.unwrap();
+    sqlx::query(RAW_NODE)
+        .bind(NODE)
+        .bind("web-a")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, issuer, subject, email, username, groups, created_at, updated_at) VALUES ('u', 'i', 's', 'u@example.com', 'u', '[]', 1, 1)")
+        .execute(&raw)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO certificates (serial, user_id, kind, key_id, valid_after, valid_before, issued_at) VALUES (1, 'u', 'user', 'k', 0, 9, 0)")
+        .execute(&raw)
+        .await
+        .unwrap();
+    for id in ["s-web", "s-ssh"] {
+        sqlx::query("INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at) VALUES (?, 'u', 1, ?, 'ended', 1, 2)")
+            .bind(id)
+            .bind(NODE)
+            .execute(&raw)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO audit_events (id, time_ms, event_type, actor, session_id, payload, v) VALUES ('e1', 1, 'terminal.opened', 'u', 's-web', '{}', 1), ('e2', 1, 'session.start', 'u', 's-ssh', '{}', 1)")
+        .execute(&raw)
+        .await
+        .unwrap();
+    raw.close().await;
+
+    let store = Store::open(&path).await.unwrap();
+    store.migrate().await.unwrap();
+    let origin = |id: &'static str| {
+        let store = store.clone();
+        async move { store.sessions().get(id).await.unwrap().unwrap().origin }
+    };
+    assert_eq!(origin("s-web").await, SessionOrigin::Web);
+    assert_eq!(origin("s-ssh").await, SessionOrigin::Ssh);
 }

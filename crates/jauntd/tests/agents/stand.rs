@@ -36,6 +36,8 @@ const ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\ns
     members: { users: [alice@example.com] }\n  ssh: { nodes: { env: [test] }, logins: [deploy] }\n";
 const ADMIN_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: admins }\nspec:\n  \
     members: { users: [alice@example.com] }\n  admin: [nodes.approve]\n";
+const TERMINATE_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: terminators }\nspec:\n  \
+    members: { users: [alice@example.com] }\n  admin: [sessions.terminate]\n";
 
 #[derive(Default)]
 pub struct AgentLog {
@@ -334,6 +336,16 @@ impl Stand {
         std::fs::write(
             policy.path().join("roles.yaml"),
             format!("{ROLE}---\n{ADMIN_ROLE}"),
+        )
+        .unwrap();
+        assert!(self.harness.control.policy().reload(policy.path()).applied);
+    }
+
+    pub fn grant_session_terminate(&self) {
+        let policy = tempfile::tempdir().unwrap();
+        std::fs::write(
+            policy.path().join("roles.yaml"),
+            format!("{ROLE}---\n{TERMINATE_ROLE}"),
         )
         .unwrap();
         assert!(self.harness.control.policy().reload(policy.path()).applied);

@@ -13,6 +13,7 @@ mod revocations;
 mod service_certificates;
 mod services;
 mod sessions;
+mod user_pins;
 mod users;
 mod web_sessions;
 
@@ -67,10 +68,12 @@ pub use services::{
     Services,
 };
 pub use sessions::{
-    ActivateSession, EndOutcome, EndRejection, EndSession, MAX_SESSION_PAGE, NewSession,
-    NodeSessionCounts, OpenSessions, Session, SessionCursor, SessionEndReason, SessionListing,
-    SessionPage, SessionQuery, SessionRecording, SessionState, Sessions,
+    ActivateSession, EndOutcome, EndRejection, EndSession, MAX_RECENT_PAIRS, MAX_SESSION_PAGE,
+    NewSession, NodeSessionCounts, OpenSessions, RecentPair, Session, SessionCursor,
+    SessionEndReason, SessionListing, SessionOrigin, SessionPage, SessionQuery, SessionRecording,
+    SessionState, Sessions,
 };
+pub use user_pins::{PinOutcome, UserPins};
 pub use users::{NewUser, User, Users};
 pub use web_sessions::{NewWebSession, ValidWebSession, WebSession, WebSessions};
 
@@ -159,6 +162,10 @@ impl Store {
 
     pub fn sessions(&self) -> Sessions {
         Sessions::new(self.pool.clone())
+    }
+
+    pub fn user_pins(&self) -> UserPins {
+        UserPins::new(self.pool.clone())
     }
 
     pub fn revocations(&self) -> Revocations {

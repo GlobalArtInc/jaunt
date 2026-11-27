@@ -12,6 +12,7 @@ pub enum KillReason {
     Expired,
     AgentGone,
     NodeRemoved,
+    Terminated,
 }
 
 impl KillReason {
@@ -21,6 +22,7 @@ impl KillReason {
             KillReason::Expired => "expired",
             KillReason::AgentGone => "agent_gone",
             KillReason::NodeRemoved => "node_removed",
+            KillReason::Terminated => "terminated",
         }
     }
 }
@@ -48,6 +50,34 @@ pub struct KillOrder {
 
 pub trait SessionKiller: Send + Sync {
     fn kill<'a>(&'a self, order: &'a KillOrder) -> BoxFuture<'a, ()>;
+
+    fn kill_and_report<'a>(&'a self, order: &'a KillOrder) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.kill(order).await;
+            true
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Delivered,
+    Undelivered,
+    NoKiller,
+}
+
+fn order_of(scope: KillScope, reason: KillReason, sessions: &[Session]) -> KillOrder {
+    KillOrder {
+        scope,
+        reason,
+        sessions: sessions
+            .iter()
+            .map(|session| KilledSession {
+                session_id: session.id.clone(),
+                node_id: session.node_id.clone(),
+            })
+            .collect(),
+    }
 }
 
 #[derive(Default)]
@@ -79,6 +109,32 @@ impl KillerSlot {
         reason: KillReason,
         sessions: &[Session],
     ) -> bool {
+        let dispatched = self.dispatch(scope, reason, sessions).await;
+        if dispatched {
+            for session in sessions {
+                revocation_audit::session_terminated(session, reason);
+            }
+        }
+        dispatched
+    }
+
+    pub(crate) async fn terminate(&self, session: &Session) -> Delivery {
+        let sessions = std::slice::from_ref(session);
+        let stopped = self.terminals.get().map_or(0, |terminals| {
+            terminals.stop_matching(&KillScope::Sessions, KillReason::Terminated, sessions)
+        });
+        let Some(killer) = self.current() else {
+            return Delivery::NoKiller;
+        };
+        let order = order_of(KillScope::Sessions, KillReason::Terminated, sessions);
+        if killer.kill_and_report(&order).await || stopped > 0 {
+            Delivery::Delivered
+        } else {
+            Delivery::Undelivered
+        }
+    }
+
+    async fn dispatch(&self, scope: KillScope, reason: KillReason, sessions: &[Session]) -> bool {
         if let Some(terminals) = self.terminals.get() {
             terminals.stop_matching(&scope, reason, sessions);
         }
@@ -93,21 +149,8 @@ impl KillerSlot {
             }
             return false;
         };
-        let order = KillOrder {
-            scope,
-            reason,
-            sessions: sessions
-                .iter()
-                .map(|session| KilledSession {
-                    session_id: session.id.clone(),
-                    node_id: session.node_id.clone(),
-                })
-                .collect(),
-        };
+        let order = order_of(scope, reason, sessions);
         killer.kill(&order).await;
-        for session in sessions {
-            revocation_audit::session_terminated(session, reason);
-        }
         true
     }
 }

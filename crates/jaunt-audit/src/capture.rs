@@ -8,17 +8,18 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{Filtered, Targets};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::event::{AuditEvent, RawValue};
 use crate::limiter::IntervalCounter;
 use crate::pipeline::Pipeline;
+use crate::reference::event_id;
 use crate::spec::{Classified, EventType};
 
 pub const AUDIT_TARGET: &str = "jaunt::audit";
 
 const EVENT_FIELD: &str = "event";
+const REFERENCE_FIELD: &str = "ref";
 const MAX_RAW_FIELDS: usize = 32;
 const MAX_DEBUG_CHARS: usize = 1024;
 const MAX_EVENT_NAME_CHARS: usize = 64;
@@ -184,7 +185,11 @@ impl AuditLayer {
             return;
         };
         let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
-        let id = format!("{sequence:016x}{}", Uuid::new_v4().simple());
+        let reference = raw.iter().rev().find_map(|(field, value)| match value {
+            RawValue::Text(text) if *field == REFERENCE_FIELD => Some(text.as_str()),
+            _ => None,
+        });
+        let id = event_id(sequence, reference);
         let (event, report) = AuditEvent::from_raw(kind, raw, id, self.inner.clock.now());
         let dropped = u64::try_from(report.fields_dropped).unwrap_or(u64::MAX);
         self.inner
@@ -362,6 +367,36 @@ mod tests {
         assert_eq!(events[0].text("login_id"), Some("l-1"));
         assert_eq!(events[0].fields.len(), 1);
         assert_eq!(stand.tap.snapshot().fields_dropped, 6);
+    }
+
+    #[tokio::test]
+    async fn a_denial_reference_becomes_part_of_the_event_id_and_other_refs_do_not() {
+        let stand = stand();
+        let subscriber = Registry::default().with(stand.tap.layer());
+        let reference = crate::reference::new_denial_reference();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "jaunt::audit", event = "terminal.denied", user_id = "u-1",
+                reason = "denied", "ref" = reference.as_str()
+            );
+            tracing::info!(
+                target: "jaunt::audit", event = "terminal.denied", user_id = "u-1",
+                reason = "account_refused", "ref" = "H-9D0311FE"
+            );
+        });
+
+        let events = drained(&stand).await;
+        assert_eq!(events[0].text("ref"), Some(reference.as_str()));
+        assert_eq!(
+            crate::reference::denial_reference_of(&events[0].id).as_deref(),
+            Some(reference.as_str())
+        );
+        assert_eq!(events[1].text("ref"), Some("H-9D0311FE"));
+        assert_ne!(
+            crate::reference::denial_reference_of(&events[1].id).as_deref(),
+            Some("H-9D0311FE")
+        );
     }
 
     #[test]

@@ -9,9 +9,10 @@ use jaunt_store::{
 };
 use jauntd::agents::{AgentServer, AgentServerParts, AgentsSettings};
 use russh::ChannelMsg;
+use tower::ServiceExt;
 
 use crate::stand::{Inner, Outer, Stand};
-use crate::support::{AGENTS_NAME, Harness, Options, eventually, unix_secs, within};
+use crate::support::{AGENTS_NAME, Harness, Options, PUBLIC_ORIGIN, eventually, unix_secs, within};
 
 const KILL_BUDGET: Duration = Duration::from_secs(5);
 const WATCH_BUDGET: Duration = Duration::from_millis(2500);
@@ -477,5 +478,79 @@ async fn the_sessions_of_an_agent_that_stays_away_are_closed_as_gone() {
         .await;
     assert_eq!(closed.state, SessionState::Ended);
     assert!(!stand.connected(0));
+    stand.stop().await;
+}
+
+async fn terminate(stand: &Stand, session_id: &str) -> http::StatusCode {
+    let opened = stand
+        .harness
+        .control
+        .open_web_session(&stand.user_id)
+        .await
+        .unwrap();
+    let mut request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(format!("/v1/admin/sessions/{session_id}/terminate"))
+        .header(http::header::COOKIE, opened.cookie)
+        .header("x-jaunt-csrf", opened.csrf_token)
+        .header(http::header::ORIGIN, PUBLIC_ORIGIN)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(r#"{"reason":"stand"}"#))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))));
+    stand
+        .harness
+        .control
+        .router()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_administrator_terminates_one_ssh_session_within_five_seconds_and_spares_the_rest() {
+    let stand = Stand::start_with(
+        &["web-01"],
+        Options {
+            web: true,
+            ..inline_enforcement_only()
+        },
+    )
+    .await;
+    stand.grant_session_terminate();
+    let identity = stand.identity().await;
+    let (outer, inner) = stand.session(&identity, "web-01").await;
+    let session_id = stand.nodes[0].log.last_authorized();
+    let (_other_outer, other_inner) = stand.session(&identity, "web-01").await;
+    let other_id = stand.nodes[0].log.last_authorized();
+    assert_ne!(session_id, other_id);
+
+    let started = Instant::now();
+    assert_eq!(
+        terminate(&stand, &session_id).await,
+        http::StatusCode::NO_CONTENT
+    );
+    let teardown = torn_down(started, KILL_BUDGET, &stand, 0, &session_id, None, &inner).await;
+
+    eprintln!("terminate: {teardown:?}");
+    let stored = stand.stored(&session_id).await;
+    assert_eq!(
+        (stored.state, stored.end_reason),
+        (SessionState::Ended, Some(SessionEndReason::Terminated))
+    );
+    assert!(!outer.handle.is_closed());
+    assert!(!other_inner.handle.is_closed());
+    assert_eq!(stand.stored(&other_id).await.state, SessionState::Active);
+    assert_eq!(
+        terminate(&stand, &session_id).await,
+        http::StatusCode::NO_CONTENT
+    );
+    assert_eq!(stand.stored(&other_id).await.state, SessionState::Active);
     stand.stop().await;
 }

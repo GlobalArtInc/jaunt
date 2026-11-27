@@ -17,6 +17,7 @@ pub(crate) const INTERNAL: u16 = 1011;
 pub(crate) const REVOKED: u16 = 4001;
 pub(crate) const IDLE: u16 = 4002;
 pub(crate) const STALLED: u16 = 4003;
+pub(crate) const TERMINATED: u16 = 4004;
 
 pub(crate) fn dimensions(cols: u32, rows: u32) -> Option<TerminalDimensions> {
     ((1..=MAX_COLS).contains(&cols) && (1..=MAX_ROWS).contains(&rows))
@@ -69,6 +70,7 @@ pub(crate) fn origin_is(headers: &HeaderMap, public_origin: &str) -> bool {
 pub(crate) enum Command {
     Resize(TerminalDimensions),
     Ping,
+    Active,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,8 @@ enum Incoming {
     Resize { cols: u32, rows: u32 },
     #[serde(rename = "ping")]
     Ping {},
+    #[serde(rename = "active")]
+    Active {},
 }
 
 pub(crate) fn parse_text(text: &str) -> Result<Command, Malformed> {
@@ -89,10 +93,43 @@ pub(crate) fn parse_text(text: &str) -> Result<Command, Malformed> {
             dimensions(cols, rows).map(Command::Resize).ok_or(Malformed)
         }
         Incoming::Ping {} => Ok(Command::Ping),
+        Incoming::Active {} => Ok(Command::Active),
     }
 }
 
-pub(crate) const ACCOUNT_STAGE: &str = "account";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Stage {
+    Node,
+    Account,
+    Shell,
+}
+
+impl Stage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Stage::Node => "node",
+            Stage::Account => "account",
+            Stage::Shell => "shell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recording {
+    Full,
+    Output,
+    Off,
+}
+
+impl Recording {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Recording::Full => "full",
+            Recording::Output => "output",
+            Recording::Off => "off",
+        }
+    }
+}
 
 #[derive(Serialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
@@ -105,6 +142,7 @@ enum Outgoing<'a> {
         account_created: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         home: Option<&'a str>,
+        recording: &'static str,
     },
     Exit {
         status: Option<u32>,
@@ -115,7 +153,13 @@ enum Outgoing<'a> {
         #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
         reference: Option<&'a str>,
     },
-    Pong,
+    Pong {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        node_ms: Option<u64>,
+    },
+    Idle {
+        seconds_left: u64,
+    },
 }
 
 fn text(message: &Outgoing<'_>) -> String {
@@ -123,15 +167,18 @@ fn text(message: &Outgoing<'_>) -> String {
         .unwrap_or_else(|_| String::from("{\"t\":\"error\",\"code\":\"unavailable\"}"))
 }
 
-pub(crate) fn progress(stage: &'static str) -> String {
-    text(&Outgoing::Progress { stage })
+pub(crate) fn progress(stage: Stage) -> String {
+    text(&Outgoing::Progress {
+        stage: stage.as_str(),
+    })
 }
 
-pub(crate) fn ready(session_id: &str, created_home: Option<&str>) -> String {
+pub(crate) fn ready(session_id: &str, created_home: Option<&str>, recording: Recording) -> String {
     text(&Outgoing::Ready {
         session_id,
         account_created: created_home.is_some(),
         home: created_home,
+        recording: recording.as_str(),
     })
 }
 
@@ -148,8 +195,12 @@ pub(crate) fn error(code: &'static str, reference: Option<&str>) -> String {
     text(&Outgoing::Error { code, reference })
 }
 
-pub(crate) fn pong() -> String {
-    text(&Outgoing::Pong)
+pub(crate) fn pong(node_ms: Option<u64>) -> String {
+    text(&Outgoing::Pong { node_ms })
+}
+
+pub(crate) fn idle(seconds_left: u64) -> String {
+    text(&Outgoing::Idle { seconds_left })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +260,12 @@ pub(crate) const fn closing(end: End) -> Closing {
         ),
         End::DeadPeer => (None, None, "", "dead_peer"),
         End::Wedged => (Some(STALLED), Some("stalled"), "stalled", "wedged"),
+        End::Terminated => (
+            Some(TERMINATED),
+            Some("terminated"),
+            "terminated",
+            "terminated",
+        ),
         End::Shutdown => (
             Some(GOING_AWAY),
             Some("unavailable"),
@@ -230,8 +287,8 @@ mod tests {
     use jaunt_ssh::{TerminalDimensions, TerminalExit};
 
     use super::{
-        ACCOUNT_STAGE, Command, Malformed, Offer, closing, dimensions, error, exit, offer,
-        origin_is, parse_text, progress, ready,
+        Command, Malformed, Offer, Recording, Stage, closing, dimensions, error, exit, idle, offer,
+        origin_is, parse_text, pong, progress, ready,
     };
     use crate::web::terminal::live::End;
 
@@ -312,6 +369,7 @@ mod tests {
             }))
         );
         assert_eq!(parse_text(r#"{"t":"ping"}"#), Ok(Command::Ping));
+        assert_eq!(parse_text(r#"{"t":"active"}"#), Ok(Command::Active));
         for refused in [
             r#"{"t":"resize","cols":0,"rows":24}"#,
             r#"{"t":"resize","cols":501,"rows":24}"#,
@@ -321,6 +379,8 @@ mod tests {
             r#"{"t":"resize","cols":80}"#,
             r#"{"t":"resize","cols":80,"rows":24,"x":1}"#,
             r#"{"t":"ping","extra":true}"#,
+            r#"{"t":"active","seconds":1}"#,
+            r#"{"t":"idle","seconds_left":120}"#,
             r#"{"t":"exec","command":"id"}"#,
             r#"{"cols":80,"rows":24}"#,
             "not json",
@@ -337,16 +397,30 @@ mod tests {
     #[test]
     fn server_messages_have_the_documented_shape() {
         assert_eq!(
-            ready("s-1", None),
-            r#"{"t":"ready","session_id":"s-1","account_created":false}"#
+            ready("s-1", None, Recording::Full),
+            r#"{"t":"ready","session_id":"s-1","account_created":false,"recording":"full"}"#
         );
         assert_eq!(
-            ready("s-1", Some("/home/alice")),
-            r#"{"t":"ready","session_id":"s-1","account_created":true,"home":"/home/alice"}"#
+            ready("s-1", Some("/home/alice"), Recording::Output),
+            r#"{"t":"ready","session_id":"s-1","account_created":true,"home":"/home/alice","recording":"output"}"#
         );
         assert_eq!(
-            progress(ACCOUNT_STAGE),
-            r#"{"t":"progress","stage":"account"}"#
+            ready("s-1", None, Recording::Off),
+            r#"{"t":"ready","session_id":"s-1","account_created":false,"recording":"off"}"#
+        );
+        for (stage, expected) in [
+            (Stage::Node, r#"{"t":"progress","stage":"node"}"#),
+            (Stage::Account, r#"{"t":"progress","stage":"account"}"#),
+            (Stage::Shell, r#"{"t":"progress","stage":"shell"}"#),
+        ] {
+            assert_eq!(progress(stage), expected);
+        }
+        assert_eq!(pong(None), r#"{"t":"pong"}"#);
+        assert_eq!(pong(Some(42)), r#"{"t":"pong","node_ms":42}"#);
+        assert_eq!(idle(120), r#"{"t":"idle","seconds_left":120}"#);
+        assert_eq!(
+            error("terminated", Some("D-0123ABCD")),
+            r#"{"t":"error","code":"terminated","ref":"D-0123ABCD"}"#
         );
         assert_eq!(
             exit(Some(&TerminalExit::Status(3))),
@@ -423,6 +497,12 @@ mod tests {
             (End::TooBig, Some(1009), None, "too_big"),
             (End::DeadPeer, None, None, "dead_peer"),
             (End::Wedged, Some(4003), Some("stalled"), "wedged"),
+            (
+                End::Terminated,
+                Some(4004),
+                Some("terminated"),
+                "terminated",
+            ),
             (End::Shutdown, Some(1001), Some("unavailable"), "shutdown"),
         ] {
             let closing = closing(end);

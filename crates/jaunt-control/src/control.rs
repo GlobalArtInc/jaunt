@@ -332,6 +332,17 @@ impl Control {
 
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
+    pub fn hold_web_terminal(
+        &self,
+        user_id: &str,
+        web_session: &str,
+        node_id: &str,
+    ) -> Option<crate::web::HeldTerminal> {
+        self.web.terminals.hold(user_id, web_session, node_id)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
     pub fn web_terminal_certificates(&self) -> Vec<String> {
         self.web.terminals.issued()
     }

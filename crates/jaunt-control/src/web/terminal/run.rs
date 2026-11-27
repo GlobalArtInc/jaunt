@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use jaunt_audit::new_denial_reference;
 use jaunt_ca::ssh_key::PublicKey;
 use jaunt_proto::{AccountEvent, AccountReference, AccountRefusal};
 use jaunt_ssh::{
@@ -28,7 +29,7 @@ use crate::user_cert::{self, CertOrigin};
 
 use super::audit::{self, Denial};
 use super::live::{Admission, End, Refused, Stop};
-use super::protocol::{self, ACCOUNT_STAGE, Command};
+use super::protocol::{self, Command, Recording, Stage};
 use super::{
     GateEvent, GateEvents, GateRequest, Installed, TERMINAL_DEAD_PEER_TIMEOUT,
     TERMINAL_MAX_FRAME_BYTES, TERMINAL_PING_INTERVAL, TERMINAL_WEDGE_TIMEOUT,
@@ -43,6 +44,12 @@ const PUMP_GRACE: Duration = Duration::from_secs(2);
 const SESSION_RECHECK: Duration = Duration::from_secs(60);
 const OUTGOING_QUEUE: usize = 4;
 const STORE_DEADLINE: Duration = Duration::from_secs(2);
+const IDLE_WARNING: Duration = Duration::from_secs(120);
+const MIN_WARNED_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+const ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
+const NODE_PROBE_INTERVAL: Duration = Duration::from_secs(20);
+const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const NODE_LATENCY_STALE: Duration = Duration::from_secs(60);
 
 pub(crate) struct Plan {
     pub(crate) user: User,
@@ -64,6 +71,8 @@ enum Out {
 
 const NOT_PINGED: u64 = u64::MAX;
 const NOT_WRITING: u64 = u64::MAX;
+const NOT_WARNED: u64 = u64::MAX;
+const NEVER_ACTIVE: u64 = u64::MAX;
 
 struct Flow {
     pending_output: AtomicU64,
@@ -80,6 +89,9 @@ struct Flow {
     reading_blocked: AtomicBool,
     ping_due: AtomicBool,
     ping_wanted: Notify,
+    warned_ms: AtomicU64,
+    active_ms: AtomicU64,
+    probe_wanted: Notify,
 }
 
 fn millis(elapsed: Duration) -> u64 {
@@ -103,6 +115,9 @@ impl Flow {
             reading_blocked: AtomicBool::new(false),
             ping_due: AtomicBool::new(false),
             ping_wanted: Notify::new(),
+            warned_ms: AtomicU64::new(NOT_WARNED),
+            active_ms: AtomicU64::new(NEVER_ACTIVE),
+            probe_wanted: Notify::new(),
         };
         flow.touch(now);
         flow.heard(now);
@@ -182,6 +197,138 @@ impl Flow {
 
     fn silent_for(&self, now: Duration) -> Duration {
         Duration::from_millis(millis(now).saturating_sub(self.heard_ms.load(Ordering::Relaxed)))
+    }
+
+    fn idle_warning(&self, now: Duration, idle_timeout: Duration) -> Option<IdleWarning> {
+        if idle_timeout < MIN_WARNED_IDLE_TIMEOUT {
+            return None;
+        }
+        let mark = self.activity_ms.load(Ordering::Relaxed);
+        let idle = Duration::from_millis(millis(now).saturating_sub(mark));
+        if idle < idle_timeout.saturating_sub(IDLE_WARNING)
+            || idle >= idle_timeout
+            || self.warned_ms.load(Ordering::Relaxed) == mark
+        {
+            return None;
+        }
+        let left = millis(idle_timeout.saturating_sub(idle));
+        Some(IdleWarning {
+            seconds_left: left.div_ceil(1000),
+            mark,
+        })
+    }
+
+    fn warned(&self, warning: &IdleWarning) {
+        self.warned_ms.store(warning.mark, Ordering::Relaxed);
+    }
+
+    fn active(&self, now: Duration) -> bool {
+        let last = self.active_ms.load(Ordering::Relaxed);
+        if last != NEVER_ACTIVE
+            && Duration::from_millis(millis(now).saturating_sub(last)) < ACTIVE_INTERVAL
+        {
+            return false;
+        }
+        self.active_ms.store(millis(now), Ordering::Relaxed);
+        self.touch(now);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cadence {
+    every: Duration,
+    last: Duration,
+}
+
+impl Cadence {
+    fn starting(every: Duration, now: Duration) -> Cadence {
+        Cadence { every, last: now }
+    }
+
+    fn due(&mut self, now: Duration) -> bool {
+        if now.saturating_sub(self.last) < self.every {
+            return false;
+        }
+        self.last = now;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdleWarning {
+    seconds_left: u64,
+    mark: u64,
+}
+
+#[derive(Default)]
+struct NodeLatency {
+    last: Mutex<Option<(u64, u64)>>,
+}
+
+impl NodeLatency {
+    fn record(&self, round_trip: Duration, now: Duration) {
+        let measured = millis(round_trip).min(millis(NODE_PROBE_TIMEOUT));
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((measured, millis(now)));
+    }
+
+    fn current(&self, now: Duration) -> Option<u64> {
+        let (measured, at) = (*self.last.lock().unwrap_or_else(PoisonError::into_inner))?;
+        (millis(now).saturating_sub(at) <= millis(NODE_LATENCY_STALE)).then_some(measured)
+    }
+}
+
+const NO_STAGE: u8 = 0;
+
+const fn stage_rank(stage: Stage) -> u8 {
+    match stage {
+        Stage::Node => 1,
+        Stage::Account => 2,
+        Stage::Shell => 3,
+    }
+}
+
+#[derive(Default)]
+struct Steps {
+    reached: AtomicU8,
+    changed: Notify,
+}
+
+impl Steps {
+    fn reach(&self, stage: Stage) {
+        self.reached.fetch_max(stage_rank(stage), Ordering::Relaxed);
+        self.changed.notify_one();
+    }
+
+    fn reached(&self) -> Option<Stage> {
+        match self.reached.load(Ordering::Relaxed) {
+            NO_STAGE => None,
+            1 => Some(Stage::Node),
+            2 => Some(Stage::Account),
+            _ => Some(Stage::Shell),
+        }
+    }
+}
+
+fn due_stages(sent: Option<Stage>, reached: Option<Stage>, creating: bool) -> Vec<Stage> {
+    let reached = reached.map_or(NO_STAGE, stage_rank);
+    let sent = sent.map_or(NO_STAGE, stage_rank);
+    [
+        (Stage::Node, reached >= stage_rank(Stage::Node) || creating),
+        (Stage::Account, creating),
+        (Stage::Shell, reached >= stage_rank(Stage::Shell)),
+    ]
+    .into_iter()
+    .filter(|(stage, due)| *due && stage_rank(*stage) > sent)
+    .map(|(stage, _)| stage)
+    .collect()
+}
+
+fn recording_mode(recordings_on: bool, record_input: Option<bool>) -> Recording {
+    match (recordings_on, record_input) {
+        (false, _) => Recording::Off,
+        (true, Some(false)) => Recording::Output,
+        (true, Some(true) | None) => Recording::Full,
     }
 }
 
@@ -313,6 +460,7 @@ struct Opened {
     output: TerminalOutput,
     session_id: String,
     deadline: i64,
+    recording: Recording,
 }
 
 struct Attempt {
@@ -446,9 +594,10 @@ async fn setup(
     control: &Control,
     plan: &Plan,
     stop: &Arc<Stop>,
-    account: &Arc<AccountWatch>,
+    watches: (&Arc<AccountWatch>, &Arc<Steps>),
     attempt: &mut Attempt,
 ) -> Result<Opened, End> {
+    let (account, steps) = watches;
     let (key, certificate, authorities, serial) = issue_certificate(control, plan, stop).await?;
     attempt.serial = Some(serial);
     let refused: Arc<OnceLock<ForwardRefusal>> = Arc::default();
@@ -468,6 +617,7 @@ async fn setup(
         })
     };
     let token = stop.token().child_token();
+    steps.reach(Stage::Node);
     let link = plan
         .installed
         .gate
@@ -487,6 +637,10 @@ async fn setup(
         .now()
         .and_then(|now| u64::try_from(now.secs).ok())
         .ok_or(End::Unavailable)?;
+    let logged_in = {
+        let steps = Arc::clone(steps);
+        move || steps.reach(Stage::Shell)
+    };
     let opened = open_terminal(
         link.stream,
         key,
@@ -498,6 +652,7 @@ async fn setup(
             authorities: &authorities,
             size: plan.size,
             now_unix,
+            logged_in: &logged_in,
         },
     )
     .await;
@@ -510,28 +665,32 @@ async fn setup(
         }
     };
     let session_id = stop.session_id().ok_or(End::Unavailable)?.to_owned();
-    let deadline = session_deadline(control, &session_id).await;
+    let (deadline, record_input) = session_terms(control, &session_id).await;
     let (input, output) = opened.split();
     Ok(Opened {
         input: Arc::new(input),
         output,
         session_id,
         deadline,
+        recording: recording_mode(control.recordings.is_some(), record_input),
     })
 }
 
-async fn session_deadline(control: &Control, session_id: &str) -> i64 {
+async fn session_terms(control: &Control, session_id: &str) -> (i64, Option<bool>) {
     let now = control.now().map_or(0, |now| now.secs);
     let default = i64::try_from(DEFAULT_MAX_SESSION_SECS).unwrap_or(i64::MAX);
     match control.store.sessions().get(session_id).await {
-        Ok(Some(session)) => session
-            .authorized_at
-            .unwrap_or(now)
-            .saturating_add(session.max_duration_secs.unwrap_or(default)),
-        Ok(None) => now.saturating_add(default),
+        Ok(Some(session)) => (
+            session
+                .authorized_at
+                .unwrap_or(now)
+                .saturating_add(session.max_duration_secs.unwrap_or(default)),
+            session.record_input,
+        ),
+        Ok(None) => (now.saturating_add(default), None),
         Err(err) => {
             tracing::warn!(target: "jaunt::web", error = %err, "loading a terminal session failed");
-            now.saturating_add(default)
+            (now.saturating_add(default), None)
         }
     }
 }
@@ -550,6 +709,20 @@ struct Waiting<'a> {
     stop: &'a Arc<Stop>,
     tx: &'a mpsc::Sender<Out>,
     account: &'a Arc<AccountWatch>,
+    steps: &'a Arc<Steps>,
+}
+
+async fn send_stages(waiting: &Waiting<'_>, sent: &mut Option<Stage>) {
+    let creating = waiting.account.latest().creating.is_some();
+    for stage in due_stages(*sent, waiting.steps.reached(), creating) {
+        *sent = Some(stage);
+        send_or_stop(
+            waiting.tx,
+            waiting.stop,
+            Out::Text(protocol::progress(stage)),
+        )
+        .await;
+    }
 }
 
 async fn wait_for_setup(
@@ -560,29 +733,55 @@ async fn wait_for_setup(
     early: &mut Vec<Message>,
     attempt: &mut Attempt,
 ) -> Result<Opened, End> {
+    let started = bounded_setup(setup(
+        control,
+        plan,
+        waiting.stop,
+        (waiting.account, waiting.steps),
+        attempt,
+    ));
+    await_setup(started, waiting, stream, early).await
+}
+
+async fn bounded_setup<T, F>(setup: F) -> Result<T, End>
+where
+    F: std::future::Future<Output = Result<T, End>>,
+{
+    tokio::time::timeout(SETUP_TIMEOUT, setup)
+        .await
+        .unwrap_or(Err(End::Unavailable))
+}
+
+async fn await_setup<T, F, S>(
+    started: F,
+    waiting: &Waiting<'_>,
+    stream: &mut S,
+    early: &mut Vec<Message>,
+) -> Result<T, End>
+where
+    F: std::future::Future<Output = Result<T, End>>,
+    S: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
     let stop = waiting.stop;
     let mut early_bytes = 0_usize;
     let mut watching = None;
-    let mut progressed = false;
-    let started = tokio::time::timeout(
-        SETUP_TIMEOUT,
-        setup(control, plan, stop, waiting.account, attempt),
-    );
+    let mut sent = None;
     tokio::pin!(started);
     loop {
         tokio::select! {
             biased;
             () = stop.cancelled() => return Err(stop.end().unwrap_or(End::Unavailable)),
             done = &mut started => {
-                return match done {
-                    Ok(result) => result,
-                    Err(_) => Err(End::Unavailable),
-                };
+                if done.is_ok() {
+                    send_stages(waiting, &mut sent).await;
+                }
+                return done;
             }
             () = waiting.account.subscribed.notified(), if watching.is_none() => {
                 watching = waiting.account.receiver.get().cloned();
             }
             () = account_changed(&mut watching) => {}
+            () = waiting.steps.changed.notified() => {}
             message = stream.next() => match message {
                 None | Some(Ok(Message::Close(_))) => return Err(End::ClientClosed),
                 Some(Err(error)) => return Err(read_end(&error)),
@@ -596,14 +795,7 @@ async fn wait_for_setup(
                 }
             },
         }
-        let creating = watching
-            .as_ref()
-            .is_some_and(|receiver| receiver.borrow().creating.is_some());
-        if creating && !progressed {
-            progressed = true;
-            let progress = Out::Text(protocol::progress(ACCOUNT_STAGE));
-            send_or_stop(waiting.tx, stop, progress).await;
-        }
+        send_stages(waiting, &mut sent).await;
     }
 }
 
@@ -683,6 +875,7 @@ struct Pump {
     control: Control,
     stop: Arc<Stop>,
     flow: Arc<Flow>,
+    latency: Arc<NodeLatency>,
     tx: mpsc::Sender<Out>,
 }
 
@@ -812,7 +1005,12 @@ impl Pump {
                     true
                 }
                 Ok(Command::Ping) => {
-                    send_or_stop(&self.tx, &self.stop, Out::Text(protocol::pong())).await
+                    let node_ms = self.latency.current(self.control.tick());
+                    send_or_stop(&self.tx, &self.stop, Out::Text(protocol::pong(node_ms))).await
+                }
+                Ok(Command::Active) => {
+                    self.flow.active(self.control.tick());
+                    true
                 }
                 Err(_) => {
                     self.stop.stop(End::Malformed);
@@ -907,6 +1105,7 @@ async fn watch(
     let mut interval = tokio::time::interval(WATCH_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_ping = control.tick();
+    let mut probes = Cadence::starting(NODE_PROBE_INTERVAL, control.tick());
     let mut last_recheck = control.tick();
     loop {
         tokio::select! {
@@ -928,6 +1127,13 @@ async fn watch(
         if tx.is_closed() {
             stop.stop(End::ClientClosed);
             return;
+        }
+        if let Some(warning) = flow.idle_warning(tick, settings.idle_timeout)
+            && tx
+                .try_send(Out::Text(protocol::idle(warning.seconds_left)))
+                .is_ok()
+        {
+            flow.warned(&warning);
         }
         if let Some(end) = verdict(flow, tick, settings.idle_timeout) {
             if end == End::Wedged {
@@ -954,11 +1160,46 @@ async fn watch(
             last_ping = tick;
             flow.ask_for_ping();
         }
+        if probes.due(tick) {
+            flow.probe_wanted.notify_one();
+        }
         if tick.saturating_sub(last_recheck) >= SESSION_RECHECK {
             last_recheck = tick;
             if let Some(end) = recheck(control, plan).await {
                 stop.stop(end);
                 return;
+            }
+        }
+    }
+}
+
+async fn probe_node(
+    control: Control,
+    stop: Arc<Stop>,
+    flow: Arc<Flow>,
+    input: Arc<TerminalInput>,
+    latency: Arc<NodeLatency>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => return,
+            () = flow.probe_wanted.notified() => {}
+        }
+        let started = control.tick();
+        let answered = tokio::select! {
+            biased;
+            () = stop.cancelled() => return,
+            answered = tokio::time::timeout(NODE_PROBE_TIMEOUT, input.probe()) => answered,
+        };
+        match answered {
+            Ok(Ok(())) => {
+                let now = control.tick();
+                latency.record(now.saturating_sub(started), now);
+            }
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::debug!(target: "jaunt::web", "a node did not answer a keepalive in time");
             }
         }
     }
@@ -976,7 +1217,12 @@ async fn settle<T>(task: JoinHandle<T>) -> Option<T> {
     }
 }
 
-fn record_denial(control: &Control, plan: &Plan, reason: &str, reference: Option<&str>) {
+fn record_denial(
+    control: &Control,
+    plan: &Plan,
+    reason: &str,
+    reference: Option<&str>,
+) -> Option<String> {
     control.web.terminals.denials.record(
         &Denial {
             user_id: &plan.user.id,
@@ -987,7 +1233,7 @@ fn record_denial(control: &Control, plan: &Plan, reason: &str, reference: Option
             client_addr: Some(plan.client_addr),
         },
         control.tick(),
-    );
+    )
 }
 
 pub(crate) async fn run(
@@ -1006,13 +1252,14 @@ pub(crate) async fn run(
                 Refused::Full => End::Limit,
                 Refused::Closing => End::Shutdown,
             };
-            record_denial(&control, &plan, setup_reason(end), None);
-            writer.finish(end, None, None).await;
+            let reference = record_denial(&control, &plan, setup_reason(end), None);
+            writer.finish(end, None, reference.as_deref()).await;
             return;
         }
     };
     let stop = Arc::clone(&admission.stop);
     let account = Arc::new(AccountWatch::default());
+    let steps = Arc::new(Steps::default());
     let mut early = Vec::new();
     let mut attempt = Attempt {
         serial: None,
@@ -1026,6 +1273,7 @@ pub(crate) async fn run(
             stop: &stop,
             tx: &writer.tx,
             account: &account,
+            steps: &steps,
         },
         &mut stream,
         &mut early,
@@ -1042,9 +1290,13 @@ pub(crate) async fn run(
                 (End::Unavailable, Some(detail)) => detail,
                 _ => setup_reason(end),
             };
-            let reference = reference.map(AccountReference::as_str);
-            record_denial(&control, &plan, reason, reference);
-            writer.finish(end, None, reference).await;
+            let reference = record_denial(
+                &control,
+                &plan,
+                reason,
+                reference.map(AccountReference::as_str),
+            );
+            writer.finish(end, None, reference.as_deref()).await;
             if let Some(gate) = attempt.gate.take() {
                 gate.finish().await;
             }
@@ -1057,7 +1309,11 @@ pub(crate) async fn run(
     send_or_stop(
         &writer.tx,
         &stop,
-        Out::Text(protocol::ready(&opened.session_id, created_home(&notice))),
+        Out::Text(protocol::ready(
+            &opened.session_id,
+            created_home(&notice),
+            opened.recording,
+        )),
     )
     .await;
     flow.touch(control.tick());
@@ -1070,15 +1326,24 @@ pub(crate) async fn run(
         serial,
         client_addr: plan.client_addr,
     });
+    let latency = Arc::new(NodeLatency::default());
     let pump = |stop: &Arc<Stop>| Pump {
         control: control.clone(),
         stop: Arc::clone(stop),
         flow: Arc::clone(&flow),
+        latency: Arc::clone(&latency),
         tx: writer.tx.clone(),
     };
     let window = opened.output.window();
     let outputs = tokio::spawn(pump(&stop).output(opened.output));
     let inputs = tokio::spawn(pump(&stop).input(stream, early, Arc::clone(&opened.input)));
+    let probes = tokio::spawn(probe_node(
+        control.clone(),
+        Arc::clone(&stop),
+        Arc::clone(&flow),
+        Arc::clone(&opened.input),
+        Arc::clone(&latency),
+    ));
     watch(
         &control,
         &plan,
@@ -1095,7 +1360,14 @@ pub(crate) async fn run(
     if settle(inputs).await.is_none() {
         tracing::debug!(target: "jaunt::web", "the input pump of a web terminal was stopped");
     }
-    writer.finish(end, exit.as_ref(), None).await;
+    if settle(probes).await.is_none() {
+        tracing::debug!(target: "jaunt::web", "the node probe of a web terminal was stopped");
+    }
+    let closing = protocol::closing(end);
+    let reference = (closing.code.is_some() && closing.error.is_some()).then(new_denial_reference);
+    writer
+        .finish(end, exit.as_ref(), reference.as_deref())
+        .await;
     if tokio::time::timeout(PUMP_GRACE, opened.input.disconnect())
         .await
         .is_err()
@@ -1110,11 +1382,12 @@ pub(crate) async fn run(
         user_id: &plan.user.id,
         session_id: &opened.session_id,
         node_id: &plan.node.id,
-        reason: protocol::closing(end).audit,
+        reason: closing.audit,
         bytes_in: flow.bytes_in.load(Ordering::Relaxed),
         bytes_out: flow.bytes_out.load(Ordering::Relaxed),
         duration: control.tick().saturating_sub(started),
         serial,
+        reference: reference.as_deref(),
     });
     drop(admission);
 }
@@ -1133,13 +1406,16 @@ mod tests {
     use jaunt_proto::{AccountEvent, AccountReference, AccountRefusal, AccountStage};
 
     use super::{
-        Flow, SETUP_TIMEOUT, STORE_DEADLINE, abrupt_cause, account_end, created_home, observe,
-        output_end, recheck_cause, verdict,
+        AccountWatch, Cadence, Flow, NodeLatency, Out, SETUP_TIMEOUT, STORE_DEADLINE, Steps,
+        Waiting, abrupt_cause, account_end, await_setup, bounded_setup, created_home, due_stages,
+        observe, output_end, recheck_cause, recording_mode, verdict,
     };
     use crate::host_accounts::AccountNotice;
     use crate::principal::Refusal;
     use crate::serve::SocketWrites;
     use crate::web::terminal::live::End;
+    use crate::web::terminal::live::{Limits, LiveTerminals};
+    use crate::web::terminal::protocol::{Recording, Stage, progress};
 
     const PATIENCE: Duration = Duration::from_secs(10);
     const IDLE: Duration = Duration::from_secs(1800);
@@ -1229,6 +1505,224 @@ mod tests {
         input.pending_input.store(1, Ordering::Relaxed);
         assert!(input.socket_wrote(10, at(50)));
         assert_eq!(verdict(&input, at(60), IDLE), Some(End::Wedged));
+    }
+
+    #[test]
+    fn progress_goes_node_then_account_only_when_creating_then_shell_and_never_back() {
+        let steps = Steps::default();
+        assert_eq!(due_stages(None, steps.reached(), false), []);
+        steps.reach(Stage::Node);
+        assert_eq!(due_stages(None, steps.reached(), false), [Stage::Node]);
+        assert_eq!(due_stages(Some(Stage::Node), steps.reached(), false), []);
+        assert_eq!(
+            due_stages(Some(Stage::Node), steps.reached(), true),
+            [Stage::Account]
+        );
+        steps.reach(Stage::Shell);
+        steps.reach(Stage::Node);
+        assert_eq!(steps.reached(), Some(Stage::Shell));
+        assert_eq!(
+            due_stages(Some(Stage::Account), steps.reached(), true),
+            [Stage::Shell]
+        );
+        assert_eq!(
+            due_stages(None, steps.reached(), true),
+            [Stage::Node, Stage::Account, Stage::Shell]
+        );
+        assert_eq!(
+            due_stages(None, steps.reached(), false),
+            [Stage::Node, Stage::Shell]
+        );
+        assert_eq!(due_stages(Some(Stage::Shell), steps.reached(), true), []);
+    }
+
+    #[tokio::test]
+    async fn stages_not_yet_sent_reach_the_browser_in_order_before_a_setup_done_in_one_poll() {
+        let live = std::sync::Arc::new(LiveTerminals::default());
+        let admission = live
+            .admit(
+                "alice",
+                "s-1",
+                "n-1",
+                &Limits {
+                    per_user: 1,
+                    total: 1,
+                },
+            )
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let account = std::sync::Arc::new(AccountWatch::default());
+        let (_notices, receiver) = tokio::sync::watch::channel(AccountNotice {
+            creating: Some(AccountReference::parse("H-00000001").unwrap()),
+            outcome: None,
+        });
+        assert!(account.receiver.set(receiver).is_ok());
+        let steps = std::sync::Arc::new(Steps::default());
+        let waiting = Waiting {
+            stop: &admission.stop,
+            tx: &tx,
+            account: &account,
+            steps: &steps,
+        };
+        let mut stream = futures_util::stream::pending();
+        let mut early = Vec::new();
+        let setup = async {
+            steps.reach(Stage::Node);
+            steps.reach(Stage::Shell);
+            Ok::<u8, End>(7)
+        };
+
+        let finished = await_setup(setup, &waiting, &mut stream, &mut early).await;
+
+        assert_eq!(finished, Ok(7));
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(out) = rx.recv().await {
+            if let Out::Text(text) = out {
+                frames.push(text);
+            }
+        }
+        assert_eq!(
+            frames,
+            [
+                progress(Stage::Node),
+                progress(Stage::Account),
+                progress(Stage::Shell)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_setup_that_failed_leaves_no_progress_frame_in_the_queue() {
+        let live = std::sync::Arc::new(LiveTerminals::default());
+        let admission = live
+            .admit(
+                "alice",
+                "s-1",
+                "n-1",
+                &Limits {
+                    per_user: 1,
+                    total: 1,
+                },
+            )
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let account = std::sync::Arc::new(AccountWatch::default());
+        let steps = std::sync::Arc::new(Steps::default());
+        let waiting = Waiting {
+            stop: &admission.stop,
+            tx: &tx,
+            account: &account,
+            steps: &steps,
+        };
+        let mut stream = futures_util::stream::pending();
+        let mut early = Vec::new();
+        let setup = async {
+            steps.reach(Stage::Node);
+            steps.reach(Stage::Shell);
+            Err::<u8, End>(End::Unavailable)
+        };
+
+        let finished = await_setup(setup, &waiting, &mut stream, &mut early).await;
+
+        assert_eq!(finished, Err(End::Unavailable));
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_setup_that_never_finishes_ends_as_unavailable_at_the_setup_timeout() {
+        let started = Instant::now();
+        let ended = bounded_setup(pending::<Result<u8, End>>()).await;
+        assert_eq!(ended, Err(End::Unavailable));
+        assert!(started.elapsed() >= SETUP_TIMEOUT);
+        assert!(started.elapsed() < SETUP_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(bounded_setup(ready(Ok::<u8, End>(3))).await, Ok(3));
+    }
+
+    #[test]
+    fn a_probe_is_due_once_per_interval_and_the_mark_moves_with_it() {
+        let mut probes = Cadence::starting(Duration::from_secs(20), at(100));
+        assert!(!probes.due(at(100)));
+        assert!(!probes.due(Duration::from_millis(119_999)));
+        assert!(probes.due(at(120)));
+        assert!(!probes.due(at(120)));
+        assert!(!probes.due(Duration::from_millis(139_999)));
+        assert!(probes.due(at(145)));
+        assert!(!probes.due(at(164)));
+        assert!(probes.due(at(165)));
+    }
+
+    #[test]
+    fn the_recording_mode_follows_the_server_store_and_the_input_decision() {
+        for (recordings_on, record_input, expected) in [
+            (true, Some(true), Recording::Full),
+            (true, Some(false), Recording::Output),
+            (true, None, Recording::Full),
+            (false, Some(true), Recording::Off),
+            (false, None, Recording::Off),
+        ] {
+            assert_eq!(
+                recording_mode(recordings_on, record_input),
+                expected,
+                "{recordings_on} {record_input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_node_latency_appears_after_a_measurement_is_clamped_and_goes_when_stale() {
+        let latency = NodeLatency::default();
+        assert_eq!(latency.current(at(5)), None);
+        latency.record(Duration::from_millis(37), at(10));
+        assert_eq!(latency.current(at(10)), Some(37));
+        assert_eq!(latency.current(at(70)), Some(37));
+        assert_eq!(latency.current(at(71)), None);
+        latency.record(Duration::from_secs(3600), at(100));
+        assert_eq!(latency.current(at(100)), Some(20_000));
+        latency.record(Duration::ZERO, at(120));
+        assert_eq!(latency.current(at(119)), Some(0));
+    }
+
+    #[test]
+    fn the_idle_warning_comes_once_two_minutes_before_the_timeout_and_activity_rearms_it() {
+        let flow = Flow::starting(at(0));
+        assert_eq!(flow.idle_warning(at(1679), IDLE), None);
+        let warning = flow.idle_warning(at(1680), IDLE).unwrap();
+        assert_eq!(warning.seconds_left, 120);
+        assert_eq!(
+            flow.idle_warning(at(1681), IDLE)
+                .map(|warning| warning.seconds_left),
+            Some(119)
+        );
+        flow.warned(&warning);
+        assert_eq!(flow.idle_warning(at(1700), IDLE), None);
+        assert_eq!(flow.idle_warning(at(1800), IDLE), None);
+        flow.touch(at(1750));
+        assert_eq!(flow.idle_warning(at(3429), IDLE), None);
+        assert!(flow.idle_warning(at(3430), IDLE).is_some());
+        let short = Flow::starting(at(0));
+        assert_eq!(short.idle_warning(at(100), Duration::from_secs(179)), None);
+        assert!(
+            short
+                .idle_warning(at(60), Duration::from_secs(180))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn active_resets_the_idle_timer_at_most_once_in_ten_seconds_and_ping_never_does() {
+        let flow = Flow::starting(at(0));
+        flow.pinged(at(1000));
+        flow.heard(at(1000));
+        assert_eq!(verdict(&flow, at(1800), IDLE), Some(End::IdleTimeout));
+        assert!(flow.active(at(1700)));
+        assert_eq!(verdict(&flow, at(1800), IDLE), None);
+        assert!(!flow.active(at(1709)));
+        assert_eq!(verdict(&flow, at(3500), IDLE), Some(End::IdleTimeout));
+        assert!(flow.active(at(1710)));
+        assert_eq!(verdict(&flow, at(3509), IDLE), None);
+        assert_eq!(verdict(&flow, at(3510), IDLE), Some(End::IdleTimeout));
     }
 
     #[test]

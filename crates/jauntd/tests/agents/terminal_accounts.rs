@@ -4,7 +4,7 @@ use http::StatusCode;
 use serde_json::{Value, json};
 
 use crate::support::{audited, field};
-use crate::terminal_support::{RECORDED_LOGIN, Received, TerminalStand};
+use crate::terminal_support::{RECORDED_LOGIN, Received, TerminalStand, without_reference};
 
 const REFERENCE: &str = "H-9D0311FE";
 
@@ -29,10 +29,6 @@ fn missing(reference: &str) -> Value {
     json!({"event": "missing", "ref": reference})
 }
 
-fn progress() -> Value {
-    json!({"t": "progress", "stage": "account"})
-}
-
 #[tokio::test]
 async fn a_login_that_creates_the_account_shows_the_step_and_the_ready_frame_names_the_home() {
     let stand = TerminalStand::start().await;
@@ -41,7 +37,6 @@ async fn a_login_that_creates_the_account_shows_the_step_and_the_ready_frame_nam
         .plan(vec![creating(REFERENCE), created()], false);
     let mut ws = stand.open(&stand.alice, RECORDED_LOGIN).await;
 
-    assert_eq!(ws.next().await, Received::Json(progress()));
     let Received::Json(ready) = ws.next().await else {
         panic!("the terminal did not become ready");
     };
@@ -49,8 +44,9 @@ async fn a_login_that_creates_the_account_shows_the_step_and_the_ready_frame_nam
     assert_eq!(
         ready,
         json!({"t": "ready", "session_id": session_id, "account_created": true,
-               "home": "/home/deploy"})
+               "home": "/home/deploy", "recording": "off"})
     );
+    assert_eq!(ws.stages, ["node", "account", "shell"]);
     assert_eq!(
         stand.accounts.answers(),
         [StatusCode::NO_CONTENT, StatusCode::NO_CONTENT]
@@ -76,8 +72,10 @@ async fn without_a_report_the_ready_frame_says_no_account_was_created() {
     let session_id = ready["session_id"].as_str().unwrap().to_owned();
     assert_eq!(
         ready,
-        json!({"t": "ready", "session_id": session_id, "account_created": false})
+        json!({"t": "ready", "session_id": session_id, "account_created": false,
+               "recording": "off"})
     );
+    assert_eq!(ws.stages, ["node", "shell"]);
 }
 
 #[tokio::test]
@@ -108,12 +106,14 @@ async fn a_refused_failed_or_missing_account_closes_with_its_own_code_and_refere
 
         let (messages, closed) = ws.ending().await;
         let error = json!({"t": "error", "code": code, "ref": reference});
-        let expected = if progressed {
-            vec![progress(), error]
+        assert_eq!(messages, [error], "{code}");
+        assert_eq!(without_reference(&messages[0], "H-")["code"], code);
+        let stages: &[&str] = if progressed {
+            &["node", "account"]
         } else {
-            vec![error]
+            &["node"]
         };
-        assert_eq!(messages, expected, "{code}");
+        assert_eq!(ws.stages, stages, "{code}");
         assert_eq!(closed, Some(1008), "{code}");
         assert_eq!(stand.accounts.answers(), answered, "{code}");
         let denied = audited(code, |event| {

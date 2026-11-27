@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use jaunt_audit::new_denial_reference;
 use jaunt_limits::{Rate, RateLimiter};
 
 const DENIALS_PER_USER: Rate = Rate::clamped(5, 6);
@@ -31,15 +32,18 @@ pub(crate) struct Denial<'a> {
 }
 
 impl DenialLog {
-    pub(crate) fn record(&self, denial: &Denial<'_>, now: Duration) {
+    pub(crate) fn record(&self, denial: &Denial<'_>, now: Duration) -> Option<String> {
         if !self
             .per_user
             .check(&denial.user_id.to_owned(), now)
             .is_allowed()
         {
             self.held_back.fetch_add(1, Ordering::Relaxed);
-            return;
+            return denial.reference.map(str::to_owned);
         }
+        let reference = denial
+            .reference
+            .map_or_else(new_denial_reference, str::to_owned);
         let suppressed = self.held_back.swap(0, Ordering::Relaxed);
         let client_addr = denial
             .client_addr
@@ -50,12 +54,13 @@ impl DenialLog {
             event = "terminal.denied",
             user_id = denial.user_id,
             reason = denial.reason,
-            "ref" = denial.reference,
+            "ref" = reference.as_str(),
             node = denial.node,
             login = denial.login,
             client_addr = client_addr.as_str(),
             suppressed
         );
+        Some(reference)
     }
 }
 
@@ -92,6 +97,7 @@ pub(crate) struct Closed<'a> {
     pub(crate) bytes_out: u64,
     pub(crate) duration: Duration,
     pub(crate) serial: u64,
+    pub(crate) reference: Option<&'a str>,
 }
 
 pub(crate) fn closed(closed: &Closed<'_>) {
@@ -105,7 +111,8 @@ pub(crate) fn closed(closed: &Closed<'_>) {
         bytes_in = closed.bytes_in,
         bytes_out = closed.bytes_out,
         duration_ms = u64::try_from(closed.duration.as_millis()).unwrap_or(u64::MAX),
-        serial = closed.serial
+        serial = closed.serial,
+        "ref" = closed.reference
     );
 }
 
@@ -127,11 +134,23 @@ mod tests {
             client_addr: None,
         };
         let at = Duration::from_secs(100);
-        for _ in 0..8 {
-            log.record(&denial("alice"), at);
-        }
+        let references: Vec<Option<String>> =
+            (0..8).map(|_| log.record(&denial("alice"), at)).collect();
         assert_eq!(log.held_back.load(std::sync::atomic::Ordering::Relaxed), 3);
-        log.record(&denial("bob"), at);
+        assert!(references[..5].iter().all(|reference| {
+            reference
+                .as_deref()
+                .is_some_and(jaunt_proto::is_denial_reference)
+        }));
+        assert!(references[5..].iter().all(Option::is_none));
+        let written: std::collections::HashSet<_> = references.iter().flatten().collect();
+        assert_eq!(written.len(), 5);
+        assert!(log.record(&denial("bob"), at).is_some());
         assert_eq!(log.held_back.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let account = Denial {
+            reference: Some("H-9D0311FE"),
+            ..denial("carol")
+        };
+        assert_eq!(log.record(&account, at).as_deref(), Some("H-9D0311FE"));
     }
 }

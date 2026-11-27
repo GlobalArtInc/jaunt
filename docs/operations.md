@@ -416,7 +416,7 @@ Defaults are in [configuration.md](configuration.md#limits). What you see when o
 | recording memory on the node (`recording.*`) | recording data is dropped and the session is marked incomplete | agent log `agent.ssh.recording_dropped`; session `recording_incomplete: true` |
 | recording uploads and sizes on the server (`recordings.*`) | the upload is refused | audit `recording.rejected` with `reason` |
 
-Noisy events are the connection-level and flood-driven ones (the `(noisy)` rows in the [Audit](#audit) table). Eleven of them carry a `suppressed` field: the first occurrence is logged and later ones are counted into it (`recording.rejected`, `login.callback_refused`, `http.rate_limited`, `http.connection_limited`, `http.client_ip_header_ignored`, `gate.limited`, `agent.limited`, `gate.tls.refused`, `terminal.denied`, `admin.signed_request_refused` and `host_user.refused`). `gate.tls.refused` counts each `reason` on its own, so a flood of one reason never hides the first event of another. The other eight have no such field and are written one by one: `login.device.code_failed`, `gate.connect`, `gate.session_refused`, `gate.disconnect`, `agent.rejected`, `join_token.refused`, `service.announce_refused` and `host_user.helper_failed`. Noisy events wait in their own queue, a quarter of `audit.queue` (256 with the default of 1024). Critical events have their own queue and are written first, so a flood of noisy events never displaces them. When the noisy queue is full, the newest noisy events are dropped, not the old ones. The daemon logs `the noisy audit queue is full, the newest noisy events were dropped` with the number dropped, at most once a minute, and the daemon log is the only place that says so.
+Noisy events are the connection-level and flood-driven ones (the `(noisy)` rows in the [Audit](#audit) table). Thirteen of them carry a `suppressed` field: the first occurrence is logged and later ones are counted into it (`recording.rejected`, `login.callback_refused`, `http.rate_limited`, `http.connection_limited`, `http.client_ip_header_ignored`, `gate.limited`, `agent.limited`, `gate.tls.refused`, `terminal.denied`, `admin.signed_request_refused`, `host_user.refused`, `token.used` and `token.refused`). `gate.tls.refused` counts each `reason` on its own, so a flood of one reason never hides the first event of another. The other eight have no such field and are written one by one: `login.device.code_failed`, `gate.connect`, `gate.session_refused`, `gate.disconnect`, `agent.rejected`, `join_token.refused`, `service.announce_refused` and `host_user.helper_failed`. Noisy events wait in their own queue, a quarter of `audit.queue` (256 with the default of 1024). Critical events have their own queue and are written first, so a flood of noisy events never displaces them. When the noisy queue is full, the newest noisy events are dropped, not the old ones. The daemon logs `the noisy audit queue is full, the newest noisy events were dropped` with the number dropped, at most once a minute, and the daemon log is the only place that says so.
 
 ## Audit
 
@@ -426,9 +426,9 @@ Every event is one JSON object: `v` (schema version, 1), `id`, `type`, `time` (U
 sudo journalctl -u jauntd -o cat | grep '^{"v":1' | jq -c 'select(.type | startswith("session."))'
 ```
 
-The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
+The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `ref` (a reference shown to a user with a refusal: `D-` or `H-` and 8 upper-case hexadecimal digits; it finds every event written since migration 0018 that carries it, otherwise `invalid_ref`; rows written before 0018 are not found by `ref`: they have no reference column, so `H-` references of older `host_user.*` rows are not searchable, and `D-` references did not exist before it), `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
 
-The 83 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
+The 86 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
 
 | Type | Actor | Fields |
 |---|---|---|
@@ -458,7 +458,7 @@ The 83 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `session.start` | user | `serial`, `login`, `pty`, `port_forwarding`, `record_input`, `max_duration_secs`, `roles`, `client_addr`; envelope: node, session_id, policy_hash |
 | `session.end` | user | `serial`, `login`, `exit_status`, `bytes_in`, `bytes_out`, `recording_incomplete`, `outcome`, `late`, `state_before`; envelope: node, session_id |
 | `session.end_rejected` | node | `reason`; envelope: node, session_id |
-| `session.terminated` | user | `serial`, `reason`; envelope: node, session_id |
+| `session.terminated` | user | `serial`, `reason`, `by`; envelope: node, session_id |
 | `revoke.created` | user | `revocation_id`, `kind`, `subject`, `reason`, `web_sessions_ended`, `api_access_removed` |
 | `revoke.removed` | user | `revocation_id`, `kind`, `subject` |
 | `gate.connect` (noisy) | anonymous | `client_addr`, `peer_addr`, `proxied` |
@@ -482,6 +482,10 @@ The 83 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `join_token.created` | user | `join_id`, `name`, `name_prefix`, `labels`, `max_uses`, `expires_at`, `allow_replace` |
 | `join_token.used` | anonymous | `join_id`, `enrollment_id`, `name`, `uses_left`, `replaced_node_id`, `source_ip`, `source_network`; envelope: node |
 | `join_token.refused` (noisy) | anonymous | `reason`, `join_id`, `name`, `source_ip`, `source_network` |
+| `token.created` | user | `jat_id`, `name`, `scope`, `cidrs`, `expires_at` |
+| `token.revoked` | user | `jat_id`, `name`, `creator` |
+| `token.used` (noisy) | user | `jat_id`, `permission`, `decision`, `reason`, `client_addr`, `suppressed` |
+| `token.refused` (noisy) | anonymous | `reason`, `client_addr`, `suppressed` |
 | `join_token.revoked` | user | `join_id`, `uses_left` |
 | `node.ssh_changed` | node | `ssh_enabled`; envelope: node |
 | `service.announce_refused` (noisy) | node | `reason`; envelope: node |
@@ -510,7 +514,7 @@ The 83 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `ca.reloaded` | system | `kind`, `trust_id`, `active_fp` |
 | `ca.reload.failed` | system | `reason` |
 | `terminal.opened` | user | `node`, `login`, `serial`, `client_addr`; envelope: node, session_id |
-| `terminal.closed` | user | `reason`, `bytes_in`, `bytes_out`, `duration_ms`, `serial`; envelope: node, session_id |
+| `terminal.closed` | user | `reason`, `bytes_in`, `bytes_out`, `duration_ms`, `serial`, `ref`; envelope: node, session_id |
 | `terminal.denied` (noisy) | user | `reason`, `node`, `login`, `client_addr`, `suppressed`, `ref` |
 | `host_user.created` | user | `login`, `uid`, `home`, `groups`, `ref`; envelope: node, session_id |
 | `host_user.refused` (noisy) | user | `login`, `reason`, `ref`, `suppressed`; envelope: node, session_id |

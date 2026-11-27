@@ -3,7 +3,7 @@ use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, ControlError as PlaneError, DenyReason, NodeCaller,
     SessionPermissions,
 };
-use jaunt_store::{ActivateSession, SessionState, Subjects};
+use jaunt_store::{ActivateSession, SessionOrigin, SessionState, Subjects};
 
 use crate::control::Control;
 use crate::holder::{self, Absent, Presented};
@@ -98,19 +98,23 @@ pub(crate) async fn authorize(
         return Ok(deny(DenyReason::PolicyDenied));
     }
     let permissions = permissions_of(&decision);
+    let origin = origin_of(control, &holder.user.id, request.serial);
 
     let activated = sessions
-        .activate(ActivateSession {
-            id: &binding.id,
-            node_id: &node_id,
-            user_id: &holder.user.id,
-            serial: holder.serial,
-            login: &request.login,
-            max_duration_secs: recorded_duration(permissions.max_duration_secs),
-            pty: permissions.pty,
-            record_input: permissions.record_input,
-            now: now.secs,
-        })
+        .activate_as(
+            ActivateSession {
+                id: &binding.id,
+                node_id: &node_id,
+                user_id: &holder.user.id,
+                serial: holder.serial,
+                login: &request.login,
+                max_duration_secs: recorded_duration(permissions.max_duration_secs),
+                pty: permissions.pty,
+                record_input: permissions.record_input,
+                now: now.secs,
+            },
+            origin,
+        )
         .await
         .map_err(store_failure("activating the session"))?;
     if activated.is_none() {
@@ -128,6 +132,19 @@ pub(crate) async fn authorize(
         policy_hash: policy.hash(),
     });
     Ok(AuthorizeDecision::Allow { permissions })
+}
+
+fn origin_of(control: &Control, user_id: &str, serial: u64) -> SessionOrigin {
+    if control
+        .web
+        .terminals
+        .live
+        .holds_certificate(user_id, serial)
+    {
+        SessionOrigin::Web
+    } else {
+        SessionOrigin::Ssh
+    }
 }
 
 fn permissions_of(decision: &SshDecision) -> SessionPermissions {

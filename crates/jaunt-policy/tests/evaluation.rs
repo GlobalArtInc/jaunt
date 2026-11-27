@@ -438,27 +438,37 @@ fn admin_permissions_are_the_union_of_applicable_roles() {
             "",
             "[audit.read, tokens.write]",
         ),
+        role(
+            "terminators",
+            Some("{ groups: [terminators] }"),
+            "",
+            "[sessions.terminate]",
+        ),
     ]);
     let cases = [
         (
             identity(ALICE, &["readers"]),
-            [true, true, true, false, false, false],
+            [true, true, false, true, false, false, false],
         ),
         (
             identity(ALICE, &[]),
-            [true, false, false, false, false, false],
+            [true, false, false, false, false, false, false],
         ),
         (
             identity("bob@example.com", &["readers"]),
-            [false, true, true, false, false, false],
+            [false, true, false, true, false, false, false],
         ),
         (
             identity("bob@example.com", &[]),
-            [false, false, false, false, false, false],
+            [false, false, false, false, false, false, false],
         ),
         (
             identity("bob@example.com", &["auditors"]),
-            [false, false, false, false, true, true],
+            [false, false, false, false, false, true, true],
+        ),
+        (
+            identity("bob@example.com", &["readers", "terminators"]),
+            [false, true, true, true, false, false, false],
         ),
     ];
     for (who, expected) in cases {
@@ -701,4 +711,46 @@ fn every_terminal_login_is_one_authorize_allows_and_route_agrees() {
             }
         }
     }
+}
+
+#[test]
+fn hidden_logins_are_the_template_substitutions_that_fail_the_portable_login_rule_but_not_a_substituted_root()
+ {
+    let set = load_roles(&[
+        role(
+            "ops",
+            Some("{ users: [alice@example.com] }"),
+            "{ nodes: { env: [prod] }, logins: [deploy, '{username}', 'g-{groups}', '{email}'] }",
+            "[]",
+        ),
+        role(
+            "elsewhere",
+            Some("{ users: [alice@example.com] }"),
+            "{ nodes: { env: [dev] }, logins: ['{username}'] }",
+            "[]",
+        ),
+    ]);
+    let who = identity_named(ALICE, "Rozmarin", &["ops", "Team A", "root"]);
+    let prod = node(&[("env", "prod")]);
+    assert_eq!(
+        set.ssh_hidden_logins(&who, &prod),
+        ["Rozmarin", "alice@example.com", "g-Team A"]
+    );
+    assert_eq!(set.ssh_logins(&who, &prod), ["deploy", "g-ops", "g-root"]);
+    assert!(
+        set.ssh_hidden_logins(&identity(ALICE, &["ops"]), &prod)
+            .iter()
+            .all(|login| login == ALICE)
+    );
+    assert!(
+        set.ssh_hidden_logins(&identity("bob@example.com", &[]), &prod)
+            .is_empty()
+    );
+    let root = identity_named(ALICE, "root", &[]);
+    assert_eq!(set.ssh_hidden_logins(&root, &prod), [ALICE]);
+    assert!(!set.ssh_logins(&root, &prod).contains(&"root".to_owned()));
+    assert!(
+        set.ssh_hidden_logins(&who, &node(&[("env", "qa")]))
+            .is_empty()
+    );
 }

@@ -248,6 +248,12 @@ impl Permission for SessionsRead {
     const REQUIRED: AdminPermission = AdminPermission::SessionsRead;
 }
 
+pub(crate) struct SessionsTerminate;
+
+impl Permission for SessionsTerminate {
+    const REQUIRED: AdminPermission = AdminPermission::SessionsTerminate;
+}
+
 pub(crate) struct RecordingsRead;
 
 impl Permission for RecordingsRead {

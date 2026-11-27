@@ -1,3 +1,4 @@
+use jaunt_proto::is_audit_reference;
 use jaunt_store::{AuditCursor, AuditQuery, Store, StoreError};
 use serde::Serialize;
 
@@ -33,6 +34,8 @@ pub enum FilterError {
     InvalidLimit,
     #[error("the cursor is not valid")]
     InvalidCursor,
+    #[error("the reference is not valid")]
+    InvalidRef,
 }
 
 impl FilterError {
@@ -48,6 +51,7 @@ impl FilterError {
             FilterError::InvalidRange => "invalid_range",
             FilterError::InvalidLimit => "invalid_limit",
             FilterError::InvalidCursor => "invalid_cursor",
+            FilterError::InvalidRef => "invalid_ref",
         }
     }
 }
@@ -64,6 +68,7 @@ pub struct AuditFilter {
     pub actor: Option<String>,
     pub node: Option<String>,
     pub session_id: Option<String>,
+    pub reference: Option<String>,
     pub from: Option<Timestamp>,
     pub to: Option<Timestamp>,
     pub limit: u32,
@@ -89,6 +94,7 @@ impl AuditFilter {
             actor: None,
             node: None,
             session_id: None,
+            reference: None,
             from: None,
             to: None,
             limit: DEFAULT_PAGE,
@@ -109,6 +115,13 @@ impl AuditFilter {
                 "node" => filter.node = Some(text(value).ok_or(FilterError::InvalidNode)?),
                 "session" => {
                     filter.session_id = Some(text(value).ok_or(FilterError::InvalidSession)?);
+                }
+                "ref" => {
+                    filter.reference = Some(
+                        is_audit_reference(value)
+                            .then(|| value.to_owned())
+                            .ok_or(FilterError::InvalidRef)?,
+                    );
                 }
                 "from" => filter.from = Some(time(value)?),
                 "to" => filter.to = Some(time(value)?),
@@ -131,6 +144,7 @@ impl AuditFilter {
             actor: self.actor.clone(),
             node: self.node.clone(),
             session_id: self.session_id.clone(),
+            reference: self.reference.clone(),
             from_ms: self.from.map(Timestamp::millis),
             to_ms: self.to.map(Timestamp::millis),
             after: self.cursor.clone(),
@@ -363,6 +377,75 @@ mod tests {
         assert_eq!(last.events.len(), 1);
         assert_eq!(last.events[0].id, "e");
         assert!(last.next_cursor.is_none());
+    }
+
+    #[test]
+    fn the_reference_filter_takes_one_exact_d_or_h_reference() {
+        for reference in ["D-0123ABCD", "H-9D0311FE"] {
+            let filter = parse(&[("ref", reference), ("type", "terminal.")]).unwrap();
+            assert_eq!(filter.reference.as_deref(), Some(reference));
+        }
+        for refused in ["", "D-0123abcd", "D-0123ABC", "X-0123ABCD", "D-0123ABCD%"] {
+            assert_eq!(
+                parse(&[("ref", refused)]).unwrap_err(),
+                FilterError::InvalidRef,
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            parse(&[("ref", "D-0123ABCD"), ("ref", "D-0123ABCD")]).unwrap_err(),
+            FilterError::DuplicateParameter
+        );
+        assert_eq!(FilterError::InvalidRef.code(), "invalid_ref");
+    }
+
+    #[tokio::test]
+    async fn a_reference_finds_every_event_that_carries_it_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("jaunt.db")).await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .audit_events()
+            .append(&[
+                row(
+                    "a",
+                    10,
+                    "terminal.denied",
+                    r#"{"reason":"denied","ref":"D-0000ABCD"}"#,
+                ),
+                row(
+                    "b",
+                    20,
+                    "terminal.closed",
+                    r#"{"reason":"revoked","ref":"D-0000ABCD"}"#,
+                ),
+                row(
+                    "c",
+                    30,
+                    "host_user.refused",
+                    r#"{"reason":"name_rule","ref":"H-9D0311FE"}"#,
+                ),
+                row("d", 40, "terminal.denied", r#"{"reason":"denied"}"#),
+            ])
+            .await
+            .unwrap();
+        let ids = |pairs: &'static [(&'static str, &'static str)]| {
+            let store = store.clone();
+            async move {
+                let page = query(&store, &parse(pairs).unwrap()).await.unwrap();
+                page.events
+                    .iter()
+                    .map(|event| event.id.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(ids(&[("ref", "D-0000ABCD")]).await, ["b", "a"]);
+        assert_eq!(ids(&[("ref", "H-9D0311FE")]).await, ["c"]);
+        assert_eq!(
+            ids(&[("ref", "D-0000ABCD"), ("type", "terminal.denied")]).await,
+            ["a"]
+        );
+        assert!(ids(&[("ref", "D-00000000")]).await.is_empty());
     }
 
     #[tokio::test]

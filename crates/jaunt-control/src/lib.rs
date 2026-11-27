@@ -104,8 +104,6 @@ pub use session_sweep::{
 };
 #[cfg(feature = "test-support")]
 pub use web::TestWebSession;
-#[cfg(feature = "test-support")]
-pub use web::WebTerminalCounters;
 pub use web::{
     DEFAULT_MAX_TERMINAL_TICKETS, DEFAULT_MAX_TERMINALS, DEFAULT_MAX_TERMINALS_PER_USER,
     DEFAULT_PLAYBACK_LIMIT_BYTES, DEFAULT_TERMINAL_IDLE_TIMEOUT, GateEvent, GateEvents, GateLink,
@@ -113,3 +111,5 @@ pub use web::{
     TERMINAL_PING_INTERVAL, TERMINAL_SUBPROTOCOL, TERMINAL_TICKET_PREFIX, TERMINAL_TICKET_TTL_SECS,
     TERMINAL_WEDGE_TIMEOUT, TerminalGate, WEB_CERTIFICATE_VALIDITY, WebTerminalSettings,
 };
+#[cfg(feature = "test-support")]
+pub use web::{HeldTerminal, WebTerminalCounters};

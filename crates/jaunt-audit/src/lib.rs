@@ -5,6 +5,7 @@ mod limiter;
 mod pipeline;
 mod query;
 mod recording;
+mod reference;
 mod retention;
 #[cfg(feature = "testing")]
 mod scoped;
@@ -37,6 +38,7 @@ pub use recording::{
     cast_sha256, manifest_bytes, manifest_sha256, read_store_proof, resolve_existing,
     store_error_of, verify_stored,
 };
+pub use reference::new_denial_reference;
 pub use retention::{
     DEFAULT_RETENTION_DAYS, MASS_DELETE_MIN_ROWS, MAX_RETENTION_DAYS, PRUNE_INTERVAL, PruneOutcome,
     Pruner, prune_once, prune_with_limits,

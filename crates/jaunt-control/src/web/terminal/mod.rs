@@ -1,6 +1,7 @@
 mod audit;
 mod live;
 mod open;
+mod pins;
 mod protocol;
 mod run;
 mod tickets;
@@ -15,7 +16,8 @@ use jaunt_ssh::{EphemeralKey, ForwardRefusal, JumpError, TunnelStream};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) use self::live::{End, LiveTerminals};
-pub(crate) use self::open::{open, targets, ticket};
+pub(crate) use self::open::{limits, open, recent, targets, ticket};
+pub(crate) use self::pins::{pin, unpin};
 
 pub const DEFAULT_MAX_TERMINALS_PER_USER: usize = 4;
 pub const DEFAULT_MAX_TERMINALS: usize = 64;
@@ -91,6 +93,29 @@ pub struct WebTerminalCounters {
     pub max_node_ahead: u64,
     pub pings: u64,
     pub socket_progress: u64,
+}
+
+#[cfg(feature = "test-support")]
+pub struct HeldTerminal {
+    admission: live::Admission,
+}
+
+#[cfg(feature = "test-support")]
+impl HeldTerminal {
+    pub fn routed(&self, session_id: &str) {
+        self.admission.stop.routed(session_id);
+    }
+
+    pub fn certificate_issued(&self, serial: u64) {
+        self.admission.stop.certificate_issued(serial);
+    }
+
+    pub fn closed_with(&self) -> Option<(Option<u16>, Option<&'static str>)> {
+        self.admission.stop.end().map(|end| {
+            let closing = protocol::closing(end);
+            (closing.code, closing.error)
+        })
+    }
 }
 
 pub(crate) type KeySource = Arc<dyn Fn() -> Result<EphemeralKey, JumpError> + Send + Sync>;
@@ -189,6 +214,27 @@ impl TerminalState {
             pings: self.counters.pings.load(Ordering::Relaxed),
             socket_progress: self.counters.socket_progress.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn hold(
+        &self,
+        user_id: &str,
+        web_session: &str,
+        node_id: &str,
+    ) -> Option<HeldTerminal> {
+        self.live
+            .admit(
+                user_id,
+                web_session,
+                node_id,
+                &live::Limits {
+                    per_user: usize::MAX,
+                    total: usize::MAX,
+                },
+            )
+            .ok()
+            .map(|admission| HeldTerminal { admission })
     }
 
     #[cfg(feature = "test-support")]

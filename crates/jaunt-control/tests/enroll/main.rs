@@ -35,6 +35,7 @@ mod web_signed;
 mod web_support;
 mod web_terminal;
 mod web_tokens;
+mod web_terminal_v2;
 
 #[allow(dead_code)]
 #[path = "../login/provider.rs"]

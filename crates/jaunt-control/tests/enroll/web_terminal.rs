@@ -448,19 +448,19 @@ async fn targets_list_the_active_nodes_the_current_policy_reaches_with_their_log
     assert_eq!(
         reply.json(),
         json!([
-            {"node": "dev-01", "labels": {"env": "dev"}, "connected": false, "creates_accounts": false, "logins": ["app"]},
-            {"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["alice", "deploy"]},
+            {"node": "dev-01", "labels": {"env": "dev"}, "connected": false, "creates_accounts": false, "logins": ["app"], "hidden_logins": [], "pinned": false},
+            {"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["alice", "deploy"], "hidden_logins": [], "pinned": false},
         ])
     );
     let reply = targets(harness, Some(&stand.bob)).await;
     assert_eq!(
         reply.json(),
-        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["bob", "deploy"]}])
+        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["bob", "deploy"], "hidden_logins": [], "pinned": false}])
     );
     let dave = browser(harness, "Dave", &["ops"]).await;
     assert_eq!(
         targets(harness, Some(&dave)).await.json(),
-        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["deploy"]}])
+        json!([{"node": "web-01", "labels": {"env": "prod"}, "connected": false, "creates_accounts": false, "logins": ["deploy"], "hidden_logins": ["Dave"], "pinned": false}])
     );
     assert_eq!(targets(harness, Some(&stand.carol)).await.json(), json!([]));
     assert_eq!(

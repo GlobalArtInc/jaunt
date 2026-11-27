@@ -233,6 +233,7 @@ pub struct JumpRequest<'a> {
     pub authorities: &'a HostAuthorities,
     pub size: TerminalDimensions,
     pub now_unix: u64,
+    pub logged_in: &'a (dyn Fn() + Send + Sync),
 }
 
 struct HostCheck {
@@ -441,6 +442,7 @@ pub async fn open_terminal<S: TunnelStream>(
     if !accepted.success() {
         return Err(JumpError::NodeRefused);
     }
+    (request.logged_in)();
     let channel = inner
         .channel_open_session()
         .await
@@ -705,6 +707,21 @@ impl TerminalInput {
 
     pub async fn disconnect(&self) {
         self.link.disconnect().await;
+    }
+
+    pub async fn probe(&self) -> Result<(), TerminalGone> {
+        if self.link.inner.is_closed() {
+            return Err(TerminalGone);
+        }
+        self.link
+            .inner
+            .send_ping()
+            .await
+            .map_err(|_| TerminalGone)?;
+        if self.link.inner.is_closed() {
+            return Err(TerminalGone);
+        }
+        Ok(())
     }
 }
 

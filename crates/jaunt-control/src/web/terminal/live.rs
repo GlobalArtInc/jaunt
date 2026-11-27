@@ -28,6 +28,7 @@ pub(crate) enum End {
     DeadPeer,
     Wedged,
     Shutdown,
+    Terminated,
 }
 
 impl End {
@@ -36,6 +37,7 @@ impl End {
             KillReason::Revoked => End::Revoked,
             KillReason::Expired => End::MaxDuration,
             KillReason::AgentGone | KillReason::NodeRemoved => End::Unavailable,
+            KillReason::Terminated => End::Terminated,
         }
     }
 }
@@ -193,16 +195,19 @@ impl LiveTerminals {
         scope: &KillScope,
         reason: KillReason,
         sessions: &[Session],
-    ) {
+    ) -> usize {
         let end = End::of_kill(reason);
+        let mut stopped = 0;
         self.each(|stop| {
             let named = stop
                 .session_id()
                 .is_some_and(|id| sessions.iter().any(|session| session.id == id));
             if named || stop.matches(scope) {
                 stop.stop(end);
+                stopped += 1;
             }
         });
+        stopped
     }
 
     pub(crate) fn stop_web_session(&self, web_session: &str, end: End) {
@@ -225,6 +230,21 @@ impl LiveTerminals {
 
     pub(crate) fn open(&self) -> usize {
         locked(&self.book).entries.len()
+    }
+
+    pub(crate) fn open_for(&self, user_id: &str) -> usize {
+        locked(&self.book)
+            .per_user
+            .get(user_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn holds_certificate(&self, user_id: &str, serial: u64) -> bool {
+        locked(&self.book)
+            .entries
+            .values()
+            .any(|stop| stop.user_id == user_id && stop.serial.get() == Some(&serial))
     }
 }
 
@@ -261,8 +281,37 @@ mod tests {
         assert_eq!(first_stop.end(), Some(End::Unavailable));
         assert!(first_stop.token().is_cancelled());
         let again = live.admit("alice", "s1", "n1", &LIMITS).unwrap();
+        assert_eq!((live.open_for("alice"), live.open_for("bob")), (2, 1));
         drop((second, third, again));
         assert_eq!(live.open(), 0);
+        assert_eq!(live.open_for("alice"), 0);
+    }
+
+    #[test]
+    fn only_a_live_terminal_holding_the_serial_for_its_own_user_vouches_for_a_web_certificate() {
+        let live = Arc::new(LiveTerminals::default());
+        let terminal = live.admit("alice", "s1", "n1", &LIMITS).unwrap();
+        assert!(!live.holds_certificate("alice", 7));
+        terminal.stop.certificate_issued(7);
+        assert!(live.holds_certificate("alice", 7));
+        assert!(!live.holds_certificate("bob", 7));
+        assert!(!live.holds_certificate("alice", 8));
+        drop(terminal);
+        assert!(!live.holds_certificate("alice", 7));
+    }
+
+    #[test]
+    fn a_terminate_order_names_one_session_and_ends_only_its_terminal_as_terminated() {
+        let live = Arc::new(LiveTerminals::default());
+        let named = live.admit("alice", "s1", "n1", &LIMITS).unwrap();
+        named.stop.routed("session-a");
+        let other = live.admit("alice", "s1", "n1", &LIMITS).unwrap();
+        other.stop.routed("session-b");
+        let mut session = jaunt_store_session("session-a");
+        session.user_id = "alice".to_owned();
+        live.stop_matching(&KillScope::Sessions, KillReason::Terminated, &[session]);
+        assert_eq!(named.stop.end(), Some(End::Terminated));
+        assert_eq!(other.stop.end(), None);
     }
 
     #[test]
@@ -352,6 +401,8 @@ mod tests {
             recording_incomplete: None,
             end_reason: None,
             max_duration_secs: None,
+            origin: jaunt_store::SessionOrigin::Web,
+            record_input: None,
         }
     }
 }

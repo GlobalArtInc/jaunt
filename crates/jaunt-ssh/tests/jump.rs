@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -358,6 +358,7 @@ fn carried(channel: Channel<Msg>, stalled: Arc<AtomicBool>) -> DuplexStream {
 
 struct Attempt {
     opened: Result<WebTerminal, JumpError>,
+    logins: usize,
     flooded: Option<Flooded>,
     node_flooded: Arc<Mutex<Option<Flooded>>>,
     node_ended: Arc<AtomicBool>,
@@ -437,6 +438,11 @@ async fn attempt_with(setup: Setup) -> Attempt {
     .to_openssh()
     .unwrap();
     let trusted = authorities.trusted();
+    let logins = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&logins);
+    let logged_in = move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    };
     let opened = tokio::time::timeout(
         STEP,
         open_terminal(
@@ -450,6 +456,7 @@ async fn attempt_with(setup: Setup) -> Attempt {
                 authorities: &trusted,
                 size: TerminalDimensions { cols: 80, rows: 24 },
                 now_unix: now,
+                logged_in: &logged_in,
             },
         ),
     )
@@ -458,6 +465,7 @@ async fn attempt_with(setup: Setup) -> Attempt {
     let flooded = *flooded.lock().unwrap();
     Attempt {
         opened,
+        logins: logins.load(Ordering::SeqCst),
         flooded,
         node_flooded,
         node_ended,
@@ -489,6 +497,38 @@ async fn still_usable(terminal: WebTerminal) {
 async fn a_certified_gate_and_node_open_a_terminal() {
     let outcome = attempt(Presented::Certified, Presented::Certified, None).await;
     assert!(outcome.opened.is_ok(), "{:?}", outcome.opened.err());
+    assert_eq!(outcome.logins, 1);
+}
+
+#[tokio::test]
+async fn the_login_hook_fires_only_after_the_node_accepted_the_login() {
+    let refused = attempt(Presented::Certified, Presented::OtherCa, None).await;
+    assert!(matches!(refused.opened, Err(JumpError::NodeHostKey)));
+    assert_eq!(refused.logins, 0);
+}
+
+#[tokio::test]
+async fn a_probe_is_answered_by_a_live_node_and_fails_once_the_connection_is_gone() {
+    let outcome = attempt(Presented::Certified, Presented::Certified, None).await;
+    let (input, _output) = outcome.opened.unwrap().split();
+    tokio::time::timeout(STEP, input.probe())
+        .await
+        .expect("the probe was not answered in time")
+        .expect("a live node did not answer the probe");
+    input.disconnect().await;
+    let gone = tokio::time::timeout(STEP, async {
+        loop {
+            if input.probe().await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "a probe kept succeeding on a closed connection"
+    );
 }
 
 #[tokio::test]

@@ -304,3 +304,64 @@ async fn the_counts_cover_the_whole_table_and_the_rows_before_a_cutoff() {
     assert_eq!(events.count_before(20).await.unwrap(), 1);
     assert_eq!(events.count_before(31).await.unwrap(), 3);
 }
+
+#[tokio::test]
+async fn a_reference_in_the_payload_is_indexed_and_found_with_the_other_filters() {
+    let (_dir, store) = fixture().await;
+    let events = store.audit_events();
+    let with = |id: &str, time_ms: i64, event_type: &str, actor: &str, reference: &str| {
+        let mut made = record(id, time_ms, event_type, actor);
+        made.payload = format!("{{\"reason\":\"denied\",\"ref\":\"{reference}\"}}");
+        made
+    };
+    events
+        .append(&[
+            with("a", 100, "terminal.denied", "u-1", "D-0000ABCD"),
+            with("b", 200, "terminal.closed", "u-2", "D-0000ABCD"),
+            with("c", 300, "host_user.refused", "u-1", "H-9D0311FE"),
+            with("d", 400, "terminal.denied", "u-1", "D-0000abcd"),
+            with("e", 500, "terminal.denied", "u-1", "D-0000ABCDX"),
+            record("f", 600, "terminal.denied", "u-1"),
+        ])
+        .await
+        .unwrap();
+    let found = |reference: &str, adjust: &dyn Fn(&mut AuditQuery)| {
+        let mut query = AuditQuery::newest(10);
+        query.reference = Some(reference.to_owned());
+        adjust(&mut query);
+        let events = events.clone();
+        async move { ids(&events.query(&query).await.unwrap()) }
+    };
+
+    assert_eq!(found("D-0000ABCD", &|_| {}).await, ["b", "a"]);
+    assert_eq!(found("H-9D0311FE", &|_| {}).await, ["c"]);
+    assert!(found("D-FFFFFFFF", &|_| {}).await.is_empty());
+    assert_eq!(
+        found("D-0000ABCD", &|query| query.actor = Some("u-1".to_owned())).await,
+        ["a"]
+    );
+    assert_eq!(
+        found("D-0000ABCD", &|query| {
+            query.type_prefix = Some("terminal.closed".to_owned());
+        })
+        .await,
+        ["b"]
+    );
+    assert_eq!(
+        found("D-0000ABCD", &|query| query.from_ms = Some(150)).await,
+        ["b"]
+    );
+    let mut invalid = AuditQuery::newest(10);
+    invalid.reference = Some("D-0000abcd".to_owned());
+    assert!(matches!(
+        events.query(&invalid).await,
+        Err(StoreError::InvalidInput(_))
+    ));
+    let mut planned = AuditQuery::newest(10);
+    planned.reference = Some("D-0000ABCD".to_owned());
+    let plan = events.query_plan(&planned).await.unwrap().join(" | ");
+    assert!(
+        plan.contains("audit_events_reference_time_ms_idx"),
+        "{plan}"
+    );
+}

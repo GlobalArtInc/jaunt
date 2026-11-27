@@ -39,6 +39,19 @@ pub(crate) fn session_terminated(session: &Session, reason: KillReason) {
     );
 }
 
+pub(crate) fn session_terminated_by(session: &Session, by: &str, reason: Option<&str>) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "session.terminated",
+        session_id = session.id.as_str(),
+        user_id = session.user_id.as_str(),
+        serial = session.serial,
+        node_id = session.node_id.as_str(),
+        reason,
+        by
+    );
+}
+
 pub(crate) fn principal_refused(user_id: &str, phase: &'static str) {
     tracing::info!(
         target: "jaunt::audit",

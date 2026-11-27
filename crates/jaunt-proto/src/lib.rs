@@ -1,6 +1,7 @@
 mod admin_signature;
 mod admin_token;
 mod agent_trust;
+mod audit_ref;
 mod client;
 mod db_principal;
 mod device;
@@ -37,6 +38,10 @@ pub use agent_trust::{
 pub use client::{
     CLIENT_CONFIG_V2_PATH, ClientConfig, ClientConfigV2, ClientTransport, GateEndpoint, NodeList,
     NodeSummary, PinnedRoot, ServicesClient, SshGateClient,
+};
+pub use audit_ref::{
+    ACCOUNT_REFERENCE_PREFIX, AUDIT_REFERENCE_DIGITS, DENIAL_REFERENCE_PREFIX, is_audit_reference,
+    is_denial_reference,
 };
 pub use db_principal::{
     is_db_name, is_db_user, is_valid_substituted_db_name, is_valid_substituted_db_user,

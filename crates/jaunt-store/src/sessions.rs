@@ -31,6 +31,29 @@ impl SessionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    Web,
+    Ssh,
+}
+
+impl SessionOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionOrigin::Web => "web",
+            SessionOrigin::Ssh => "ssh",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<SessionOrigin> {
+        match value {
+            "web" => Some(SessionOrigin::Web),
+            "ssh" => Some(SessionOrigin::Ssh),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndReason {
     Closed,
     Revoked,
@@ -38,6 +61,7 @@ pub enum SessionEndReason {
     AgentRestarted,
     AgentGone,
     NodeRemoved,
+    Terminated,
 }
 
 impl SessionEndReason {
@@ -49,6 +73,7 @@ impl SessionEndReason {
             SessionEndReason::AgentRestarted => "agent_restarted",
             SessionEndReason::AgentGone => "agent_gone",
             SessionEndReason::NodeRemoved => "node_removed",
+            SessionEndReason::Terminated => "terminated",
         }
     }
 
@@ -60,12 +85,14 @@ impl SessionEndReason {
             "agent_restarted" => Ok(SessionEndReason::AgentRestarted),
             "agent_gone" => Ok(SessionEndReason::AgentGone),
             "node_removed" => Ok(SessionEndReason::NodeRemoved),
+            "terminated" => Ok(SessionEndReason::Terminated),
             other => Err(StoreError::Corrupt(format!("sessions.end_reason: {other}"))),
         }
     }
 }
 
 pub const MAX_SESSION_PAGE: u32 = 200;
+pub const MAX_RECENT_PAIRS: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCursor {
@@ -79,6 +106,7 @@ pub struct SessionQuery {
     pub user: Option<String>,
     pub node: Option<String>,
     pub login: Option<String>,
+    pub origin: Option<SessionOrigin>,
     pub from: Option<i64>,
     pub to: Option<i64>,
     pub after: Option<SessionCursor>,
@@ -166,6 +194,15 @@ pub struct Session {
     pub recording_incomplete: Option<bool>,
     pub end_reason: Option<SessionEndReason>,
     pub max_duration_secs: Option<i64>,
+    pub origin: SessionOrigin,
+    pub record_input: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentPair {
+    pub node_id: String,
+    pub login: String,
+    pub last_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +240,7 @@ pub enum EndRejection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenSessions<'a> {
+    OfId(&'a str),
     OfUser(&'a str),
     OfSerial(i64),
     OfNode(&'a str),
@@ -232,7 +270,7 @@ macro_rules! session_columns {
     () => {
         "id, user_id, serial, node_id, state, created_at, expires_at, authorized_at, ended_at, \
          login, exit_status, bytes_in, bytes_out, recording_incomplete, end_reason, \
-         max_duration_secs"
+         max_duration_secs, origin, record_input"
     };
 }
 
@@ -258,7 +296,7 @@ const GET: &str = concat!("SELECT ", session_columns!(), " FROM sessions WHERE i
 
 const ACTIVATE: &str = concat!(
     "UPDATE sessions SET state = 'active', authorized_at = ?, login = ?, max_duration_secs = ?, \
-     pty = ?, record_input = ? \
+     pty = ?, record_input = ?, origin = ? \
      WHERE id = ? AND node_id = ? AND user_id = ? AND serial = ? \
      AND state = 'routed' AND expires_at > ? \
      AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') RETURNING ",
@@ -271,6 +309,8 @@ const END: &str = concat!(
      WHERE id = ? AND node_id = ? AND state = 'active' RETURNING ",
     session_columns!()
 );
+
+const CLOSE_OF_ID: &str = close_open!("id = ?");
 
 const CLOSE_OF_USER: &str = close_open!("user_id = ?");
 
@@ -326,7 +366,7 @@ const LISTING_SELECT: &str = "SELECT s.id AS id, s.user_id AS user_id, s.serial 
     s.login AS login, s.exit_status AS exit_status, s.bytes_in AS bytes_in, \
     s.bytes_out AS bytes_out, s.recording_incomplete AS recording_incomplete, \
     s.end_reason AS end_reason, s.max_duration_secs AS max_duration_secs, \
-    u.email AS user_email, n.name AS node_name, \
+    s.origin AS origin, s.record_input AS record_input, u.email AS user_email, n.name AS node_name, \
     r.state AS recording_state, r.salvaged AS recording_salvaged \
     FROM sessions s JOIN users u ON u.id = s.user_id JOIN nodes n ON n.id = s.node_id \
     LEFT JOIN recordings r ON r.session_id = s.id \
@@ -336,6 +376,19 @@ const NODE_COUNTS: &str = "SELECT \
     COALESCE(SUM(CASE WHEN state IN ('routed', 'active') THEN 1 ELSE 0 END), 0) AS open, \
     COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS since \
     FROM sessions WHERE node_id = ?";
+
+macro_rules! recent_pairs {
+    () => {
+        "SELECT node_id, login, MAX(created_at) AS last_at FROM sessions \
+         WHERE user_id = ? AND origin = ? AND login IS NOT NULL \
+         GROUP BY node_id, login ORDER BY last_at DESC, node_id, login LIMIT ?"
+    };
+}
+
+const RECENT_PAIRS: &str = recent_pairs!();
+
+#[cfg(test)]
+const RECENT_PAIRS_PLAN: &str = concat!("EXPLAIN QUERY PLAN ", recent_pairs!());
 
 const PURGE_EXPIRED_ROUTED: &str = "DELETE FROM sessions WHERE state = 'routed' AND expires_at < ?";
 
@@ -377,12 +430,21 @@ impl Sessions {
         &self,
         activation: ActivateSession<'_>,
     ) -> Result<Option<Session>, StoreError> {
+        self.activate_as(activation, SessionOrigin::Ssh).await
+    }
+
+    pub async fn activate_as(
+        &self,
+        activation: ActivateSession<'_>,
+        origin: SessionOrigin,
+    ) -> Result<Option<Session>, StoreError> {
         let row = sqlx::query(ACTIVATE)
             .bind(activation.now)
             .bind(activation.login)
             .bind(activation.max_duration_secs)
             .bind(activation.pty)
             .bind(activation.record_input)
+            .bind(origin.as_str())
             .bind(activation.id)
             .bind(activation.node_id)
             .bind(activation.user_id)
@@ -454,6 +516,7 @@ impl Sessions {
     ) -> Result<Vec<Session>, StoreError> {
         let closing = |sql| sqlx::query(sql).bind(now).bind(reason.as_str());
         let query = match which {
+            OpenSessions::OfId(id) => closing(CLOSE_OF_ID).bind(id),
             OpenSessions::OfUser(user_id) => closing(CLOSE_OF_USER).bind(user_id),
             OpenSessions::OfSerial(serial) => closing(CLOSE_OF_SERIAL).bind(serial).bind(serial),
             OpenSessions::OfNode(node_id) => closing(CLOSE_OF_NODE).bind(node_id),
@@ -543,6 +606,34 @@ impl Sessions {
         })
     }
 
+    pub async fn recent_pairs(
+        &self,
+        user_id: &str,
+        origin: SessionOrigin,
+        limit: u32,
+    ) -> Result<Vec<RecentPair>, StoreError> {
+        if limit == 0 || limit > MAX_RECENT_PAIRS {
+            return Err(StoreError::InvalidInput(
+                "the recent pair count is out of range",
+            ));
+        }
+        let rows = sqlx::query(RECENT_PAIRS)
+            .bind(user_id)
+            .bind(origin.as_str())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RecentPair {
+                    node_id: row.try_get("node_id")?,
+                    login: row.try_get("login")?,
+                    last_at: row.try_get("last_at")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn purge_expired_routed(&self, cutoff: i64) -> Result<u64, StoreError> {
         let done = sqlx::query(PURGE_EXPIRED_ROUTED)
             .bind(cutoff)
@@ -575,6 +666,10 @@ fn page_builder(prefix: &str, query: &SessionQuery) -> QueryBuilder<Sqlite> {
     if let Some(login) = &query.login {
         builder.push(" AND s.login = ");
         builder.push_bind(login.clone());
+    }
+    if let Some(origin) = query.origin {
+        builder.push(" AND s.origin = ");
+        builder.push_bind(origin.as_str());
     }
     if let Some(from) = query.from {
         builder.push(" AND s.created_at >= ");
@@ -614,6 +709,7 @@ fn listing_from_row(row: &SqliteRow) -> Result<SessionListing, StoreError> {
 fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
     let state: String = row.try_get("state")?;
     let end_reason: Option<String> = row.try_get("end_reason")?;
+    let origin: String = row.try_get("origin")?;
     Ok(Session {
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
@@ -634,5 +730,37 @@ fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
             .map(SessionEndReason::parse)
             .transpose()?,
         max_duration_secs: row.try_get("max_duration_secs")?,
+        origin: SessionOrigin::parse(&origin)
+            .ok_or_else(|| StoreError::Corrupt(format!("sessions.origin: {origin}")))?,
+        record_input: row.try_get("record_input")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::Row;
+
+    use super::RECENT_PAIRS_PLAN;
+
+    #[tokio::test]
+    async fn the_recent_pairs_of_a_user_are_read_through_the_user_origin_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(&dir.path().join("jaunt.db"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let rows = sqlx::query(RECENT_PAIRS_PLAN)
+            .bind("user")
+            .bind("web")
+            .bind(10_i64)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+        let plan: Vec<String> = rows.iter().map(|row| row.get("detail")).collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("sessions_user_id_origin_created_at_idx")),
+            "{plan:?}"
+        );
+    }
 }
