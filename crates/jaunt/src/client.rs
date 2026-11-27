@@ -4,9 +4,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jaunt_proto::{
-    ADMIN_CERTIFICATE_HEADER, CONTENT_DIGEST_HEADER, ClientConfig, ErrorBody, FinishRequest,
-    FinishResponse, NodeList, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER, StartRequest,
-    StartResponse, WhoamiResponse,
+    ADMIN_CERTIFICATE_HEADER, CLIENT_CONFIG_V2_PATH, CONTENT_DIGEST_HEADER, ClientConfig,
+    ClientConfigV2, ErrorBody, FinishRequest, FinishResponse, NodeList, SERVICES_PATH,
+    SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER, ServiceList, StartRequest, StartResponse,
+    WhoamiResponse, X509_CERTIFICATES_PATH, X509CertificateRequest, X509CertificateResponse,
 };
 use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -66,6 +67,16 @@ pub enum ApiError {
     BodyTooLarge,
     #[error("the server sent a response that cannot be understood")]
     BadResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchedConfig {
+    V2(ClientConfigV2),
+    V1(ClientConfig),
+}
+
+pub fn is_missing_route(err: ApiError) -> bool {
+    matches!(err, ApiError::Rejected { status: 404 | 405 })
 }
 
 pub struct ApiClient {
@@ -179,19 +190,48 @@ impl ApiClient {
         self.call(request)
     }
 
+    pub fn client_config_v2(&self, token: &Secret) -> Result<FetchedConfig, ApiError> {
+        match self.fetch_client_config_v2(token) {
+            Ok(config) => Ok(FetchedConfig::V2(config)),
+            Err(err) if is_missing_route(err) => self.client_config().map(FetchedConfig::V1),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn fetch_client_config_v2(&self, token: &Secret) -> Result<ClientConfigV2, ApiError> {
+        self.get_with_token(CLIENT_CONFIG_V2_PATH, token)
+    }
+
+    pub fn services(&self, token: &Secret) -> Result<ServiceList, ApiError> {
+        self.get_with_token(SERVICES_PATH, token)
+    }
+
+    pub fn issue_x509(
+        &self,
+        token: &Secret,
+        request: &X509CertificateRequest,
+    ) -> Result<X509CertificateResponse, ApiError> {
+        let bytes = serde_json::to_vec(request).map_err(|_| ApiError::Transport)?;
+        let request = self
+            .http
+            .post(self.server.endpoint(X509_CERTIFICATES_PATH))
+            .header(ACCEPT, JSON)
+            .header(CONTENT_TYPE, JSON)
+            .header(AUTHORIZATION, bearer(token)?)
+            .body(bytes);
+        self.call(request)
+    }
+
     fn get_with_token<T: DeserializeOwned>(
         &self,
         path: &str,
         token: &Secret,
     ) -> Result<T, ApiError> {
-        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
-            .map_err(|_| ApiError::Unauthorized)?;
-        bearer.set_sensitive(true);
         let request = self
             .http
             .get(self.server.endpoint(path))
             .header(ACCEPT, JSON)
-            .header(AUTHORIZATION, bearer);
+            .header(AUTHORIZATION, bearer(token)?);
         self.call(request)
     }
 
@@ -231,6 +271,13 @@ impl ApiClient {
             Err(error_for(status, &body))
         }
     }
+}
+
+fn bearer(token: &Secret) -> Result<HeaderValue, ApiError> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+        .map_err(|_| ApiError::Unauthorized)?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 fn fetch(request: RequestBuilder, deadline: Instant) -> Result<(u16, Vec<u8>), ApiError> {

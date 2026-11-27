@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
 use jaunt_policy::AdminPermission;
-use jaunt_proto::ADMIN_TOKEN_ENV;
+use jaunt_proto::{ADMIN_TOKEN_ENV, NodeList, ServiceList};
 
 use crate::admin::{
     AGENT_TIMEOUT, AdminContext, NewToken, TokenSource, create_token, list_tokens, parse_scope,
@@ -16,13 +16,18 @@ use crate::admin::{
 };
 use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
-use crate::client::{ApiClient, ApiError};
+use crate::client::{ApiClient, ApiError, is_missing_route};
 use crate::consent::TerminalPrompt;
 use crate::ensure::{EnsureIo, EnsureRequest, RenewOptions, SIGN_IN_DEADLINE};
 use crate::login::{LoginOptions, LoginPorts, SshSetup, lock_profile, login};
 use crate::logout::logout;
-use crate::ls::{render_json, render_text};
+use crate::ls::{
+    ListKind, Listing, render_everything_json, render_json, render_kinds_text,
+    render_services_json, render_text, select_services,
+};
 use crate::profile::{ProfileName, resolve_home};
+use crate::proxy::proxy_ssh;
+use crate::secret::Secret;
 use crate::server_url::ServerUrl;
 use crate::ssh_config::{EnsureCommand, validate};
 use crate::ssh_include::{IncludeTarget, include_line};
@@ -107,6 +112,13 @@ pub struct LsArgs {
     pub profile: ProfileName,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ListKind::Ssh,
+        help = "What to list: hosts (ssh), Kubernetes clusters (kube), databases (db), TCP services (tcp) or everything (all)"
+    )]
+    pub kind: ListKind,
 }
 
 #[derive(Debug, Args)]
@@ -138,6 +150,27 @@ pub struct EnsureArgs {
     pub home: Option<PathBuf>,
     #[arg(long, help = "Print only warnings and errors")]
     pub quiet: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProxyCommand {
+    #[command(
+        about = "Connect standard input and output to the SSH gateway over TLS (ssh runs this through the generated ssh_config)"
+    )]
+    Ssh(ProxySshArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProxySshArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, hide = true, value_name = "PATH")]
+    pub home: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -490,16 +523,20 @@ fn ensure_ssh_setup(environment: &Environment, home: &Path) -> Option<SshSetup> 
     })
 }
 
-fn ensure_request(args: &EnsureArgs, environment: &Environment) -> Result<EnsureRequest, String> {
-    let home = match &args.home {
-        Some(home) if home.is_absolute() => home.clone(),
-        Some(_) => return Err("--home must be an absolute path".to_owned()),
+fn explicit_home(home: Option<&PathBuf>, environment: &Environment) -> Result<PathBuf, String> {
+    match home {
+        Some(home) if home.is_absolute() => Ok(home.clone()),
+        Some(_) => Err("--home must be an absolute path".to_owned()),
         None => resolve_home(
             environment.jaunt_home.clone(),
             environment.user_home.clone(),
         )
-        .map_err(|err| err.to_string())?,
-    };
+        .map_err(|err| err.to_string()),
+    }
+}
+
+fn ensure_request(args: &EnsureArgs, environment: &Environment) -> Result<EnsureRequest, String> {
+    let home = explicit_home(args.home.as_ref(), environment)?;
     Ok(EnsureRequest {
         renew: RenewOptions {
             ssh: ensure_ssh_setup(environment, &home),
@@ -539,6 +576,31 @@ pub fn run_ensure(args: &EnsureArgs, environment: &Environment) -> ExitCode {
     ExitCode::from(run_ensure_with(args, environment, io))
 }
 
+pub fn run_proxy(command: &ProxyCommand, environment: &Environment) -> ExitCode {
+    match command {
+        ProxyCommand::Ssh(args) => run_proxy_ssh(args, environment),
+    }
+}
+
+fn run_proxy_ssh(args: &ProxySshArgs, environment: &Environment) -> ExitCode {
+    let home = match explicit_home(args.home.as_ref(), environment) {
+        Ok(home) => home,
+        Err(message) => return usage_error(message),
+    };
+    let now = match now_secs() {
+        Ok(now) => now,
+        Err(code) => return code,
+    };
+    let store = ProfileStore::new(&home, &args.profile);
+    match proxy_ssh(&store, &args.profile, now) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => failure(err),
+    }
+}
+
+const NO_SERVICES: &str =
+    "this server does not list Kubernetes clusters, databases or TCP services";
+
 pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
     let home = match home_for(environment) {
         Ok(home) => home,
@@ -564,12 +626,91 @@ pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
         Ok(client) => client,
         Err(err) => return failure(err),
     };
-    let list = match client.nodes(&token) {
-        Ok(list) => list,
-        Err(ApiError::Unauthorized) => {
-            return failure("your session expired: run `jaunt login`");
+    match args.kind {
+        ListKind::Ssh => list_hosts(args, &store, &client, &token),
+        ListKind::All => list_everything(args, &store, &client, &token),
+        ListKind::Kube | ListKind::Db | ListKind::Tcp => list_services(args, &client, &token),
+    }
+}
+
+fn fetch_nodes(client: &ApiClient, token: &Secret) -> Result<NodeList, ExitCode> {
+    match client.nodes(token) {
+        Ok(list) => Ok(list),
+        Err(ApiError::Unauthorized) => Err(failure("your session expired: run `jaunt login`")),
+        Err(err) => Err(failure(err)),
+    }
+}
+
+fn fetch_services(client: &ApiClient, token: &Secret) -> Result<Option<ServiceList>, ExitCode> {
+    match client.services(token) {
+        Ok(list) => Ok(Some(list)),
+        Err(ApiError::Unauthorized) => Err(failure("your session expired: run `jaunt login`")),
+        Err(err) if is_missing_route(err) || err == ApiError::NotConfigured => Ok(None),
+        Err(err) => Err(failure(err)),
+    }
+}
+
+fn list_services(args: &LsArgs, client: &ApiClient, token: &Secret) -> ExitCode {
+    let list = match fetch_services(client, token) {
+        Ok(Some(list)) => select_services(list, args.kind),
+        Ok(None) => return failure(NO_SERVICES),
+        Err(code) => return code,
+    };
+    let rendered = match args.format {
+        OutputFormat::Json => match render_services_json(&list) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => render_kinds_text(&Listing {
+            nodes: None,
+            suffix: None,
+            services: Some(&list),
+        }),
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
+}
+
+fn list_everything(
+    args: &LsArgs,
+    store: &ProfileStore,
+    client: &ApiClient,
+    token: &Secret,
+) -> ExitCode {
+    let nodes = match fetch_nodes(client, token) {
+        Ok(nodes) => nodes,
+        Err(code) => return code,
+    };
+    let services = match fetch_services(client, token) {
+        Ok(services) => services,
+        Err(code) => return code,
+    };
+    if services.is_none() {
+        eprintln!("jaunt: note: {NO_SERVICES}; only hosts are shown");
+    }
+    let rendered = match args.format {
+        OutputFormat::Json => match render_everything_json(&nodes, services.as_ref()) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => {
+            let suffix = match display_suffix(store, client) {
+                Ok(suffix) => suffix,
+                Err(code) => return code,
+            };
+            render_kinds_text(&Listing {
+                nodes: Some(&nodes),
+                suffix: suffix.as_deref(),
+                services: services.as_ref(),
+            })
         }
-        Err(err) => return failure(err),
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
+}
+
+fn list_hosts(args: &LsArgs, store: &ProfileStore, client: &ApiClient, token: &Secret) -> ExitCode {
+    let list = match fetch_nodes(client, token) {
+        Ok(list) => list,
+        Err(code) => return code,
     };
     let rendered = match args.format {
         OutputFormat::Json => match render_json(&list) {
@@ -577,7 +718,7 @@ pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
             Err(err) => return failure(format!("cannot format the answer: {err}")),
         },
         OutputFormat::Text => {
-            let suffix = match display_suffix(&store, &client) {
+            let suffix = match display_suffix(store, client) {
                 Ok(suffix) => suffix,
                 Err(code) => return code,
             };

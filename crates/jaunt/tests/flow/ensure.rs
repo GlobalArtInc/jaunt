@@ -16,7 +16,7 @@ use jaunt::profile::ProfileName;
 use jaunt::ssh_config::{EnsureCommand, HEADER, SshConfigError, render_ssh_config, validate};
 use jaunt::ssh_include::{IncludeTarget, include_line};
 use jaunt::store::ProfileStore;
-use jaunt_proto::{ClientConfig, GateEndpoint};
+use jaunt_proto::{ClientConfig, ClientTransport, GateEndpoint};
 use serde_json::json;
 
 use crate::cli::{base_command, jaunt, stderr, stdout, write_profile};
@@ -1241,6 +1241,7 @@ fn the_system_ssh_runs_the_generated_command_once_and_keeps_its_stdout_off_the_d
     let home = root.path().join("state");
     let text = render_ssh_config(
         &config,
+        ClientTransport::Tcp,
         &home.join("default"),
         &EnsureCommand {
             program: &program,

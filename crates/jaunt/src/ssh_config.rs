@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
-use jaunt_proto::{ClientConfig, GateEndpoint};
+use jaunt_proto::{ClientConfig, ClientTransport, GateEndpoint};
 
 use crate::issued::canonical_host_key;
 use crate::profile::ProfileName;
@@ -41,6 +41,28 @@ pub enum SshConfigError {
     UnsafeProgram { path: PathBuf },
     #[error("the profile name {name:?} cannot be written to an ssh_config safely")]
     UnsafeProfile { name: String },
+    #[error("the server sent a services domain that is not a lowercase DNS name")]
+    BadServicesDomain,
+    #[error("the server sent a TLS name for the gate that is not a lowercase DNS name")]
+    BadGateTlsName,
+    #[error("the server sent a TLS port for the gate that is not between 1 and 65535")]
+    BadServicesPort,
+    #[error("the server sent unusable TLS protocol names for the gate")]
+    BadAlpn,
+    #[error("the server offers SSH over TLS without the jaunt-ssh/1 protocol")]
+    MissingSshAlpn,
+    #[error("the server sent no pinned root for the gate, or more than 8")]
+    RootCount,
+    #[error("the server sent a pinned root that is not base64 DER")]
+    RootUnreadable,
+    #[error("the server sent a pinned root whose SHA-256 does not match the certificate")]
+    RootDigest,
+    #[error("the server sent a pinned root that is not a CA certificate")]
+    RootNotCa,
+    #[error("the server sent a pinned root that is not self-signed")]
+    RootNotSelfSigned,
+    #[error("the pinned root of the gate is not valid at this time (check the system clock)")]
+    RootOutsideValidity,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,7 +133,7 @@ pub fn is_dns_label(label: &str) -> bool {
         && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
 }
 
-fn is_dns_name(text: &str) -> bool {
+pub(crate) fn is_dns_name(text: &str) -> bool {
     text.len() <= MAX_DNS_NAME_LEN && text.split('.').all(is_dns_label)
 }
 
@@ -171,7 +193,13 @@ pub fn check_profile_dir(profile_dir: &Path) -> Result<(), SshConfigError> {
     Ok(())
 }
 
-fn ensure_words(command: &EnsureCommand<'_>) -> Result<String, SshConfigError> {
+struct CommandWords<'a> {
+    program: &'a str,
+    profile: &'a str,
+    home: String,
+}
+
+fn command_words<'a>(command: &EnsureCommand<'a>) -> Result<CommandWords<'a>, SshConfigError> {
     let program = command
         .program
         .to_str()
@@ -197,8 +225,32 @@ fn ensure_words(command: &EnsureCommand<'_>) -> Result<String, SshConfigError> {
         }
         None => String::new(),
     };
+    Ok(CommandWords {
+        program,
+        profile,
+        home,
+    })
+}
+
+fn ensure_words(command: &EnsureCommand<'_>) -> Result<String, SshConfigError> {
+    let CommandWords {
+        program,
+        profile,
+        home,
+    } = command_words(command)?;
     Ok(format!(
         "'{program}' ensure{home} --profile {profile} --quiet"
+    ))
+}
+
+pub fn proxy_command_line(command: &EnsureCommand<'_>) -> Result<String, SshConfigError> {
+    let CommandWords {
+        program,
+        profile,
+        home,
+    } = command_words(command)?;
+    Ok(format!(
+        "ProxyCommand '{program}' proxy ssh --profile {profile}{home}"
     ))
 }
 
@@ -216,6 +268,7 @@ pub fn ensure_match_line(
 
 pub fn render_ssh_config(
     config: &ClientConfig,
+    transport: ClientTransport,
     profile_dir: &Path,
     command: &EnsureCommand<'_>,
 ) -> Result<String, SshConfigError> {
@@ -223,6 +276,10 @@ pub fn render_ssh_config(
     let certificate = profile_path(profile_dir, CERTIFICATE_FILE)?;
     let known_hosts = profile_path(profile_dir, KNOWN_HOSTS_FILE)?;
     let auto_sign_in = ensure_match_line(&config.ssh_suffix, command)?;
+    let route = match transport {
+        ClientTransport::Tcp => "ProxyJump none".to_owned(),
+        ClientTransport::Tls => proxy_command_line(command)?,
+    };
     let common = format!(
         "    IdentityFile {identity}\n    CertificateFile {certificate}\n    IdentitiesOnly yes\n    UserKnownHostsFile {known_hosts}\n    StrictHostKeyChecking yes\n"
     );
@@ -234,7 +291,7 @@ pub fn render_ssh_config(
     if gate.port != DEFAULT_GATE_PORT {
         text.push_str(&format!("    Port {}\n", gate.port));
     }
-    text.push_str("    ProxyJump none\n");
+    text.push_str(&format!("    {route}\n"));
     text.push_str(&common);
     text.push_str(&format!(
         "\nHost *.{}\n    ProxyJump {GATE_USER}@{}\n",
@@ -264,12 +321,13 @@ pub fn render_known_hosts(config: &ClientConfig) -> String {
 mod tests {
     use std::path::Path;
 
-    use jaunt_proto::{ClientConfig, GateEndpoint};
+    use jaunt_proto::{ClientConfig, ClientTransport, GateEndpoint};
     use ssh_key::rand_core::OsRng;
     use ssh_key::{Algorithm, PrivateKey, PublicKey};
 
     use super::{
-        EnsureCommand, SshConfigError, check_ensure_command, render_known_hosts, validate,
+        EnsureCommand, SshConfigError, check_ensure_command, proxy_command_line,
+        render_known_hosts, validate,
     };
     use crate::profile::ProfileName;
 
@@ -285,7 +343,7 @@ mod tests {
             home: None,
             profile: &profile,
         };
-        super::render_ssh_config(config, profile_dir, &command)
+        super::render_ssh_config(config, ClientTransport::Tcp, profile_dir, &command)
     }
 
     fn key_line() -> String {
@@ -514,9 +572,13 @@ Host *.example.test
             profile: &profile,
         };
 
-        let text =
-            super::render_ssh_config(&valid, Path::new("/srv/Jörg Müller/jaunt/work-2"), &command)
-                .unwrap();
+        let text = super::render_ssh_config(
+            &valid,
+            ClientTransport::Tcp,
+            Path::new("/srv/Jörg Müller/jaunt/work-2"),
+            &command,
+        )
+        .unwrap();
 
         let expected = "# Managed by jaunt. Do not edit.
 Match host *.corp.test exec \"'/home/Jörg Müller/bin/jaunt' ensure --home '/srv/Jörg Müller/jaunt' --profile work-2 --quiet\"
@@ -540,6 +602,65 @@ Host *.corp.test
 ";
         assert_eq!(text, expected);
         assert!(!text.contains('%'));
+    }
+
+    #[test]
+    fn the_tls_transport_gives_the_gate_a_proxy_command_and_keeps_the_jump_for_nodes() {
+        let valid = validate(config("corp.test", "gate.corp.test", 2222, &[key_line()])).unwrap();
+        let profile = ProfileName::parse("work-2").unwrap();
+        let command = EnsureCommand {
+            program: Path::new("/home/Jörg Müller/bin/jaunt"),
+            home: Some(Path::new("/srv/Jörg Müller/jaunt")),
+            profile: &profile,
+        };
+
+        let text = super::render_ssh_config(
+            &valid,
+            ClientTransport::Tls,
+            Path::new("/srv/Jörg Müller/jaunt/work-2"),
+            &command,
+        )
+        .unwrap();
+        let again = super::render_ssh_config(
+            &valid,
+            ClientTransport::Tls,
+            Path::new("/srv/Jörg Müller/jaunt/work-2"),
+            &command,
+        )
+        .unwrap();
+
+        let expected = "# Managed by jaunt. Do not edit.
+Match host *.corp.test exec \"'/home/Jörg Müller/bin/jaunt' ensure --home '/srv/Jörg Müller/jaunt' --profile work-2 --quiet\"
+
+Host gate.corp.test
+    User jaunt
+    Port 2222
+    ProxyCommand '/home/Jörg Müller/bin/jaunt' proxy ssh --profile work-2 --home '/srv/Jörg Müller/jaunt'
+    IdentityFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519\"
+    CertificateFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519-cert.pub\"
+    IdentitiesOnly yes
+    UserKnownHostsFile \"/srv/Jörg Müller/jaunt/work-2/known_hosts\"
+    StrictHostKeyChecking yes
+
+Host *.corp.test
+    ProxyJump jaunt@gate.corp.test:2222
+    IdentityFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519\"
+    CertificateFile \"/srv/Jörg Müller/jaunt/work-2/id_ed25519-cert.pub\"
+    IdentitiesOnly yes
+    UserKnownHostsFile \"/srv/Jörg Müller/jaunt/work-2/known_hosts\"
+    StrictHostKeyChecking yes
+";
+        assert_eq!(text, expected);
+        assert_eq!(again, text);
+        let default_home = EnsureCommand {
+            program: Path::new(PROGRAM),
+            home: None,
+            profile: &profile,
+        };
+        assert_eq!(
+            proxy_command_line(&default_home).unwrap(),
+            "ProxyCommand '/usr/local/bin/jaunt' proxy ssh --profile work-2"
+        );
     }
 
     #[test]
@@ -570,12 +691,19 @@ Host *.corp.test
                 home: None,
                 profile: &profile,
             };
-            let outcome = super::render_ssh_config(&valid, Path::new("/p"), &command);
+            let outcome =
+                super::render_ssh_config(&valid, ClientTransport::Tcp, Path::new("/p"), &command);
             assert!(
                 matches!(outcome, Err(SshConfigError::UnsafeProgram { .. })),
                 "{program:?}"
             );
             assert!(check_ensure_command(&command).is_err(), "{program:?}");
+            let outcome =
+                super::render_ssh_config(&valid, ClientTransport::Tls, Path::new("/p"), &command);
+            assert!(
+                matches!(outcome, Err(SshConfigError::UnsafeProgram { .. })),
+                "{program:?}"
+            );
         }
         for home in ["/srv/50%", "/srv/a'b", "/srv/$X", "relative"] {
             let command = EnsureCommand {

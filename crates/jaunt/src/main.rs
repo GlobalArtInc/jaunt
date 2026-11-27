@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use jaunt::commands::{
-    AdminArgs, EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_admin,
-    run_ensure, run_login, run_logout, run_ls, run_status,
+    AdminArgs, EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, ProxyCommand, StatusArgs,
+    run_admin, run_ensure, run_login, run_logout, run_ls, run_proxy, run_status,
 };
 
 use crate::policy::PolicyCommand;
@@ -25,7 +25,7 @@ enum Command {
     Logout(LogoutArgs),
     #[command(about = "Show session status")]
     Status(StatusArgs),
-    #[command(about = "List available hosts")]
+    #[command(about = "List available hosts and services")]
     Ls(LsArgs),
     #[command(about = "Policy commands")]
     Policy {
@@ -36,6 +36,11 @@ enum Command {
     Ensure(EnsureArgs),
     #[command(about = "Administrator commands, sent as requests signed by the session key")]
     Admin(AdminArgs),
+    #[command(about = "Connect through the gateway over TLS (used by ssh)")]
+    Proxy {
+        #[command(subcommand)]
+        command: ProxyCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -48,6 +53,7 @@ fn main() -> ExitCode {
         Command::Ls(args) => run_ls(&args, &Environment::from_process()),
         Command::Ensure(args) => run_ensure(&args, &Environment::from_process()),
         Command::Admin(args) => run_admin(&args, &Environment::from_process()),
+        Command::Proxy { command } => run_proxy(&command, &Environment::from_process()),
     }
 }
 

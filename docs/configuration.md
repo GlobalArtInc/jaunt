@@ -257,18 +257,39 @@ Every name in these lists is written like a login: `[a-z_][a-z0-9_.-]{0,31}`. A 
 | `id_ed25519.pub`, `id_ed25519-cert.pub` | the public key and the certificate (mode 0600). The private key is in the ssh-agent; `id_ed25519` exists only when no ssh-agent is available |
 | `token` | the API token for `jaunt ls` and `jaunt status --online` |
 | `meta.json`, `client.json` | certificate serial and times; the server's SSH settings |
-| `ssh_config`, `known_hosts` | generated: `ProxyJump` through the gate, `CertificateFile`, `IdentitiesOnly yes`, and one `@cert-authority` line per host CA key |
+| `services.json` | only when the server has `services.domain`, with or without the SSH setup: the TLS name and port of the gate, the transport the server asks for, and the pinned roots of the gate that passed the checks (mode 0600) |
+| `ssh_config`, `known_hosts` | generated: `ProxyJump` through the gate (or `ProxyCommand` for the gate itself with the TLS transport), `CertificateFile`, `IdentitiesOnly yes`, and one `@cert-authority` line per host CA key |
+| `x509/key.pem`, `x509/cert.pem` | an Ed25519 key in PKCS#8 and a short-lived X.509 client certificate for Kubernetes and database access (mode 0600 in a 0700 directory). The key is made once per profile; the certificate is fetched when it is missing, ends within 60 seconds, does not match the key or names another user, and never outlives the SSH certificate. A sign-in to another server or as another user removes the certificate and keeps the key |
 
-`jaunt login` adds `Include ~/.jaunt/*/ssh_config` to `~/.ssh/config` once and keeps a copy in `~/.ssh/config.jaunt-backup`.
+`jaunt login` adds `Include ~/.jaunt/*/ssh_config` to `~/.ssh/config` once and keeps a copy in `~/.ssh/config.jaunt-backup`. `jaunt logout` removes the whole profile directory, `x509/` included; the private keys are overwritten before they are removed.
 
 | Command | Flags |
 |---|---|
 | `jaunt login` | `--server <URL>`, `--profile`, `--no-browser`, `--timeout <SECS>` (default 300, at most 900), `--no-ssh-config`, `--accept-ssh-config`, `--device` (not implemented) |
-| `jaunt logout`, `jaunt status`, `jaunt ls`, `jaunt ensure` | `--profile`; `status --online`; `ls --format text\|json`; `ensure --quiet` |
+| `jaunt logout`, `jaunt status`, `jaunt ls`, `jaunt ensure` | `--profile`; `status --online`; `ls --format text\|json`, `ls --kind ssh\|kube\|db\|tcp\|all`; `ensure --quiet` |
+| `jaunt proxy ssh` | `--profile`. Connects its standard input and output to the gate over TLS; `ssh` runs it through the generated `ProxyCommand` |
 | `jaunt policy check <DIR>` | `--format text\|json`. Loads the policy files and runs their `AccessTest` cases; exit code 0 when everything loads and every test passes, 1 when a test fails, 2 when the files do not load |
 | `jaunt policy schema` | prints the JSON Schema of the policy documents |
 
 `jaunt ensure` is what `ssh` runs through the generated `Match` line: exit 0 when a certificate with at least 60 seconds left is in place (it signs in again if needed), 1 when a sign-in is needed and cannot be done, 2 on a local error.
+
+`jaunt ls` lists the hosts you may reach, as before. `--kind kube`, `db` or `tcp` lists the Kubernetes clusters, databases or TCP services instead, `--kind all` lists hosts and services in one table with a `KIND` column. With `--format json` the answer of the server is printed in the same shape: for `kube`, `db` and `tcp` the service list after the services of the other kinds are left out, for `all` both lists unfiltered as `{"nodes": ..., "services": ...}`. A server without the service list is named in one line; `--kind kube`, `db` and `tcp` then exit with 1, `--kind all` shows the hosts only.
+
+### SSH through port 443
+
+`jaunt login`, and `jaunt ensure` when it signs in again, read `GET /v2/client/config` with the API token, also with `--no-ssh-config` (a server without that address answers 404 or 405, and `jaunt` then uses the older `GET /v1/client-config` and the direct port). When the answer names `services` and `ssh_gate.client_transport` is `tls`, the block of the gate in `ssh_config` gets
+
+```text
+ProxyCommand '/usr/local/bin/jaunt' proxy ssh --profile default
+```
+
+instead of `ProxyJump none`; the blocks of the nodes keep `ProxyJump` through the gate. With `tcp`, or with an older server, the file is the same as before and `ssh` connects to the gate's own port (2222 in the examples).
+
+`jaunt proxy ssh` connects to `services.gate_tls_name` on `services.port` with TLS 1.3 and the protocol `jaunt-ssh/1`, and checks the gate's certificate only against the roots pinned in `services.json`. It never uses the roots of the system and has no option to skip the check. The roots come from the server over the API channel, whose certificate is checked like that of any HTTPS address; every sign-in replaces them, and they are removed when the server stops offering `services`. Each root is checked on its own before it is stored: its SHA-256 must match, and it must be a self-signed CA certificate that is valid now. A root that fails is left out with one warning, and the others are kept; `jaunt proxy ssh` checks the stored roots again before each connection. At most 8 roots are accepted. SSH authentication still happens inside the TLS connection; TLS adds no client certificate.
+
+A defect in the TLS settings never stops a sign-in. When no root passes, or the settings themselves are broken, `jaunt` warns, stores no `services.json` and writes the direct route to the gate into `ssh_config` even if the server asks for `tls` ("TLS roots unusable, using port 2222 for ssh"). This is not a weaker check: SSH authenticates the gate by its host certificate end to end on either route. When a sign-in with the SSH setup cannot read the server's settings, the sign-in fails as before and nothing changes; when the SSH settings themselves are refused, `--no-ssh-config` signs in and stores only the TLS settings. When a sign-in without the SSH setup cannot read them (a timeout, a server error), it still succeeds, warns, and keeps the previous `services.json` unchanged; a server that answers that it has no such settings (404, 405 or `not_configured`) has its stored ones removed.
+
+Networks with a proxy that intercepts TLS break the pinned root. `jaunt proxy ssh` then stops with "the gate's certificate is not signed by the pinned root: a network device may be intercepting TLS; in such networks only the web console works; if the server's TLS roots changed, run `jaunt login` again" and does not try again with weaker settings. Only the web console works in such networks. The same message appears when the server has moved to a new root since the last sign-in; `jaunt login` fetches it.
 
 ## Policy files
 

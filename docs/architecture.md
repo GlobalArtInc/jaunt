@@ -69,6 +69,8 @@ The browser asks control for a one-time ticket (`POST /v1/web/terminal/ticket`) 
 | `jaunt-control`, `jaunt-gate` | the two roles |
 | `jauntd`, `jaunt-agent`, `jaunt` | the programs |
 
+In the `jaunt` crate every write to a profile directory happens under the profile lock (`login::lock_profile`). Commands that need the user X.509 certificate (Kubernetes, databases, TCP services) take the lock, check the SSH certificate with `ensure::check` and, when it is stale, sign in again with `login::login_with_lock`, then call `user_x509::ensure_x509` while still holding the lock. They never call `ensure::renew` or run `jaunt ensure` while holding it: both take the same lock and would wait for themselves until their deadline.
+
 `scripts/check-boundaries.sh` keeps `jaunt-gate` from depending on `jaunt-ca` and `jaunt-store`, and the agent and the CLI from depending on the signing, database and control crates. This is a boundary between crates, not between processes: in v1 the gate runs inside `jauntd` next to the control role, so code execution in the gate's listener reaches the keys in the process memory. A separate gate process is not implemented ([security.md](security.md)).
 
 ## Roadmap

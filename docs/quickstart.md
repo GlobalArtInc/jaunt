@@ -220,7 +220,7 @@ web-01.nodes.example.com   env=eval
 ssh <login>@web-01.nodes.example.com
 ```
 
-`jaunt login` also wrote `~/.jaunt/default/ssh_config`, `known_hosts` and the certificate. `Auto sign-in` means that `ssh` runs `jaunt ensure` when the certificate has expired and signs you in again.
+`jaunt login` also wrote `~/.jaunt/default/ssh_config`, `known_hosts` and the certificate. `Auto sign-in` means that `ssh` runs `jaunt ensure` when the certificate has expired and signs you in again. When the server has `services.domain`, `ssh` reaches the gate through `jaunt proxy ssh` over TLS on the agents port instead of port 2222; see [SSH through port 443](configuration.md#ssh-through-port-443). `jaunt ls --kind all` lists Kubernetes clusters, databases and TCP services next to the hosts.
 
 Now plain OpenSSH works. The name is `<node>.<suffix>`:
 

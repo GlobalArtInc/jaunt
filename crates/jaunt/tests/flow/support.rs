@@ -26,7 +26,8 @@ use jaunt::server_url::ServerUrl;
 use jaunt::ssh_include::IncludeTarget;
 use jaunt_proto::{
     ClientConfig, ErrorBody, FinishRequest, FinishResponse, GateEndpoint, NodeList, NodeSummary,
-    StartRequest, StartResponse, WhoamiResponse,
+    ServiceList, ServiceSummary, StartRequest, StartResponse, WhoamiResponse,
+    X509CertificateRequest, X509CertificateResponse,
 };
 use sha2::{Digest, Sha256};
 use ssh_key::certificate::{Builder, CertType};
@@ -146,8 +147,30 @@ pub enum ClientConfigReply {
 }
 
 #[derive(Clone, Default)]
+pub enum V2Reply {
+    #[default]
+    Missing,
+    Status(StatusCode),
+    Json(serde_json::Value),
+}
+
+#[derive(Clone, Default)]
+pub enum X509Reply {
+    #[default]
+    Missing,
+    NotConfigured,
+    Garbage,
+    Issue {
+        valid_before: i64,
+    },
+}
+
+#[derive(Clone, Default)]
 pub struct Behavior {
     pub client_config: ClientConfigReply,
+    pub client_config_v2: V2Reply,
+    pub services: Option<Vec<ServiceSummary>>,
+    pub x509: X509Reply,
     pub nodes: Vec<NodeSummary>,
     pub finish_error: Option<&'static str>,
     pub principals: Option<Vec<String>>,
@@ -168,6 +191,8 @@ pub struct Seen {
     pub public_key: Option<String>,
     pub finish_calls: usize,
     pub client_config_calls: usize,
+    pub client_config_v2_calls: usize,
+    pub x509_requests: Vec<SeenRequest>,
     pub revoked: bool,
     pub requests: usize,
     pub admin_requests: Vec<Vec<(String, String)>>,
@@ -199,6 +224,7 @@ fn record_request(shared: &Shared) -> bool {
 
 struct Shared {
     behavior: Behavior,
+    v2: Mutex<V2Reply>,
     ca: PrivateKey,
     host_ca: PrivateKey,
     port: Mutex<u16>,
@@ -472,6 +498,121 @@ async fn client_config_handler(State(shared): State<Arc<Shared>>) -> Response {
     }
 }
 
+fn bearer_matches(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(format!("Bearer {API_TOKEN}").as_str())
+}
+
+async fn client_config_v2_handler(
+    State(shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+) -> Response {
+    let reply = shared.v2.lock().unwrap().clone();
+    if matches!(reply, V2Reply::Missing) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    shared.seen.lock().unwrap().client_config_v2_calls += 1;
+    if !bearer_matches(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match reply {
+        V2Reply::Missing => StatusCode::NOT_FOUND.into_response(),
+        V2Reply::Status(status) => status.into_response(),
+        V2Reply::Json(value) => Json(value).into_response(),
+    }
+}
+
+async fn services_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    let Some(services) = shared.behavior.services.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    record_request(&shared);
+    if !bearer_matches(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(ServiceList {
+        services,
+        truncated: false,
+    })
+    .into_response()
+}
+
+async fn x509_handler(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    shared.seen.lock().unwrap().x509_requests.push(SeenRequest {
+        method: method.to_string(),
+        path: uri.path().to_owned(),
+        headers: headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect(),
+        body: body.to_vec(),
+    });
+    if !bearer_matches(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match shared.behavior.x509 {
+        X509Reply::Missing => StatusCode::NOT_FOUND.into_response(),
+        X509Reply::NotConfigured => error_response(StatusCode::NOT_FOUND, "not_configured"),
+        X509Reply::Garbage => Json(X509CertificateResponse {
+            certificate_der: "bm90IGEgY2VydGlmaWNhdGU=".to_owned(),
+            serial: 9,
+            parent_serial: 7,
+            valid_after: 1,
+            valid_before: 2,
+        })
+        .into_response(),
+        X509Reply::Issue { valid_before } => {
+            let request: X509CertificateRequest = serde_json::from_slice(&body).unwrap();
+            Json(user_certificate(&request.public_key, valid_before)).into_response()
+        }
+    }
+}
+
+pub fn user_certificate(public_key: &str, valid_before: i64) -> X509CertificateResponse {
+    use base64::engine::general_purpose::STANDARD;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, SanType, SubjectPublicKeyInfo,
+    };
+
+    let mut root = CertificateParams::new(Vec::<String>::new()).unwrap();
+    root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let issuer = CertifiedIssuer::self_signed(root, KeyPair::generate().unwrap()).unwrap();
+    let spki = STANDARD.decode(public_key).unwrap();
+    let subject = SubjectPublicKeyInfo::from_der(&spki).unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = vec![SanType::URI(
+        format!("urn:jaunt:user:{USER_ID}").try_into().unwrap(),
+    )];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.is_ca = IsCa::ExplicitNoCa;
+    let epoch = rcgen::date_time_ymd(1970, 1, 1);
+    let now = i64::try_from(now_secs()).unwrap();
+    params.not_before = epoch + Duration::from_secs(u64::try_from(now - 60).unwrap());
+    params.not_after = epoch + Duration::from_secs(u64::try_from(valid_before).unwrap());
+    let certificate = params.signed_by(&subject, &issuer).unwrap();
+    X509CertificateResponse {
+        certificate_der: STANDARD.encode(certificate.der()),
+        serial: 9,
+        parent_serial: 7,
+        valid_after: now - 60,
+        valid_before,
+    }
+}
+
 async fn nodes_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -490,6 +631,7 @@ async fn nodes_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) ->
 impl FakeServer {
     pub fn start(behavior: Behavior) -> FakeServer {
         let shared = Arc::new(Shared {
+            v2: Mutex::new(behavior.client_config_v2.clone()),
             behavior,
             ca: ca_key(),
             host_ca: ca_key(),
@@ -502,6 +644,9 @@ impl FakeServer {
             .route("/v1/login/finish", post(finish_handler))
             .route("/v1/whoami", get(whoami_handler))
             .route("/v1/client-config", get(client_config_handler))
+            .route("/v2/client/config", get(client_config_v2_handler))
+            .route("/v1/services", get(services_handler))
+            .route("/v1/certificates/x509", post(x509_handler))
             .route("/v1/nodes", get(nodes_handler))
             .route("/v1/admin/whoami", get(admin_whoami_handler))
             .route(
@@ -558,6 +703,10 @@ impl FakeServer {
 
     pub fn seen<T>(&self, read: impl FnOnce(&Seen) -> T) -> T {
         read(&self.shared.seen.lock().unwrap())
+    }
+
+    pub fn set_client_config_v2(&self, reply: V2Reply) {
+        *self.shared.v2.lock().unwrap() = reply;
     }
 
     pub fn revoke(&self) {

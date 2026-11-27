@@ -10,6 +10,7 @@ use jaunt_proto::ClientConfig;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::gate_config::GateServices;
 use crate::profile::{ProfileName, profile_dir};
 use crate::secret::Secret;
 use crate::server_url::ServerUrl;
@@ -24,7 +25,8 @@ const PRIVATE_KEY_FILE: &str = "id_ed25519";
 const CLIENT_FILE: &str = "client.json";
 const SSH_CONFIG_FILE: &str = "ssh_config";
 const KNOWN_HOSTS_FILE: &str = "known_hosts";
-const OWNED_FILES: [&str; 9] = [
+const SERVICES_FILE: &str = "services.json";
+const OWNED_FILES: [&str; 10] = [
     PRIVATE_KEY_FILE,
     CERTIFICATE_FILE,
     PUBLIC_KEY_FILE,
@@ -34,7 +36,12 @@ const OWNED_FILES: [&str; 9] = [
     CLIENT_FILE,
     SSH_CONFIG_FILE,
     KNOWN_HOSTS_FILE,
+    SERVICES_FILE,
 ];
+pub(crate) const X509_DIR: &str = "x509";
+pub(crate) const X509_KEY_FILE: &str = "key.pem";
+pub(crate) const X509_CERT_FILE: &str = "cert.pem";
+const X509_OWNED_FILES: [&str; 2] = [X509_KEY_FILE, X509_CERT_FILE];
 const MAX_MARKER_BYTES: u64 = 64;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -42,7 +49,7 @@ const PRIVATE_MODE_FORBIDDEN: u32 = 0o077;
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
-static SIBLING_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SIBLING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMeta {
@@ -63,6 +70,13 @@ pub struct LoginFiles<'a> {
     pub token: &'a Secret,
     pub meta: &'a ProfileMeta,
     pub ssh: Option<&'a SshFiles>,
+    pub services: Option<ServicesFile<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServicesFile<'a> {
+    Checked(&'a GateServices),
+    Kept(&'a [u8]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +243,34 @@ impl ProfileStore {
             .map_err(|_| StoreError::Corrupt { path })
     }
 
+    pub fn read_gate_services(&self) -> Result<Option<GateServices>, StoreError> {
+        let path = self.dir.join(SERVICES_FILE);
+        let Some(bytes) = self.read_bytes(&path)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| StoreError::Corrupt { path })
+    }
+
+    pub fn read_gate_services_bytes(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read_bytes(&self.dir.join(SERVICES_FILE))
+    }
+
+    pub fn x509_dir(&self) -> PathBuf {
+        self.dir.join(X509_DIR)
+    }
+
+    pub fn forget_x509_certificate(&self) -> Result<bool, StoreError> {
+        let dir = self.x509_dir();
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => remove_if_present(&dir.join(X509_CERT_FILE)),
+            Ok(_) => Err(StoreError::NotADirectory { path: dir }),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(io_error("inspect", &dir, err)),
+        }
+    }
+
     pub fn read_certificate_line(&self) -> Result<Option<String>, StoreError> {
         let path = self.certificate_path();
         Ok(self.read_text(&path)?.map(|text| text.trim().to_owned()))
@@ -378,6 +420,17 @@ impl ProfileStore {
             transaction.write(SSH_CONFIG_FILE, ssh.ssh_config.as_bytes())?;
             transaction.write(KNOWN_HOSTS_FILE, ssh.known_hosts.as_bytes())?;
         }
+        match files.services {
+            Some(ServicesFile::Checked(services)) => {
+                let services =
+                    serde_json::to_vec_pretty(services).map_err(|_| StoreError::Corrupt {
+                        path: self.dir.join(SERVICES_FILE),
+                    })?;
+                transaction.write(SERVICES_FILE, &services)?;
+            }
+            Some(ServicesFile::Kept(bytes)) => transaction.write(SERVICES_FILE, bytes)?,
+            None => {}
+        }
         Ok(transaction)
     }
 
@@ -396,6 +449,13 @@ impl ProfileStore {
             Ok(true) => {
                 let (removed, first_error) = remove_owned(&self.dir);
                 removed_any |= removed;
+                let first_error = match remove_x509(&self.dir.join(X509_DIR)) {
+                    Ok(removed) => {
+                        removed_any |= removed;
+                        first_error
+                    }
+                    Err(err) => first_error.or(Some(err)),
+                };
                 match (first_error, fs::remove_dir(&self.dir)) {
                     (Some(err), _) => {
                         failure.get_or_insert(err);
@@ -471,6 +531,10 @@ impl ProfileStore {
                         }
                     }
                     let (_, first_error) = remove_owned(&path);
+                    let first_error = match remove_x509(&path.join(X509_DIR)) {
+                        Ok(_) => first_error,
+                        Err(err) => first_error.or(Some(err)),
+                    };
                     let removed = fs::remove_dir_all(&path);
                     match (first_error, removed) {
                         (Some(err), _) => {
@@ -764,13 +828,65 @@ fn remove_owned(dir: &Path) -> (bool, Option<StoreError>) {
     (removed, failure)
 }
 
+fn is_x509_owned_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|text| {
+        X509_OWNED_FILES.contains(&text)
+            || (text.starts_with('.')
+                && text.ends_with(".tmp")
+                && X509_OWNED_FILES
+                    .iter()
+                    .any(|owned| text.starts_with(&format!(".{owned}."))))
+    })
+}
+
+fn remove_x509(dir: &Path) -> Result<bool, StoreError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return remove_if_present(dir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_error("inspect", dir, err)),
+    }
+    let mut removed = false;
+    let mut failure: Option<StoreError> = None;
+    let mut record = |result: Result<bool, StoreError>| match result {
+        Ok(did_remove) => removed |= did_remove,
+        Err(err) => {
+            failure.get_or_insert(err);
+        }
+    };
+    record(shred(&dir.join(X509_KEY_FILE)));
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) if is_x509_owned_name(&entry.file_name()) => {
+                        record(shred(&entry.path()));
+                    }
+                    Ok(_) => {}
+                    Err(err) => record(Err(io_error("list", dir, err))),
+                }
+            }
+        }
+        Err(err) => record(Err(io_error("list", dir, err))),
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(removed),
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(removed),
+        Err(err) => Err(io_error("remove", dir, err)),
+    }
+}
+
 fn line_bytes(text: &str) -> Vec<u8> {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(b'\n');
     bytes
 }
 
-fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -780,7 +896,7 @@ fn write_new_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), StoreError> {
     File::open(dir)
         .and_then(|handle| handle.sync_all())
         .map_err(|err| io_error("flush", dir, err))
@@ -794,7 +910,7 @@ fn remove_if_present(path: &Path) -> Result<bool, StoreError> {
     }
 }
 
-fn shred(path: &Path) -> Result<bool, StoreError> {
+pub(crate) fn shred(path: &Path) -> Result<bool, StoreError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -866,6 +982,7 @@ mod tests {
                 token: &token,
                 meta: &meta(),
                 ssh: None,
+                services: None,
             },
             SystemTime::now(),
         )
@@ -1009,6 +1126,52 @@ mod tests {
 
         retired.discard().unwrap();
         assert_eq!(names(&root.path().join("state")), ["default"]);
+    }
+
+    #[test]
+    fn a_new_sign_in_keeps_the_x509_key_and_a_logout_keeps_only_foreign_x509_files() {
+        let (_root, store) = store();
+        save(&store, "jt_first");
+        let x509 = store.x509_dir();
+        fs::create_dir(&x509).unwrap();
+        fs::write(x509.join("key.pem"), "KEY").unwrap();
+        fs::write(x509.join("cert.pem"), "CERT").unwrap();
+        fs::write(x509.join(".cert.pem.1.2.tmp"), "HALF").unwrap();
+
+        save(&store, "jt_second").unwrap().discard().unwrap();
+
+        assert_eq!(fs::read_to_string(x509.join("key.pem")).unwrap(), "KEY");
+        fs::write(x509.join("notes.txt"), "mine").unwrap();
+        let cleared = store.clear().unwrap();
+        assert!(cleared.directory_kept);
+        assert_eq!(names(&x509), ["notes.txt"]);
+    }
+
+    #[test]
+    fn a_failed_carry_leaves_the_x509_key_where_it_can_be_recovered() {
+        let (root, _store) = store();
+        let retired_dir = root.path().join(".default.old.1.2");
+        fs::create_dir_all(retired_dir.join("x509")).unwrap();
+        fs::write(retired_dir.join("x509/key.pem"), "KEY").unwrap();
+        fs::write(retired_dir.join("token"), "jt_old").unwrap();
+        let retired = Retired {
+            dir: retired_dir.clone(),
+            carry_error: Some(StoreError::NotEmpty {
+                path: retired_dir.join("x509"),
+            }),
+        };
+
+        let outcome = retired.discard();
+
+        assert!(
+            matches!(outcome, Err(StoreError::NotEmpty { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(retired_dir.join("x509/key.pem")).unwrap(),
+            "KEY"
+        );
+        assert!(!retired_dir.join("token").exists());
     }
 
     #[test]
@@ -1234,6 +1397,14 @@ mod tests {
         symlink(outside.path(), home.join(".default.new.4.1")).unwrap();
         let alias = root.path().join("alias");
         fs::hard_link(stale_new.join("id_ed25519"), &alias).unwrap();
+        fs::create_dir(stale_old.join("x509")).unwrap();
+        fs::write(stale_old.join("x509/key.pem"), "OLD-X509-KEY\n").unwrap();
+        let x509_alias = root.path().join("x509-alias");
+        fs::hard_link(stale_old.join("x509/key.pem"), &x509_alias).unwrap();
+        let live = store.dir().to_owned();
+        fs::create_dir_all(live.join("x509")).unwrap();
+        fs::write(live.join("x509/key.pem"), "LIVE-X509-KEY\n").unwrap();
+        fs::write(live.join("services.json"), "{}").unwrap();
         for dir in [&stale_new, &stale_old, &other_profile, &lookalike] {
             age(dir, 16 * 60);
         }
@@ -1243,6 +1414,15 @@ mod tests {
         assert!(transaction.sweep_warning().is_none());
         assert!(!stale_new.exists() && !stale_old.exists());
         assert_zeroed(&alias, "LEFTOVER-KEY\n".len());
+        assert_zeroed(&x509_alias, "OLD-X509-KEY\n".len());
+        assert_eq!(
+            fs::read_to_string(live.join("x509/key.pem")).unwrap(),
+            "LIVE-X509-KEY\n"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("services.json")).unwrap(),
+            "{}"
+        );
         for kept in [&recent, &fresh, &other_profile, &lookalike] {
             assert_eq!(names(kept), ["id_ed25519", "token"], "{}", kept.display());
         }
@@ -1396,6 +1576,7 @@ mod tests {
                     token: &token,
                     meta: &meta(),
                     ssh: Some(ssh),
+                    services: None,
                 },
                 SystemTime::now(),
             )

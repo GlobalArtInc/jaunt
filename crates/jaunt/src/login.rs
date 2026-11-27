@@ -2,27 +2,30 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use jaunt_proto::{FinishRequest, StartRequest};
+use jaunt_proto::{ClientTransport, FinishRequest, StartRequest};
 use url::Url;
 
 use crate::agent::{AgentError, SshAgent};
 use crate::browser::BrowserOpener;
-use crate::client::{ApiClient, ApiError, TOTAL_TIMEOUT};
+use crate::client::{ApiClient, ApiError, FetchedConfig, TOTAL_TIMEOUT, is_missing_route};
 use crate::consent::ConsentPrompt;
 use crate::display::format_local;
+use crate::gate_config::{GateServices, SplitConfig, accept_services, split_v2};
 use crate::issued::{VerifyError, verify};
 use crate::key::{KeyError, SessionKey};
 use crate::lock::{LockError, ProfileLock};
 use crate::loopback::{Callback, FailureCode, LoopbackError, LoopbackListener};
 use crate::pkce::{EntropyError, Pkce};
 use crate::profile::ProfileName;
+use crate::secret::Secret;
 use crate::server_url::{ServerUrl, check_web_url};
 use crate::ssh_config::{
     EnsureCommand, SshConfigError, check_ensure_command, check_profile_dir, render_known_hosts,
     render_ssh_config, validate,
 };
 use crate::ssh_include::{IncludeOutcome, IncludeTarget, ensure_include};
-use crate::store::{LoginFiles, ProfileStore, SshFiles, StoreError, Transaction};
+use crate::status::Session;
+use crate::store::{LoginFiles, ProfileStore, ServicesFile, SshFiles, StoreError, Transaction};
 
 const CHALLENGE_METHOD: &str = "S256";
 const MAX_LABEL_LEN: usize = 64;
@@ -52,7 +55,7 @@ pub enum LoginError {
     )]
     ClientConfig { source: ApiError },
     #[error(
-        "the SSH settings from the server were refused: {0}; sign in with --no-ssh-config to skip them"
+        "the SSH settings from the server were refused: {0}; sign in with --no-ssh-config to skip them; use `--no-ssh-config` to store only the TLS settings"
     )]
     SshSettings(#[from] SshConfigError),
     #[error(transparent)]
@@ -336,17 +339,38 @@ fn signed_in(
         .ok_or(VerifyError::Expired)?;
 
     let mut notes = Vec::new();
-    let ssh = match &options.ssh {
-        Some(setup) => prepare_ssh(
-            &client.with_deadline(calls.after_approval(deadline)),
-            store,
-            &ensure_command(setup, &options.profile),
-            ports.consent,
-            options.accept_ssh_config,
-            &mut notes,
-        )?,
-        None => None,
+    let config_client = client.with_deadline(calls.after_approval(deadline));
+    let fetch = SshFetch {
+        client: &config_client,
+        token: &verified.token,
+        now: i64::try_from(now).map_err(|_| LoginError::Clock)?,
     };
+    let (ssh, services, kept_services) = match &options.ssh {
+        Some(setup) => {
+            let (ssh, services) = prepare_ssh(
+                &fetch,
+                store,
+                &ensure_command(setup, &options.profile),
+                ports.consent,
+                options.accept_ssh_config,
+                &mut notes,
+            )?;
+            (ssh, services, None)
+        }
+        None => match services_without_ssh(&fetch, &mut notes) {
+            Ok(services) => (None, services, None),
+            Err(err) => (None, None, previous_services(store, err, &mut notes)),
+        },
+    };
+    let services_file = services
+        .as_ref()
+        .map(ServicesFile::Checked)
+        .or(kept_services.as_deref().map(ServicesFile::Kept));
+    let same_identity = matches!(
+        Session::load(store),
+        Ok(Some(previous))
+            if previous.server == options.server && previous.meta.user_id == verified.meta.user_id
+    );
     let had_ssh_files = store.has_any_ssh_file()?;
     let mut transaction = store.begin(
         &LoginFiles {
@@ -356,6 +380,7 @@ fn signed_in(
             token: &verified.token,
             meta: &verified.meta,
             ssh: ssh.as_ref(),
+            services: services_file,
         },
         clock_now,
     )?;
@@ -399,6 +424,11 @@ fn signed_in(
             ));
         }
     }
+    if !same_identity && let Err(err) = store.forget_x509_certificate() {
+        notes.push(format!(
+            "warning: the X.509 certificate of the previous sign-in was not removed: {err}"
+        ));
+    }
     if ssh.is_none() && had_ssh_files {
         notes.push("warning: the previous SSH setup of this profile was removed".to_owned());
     }
@@ -435,26 +465,85 @@ fn signed_in(
     })
 }
 
+struct SshFetch<'a> {
+    client: &'a ApiClient,
+    token: &'a Secret,
+    now: i64,
+}
+
+fn services_without_ssh(
+    fetch: &SshFetch<'_>,
+    notes: &mut Vec<String>,
+) -> Result<Option<GateServices>, ApiError> {
+    match fetch.client.fetch_client_config_v2(fetch.token) {
+        Ok(config) => {
+            let split = split_v2(config);
+            let accepted = accept_services(split.transport, split.services, fetch.now);
+            notes.extend(accepted.notes);
+            Ok(accepted.services)
+        }
+        Err(err) if err == ApiError::NotConfigured || is_missing_route(err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn previous_services(
+    store: &ProfileStore,
+    failure: ApiError,
+    notes: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    let (kept, outcome) = match store.read_gate_services_bytes() {
+        Ok(Some(bytes)) => (
+            Some(bytes),
+            "the previous TLS settings were kept".to_owned(),
+        ),
+        Ok(None) => (None, "no TLS settings are stored".to_owned()),
+        Err(err) => (
+            None,
+            format!("the previous TLS settings cannot be read and were dropped: {err}"),
+        ),
+    };
+    notes.push(format!(
+        "warning: cannot fetch the TLS settings of the gate: {failure}; {outcome}"
+    ));
+    kept
+}
+
+type PreparedSsh = (Option<SshFiles>, Option<GateServices>);
+
 fn prepare_ssh(
-    client: &ApiClient,
+    fetch: &SshFetch<'_>,
     store: &ProfileStore,
     command: &EnsureCommand<'_>,
     consent: &dyn ConsentPrompt,
     accept: bool,
     notes: &mut Vec<String>,
-) -> Result<Option<SshFiles>, LoginError> {
-    let fetched = match client.client_config() {
+) -> Result<PreparedSsh, LoginError> {
+    let fetched = match fetch.client.client_config_v2(fetch.token) {
         Ok(fetched) => fetched,
         Err(ApiError::NotConfigured) => {
             notes.push(
                 "warning: the server has no SSH gateway configured yet; the SSH setup was skipped"
                     .to_owned(),
             );
-            return Ok(None);
+            return Ok((None, None));
         }
         Err(source) => return Err(LoginError::ClientConfig { source }),
     };
-    let client_config = validate(fetched)?;
+    let split = match fetched {
+        FetchedConfig::V2(config) => split_v2(config),
+        FetchedConfig::V1(client) => SplitConfig {
+            client,
+            transport: ClientTransport::Tcp,
+            services: None,
+        },
+    };
+    let offered = split.services.is_some();
+    let accepted = accept_services(split.transport, split.services, fetch.now);
+    let transport = accepted.transport();
+    notes.extend(accepted.notes);
+    let services = accepted.services;
+    let client_config = validate(split.client)?;
     let scope = format!(
         "*.{} through {}:{}",
         client_config.ssh_suffix, client_config.gate.host, client_config.gate.port
@@ -471,7 +560,7 @@ fn prepare_ssh(
             notes.push(format!(
                 "warning: the server wants to manage ssh for {scope}; the SSH setup was skipped: run `jaunt login --accept-ssh-config` to enable it"
             ));
-            return Ok(None);
+            return Ok((None, services));
         }
         let question = format!(
             "This server will manage ssh for *.{} through {}:{}. Configure ssh? [y/N]",
@@ -481,16 +570,32 @@ fn prepare_ssh(
             notes.push(format!(
                 "warning: the SSH setup for {scope} was declined: run `jaunt login --accept-ssh-config` to enable it"
             ));
-            return Ok(None);
+            return Ok((None, services));
         }
     }
-    let ssh_config = render_ssh_config(&client_config, store.dir(), command)?;
+    if split.transport == ClientTransport::Tls && transport != ClientTransport::Tls {
+        notes.push(if offered {
+            format!(
+                "warning: TLS roots unusable, using port {} for ssh",
+                client_config.gate.port
+            )
+        } else {
+            format!(
+                "warning: the server asks for SSH over TLS but sends no TLS settings for the gate; using port {} for ssh",
+                client_config.gate.port
+            )
+        });
+    }
+    let ssh_config = render_ssh_config(&client_config, transport, store.dir(), command)?;
     let known_hosts = render_known_hosts(&client_config);
-    Ok(Some(SshFiles {
-        client: client_config,
-        ssh_config,
-        known_hosts,
-    }))
+    Ok((
+        Some(SshFiles {
+            client: client_config,
+            ssh_config,
+            known_hosts,
+        }),
+        services,
+    ))
 }
 
 fn include_note(
