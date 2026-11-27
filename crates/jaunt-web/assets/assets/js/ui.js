@@ -3,7 +3,7 @@ import { clean } from "./format.js";
 import { icon } from "./icons.js";
 import { S } from "./strings.js";
 
-const BADGE_KINDS = new Set(["ok", "off", "warn", "danger", "info", "live", "plain"]);
+const BADGE_KINDS = new Set(["ok", "off", "warn", "danger", "info", "live", "plain", "acct"]);
 
 export function badge(kind, text) {
   const safeKind = BADGE_KINDS.has(kind) ? kind : "plain";

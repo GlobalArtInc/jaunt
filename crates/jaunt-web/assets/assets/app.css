@@ -252,6 +252,8 @@ kbd {
 .b-live::before { content: "\25C9"; content: "\25C9" / ""; }
 .b-plain { color: var(--text-muted); background: transparent; border-style: dashed; }
 .b-plain::before { content: none; }
+.b-acct { color: var(--info); background: var(--info-weak); }
+.b-acct::before { content: "+"; content: "+" / ""; font-weight: 700; }
 
 .chips { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
 .chip {
@@ -393,6 +395,13 @@ main { flex: 1 1 auto; min-width: 0; padding: var(--space-5) var(--space-6) var(
 .menu-hint { font-size: var(--fs-sm); color: var(--text-muted); font-weight: 400; }
 .menu-heading { padding: var(--space-2) var(--space-3); font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); }
 .menu-sep { height: 1px; margin: var(--space-2) 0; background: var(--border); }
+.menu-info {
+  display: flex; gap: var(--space-3); align-items: flex-start; margin: var(--space-2); padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm); color: var(--text); background: var(--info-weak); border: 1px solid var(--info); border-radius: var(--radius-md); max-width: 300px;
+}
+.menu-info .icon { color: var(--info); margin-top: 1px; flex: none; }
+.ref { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.ref .mono { font-weight: 600; }
 
 .filters { margin-bottom: var(--space-3); }
 .searchbar { display: flex; gap: 2px; align-items: center; max-width: 780px; }

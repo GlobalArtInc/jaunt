@@ -23,7 +23,16 @@ export function stateBadges(node) {
   if (node.revoked) {
     badges.push(badge("danger", S.nodes.revoked));
   }
+  if (node.state === "active" && node.creates_accounts === true) {
+    badges.push(createsAccountsBadge());
+  }
   return el("span", { class: "chips" }, ...badges);
+}
+
+export function createsAccountsBadge() {
+  const mark = badge("acct", S.nodes.createsAccounts);
+  mark.setAttribute("title", S.nodes.createsAccountsTip);
+  return mark;
 }
 
 export function expiryLine(label, seconds) {

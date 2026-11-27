@@ -135,6 +135,9 @@ export function menuButton({ content, ariaLabel, className, items, align, onOpen
         if (entry.type === "separator") {
           return el("div", { class: "menu-sep", role: "separator" });
         }
+        if (entry.type === "info") {
+          return el("div", { class: "menu-info", role: "presentation" }, icon("info", { size: "sm" }), el("span", {}, el("strong", { text: entry.title }), " ", entry.text));
+        }
         if (entry.type === "heading") {
           return el("div", { class: "menu-heading", role: "presentation", text: entry.text });
         }

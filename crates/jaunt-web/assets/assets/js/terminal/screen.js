@@ -1,6 +1,7 @@
-import { el, replace } from "../dom.js";
+import { el, encodeSegment, replace } from "../dom.js";
 import { openConfirm } from "../dialog.js";
 import { clean } from "../format.js";
+import { icon } from "../icons.js";
 import { S } from "../strings.js";
 import { badge, banner, button, crumbs, linkButton } from "../ui.js";
 import { isUnsafeTerminalError } from "./cells.js";
@@ -14,6 +15,8 @@ const FONT_KEY = "jaunt-terminal-font";
 const RESIZE_DEBOUNCE_MS = 150;
 const INITIAL_SIZE = { cols: 80, rows: 24 };
 const CAUSE_KINDS = { info: "info", warn: "warn", danger: "danger" };
+const NO_RETRY_CAUSES = new Set(["disabled", "unsafe", "account_refused", "no_account"]);
+const OTHER_LOGIN_CAUSES = new Set(["account_refused", "no_account"]);
 
 function readFontIndex() {
   try {
@@ -329,9 +332,34 @@ export function openSession(ctx, { node, login }) {
     }
   }
 
+  function dismissBanner() {
+    replace(bannerSlot);
+    focusTerminal();
+  }
+
+  function copyReference(value) {
+    const clipboard = terminalHooks.clipboard();
+    if (!clipboard || typeof clipboard.writeText !== "function") {
+      say(text.reference.copyBlocked);
+      return;
+    }
+    clipboard.writeText(value).then(
+      () => say(text.reference.copied),
+      () => say(text.reference.copyBlocked),
+    );
+  }
+
+  function referenceLine(value) {
+    const copy = button(text.reference.copy, { small: true, onClick: () => copyReference(value) });
+    copy.setAttribute("aria-label", text.reference.copyLabel(value));
+    copy.replaceChildren(icon("copy", { size: "sm" }), el("span", { text: text.reference.copy }));
+    return el("p", { class: "ref small" }, el("span", { text: text.reference.label }), el("span", { class: "mono", text: value }), copy);
+  }
+
   function showEnded(info) {
     const entry = text.causes[info.cause] || text.causes.lost;
-    let body = entry[1];
+    const title = typeof entry[0] === "function" ? entry[0](names.login, names.node) : entry[0];
+    let body = typeof entry[1] === "function" ? entry[1](names.login, names.node) : entry[1];
     if (info.cause === "exit") {
       const exit = info.exit || { status: null, signal: null };
       body = exit.signal !== null ? text.exitSignal(exit.signal) : exit.status !== null ? text.exitCode(exit.status) : entry[1];
@@ -341,10 +369,14 @@ export function openSession(ctx, { node, login }) {
     }
     const kind = CAUSE_KINDS[entry[2]] || "info";
     const actions = [];
-    if (info.cause !== "disabled" && info.cause !== "unsafe") {
+    if (!NO_RETRY_CAUSES.has(info.cause)) {
       actions.push(button(info.wasReady && info.cause !== "lost" ? text.reconnect : S.retry, { kind: "primary", onClick: () => reconnect() }));
     }
-    actions.push(linkButton(text.chooseOther, "#/terminal"));
+    if (OTHER_LOGIN_CAUSES.has(info.cause)) {
+      actions.push(linkButton(text.chooseOtherLogin, "#/terminal?node=" + encodeSegment(node)));
+    } else if (info.cause !== "account_failed") {
+      actions.push(linkButton(text.chooseOther, "#/terminal"));
+    }
     const extra = [];
     if (info.cause !== "disabled" && info.wasReady) {
       extra.push(el("p", { class: "muted small", text: text.reconnectNote }));
@@ -352,7 +384,11 @@ export function openSession(ctx, { node, login }) {
     if (info.sessionId) {
       extra.push(el("p", { class: "muted small" }, text.sessionId + ": ", el("span", { class: "mono", text: info.sessionId })));
     }
-    replace(bannerSlot, banner(kind, entry[0], body, ...actions), ...extra);
+    const shown = banner(kind, title, body, ...actions);
+    if (typeof info.reference === "string") {
+      shown.querySelector(".banner-body > p").after(referenceLine(info.reference));
+    }
+    replace(bannerSlot, shown, ...extra);
     paintState(kind === "info" ? "off" : kind, !info.wasReady ? text.states.notOpened : info.cause === "unavailable" || info.cause === "lost" ? text.states.lost : text.states.ended);
     disconnect.hidden = true;
     const focusTarget = bannerSlot.querySelector(".btn-primary");
@@ -374,11 +410,23 @@ export function openSession(ctx, { node, login }) {
         } else if (phase === "connecting") {
           paintState("info", text.states.connecting);
         } else if (phase === "ready") {
+          replace(bannerSlot);
           paintState("ok", text.states.ready);
           terminal.options.disableStdin = false;
           startTicker();
           focusTerminal();
         }
+      }),
+      onAccountProgress: live(() => {
+        paintState("info", text.states.creatingAccount);
+        replace(bannerSlot, banner("info", text.creating.title(names.login, names.node), text.creating.body));
+      }),
+      onAccountCreated: live(({ home }) => {
+        const dismiss = button(text.created.dismiss, { small: true, onClick: dismissBanner });
+        const detail = home === null ? text.created.body(names.login, names.node) : text.created.bodyHome(names.login, names.node, clean(home));
+        const created = banner("info", text.created.title, detail, dismiss);
+        created.querySelector(".banner-icon").replaceChildren(icon("check"));
+        replace(bannerSlot, created);
       }),
       onOutput: live((bytes) => writer.write(bytes)),
       onLatency: live((ms) => {

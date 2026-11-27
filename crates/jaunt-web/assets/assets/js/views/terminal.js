@@ -6,6 +6,7 @@ import { icon } from "../icons.js";
 import { S } from "../strings.js";
 import { openSession } from "../terminal/screen.js";
 import { badge, banner, button, chips, pageHead } from "../ui.js";
+import { createsAccountsBadge } from "./node-parts.js";
 import { emptyState } from "./shared.js";
 
 const TARGETS = "/v1/web/terminal/targets";
@@ -43,6 +44,7 @@ export function readTargets(body) {
       labels: readLabels(entry.labels),
       connected: entry.connected === true,
       logins: entry.logins.filter(isSafeLogin).slice(0, MAX_LOGINS),
+      createsAccounts: entry.creates_accounts === true,
     });
   }
   return targets;
@@ -184,6 +186,7 @@ function renderPicker(ctx, targets) {
           { class: "pick-body" },
           el("span", { class: "pick-name", text: clean(target.node) }),
           target.connected ? badge("ok", S.terminal.connectedState) : badge("off", S.terminal.offlineState),
+          target.connected && target.createsAccounts ? createsAccountsBadge() : null,
           chips(target.labels),
           target.connected ? null : el("span", { class: "muted small", text: S.terminal.offlineHint }),
         ),
@@ -229,6 +232,7 @@ function renderPicker(ctx, targets) {
     replace(
       loginSlot,
       el("fieldset", {}, el("legend", { text: S.terminal.loginLegend }), el("ul", { class: "plain pick-logins" }, options)),
+      target.createsAccounts ? el("p", { class: "muted small", text: S.terminal.createsAccountsHelp }) : null,
       target.logins.length === 1 ? el("p", { class: "muted small", text: S.terminal.loginOnly(target.logins[0]) }) : null,
     );
   }

@@ -89,7 +89,7 @@ export function queryStream() {
 export function createTerminalBackend({ origin }) {
   const tickets = new Map();
   const sessions = [];
-  const control = { sessions, tickets, denyNext: null, handshakeFailures: [] };
+  const control = { sessions, tickets, denyNext: null, handshakeFailures: [], plan: null };
 
   function issue(current, input, targets) {
     if (control.denyNext) {
@@ -180,9 +180,22 @@ export function createTerminalBackend({ origin }) {
     };
     Object.assign(record, { sendText, sendBinary, close, alive: true });
     sessions.push(record);
-    sendText({ t: "ready", session_id: "stub-session-" + sessions.length });
-    sendBinary(`Connected to ${query.node} as ${query.login}\r\n`);
-    prompt();
+    const plan = control.plan;
+    control.plan = null;
+    const greet = (fields) => {
+      sendText({ t: "ready", session_id: "stub-session-" + sessions.length, ...fields });
+      sendBinary(`Connected to ${query.node} as ${query.login}\r\n`);
+      prompt();
+    };
+    if (plan && plan.refuse) {
+      sendText({ t: "error", code: plan.refuse.code, ref: plan.refuse.ref });
+      close(1008, plan.refuse.code);
+    } else if (plan && plan.account) {
+      sendText({ t: "progress", stage: "account" });
+      record.release = () => greet({ account_created: true, home: plan.account.home });
+    } else {
+      greet({});
+    }
 
     function sendBypass(kind) {
       const finals = ["L", "S", "T", "M", "Z", "@", "P", "X", "b"];

@@ -37,7 +37,7 @@ function seedNodes() {
   });
   return [
     make(1, "web-01", { env: "prod", team: "web" }),
-    make(2, "web-02", { env: "prod", team: "web" }),
+    make(2, "web-02", { env: "prod", team: "web" }, { creates_accounts: true }),
     make(3, "db-01", { env: "prod", team: "data", tier: "primary" }),
     make(4, "db-replica-02", { env: "prod", team: "data" }, { connected: false, connected_since: null, certificates: { state: "delivered", x509_expires_at: t + 21 * 3600, ssh_host_expires_at: t + 21 * 3600 } }),
     make(5, "ci-runner-03", { env: "staging", team: "platform" }),

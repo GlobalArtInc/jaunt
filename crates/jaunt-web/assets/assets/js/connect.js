@@ -20,7 +20,7 @@ function readTargets(body) {
     if (!entry || typeof entry.node !== "string" || !Array.isArray(entry.logins)) {
       continue;
     }
-    targets.set(entry.node, entry.logins.filter(isSafeLogin).slice(0, MAX_LOGINS));
+    targets.set(entry.node, { logins: entry.logins.filter(isSafeLogin).slice(0, MAX_LOGINS), createsAccounts: entry.creates_accounts === true });
   }
   return targets;
 }
@@ -84,8 +84,9 @@ export function createConnectInfo(api) {
     },
     hasTargets: () => targets !== null,
     loginsFor(node) {
-      return targets && targets.has(node) ? targets.get(node) : null;
+      return targets && targets.has(node) ? targets.get(node).logins : null;
     },
+    createsAccounts: (node) => Boolean(targets && targets.has(node) && targets.get(node).createsAccounts),
     command(node, login) {
       if (suffix === null || typeof node !== "string" || !DNS_LABEL.test(node)) {
         return null;

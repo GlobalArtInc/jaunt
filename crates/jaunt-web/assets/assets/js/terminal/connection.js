@@ -18,7 +18,10 @@ const OPEN = 1;
 const TICKET_SHAPE = /^[A-Za-z0-9._~-]{16,128}$/;
 const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 const SIGNAL_SHAPE = /^[A-Za-z0-9_+-]+$/;
-const ERROR_CODES = new Set(["denied", "unavailable", "limit", "revoked", "timeout"]);
+const ERROR_CODES = new Set(["denied", "unavailable", "limit", "revoked", "timeout", "account_refused", "account_failed", "no_account"]);
+const REFERENCE_SHAPE = /^H-[0-9A-F]{8}$/;
+const ACCOUNT_STAGE = "account";
+const MAX_HOME_CHARS = 256;
 
 export function realHooks() {
   return {
@@ -98,6 +101,17 @@ function closeCause({ code, exit, errorCode, ready }) {
   return ready ? "lost" : "connect_failed";
 }
 
+function readReference(message) {
+  return typeof message.ref === "string" && REFERENCE_SHAPE.test(message.ref) ? message.ref : null;
+}
+
+function readHome(message) {
+  if (typeof message.home !== "string" || message.home === "") {
+    return null;
+  }
+  return message.home.length > MAX_HOME_CHARS ? message.home.slice(0, MAX_HOME_CHARS) + "…" : message.home;
+}
+
 function readExit(message) {
   const status = Number.isInteger(message.status) ? message.status : null;
   const signal = typeof message.signal === "string" && message.signal.length <= MAX_SIGNAL_LENGTH && SIGNAL_SHAPE.test(message.signal) ? message.signal : null;
@@ -113,6 +127,7 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
   let ended = false;
   let exit = null;
   let errorCode = null;
+  let reference = null;
   let sessionId = null;
   let pingTimer = null;
   let pingSentAt = null;
@@ -158,7 +173,7 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     stopPing();
     closeSocket();
     phase = "ended";
-    handlers.onEnd({ cause, exit, sessionId, wasReady: readyAt !== null, retryAfter: extra.retryAfter || null, closeCode: extra.closeCode === undefined ? null : extra.closeCode });
+    handlers.onEnd({ cause, exit, reference, sessionId, wasReady: readyAt !== null, retryAfter: extra.retryAfter || null, closeCode: extra.closeCode === undefined ? null : extra.closeCode });
   }
 
   function sendText(payload) {
@@ -209,6 +224,9 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     normalTicks = 0;
     pingTimer = clock.setInterval(tick, PING_INTERVAL_MS);
     setPhase("ready");
+    if (message.account_created === true && handlers.onAccountCreated) {
+      handlers.onAccountCreated({ home: readHome(message) });
+    }
     const current = size();
     if (current !== null) {
       sendResize(current.cols, current.rows);
@@ -230,11 +248,16 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     }
     if (message.t === "ready") {
       onReady(message);
+    } else if (message.t === "progress") {
+      if (message.stage === ACCOUNT_STAGE && !ready && !ended && handlers.onAccountProgress) {
+        handlers.onAccountProgress();
+      }
     } else if (message.t === "exit") {
       exit = readExit(message);
     } else if (message.t === "error") {
       if (typeof message.code === "string" && ERROR_CODES.has(message.code)) {
         errorCode = message.code;
+        reference = readReference(message);
       }
     } else if (message.t === "pong") {
       if (pingSentAt !== null && handlers.onLatency) {

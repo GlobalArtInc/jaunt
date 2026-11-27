@@ -10,7 +10,7 @@ const WIDTHS = [380, 1440];
 const THEMES = ["light", "dark"];
 const FLEET = [
   { node: "web-01", labels: { env: "prod", team: "web" }, connected: true, logins: ["deploy", "alice"] },
-  { node: "web-02", labels: { env: "prod" }, connected: true, logins: ["deploy"] },
+  { node: "web-02", labels: { env: "prod" }, connected: true, creates_accounts: true, logins: ["deploy"] },
   { node: "db-replica-02", labels: { env: "prod", team: "data" }, connected: false, logins: ["deploy"] },
 ];
 const ALLOWED_REPLY = /^(\u001b\[\?1;2c|\u001b\[>0;276;0c|\u001b\[0n|\u001b\[\d+;\d+R|\u001b\[\?\d+;\d+R)+$/;
@@ -224,9 +224,7 @@ async function until(check, description, context, timeout = 6000) {
   return false;
 }
 
-async function openSession(page, stub, context, node, login) {
-  await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
+async function trackTerminals(page) {
   await page.evaluate(async () => {
     const { terminalHooks } = await import("/assets/js/terminal/hooks.js");
     if (!terminalHooks.__wrapped) {
@@ -239,6 +237,12 @@ async function openSession(page, stub, context, node, login) {
       };
     }
   });
+}
+
+async function openSession(page, stub, context, node, login) {
+  await page.goto(stub.origin + "/#/terminal");
+  await page.waitForSelector('input[name="terminal-node"]');
+  await trackTerminals(page);
   await page.click(`label.pick-card:has(input[value="${node}"])`);
   if (login !== null) await page.click(`label.pick-login:has(input[value="${login}"])`);
   await page.click("button:has-text('Open terminal')");
@@ -606,6 +610,93 @@ async function runContext(browser, stub, width, theme) {
   await browserContext.close();
 }
 
+const REFUSALS = [
+  ["account_refused", "H-9D0311FE", "Your account could not be created.", "refused"],
+  ["account_failed", "H-51C07A42", "The node could not create your account.", "failed"],
+  ["no_account", "H-0000000D", "There is no account deploy on web-02.", "no-account"],
+];
+
+async function openWeb02(page, stub, context) {
+  const before = stub.terminal.sessions.length;
+  await page.goto(stub.origin + "/#/nodes");
+  await page.waitForSelector(".node-card");
+  await page.goto(stub.origin + "/#/terminal");
+  await page.waitForSelector('input[name="terminal-node"]');
+  await page.click('label.pick-card:has(input[value="web-02"])');
+  await page.click("button:has-text('Open terminal')");
+  await until(() => stub.terminal.sessions.length === before + 1, "the account session", context);
+  return stub.terminal.sessions.at(-1);
+}
+
+async function runAccount(browser, stub, width, theme) {
+  const context = `account-${theme}-${width}`;
+  const narrow = width <= 520;
+  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1 });
+  await browserContext.grantPermissions(["clipboard-read", "clipboard-write"], { origin: stub.origin });
+  const { page, problems } = await instrument(browserContext, stub.origin);
+  await page.goto(stub.origin + "/");
+  await page.click("a.btn-primary");
+  await page.waitForSelector(".rail a", { state: "attached" });
+
+  await page.goto(stub.origin + "/#/terminal");
+  await page.waitForSelector('input[name="terminal-node"]');
+  const marked = await page.locator("label.pick-card .badge.b-acct").evaluateAll((nodes) => nodes.map((node) => node.closest("label").querySelector("input").value));
+  if (marked.join(",") !== "web-02") fail(context, "the Creates accounts marker is on " + JSON.stringify(marked));
+  await trackTerminals(page);
+  await shot(page, "account-picker", context);
+  await layout(page, context, "account-picker", narrow);
+  await page.click('label.pick-card:has(input[value="web-02"])');
+  await shot(page, "account-picker-chosen", context);
+  await layout(page, context, "account-picker-chosen", narrow);
+
+  await page.goto(stub.origin + "/#/nodes");
+  await page.waitForSelector(".node-card");
+  const cardMarks = await page.locator(".node-card:has(.badge.b-acct) .node-name").allTextContents();
+  if (cardMarks.join(",") !== "web-02") fail(context, "the node cards with the marker are " + JSON.stringify(cardMarks));
+  await page.click('button[aria-label="Connect to web-02"]');
+  await page.waitForSelector(".menu .menu-info");
+  await shot(page, "account-menu", context);
+  await layout(page, context, "account-menu", narrow);
+  await page.keyboard.press("Escape");
+
+  stub.terminal.plan = { account: { home: "/home/deploy" } };
+  const held = await openWeb02(page, stub, context);
+  await page.waitForSelector(".term-banner:has-text('Creating your account deploy on web-02…')", { timeout: 6000 }).catch(() => fail(context, "no progress banner"));
+  await shot(page, "account-creating", context);
+  await layout(page, context, "account-creating", narrow);
+  held.release();
+  await page.waitForSelector(".term-banner:has-text('Account created.')", { timeout: 6000 }).catch(() => fail(context, "no created banner"));
+  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: 8000 });
+  const createdText = await page.locator(".term-banner").textContent();
+  if (!createdText.includes("/home/deploy")) fail(context, "the created banner lacks the home path: " + createdText);
+  await waitForText(page, "deploy@web-02", context);
+  if ((await screenText(page)).includes("Account created")) fail(context, "the console wrote into the terminal area");
+  await shot(page, "account-created", context);
+  await layout(page, context, "account-created", narrow);
+  await page.click(".term-banner button:has-text('Dismiss')");
+  if ((await page.locator(".term-banner").textContent()) !== "") fail(context, "the created banner was not dismissed");
+
+  for (const [code, reference, title, name] of REFUSALS) {
+    stub.terminal.plan = { refuse: { code, ref: reference } };
+    await openWeb02(page, stub, context);
+    await page.waitForSelector(`.term-banner:has-text('${title}')`, { timeout: 6000 }).catch(() => fail(context, "no banner for " + code));
+    const shown = await page.locator(".term-banner .ref .mono").textContent().catch(() => null);
+    if (shown !== reference) fail(context, `${code} shows the reference ${JSON.stringify(shown)}`);
+    await shot(page, "account-" + name, context);
+    await layout(page, context, "account-" + name, narrow);
+    if (name === "refused") {
+      await page.click(".term-banner .ref button");
+      await until(async () => (await page.evaluate(() => navigator.clipboard.readText())) === reference, "the copied reference", context);
+    }
+  }
+
+  const violations = await page.evaluate(() => window.__csp);
+  if (violations.length > 0) fail(context, "CSP violations: " + violations.join("; "));
+  for (const problem of problems) fail(context, problem);
+  notes.push(`${context}: Creates accounts marker on the picker and the node cards, the Connect menu note, the creating banner, the created banner with its home path, and ${REFUSALS.length} refusals with their references (Copy checked on the first)`);
+  await browserContext.close();
+}
+
 async function runDisabled(browser, width) {
   const context = `disabled-${width}`;
   const stub = await startStub({ permissions: ["nodes.approve"] });
@@ -650,6 +741,7 @@ async function main() {
       for (const width of WIDTHS) {
         await runContext(browser, stub, width, theme);
         await runLongNames(browser, stub, width, theme);
+        await runAccount(browser, stub, width, theme);
       }
     }
     for (const width of WIDTHS) {

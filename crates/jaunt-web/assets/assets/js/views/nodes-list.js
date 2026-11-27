@@ -122,6 +122,9 @@ function connectEntries(ctx, node) {
   const logins = connect.loginsFor(node.name);
   const entries = [];
   if (logins && logins.length > 0) {
+    if (connect.createsAccounts(node.name)) {
+      entries.push({ type: "info", title: S.nodes.createsAccountsTitle(clean(node.name)), text: S.nodes.createsAccountsText });
+    }
     for (const login of logins) {
       entries.push({ text: S.nodes.openAs(login), icon: "terminal", href: "#/terminal?node=" + encodeSegment(node.name) + "&login=" + encodeSegment(login) });
     }
