@@ -1,3 +1,4 @@
+mod admin;
 mod agent;
 mod agent_faults;
 mod certs;

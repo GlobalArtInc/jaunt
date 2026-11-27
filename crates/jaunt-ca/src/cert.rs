@@ -18,6 +18,8 @@ pub const BACKDATE: Duration = Duration::from_secs(2 * 60);
 pub const ORIGIN_EXTENSION: &str = "jaunt-origin@globalart.dev";
 pub const WEB_ORIGIN: &str = "web";
 
+const USER_KEY_ID_PREFIX: &str = "jaunt:";
+
 const MIN_VALIDITY: Duration = Duration::from_secs(1);
 const MAX_EMAIL_LEN: usize = 254;
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -80,7 +82,10 @@ fn sign_user(
     builder.serial(params.serial).map_err(CaError::SshKey)?;
     builder.cert_type(CertType::User).map_err(CaError::SshKey)?;
     builder
-        .key_id(format!("jaunt:{}:{}", params.email, params.serial))
+        .key_id(format!(
+            "{USER_KEY_ID_PREFIX}{}:{}",
+            params.email, params.serial
+        ))
         .map_err(CaError::SshKey)?;
     builder
         .valid_principal(params.user_id.to_string())
@@ -155,6 +160,16 @@ pub(crate) fn validate_email(email: &str) -> Result<(), CaError> {
     } else {
         Err(CaError::InvalidEmail)
     }
+}
+
+pub fn is_user_key_id(key_id: &str, serial: u64) -> bool {
+    let Some((email, serial_text)) = key_id
+        .strip_prefix(USER_KEY_ID_PREFIX)
+        .and_then(|rest| rest.rsplit_once(':'))
+    else {
+        return false;
+    };
+    serial_text == serial.to_string() && validate_email(email).is_ok()
 }
 
 fn validate_hostname(name: &str) -> bool {
@@ -247,8 +262,8 @@ mod tests {
 
     use super::{
         DEFAULT_HOST_VALIDITY, DEFAULT_USER_VALIDITY, HostCertParams, MAX_HOST_VALIDITY,
-        MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, sign_host_certificate,
-        sign_user_certificate, sign_web_user_certificate,
+        MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, is_user_key_id,
+        sign_host_certificate, sign_user_certificate, sign_web_user_certificate,
     };
     use crate::error::CaError;
     use crate::kind::CaKind;
@@ -261,6 +276,28 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(NOW_SECS)
+    }
+
+    #[test]
+    fn the_user_key_id_check_accepts_what_signing_writes_and_nothing_else() {
+        let authority = authority(CaKind::User);
+        let cert = sign_user_certificate(
+            &authority.backend,
+            user_params(DEFAULT_USER_VALIDITY),
+            now(),
+        )
+        .unwrap();
+        assert!(is_user_key_id(cert.key_id(), 42));
+        for (key_id, serial) in [
+            ("jaunt:alice@example.com:42", 43),
+            ("jaunt::42", 42),
+            ("jaunt-host:alice@example.com:42", 42),
+            ("jaunt:a\"b@example.com:42", 42),
+            ("jaunt:alice@example.com", 42),
+            ("jaunt:alice@example.com:042", 42),
+        ] {
+            assert!(!is_user_key_id(key_id, serial), "{key_id}");
+        }
     }
 
     fn user_params(validity: Duration) -> UserCertParams {

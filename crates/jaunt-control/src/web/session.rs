@@ -16,8 +16,10 @@ use crate::identity::policy_identity;
 use crate::principal;
 use crate::token;
 
+use super::admin_principal::AdminPrincipal;
 use super::cookies::{self, SESSION_COOKIE};
 use super::csrf;
+use super::signed;
 
 const LOGIN_PATH: &str = "/v1/web/login";
 const API_PREFIX: &str = "/v1/";
@@ -192,6 +194,12 @@ pub(crate) async fn guard(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
+    if is_under(path, ADMIN_PREFIX) && signed::is_signed(request.headers()) {
+        return match signed::authenticate(&control, request).await {
+            Ok(request) => next.run(request).await,
+            Err(denied) => denied.into_response(),
+        };
+    }
     let session_required = is_under(path, ADMIN_PREFIX)
         || (is_under(path, WEB_PREFIX) && csrf::is_state_changing(request.method()));
     if session_required && let Err(rejection) = ensure_session(&control, &mut request).await {
@@ -235,7 +243,7 @@ impl Permission for RecordingsRead {
 }
 
 pub(crate) struct RequireAdmin<P: Permission> {
-    pub(crate) session: WebSession,
+    pub(crate) principal: AdminPrincipal,
     permission: PhantomData<P>,
 }
 
@@ -246,14 +254,24 @@ impl<P: Permission> FromRequestParts<Control> for RequireAdmin<P> {
         parts: &mut Parts,
         control: &Control,
     ) -> Result<RequireAdmin<P>, Rejection> {
-        let session = WebSession::from_request_parts(parts, control).await?;
+        let principal = match parts.extensions.get::<AdminPrincipal>() {
+            Some(principal) => principal.clone(),
+            None => {
+                AdminPrincipal::WebSession(WebSession::from_request_parts(parts, control).await?)
+            }
+        };
         let policy = control.policy_snapshot();
-        if !policy.admin_can(&policy_identity(session.user()), P::REQUIRED) {
-            audit::admin_denied(&session.user().id, P::REQUIRED.as_str(), policy.hash());
+        if !policy.admin_can(&policy_identity(principal.user()), P::REQUIRED) {
+            audit::admin_denied(
+                &principal.user().id,
+                P::REQUIRED.as_str(),
+                policy.hash(),
+                principal.serial(),
+            );
             return Err(Rejection::new(Failure::Refused, &parts.uri));
         }
         Ok(RequireAdmin {
-            session,
+            principal,
             permission: PhantomData,
         })
     }

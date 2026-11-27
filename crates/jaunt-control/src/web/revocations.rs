@@ -15,7 +15,6 @@ use crate::revocation::{
 use super::session::{RequireAdmin, RevocationsWrite, SessionsRead};
 
 const DEFAULT_PAGE: u32 = 50;
-const WEB_AUTHOR_PREFIX: &str = "web:";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,7 +65,7 @@ fn invalid_request() -> Response {
 }
 
 fn author_of(admin: &RequireAdmin<impl super::session::Permission>) -> String {
-    format!("{WEB_AUTHOR_PREFIX}{}", admin.session.user().id)
+    admin.principal.actor()
 }
 
 pub(crate) async fn create(

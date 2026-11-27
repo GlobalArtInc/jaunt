@@ -210,7 +210,12 @@ pub(crate) fn web_csrf_denied(user_id: &str, reason: &'static str) {
     );
 }
 
-pub(crate) fn admin_denied(user_id: &str, permission: &'static str, policy_hash: &str) {
+pub(crate) fn admin_denied(
+    user_id: &str,
+    permission: &'static str,
+    policy_hash: &str,
+    serial: Option<i64>,
+) {
     tracing::info!(
         target: "jaunt::audit",
         event = "authz.deny",
@@ -218,6 +223,7 @@ pub(crate) fn admin_denied(user_id: &str, permission: &'static str, policy_hash:
         permission,
         reason = "policy_denied",
         user_id,
+        serial,
         policy_hash
     );
 }

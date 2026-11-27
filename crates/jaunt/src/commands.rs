@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 
+use crate::admin::{AGENT_TIMEOUT, AdminContext, render_identity, whoami};
 use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
 use crate::client::{ApiClient, ApiError};
@@ -131,6 +132,25 @@ pub struct EnsureArgs {
     pub home: Option<PathBuf>,
     #[arg(long, help = "Print only warnings and errors")]
     pub quiet: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AdminCommand {
+    #[command(about = "Show the identity the server sees in a signed administrator request")]
+    Whoami(AdminWhoamiArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdminWhoamiArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
@@ -455,6 +475,38 @@ pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
             };
             render_text(&list, suffix.as_deref())
         }
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
+}
+
+pub fn run_admin(command: &AdminCommand, environment: &Environment) -> ExitCode {
+    match command {
+        AdminCommand::Whoami(args) => run_admin_whoami(args, environment),
+    }
+}
+
+fn run_admin_whoami(args: &AdminWhoamiArgs, environment: &Environment) -> ExitCode {
+    let home = match home_for(environment) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let store = ProfileStore::new(&home, &args.profile);
+    let context = AdminContext {
+        store: &store,
+        agent_socket: environment.ssh_auth_sock.as_ref(),
+        clock: &SystemTime::now,
+        agent_timeout: AGENT_TIMEOUT,
+    };
+    let identity = match whoami(&context) {
+        Ok(identity) => identity,
+        Err(err) => return failure(err),
+    };
+    let rendered = match args.format {
+        OutputFormat::Json => match serde_json::to_string_pretty(&identity) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => render_identity(&identity),
     };
     report_lines(&rendered, ExitCode::SUCCESS)
 }

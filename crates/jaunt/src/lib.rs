@@ -1,4 +1,7 @@
+pub mod admin;
+pub mod admin_signature;
 pub mod agent;
+pub mod agent_protocol;
 pub mod browser;
 pub mod client;
 pub mod commands;

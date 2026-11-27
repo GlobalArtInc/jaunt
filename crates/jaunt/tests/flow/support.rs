@@ -152,6 +152,7 @@ pub struct Behavior {
     pub foreign_key: bool,
     pub validity_secs: Option<u64>,
     pub authorize_url: Option<String>,
+    pub admin_status: Option<StatusCode>,
 }
 
 #[derive(Default)]
@@ -166,6 +167,7 @@ pub struct Seen {
     pub client_config_calls: usize,
     pub revoked: bool,
     pub requests: usize,
+    pub admin_requests: Vec<Vec<(String, String)>>,
 }
 
 fn record_request(shared: &Shared) -> bool {
@@ -289,6 +291,41 @@ async fn whoami_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -
     .into_response()
 }
 
+pub const ADMIN_HEADERS: [&str; 4] = [
+    "jaunt-certificate",
+    "content-digest",
+    "signature-input",
+    "signature",
+];
+
+async fn admin_whoami_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    record_request(&shared);
+    let captured = ADMIN_HEADERS
+        .iter()
+        .filter_map(|name| {
+            let value = headers.get(*name)?.to_str().ok()?;
+            Some(((*name).to_owned(), value.to_owned()))
+        })
+        .collect();
+    shared.seen.lock().unwrap().admin_requests.push(captured);
+    if let Some(status) = shared.behavior.admin_status {
+        let code = match status {
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::TOO_MANY_REQUESTS => "too_many_requests",
+            _ => "unauthorized",
+        };
+        return error_response(status, code);
+    }
+    Json(serde_json::json!({
+        "user_id": USER_ID,
+        "email": EMAIL,
+        "display_name": "Alice",
+        "groups": ["ops"],
+    }))
+    .into_response()
+}
+
 fn host_ca_line(shared: &Shared) -> String {
     PublicKey::from(shared.host_ca.public_key().key_data().clone())
         .to_openssh()
@@ -347,6 +384,7 @@ impl FakeServer {
             .route("/v1/whoami", get(whoami_handler))
             .route("/v1/client-config", get(client_config_handler))
             .route("/v1/nodes", get(nodes_handler))
+            .route("/v1/admin/whoami", get(admin_whoami_handler))
             .with_state(Arc::clone(&shared));
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

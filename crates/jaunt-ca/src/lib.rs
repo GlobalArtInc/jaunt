@@ -19,8 +19,8 @@ pub use uuid::{self, Uuid};
 
 pub use cert::{
     BACKDATE, DEFAULT_HOST_VALIDITY, DEFAULT_USER_VALIDITY, HostCertParams, MAX_HOST_VALIDITY,
-    MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, sign_host_certificate,
-    sign_user_certificate, sign_web_user_certificate,
+    MAX_USER_VALIDITY, ORIGIN_EXTENSION, UserCertParams, WEB_ORIGIN, is_user_key_id,
+    sign_host_certificate, sign_user_certificate, sign_web_user_certificate,
 };
 pub use client_slot::{ClientInitialized, ClientKeyAdded, ClientSlot, TrustedRoot};
 pub use error::CaError;

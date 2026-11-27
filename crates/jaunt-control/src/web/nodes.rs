@@ -23,7 +23,7 @@ use crate::revocation::is_identifier;
 
 use super::admin_common::{
     DEFAULT_PAGE, Refusal, conflict, invalid_value, known_id, not_found, once, page_limit,
-    unix_secs, web_actor,
+    unix_secs,
 };
 use super::session::{NodesApprove, RequireAdmin, SessionsRead};
 
@@ -285,7 +285,7 @@ pub(crate) async fn remove(
     let Some(id) = known_id(&id).map(str::to_owned) else {
         return not_found();
     };
-    let actor = web_actor(&admin.session);
+    let actor = admin.principal.actor();
     let finished = tokio::spawn(async move {
         let removed = control
             .node_admin()

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,7 @@ pub struct Options {
     pub extra_web_routes: Option<Router<Control>>,
     pub request_limits: RequestLimits,
     pub sign_hook: Option<SignHook>,
+    pub clock_before_epoch_at_start: bool,
 }
 
 impl Default for Options {
@@ -118,6 +119,7 @@ impl Default for Options {
             extra_web_routes: None,
             request_limits: RequestLimits::default(),
             sign_hook: None,
+            clock_before_epoch_at_start: false,
         }
     }
 }
@@ -295,6 +297,18 @@ impl Harness {
         let clock = TestClock::new();
         let policy = loaded_policy(dir.path());
         let policy_dir = dir.path().join("policy");
+        let started = Arc::new(AtomicBool::new(!options.clock_before_epoch_at_start));
+        let control_clock: Clock = {
+            let started = Arc::clone(&started);
+            let running = clock.clock();
+            Arc::new(move || {
+                if started.load(Ordering::SeqCst) {
+                    running()
+                } else {
+                    UNIX_EPOCH - Duration::from_secs(1)
+                }
+            })
+        };
         let trusted_proxies = match (options.trusted_proxies, options.client_ip_header) {
             (Some(given), _) => given,
             (None, Some(_)) => DEFAULT_PROXY_NETWORKS,
@@ -326,12 +340,13 @@ impl Harness {
                 },
                 policy: policy.clone(),
                 web_enabled: options.web,
-                clock: clock.clock(),
+                clock: control_clock,
                 recordings: None,
             },
             options.request_limits,
             options.ticker.unwrap_or_else(|| clock.ticker()),
         )?;
+        started.store(true, Ordering::SeqCst);
         let router = match options.extra_web_routes {
             Some(extra) => control.router_with_extra_web_routes(extra),
             None => control.router(),

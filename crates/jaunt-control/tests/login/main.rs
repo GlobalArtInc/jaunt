@@ -1,3 +1,5 @@
+mod admin_signed;
+mod admin_signed_rows;
 mod audit;
 mod audit_events;
 mod ca_rotation;
@@ -17,6 +19,7 @@ mod limits;
 mod provider;
 mod revoked_user;
 mod sign_hook;
+mod signed_support;
 mod start;
 mod support;
 mod sweep;

@@ -9,6 +9,7 @@ pub(crate) enum Channel {
     ApiToken,
     Certificate,
     DeviceApproval,
+    SignedAdmin,
 }
 
 impl Channel {
@@ -19,6 +20,7 @@ impl Channel {
             Channel::ApiToken => "api_token",
             Channel::Certificate => "certificate",
             Channel::DeviceApproval => "device_approval",
+            Channel::SignedAdmin => "signed_admin",
         }
     }
 }

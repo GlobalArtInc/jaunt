@@ -4,15 +4,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jaunt_proto::{
-    ClientConfig, ErrorBody, FinishRequest, FinishResponse, NodeList, StartRequest, StartResponse,
-    WhoamiResponse,
+    ADMIN_CERTIFICATE_HEADER, CONTENT_DIGEST_HEADER, ClientConfig, ErrorBody, FinishRequest,
+    FinishResponse, NodeList, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER, StartRequest,
+    StartResponse, WhoamiResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use url::Url;
 
+use crate::admin_signature::SignedHeaders;
 use crate::secret::Secret;
 use crate::server_url::ServerUrl;
 
@@ -106,6 +109,27 @@ impl ApiClient {
 
     pub fn nodes(&self, token: &Secret) -> Result<NodeList, ApiError> {
         self.get_with_token(NODES_PATH, token)
+    }
+
+    pub fn endpoint_url(&self, path: &str) -> Result<Url, ApiError> {
+        Url::parse(&self.server.endpoint(path)).map_err(|_| ApiError::Transport)
+    }
+
+    pub fn get_signed<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        signed: &SignedHeaders,
+    ) -> Result<T, ApiError> {
+        let header = |value: &str| HeaderValue::from_str(value).map_err(|_| ApiError::Transport);
+        let request = self
+            .http
+            .get(url)
+            .header(ACCEPT, JSON)
+            .header(ADMIN_CERTIFICATE_HEADER, header(&signed.certificate)?)
+            .header(CONTENT_DIGEST_HEADER, header(&signed.content_digest)?)
+            .header(SIGNATURE_INPUT_HEADER, header(&signed.signature_input)?)
+            .header(SIGNATURE_HEADER, header(&signed.signature)?);
+        self.call(request)
     }
 
     pub fn client_config(&self) -> Result<ClientConfig, ApiError> {

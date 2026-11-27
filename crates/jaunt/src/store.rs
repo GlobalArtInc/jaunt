@@ -1,13 +1,14 @@
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use jaunt_proto::ClientConfig;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::profile::{ProfileName, profile_dir};
 use crate::secret::Secret;
@@ -37,6 +38,7 @@ const OWNED_FILES: [&str; 9] = [
 const MAX_MARKER_BYTES: u64 = 64;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
+const PRIVATE_MODE_FORBIDDEN: u32 = 0o077;
 const MAX_READ_BYTES: u64 = 1024 * 1024;
 const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 
@@ -86,6 +88,10 @@ pub enum StoreError {
     TooLarge { path: PathBuf },
     #[error("{path} is damaged; run `jaunt logout` and sign in again")]
     Corrupt { path: PathBuf },
+    #[error(
+        "{path} can be read by other users; restrict it with `chmod 600` or run `jaunt login` again"
+    )]
+    Exposed { path: PathBuf },
     #[error("{path} still contains other files and was kept")]
     NotEmpty { path: PathBuf },
     #[error(
@@ -296,6 +302,29 @@ impl ProfileStore {
             return Err(StoreError::Corrupt { path });
         }
         Ok(Some(Secret::new(text)))
+    }
+
+    pub fn read_private_key(&self) -> Result<Option<Secret>, StoreError> {
+        let path = self.private_key_path();
+        if !self.dir_exists()? {
+            return Ok(None);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Err(StoreError::NotARegularFile { path }),
+            Ok(meta) if meta.permissions().mode() & PRIVATE_MODE_FORBIDDEN != 0 => {
+                return Err(StoreError::Exposed { path });
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error("inspect", &path, err)),
+        }
+        let Some(bytes) = self.read_bytes(&path)?.map(Zeroizing::new) else {
+            return Ok(None);
+        };
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(Some(Secret::new(text.to_owned()))),
+            Err(_) => Err(StoreError::Corrupt { path }),
+        }
     }
 
     pub fn read_public_key_line(&self) -> Result<Option<String>, StoreError> {
@@ -1162,6 +1191,31 @@ mod tests {
             store.read_server(),
             Err(StoreError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn a_key_file_readable_by_others_is_refused_like_ssh_does() {
+        let (_root, store) = store();
+        assert!(matches!(store.read_private_key(), Ok(None)));
+        save(&store, "jt_token");
+        let path = store.private_key_path();
+        assert!(matches!(store.read_private_key(), Ok(None)));
+        fs::write(&path, "key text").unwrap();
+        for (mode, readable) in [(0o600, true), (0o400, true), (0o640, false), (0o604, false)] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            match store.read_private_key() {
+                Ok(Some(key)) if readable => assert_eq!(key.expose(), "key text"),
+                Err(StoreError::Exposed { path: reported }) if !readable => {
+                    assert_eq!(reported, path);
+                    assert!(
+                        StoreError::Exposed { path: reported }
+                            .to_string()
+                            .contains("chmod 600")
+                    );
+                }
+                other => panic!("{mode:o}: {other:?}"),
+            }
+        }
     }
 
     #[test]

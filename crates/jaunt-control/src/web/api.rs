@@ -91,7 +91,7 @@ pub(crate) async fn logout(State(control): State<Control>, session: WebSession) 
 }
 
 pub(crate) async fn whoami(admin: RequireAdmin<NodesApprove>) -> Response {
-    let user = admin.session.0.user;
+    let user = admin.principal.user().clone();
     json_response(
         StatusCode::OK,
         &AdminWhoamiBody {

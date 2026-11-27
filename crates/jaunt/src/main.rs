@@ -4,8 +4,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use jaunt::commands::{
-    EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_ensure, run_login,
-    run_logout, run_ls, run_status,
+    AdminCommand, EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, StatusArgs, run_admin,
+    run_ensure, run_login, run_logout, run_ls, run_status,
 };
 
 use crate::policy::PolicyCommand;
@@ -34,6 +34,11 @@ enum Command {
     },
     #[command(about = "Make sure a valid certificate is in place, signing in again if needed")]
     Ensure(EnsureArgs),
+    #[command(about = "Administrator commands, sent as requests signed by the session key")]
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -45,6 +50,7 @@ fn main() -> ExitCode {
         Command::Status(args) => run_status(&args, &Environment::from_process()),
         Command::Ls(args) => run_ls(&args, &Environment::from_process()),
         Command::Ensure(args) => run_ensure(&args, &Environment::from_process()),
+        Command::Admin { command } => run_admin(&command, &Environment::from_process()),
     }
 }
 

@@ -21,7 +21,8 @@ use crate::control::Control;
 use crate::http::{empty_response, error_response, json_response, server_error};
 
 use super::admin_common::{Refusal, conflict, invalid_request, not_found, once};
-use super::session::{RecordingsRead, RequireAdmin, WebSession};
+use super::admin_principal::AdminPrincipal;
+use super::session::{RecordingsRead, RequireAdmin};
 
 pub const DEFAULT_PLAYBACK_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -298,12 +299,12 @@ async fn locate(control: &Control, id: &str) -> Result<Located, Unavailable> {
     }
 }
 
-fn record_view(control: &Control, session: &WebSession, session_id: &str, kind: ViewKind) {
+fn record_view(control: &Control, principal: &AdminPrincipal, session_id: &str, kind: ViewKind) {
     let Some(now) = control.now() else {
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return;
     };
-    let actor = session.user().id.as_str();
+    let actor = principal.user().id.as_str();
     if !control.web.views.admit(actor, session_id, kind, now.secs) {
         return;
     }
@@ -365,7 +366,7 @@ pub(crate) async fn stream(
     } else {
         ViewKind::Stream
     };
-    record_view(&control, &admin.session, &id, kind);
+    record_view(&control, &admin.principal, &id, kind);
     let reader: Reader = Box::new(cast);
     let budget = (!download).then_some(limit);
     let mut response = Response::new(Body::new(CastBody::new(reader, budget, STREAM_CHUNK_BYTES)));
@@ -394,7 +395,7 @@ pub(crate) async fn manifest(
         Ok(located) => located,
         Err(unavailable) => return unavailable.into_response(),
     };
-    record_view(&control, &admin.session, &id, ViewKind::Manifest);
+    record_view(&control, &admin.principal, &id, ViewKind::Manifest);
     let Located { row, stored } = located;
     let manifest = stored.manifest;
     json_response(

@@ -15,7 +15,7 @@ use crate::labels::Labels;
 use crate::limits::too_many_requests;
 use crate::node_audit;
 
-use super::admin_common::{conflict, invalid_value, known_id, not_found, web_actor};
+use super::admin_common::{conflict, invalid_value, known_id, not_found};
 use super::intents::Binding;
 use super::session::{NodesApprove, RequireAdmin};
 
@@ -139,8 +139,8 @@ pub(crate) async fn lookup(
 }
 
 async fn run_lookup(control: Control, admin: RequireAdmin<NodesApprove>, code: String) -> Response {
-    let actor = web_actor(&admin.session);
-    let session_hash = admin.session.0.session.id_hash.clone();
+    let actor = admin.principal.actor();
+    let session_hash = admin.principal.binding();
     let Some(now) = control.now() else {
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return server_error();
@@ -251,8 +251,9 @@ fn redeem(
     intent: &str,
 ) -> Result<String, Unredeemed> {
     let now = control.now().ok_or(Unredeemed::Clock)?;
+    let session_hash = admin.principal.binding();
     let binding = Binding {
-        session_hash: &admin.session.0.session.id_hash,
+        session_hash: &session_hash,
         enrollment_id,
     };
     control
@@ -284,7 +285,7 @@ pub(crate) async fn approve(
         Ok(code_hash) => code_hash,
         Err(refused) => return refused.into_response(),
     };
-    let actor = web_actor(&admin.session);
+    let actor = admin.principal.actor();
     let node_admin = control.node_admin();
     let finished = tokio::spawn(async move {
         node_admin
@@ -323,7 +324,7 @@ pub(crate) async fn reject(
         Ok(code_hash) => code_hash,
         Err(refused) => return refused.into_response(),
     };
-    let actor = web_actor(&admin.session);
+    let actor = admin.principal.actor();
     let node_admin = control.node_admin();
     let finished = tokio::spawn(async move {
         node_admin

@@ -1,3 +1,4 @@
+mod admin_signature;
 mod agent_trust;
 mod client;
 mod db_principal;
@@ -13,6 +14,12 @@ mod session;
 mod ssh_login;
 mod whoami;
 
+pub use admin_signature::{
+    ADMIN_CERTIFICATE_HEADER, ADMIN_NONCE_MAX_LEN, ADMIN_NONCE_MIN_LEN, ADMIN_SIGNATURE_COMPONENTS,
+    ADMIN_SIGNATURE_LABEL, ADMIN_SIGNATURE_MAX_SKEW_SECS, ADMIN_SIGNATURE_NAMESPACE,
+    ADMIN_WHOAMI_PATH, CONTENT_DIGEST_HEADER, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER,
+    admin_signature_base, admin_signature_params, is_admin_nonce,
+};
 pub use agent_trust::{AgentTrust, AgentTrustV2};
 pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};
 pub use db_principal::{

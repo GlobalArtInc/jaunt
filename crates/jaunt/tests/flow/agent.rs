@@ -22,7 +22,7 @@ use crate::support::{
 
 const LONG: Duration = Duration::from_secs(30);
 
-struct RealAgent {
+pub struct RealAgent {
     child: Child,
     socket: PathBuf,
     _dir: TempDir,
@@ -42,7 +42,7 @@ fn tool_present(tool: &str) -> bool {
 }
 
 impl RealAgent {
-    fn start() -> Option<RealAgent> {
+    pub fn start() -> Option<RealAgent> {
         for tool in ["ssh-agent", "ssh-add", "ssh-keygen"] {
             if !tool_present(tool) {
                 eprintln!("skipped: {tool} is not installed");
@@ -76,8 +76,12 @@ impl RealAgent {
         Some(agent)
     }
 
-    fn client(&self) -> SshAgent {
+    pub fn client(&self) -> SshAgent {
         SshAgent::new(Some(self.socket.clone().into_os_string()))
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
     }
 
     fn signal(&self, name: &str) {

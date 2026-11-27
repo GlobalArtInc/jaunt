@@ -89,6 +89,7 @@ pub struct Inner {
     pub(crate) web: WebState,
     clock: Clock,
     ticker: Ticker,
+    started_at: Option<i64>,
     pub(crate) killer: Arc<KillerSlot>,
     pub(crate) watched: Arc<RevocationWatch>,
     pub(crate) recordings: Option<Uploads>,
@@ -160,7 +161,8 @@ impl Control {
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
             Duration::from_secs(parts.cert_ttl.as_secs().min(MAX_USER_VALIDITY.as_secs()));
-        let watched = RevocationWatch::starting_at(Moment::read(&parts.clock).map(|now| now.secs));
+        let started_at = Moment::read(&parts.clock).map(|now| now.secs);
+        let watched = RevocationWatch::starting_at(started_at);
         let killer = Arc::new(KillerSlot::default());
         killer.watch_terminals(Arc::clone(&web.terminals.live));
         Ok(Control {
@@ -183,6 +185,7 @@ impl Control {
                 web,
                 clock: parts.clock,
                 ticker,
+                started_at,
                 killer,
                 watched: Arc::new(watched),
                 recordings: parts.recordings.map(Uploads::new),
@@ -475,6 +478,10 @@ impl Control {
 
     pub(crate) fn tick(&self) -> Duration {
         (self.ticker)()
+    }
+
+    pub(crate) fn started_at(&self) -> Option<i64> {
+        self.started_at
     }
 
     pub(crate) fn public_origin(&self) -> &str {

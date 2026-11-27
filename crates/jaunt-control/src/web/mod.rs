@@ -1,4 +1,5 @@
 mod admin_common;
+mod admin_principal;
 mod admin_sessions;
 mod api;
 mod assets;
@@ -16,6 +17,7 @@ pub(crate) mod pages;
 mod recording_view;
 mod revocations;
 mod session;
+mod signed;
 pub(crate) mod terminal;
 #[cfg(feature = "test-support")]
 pub use self::terminal::WebTerminalCounters;
@@ -49,6 +51,8 @@ pub(crate) struct WebState {
     pub(crate) views: recording_view::ViewLog,
     pub(crate) playback: recording_view::PlaybackLimit,
     pub(crate) terminals: terminal::TerminalState,
+    pub(crate) nonces: signed::NonceCache,
+    pub(crate) signed_noise: crate::limits::NoiseLog,
 }
 
 impl WebState {
@@ -61,6 +65,8 @@ impl WebState {
             views: recording_view::ViewLog::default(),
             playback: recording_view::PlaybackLimit::default(),
             terminals: terminal::TerminalState::default(),
+            nonces: signed::NonceCache::default(),
+            signed_noise: crate::limits::NoiseLog::new(),
         }
     }
 }

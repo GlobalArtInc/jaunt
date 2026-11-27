@@ -6,11 +6,8 @@ use axum::response::Response;
 use crate::http::error_response;
 use crate::revocation::is_identifier;
 
-use super::session::WebSession;
-
 pub(crate) const DEFAULT_PAGE: u32 = 50;
 pub(crate) const MAX_PAGE: u32 = 200;
-const WEB_ACTOR_PREFIX: &str = "web:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -25,10 +22,6 @@ impl Refusal {
             Refusal::Invalid(code) => invalid_value(code),
         }
     }
-}
-
-pub(crate) fn web_actor(session: &WebSession) -> String {
-    format!("{WEB_ACTOR_PREFIX}{}", session.user().id)
 }
 
 pub(crate) fn invalid_request() -> Response {
