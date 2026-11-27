@@ -211,6 +211,7 @@ macro_rules! live_select {
          s.login AS login, s.exit_status AS exit_status, s.bytes_in AS bytes_in, \
          s.bytes_out AS bytes_out, s.recording_incomplete AS recording_incomplete, \
          s.end_reason AS end_reason, s.max_duration_secs AS max_duration_secs, \
+         s.origin AS origin, s.record_input AS record_input, \
          s.kind AS kind, s.service_id AS service_id, s.target AS target, s.roles AS roles, \
          s.grant_ids AS grant_ids, s.db_client_serial AS db_client_serial, \
          s.outcome AS outcome, s.decision_hash AS decision_hash, \
