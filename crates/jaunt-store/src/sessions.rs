@@ -274,7 +274,9 @@ const END: &str = concat!(
 
 const CLOSE_OF_USER: &str = close_open!("user_id = ?");
 
-const CLOSE_OF_SERIAL: &str = close_open!("serial = ?");
+const CLOSE_OF_SERIAL: &str = close_open!(
+    "(serial = ? OR serial IN (SELECT c.serial FROM certificates c WHERE c.parent_serial = ?))"
+);
 
 const CLOSE_OF_NODE: &str = close_open!("node_id = ?");
 
@@ -292,6 +294,8 @@ macro_rules! revoked_subject {
         "EXISTS (SELECT 1 FROM revocations r WHERE \
          (r.kind = 'user' AND r.subject = sessions.user_id) \
          OR (r.kind = 'serial' AND r.subject = CAST(sessions.serial AS TEXT)) \
+         OR (r.kind = 'serial' AND r.subject = (SELECT CAST(c.parent_serial AS TEXT) \
+             FROM certificates c WHERE c.serial = sessions.serial)) \
          OR (r.kind = 'node' AND r.subject = sessions.node_id))"
     };
 }
@@ -451,7 +455,7 @@ impl Sessions {
         let closing = |sql| sqlx::query(sql).bind(now).bind(reason.as_str());
         let query = match which {
             OpenSessions::OfUser(user_id) => closing(CLOSE_OF_USER).bind(user_id),
-            OpenSessions::OfSerial(serial) => closing(CLOSE_OF_SERIAL).bind(serial),
+            OpenSessions::OfSerial(serial) => closing(CLOSE_OF_SERIAL).bind(serial).bind(serial),
             OpenSessions::OfNode(node_id) => closing(CLOSE_OF_NODE).bind(node_id),
             OpenSessions::OfNodeCreatedBefore { node_id, before } => {
                 closing(CLOSE_OF_NODE_CREATED_BEFORE)

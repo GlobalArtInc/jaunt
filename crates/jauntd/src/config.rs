@@ -14,6 +14,7 @@ use jaunt_gate::{
     trusted_proxy_problem,
 };
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
+use jaunt_proto::ClientTransport;
 use serde::Deserialize;
 use url::Url;
 
@@ -89,6 +90,7 @@ pub struct SshGateSection {
     pub max_unauthenticated: usize,
     #[serde(default = "default_write_stall_secs")]
     pub write_stall_secs: u64,
+    pub client_transport: Option<ClientTransport>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +130,7 @@ pub struct RunSettings {
     pub agents: Option<AgentsSettings>,
     pub services: Option<ServicesSettings>,
     pub ssh_gate: Option<GateSshSettings>,
+    pub client_transport: Option<ClientTransport>,
     pub oidc: OidcConfig,
     pub audit: AuditSettings,
     pub limits: LimitSettings,
@@ -223,6 +226,11 @@ pub enum ConfigError {
     GateUnauthenticatedOutOfRange,
     #[error("ssh_gate.write_stall_secs must be at most {MAX_WRITE_STALL_SECS} (0 turns it off)")]
     WriteStallOutOfRange,
+    #[error(
+        "ssh_gate.client_transport: tls needs services.domain, the name clients reach the gate at \
+         over tls"
+    )]
+    TlsTransportWithoutServicesDomain,
     #[error("services.proxy_protocol and services.trusted_proxies need services.domain")]
     ServicesProxyWithoutDomain,
     #[error("services.domain needs the agents' listener: set agents_listen as well")]
@@ -350,6 +358,13 @@ impl Config {
             .transpose()?
             .flatten();
         let limits = self.limits.into_settings()?;
+        let client_transport = self
+            .ssh_gate
+            .as_ref()
+            .and_then(|section| section.client_transport);
+        if client_transport == Some(ClientTransport::Tls) && services.is_none() {
+            return Err(ConfigError::TlsTransportWithoutServicesDomain);
+        }
         let ssh_gate = self
             .ssh_gate
             .map(|section| {
@@ -422,6 +437,7 @@ impl Config {
             agents,
             services,
             ssh_gate,
+            client_transport,
             oidc,
             audit,
             limits,
@@ -669,6 +685,7 @@ mod tests {
     use crate::gate_ssh::GateSshSettings;
     use crate::recordings::StoreSettings;
     use jaunt_gate::TrustedProxyProblem;
+    use jaunt_proto::ClientTransport;
 
     use super::{CLIENT_SECRET_VAR, Config, ConfigError, load};
 
@@ -1049,6 +1066,32 @@ cert_ttl_secs: {SECRET}
         assert_eq!(tuned.trusted_proxies.len(), 2);
         assert_eq!(tuned.max_unauthenticated, 64);
         assert_eq!(tuned.write_stall, None);
+    }
+
+    #[test]
+    fn the_client_transport_is_read_from_the_ssh_gate_and_tls_needs_the_services_domain() {
+        let gated = "gate_endpoint: gate.example.com\nssh_gate:\n  listen: 0.0.0.0:2222\n  \
+                     hostnames: [gate.example.com]\n";
+        let transport = |extra: &str| {
+            parse(&format!("{gated}{extra}"))
+                .into_run_settings(&secret_env)
+                .map(|settings| settings.client_transport)
+        };
+        assert_eq!(transport("").unwrap(), None);
+        assert_eq!(
+            transport("  client_transport: tcp\n").unwrap(),
+            Some(ClientTransport::Tcp)
+        );
+        assert_eq!(
+            transport("  client_transport: tls\nservices:\n  domain: svc.example.com\n").unwrap(),
+            Some(ClientTransport::Tls)
+        );
+        assert!(matches!(
+            transport("  client_transport: tls\n"),
+            Err(ConfigError::TlsTransportWithoutServicesDomain)
+        ));
+        let unknown = format!("data_dir: /d\n{gated}  client_transport: quic\n");
+        assert!(serde_saphyr::from_str::<Config>(&unknown).is_err());
     }
 
     #[test]

@@ -134,6 +134,10 @@ impl FileBackend {
         Ok((trust, backend))
     }
 
+    pub fn read_active(root: &Path, kind: CaKind) -> Result<Fingerprint, CaError> {
+        read_active_key(&kind_dir(root, kind), kind).map(|(_, fingerprint)| fingerprint)
+    }
+
     pub fn read_slot(root: &Path, kind: CaKind) -> Result<SlotListing, CaError> {
         let dir = kind_dir(root, kind);
         let (_, trust) = read_trust(&dir, kind)?;

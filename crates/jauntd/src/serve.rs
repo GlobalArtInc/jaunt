@@ -455,6 +455,12 @@ async fn start(
                 recordings: prepared_recordings
                     .as_ref()
                     .map(|prepared| prepared.settings.clone()),
+                user_x509: authorities.user_x509,
+                services_domain: settings
+                    .services
+                    .as_ref()
+                    .map(|services| services.domain.clone()),
+                client_transport: settings.client_transport,
             },
             settings.limits.http,
         )?;

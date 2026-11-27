@@ -45,7 +45,7 @@ Revocations are checked on every connection, because certificates carry identity
 
 Jaunt has three authorities: the **user CA** signs user certificates, the **host CA** signs the certificates of the gate and the nodes, and the **internal CA** secures the agent connection. The user and host CAs rotate without downtime. Each has an `active` key, at most one `next` key and at most one `previous` key, and rotation is three commands: `add-next`, `promote`, `retire`. `promote` and `retire` check that the step is safe and refuse with exit code 3 when it is not.
 
-Exit codes of `jauntd ca add-next|promote|retire`: 0 done, 1 error, 3 blocked by a check (nothing changed). `jd ca status` prints the state and what blocks the next step; `jd ca status --json` prints the same for scripts, with the counters and the lists of names (`behind_names`, `offline_names`, `names`). The counters are complete, the lists name at most the first 20 nodes. The running daemon notices a changed key directory within 10 seconds and tells the connected agents; each agent reads the new set after a random delay of up to 5 seconds. A command that changed keys ends with the line `applied within 10 s`; `status` and a blocked step (exit 3) do not print it.
+Exit codes of `jauntd ca add-next|promote|retire`: 0 done, 1 error, 3 blocked by a check (nothing changed). `jd ca status` prints the state and what blocks the next step; `jd ca status --json` prints the same for scripts, with the counters and the lists of names (`behind_names`, `offline_names`, `names`). The counters are complete, the lists name at most the first 20 nodes. The running daemon notices a changed key directory within 10 seconds and tells the connected agents; each agent reads the new set after a random delay of up to 5 seconds. A command that changed keys ends with the line `applied within 10 s`; `status` and a blocked step (exit 3) do not print it. For `db-client` the running daemon does not reload the keys, so that command ends with `restart jauntd to apply: the running daemon reads the db-client keys only when it starts` instead. After `ca promote user-x509`, `POST /v1/certificates/x509` answers 503 `authority_unavailable` until the daemon has reloaded the keys (up to the reload interval, about 10 seconds); a slot that fails to load postpones the reload of the other slots that changed until it is fixed.
 
 ### User CA
 
@@ -428,7 +428,7 @@ sudo journalctl -u jauntd -o cat | grep '^{"v":1' | jq -c 'select(.type | starts
 
 The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
 
-The 79 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
+The 83 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
 
 | Type | Actor | Fields |
 |---|---|---|
@@ -445,6 +445,10 @@ The 79 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `login.web.session_ended` | user | `reason` |
 | `cert.issued` | user | `login_id`, `serial` |
 | `cert.rotated` | system | `not_after` |
+| `cert.x509.issued` | user | `serial`, `parent_serial`, `valid_before`, `client_addr` |
+| `cert.service.issued` | node | `service_id`, `kind`, `name`, `serial`, `valid_before`; envelope: node |
+| `cert.service.refused` | node | `service_id`, `reason`; envelope: node |
+| `cert.gate.issued` | system | `serial`, `valid_before` |
 | `admin.csrf_denied` | user | `reason` |
 | `admin.enrolment.looked_up` | user | `outcome`, `enrollment_id` |
 | `admin.signed_request` | user | `decision`, `reason`, `serial`, `method`, `path`, `client_addr` |

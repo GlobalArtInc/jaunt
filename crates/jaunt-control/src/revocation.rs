@@ -200,13 +200,22 @@ impl RevocationAdmin {
         if let Some(node) = &outcome.removed_node {
             node_audit::node_removed(&node.id, &node.name, "revoked", created_by);
         }
+        let parent = match &scope {
+            KillScope::Certificate { user_id, serial } => Some((user_id.clone(), *serial)),
+            _ => None,
+        };
         let enforced = self.enforce(scope, now.secs).await;
-        if self.killer.current().is_some() {
+        let children = match parent {
+            Some((user_id, serial)) => self.order_children(&user_id, serial, now.secs).await,
+            None => Ok(()),
+        };
+        if self.killer.current().is_some() && children.is_ok() {
             self.watched
                 .lock_watch()
                 .saw(&outcome.revocation.id, outcome.revocation.created_at);
         }
         let terminated = enforced?;
+        children.map_err(RevokeError::Store)?;
         Ok(Revoked {
             revocation: outcome.revocation,
             created: outcome.created,
@@ -285,6 +294,33 @@ impl RevocationAdmin {
         }
     }
 
+    async fn order_children(&self, user_id: &str, parent: u64, now: i64) -> Result<(), StoreError> {
+        let Ok(parent) = i64::try_from(parent) else {
+            return Ok(());
+        };
+        for child in self
+            .store
+            .certificates()
+            .unexpired_children(parent, now)
+            .await?
+        {
+            let Ok(serial) = u64::try_from(child) else {
+                continue;
+            };
+            self.killer
+                .order(
+                    KillScope::Certificate {
+                        user_id: user_id.to_owned(),
+                        serial,
+                    },
+                    KillReason::Revoked,
+                    &[],
+                )
+                .await;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn order_for(&self, revocation: &Revocation) -> Result<bool, StoreError> {
         let scope = match revocation.kind {
             RevocationKind::User => KillScope::User {
@@ -300,10 +336,26 @@ impl RevocationAdmin {
                 let Some(certificate) = self.store.certificates().get(serial).await? else {
                     return Ok(true);
                 };
-                KillScope::Certificate {
-                    user_id: certificate.user_id,
-                    serial: u64::try_from(serial).unwrap_or_default(),
+                let Ok(unsigned) = u64::try_from(serial) else {
+                    return Ok(true);
+                };
+                let ordered = self
+                    .killer
+                    .order(
+                        KillScope::Certificate {
+                            user_id: certificate.user_id.clone(),
+                            serial: unsigned,
+                        },
+                        KillReason::Revoked,
+                        &[],
+                    )
+                    .await;
+                if ordered {
+                    let expired_before = Moment::read(&self.clock).map_or(i64::MIN, |now| now.secs);
+                    self.order_children(&certificate.user_id, unsigned, expired_before)
+                        .await?;
                 }
+                return Ok(ordered);
             }
         };
         Ok(self.killer.order(scope, KillReason::Revoked, &[]).await)

@@ -6,6 +6,7 @@ mod authorize;
 pub mod ca_rotation;
 mod ca_snapshot;
 mod callback;
+mod cert_audit;
 mod client_config;
 mod clock;
 mod completion;
@@ -15,6 +16,7 @@ mod enroll;
 mod enroll_secrets;
 mod error;
 mod finish;
+mod gate_cert;
 mod holder;
 mod host_accounts;
 mod http;
@@ -45,7 +47,9 @@ mod revocation;
 mod revocation_audit;
 mod route;
 mod serve;
+mod server_cert;
 mod service_audit;
+mod service_cert;
 mod services;
 mod session_audit;
 mod session_end;
@@ -57,6 +61,7 @@ mod token;
 mod user_cert;
 mod web;
 mod whoami;
+mod x509_cert;
 
 pub use admin::{
     ApproveError, ApprovedNode, ListError, NodeAdmin, NodeListing, NodeSummary, PendingEnrollment,
@@ -80,7 +85,7 @@ pub use limits::{
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, MAX_CONNECTIONS_LIMIT,
     RequestLimits,
 };
-pub use naming::{AgentEndpoint, GateEndpoint, NamingError, SshSuffix};
+pub use naming::{AgentEndpoint, GateEndpoint, NamingError, ServicesDomain, SshSuffix};
 pub use presence::AgentPresence;
 pub use recordings::{
     CHUNK_ENVELOPE_BYTES, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CHUNKS, DEFAULT_MAX_STORE_COMMITS,

@@ -2313,6 +2313,7 @@ dependencies = [
  "jaunt-audit",
  "jaunt-ca",
  "jaunt-control",
+ "jaunt-gate",
  "jaunt-limits",
  "jaunt-oidc",
  "jaunt-policy",
@@ -2338,6 +2339,7 @@ dependencies = [
  "tower",
  "tracing",
  "tungstenite",
+ "x509-parser",
  "zeroize",
  "zstd",
 ]

@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::{ChangeStep, Context, LAST_LINE, RotationAction, Streams, execute};
+use super::{ChangeStep, Context, LAST_LINE, RESTART_LINE, RotationAction, Streams, execute};
 use crate::ca::load_authorities;
 
 const NOW: i64 = 1_700_000_000;
@@ -189,10 +189,14 @@ fn audit_events(fixture: &Fixture) -> Vec<AuditEvent> {
 }
 
 fn assert_applied(outcome: &Outcome, context: &str) {
+    assert_ends_with(outcome, context, LAST_LINE);
+}
+
+fn assert_ends_with(outcome: &Outcome, context: &str, line: &str) {
     assert_eq!(outcome.code, 0, "{context}: {}", outcome.stderr);
     assert_eq!(
         outcome.stdout.lines().last(),
-        Some(LAST_LINE),
+        Some(line),
         "{context}: {}",
         outcome.stdout
     );
@@ -789,6 +793,20 @@ fn a_blocked_retire_reports_the_interrupted_retire_it_finished_on_its_own_line()
 fn client_authorities_rotate_through_the_commands_at_the_ca_level() {
     let fixture = fixture();
     for kind in [CaKind::UserX509, CaKind::DbClient] {
+        let last = if kind == CaKind::DbClient {
+            RESTART_LINE
+        } else {
+            LAST_LINE
+        };
+        let assert_applied = |outcome: &Outcome, context: &str| {
+            assert_ends_with(outcome, context, last);
+            assert_eq!(
+                outcome.stdout.contains(LAST_LINE),
+                kind != CaKind::DbClient,
+                "{context}: {}",
+                outcome.stdout
+            );
+        };
         let shown = section(&status(&fixture), kind);
         assert!(shown.starts_with("  active    "), "{shown}");
         assert!(shown.contains("  trust id  "), "{shown}");

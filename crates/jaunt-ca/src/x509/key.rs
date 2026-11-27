@@ -3,6 +3,7 @@ use std::fmt;
 
 use ed25519_dalek::{Signature as RawSignature, VerifyingKey};
 use rcgen::{PKCS_ED25519, PublicKeyData, SignatureAlgorithm, SigningKey, SubjectPublicKeyInfo};
+use ssh_key::public::{Ed25519PublicKey, KeyData};
 use ssh_key::{Algorithm, PublicKey, Signature};
 
 use crate::error::CaError;
@@ -33,6 +34,10 @@ impl SubjectPublicKey {
     pub fn from_ssh_key(key: &PublicKey) -> Result<Self, CaError> {
         let ed25519 = key.key_data().ed25519().ok_or(CaError::InvalidSubjectKey)?;
         Self::from_raw(ed25519.0)
+    }
+
+    pub fn to_ssh_key(&self) -> PublicKey {
+        PublicKey::from(KeyData::Ed25519(Ed25519PublicKey(self.raw)))
     }
 
     pub(super) fn raw(&self) -> &[u8; ED25519_KEY_LEN] {

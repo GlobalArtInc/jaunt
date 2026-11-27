@@ -79,6 +79,14 @@ impl ClientCa {
         self.issuer.root_sha256_hex()
     }
 
+    pub fn root_not_before(&self) -> SystemTime {
+        self.issuer.root_not_before()
+    }
+
+    pub fn root_not_after(&self) -> SystemTime {
+        self.issuer.root_not_after()
+    }
+
     pub fn issue_user_certificate(
         &self,
         params: UserX509Params,

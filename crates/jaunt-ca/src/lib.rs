@@ -36,6 +36,6 @@ pub use x509::{
     CLIENT_ROOT_VALIDITY, ClientCa, DB_CLIENT_BACKDATE, DB_CLIENT_VALIDITY, DEFAULT_NODE_VALIDITY,
     DEFAULT_SERVER_VALIDITY, DEFAULT_SERVICE_VALIDITY, DbClientParams, InternalCa,
     IssuedCertificate, MAX_NODE_VALIDITY, MAX_SERVER_VALIDITY, MAX_USER_X509_VALIDITY,
-    NodeCertParams, NodeIdentity, ROOT_VALIDITY, ServerCertParams, SubjectPublicKey,
-    UserX509Params, parse_node_identity,
+    NodeCertParams, NodeIdentity, ROOT_VALIDITY, ServerCertParams, ServiceCertParams,
+    SubjectPublicKey, UserX509Params, parse_node_identity,
 };

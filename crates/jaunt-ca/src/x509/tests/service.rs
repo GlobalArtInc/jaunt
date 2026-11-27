@@ -3,12 +3,17 @@ use std::time::Duration;
 use rustls::Error as TlsError;
 
 use super::issuance::{is_wrong_name, sans, usages, verify_server};
-use super::{DAY, Fixture, NOW_SECS, now, openssl, openssl_verify_with, parsed, pem, subject};
+use super::{
+    DAY, Fixture, NOW_SECS, der_serial, now, openssl, openssl_verify_with, parsed, pem, subject,
+};
 use crate::error::CaError;
 use crate::test_support::verify_client;
 use crate::x509::{
-    DEFAULT_SERVICE_VALIDITY, InternalCa, IssuedCertificate, MAX_SERVER_VALIDITY, ServerCertParams,
+    DEFAULT_SERVICE_VALIDITY, InternalCa, IssuedCertificate, MAX_SERVER_VALIDITY, ROOT_VALIDITY,
+    ServerCertParams, ServiceCertParams,
 };
+
+const SERIAL: u64 = 4242;
 
 fn long_name() -> String {
     format!("{}.kube.svc.example.com", "a".repeat(63))
@@ -22,12 +27,62 @@ fn params(names: &[&str], validity: Duration) -> ServerCertParams {
     }
 }
 
+fn service_params(names: &[&str], serial: u64, validity: Duration) -> ServiceCertParams {
+    ServiceCertParams {
+        subject_public_key: subject(),
+        dns_names: names.iter().map(|name| (*name).to_owned()).collect(),
+        serial,
+        validity,
+    }
+}
+
 fn service(
     ca: &InternalCa,
     names: &[&str],
     validity: Duration,
 ) -> Result<IssuedCertificate, CaError> {
-    ca.issue_service_certificate(params(names, validity), now())
+    ca.issue_service_certificate(service_params(names, SERIAL, validity), now())
+}
+
+#[test]
+fn service_certificate_carries_the_serial_of_the_caller_and_refuses_zero() {
+    let fixture = Fixture::new();
+    let ca = fixture.ca();
+    let name = "grafana.tcp.svc.example.com";
+    let issued = service(&ca, &[name], DEFAULT_SERVICE_VALIDITY).unwrap();
+    assert_eq!(issued.serial, u128::from(SERIAL));
+    assert_eq!(
+        der_serial(&parsed(&issued.certificate_der)),
+        u128::from(SERIAL)
+    );
+    assert!(matches!(
+        ca.issue_service_certificate(service_params(&[name], 0, DEFAULT_SERVICE_VALIDITY), now()),
+        Err(CaError::InvalidSerial)
+    ));
+}
+
+#[test]
+fn the_internal_authority_reports_the_validity_of_its_root() {
+    let fixture = Fixture::new();
+    let ca = fixture.ca();
+    assert_eq!(ca.root_not_before(), fixture.root.not_before);
+    assert_eq!(ca.root_not_after(), fixture.root.not_after);
+    assert_eq!(ca.root_not_after(), now() + ROOT_VALIDITY);
+    let name = "grafana.tcp.svc.example.com";
+    let remaining = ROOT_VALIDITY - Duration::from_secs(DAY);
+    let late = now() + remaining;
+    let to_the_end = Duration::from_secs(DAY);
+    let issued = ca
+        .issue_service_certificate(service_params(&[name], SERIAL, to_the_end), late)
+        .unwrap();
+    assert_eq!(issued.not_after, ca.root_not_after());
+    assert!(matches!(
+        ca.issue_service_certificate(
+            service_params(&[name], SERIAL, to_the_end + Duration::from_secs(1)),
+            late
+        ),
+        Err(CaError::ExceedsRootValidity)
+    ));
 }
 
 #[test]

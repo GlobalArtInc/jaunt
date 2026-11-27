@@ -13,13 +13,14 @@ use base64::engine::general_purpose::STANDARD;
 use jaunt_audit::{DirectoryLimits, DirectorySink, RecordingSink};
 use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
-use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer, TrustSet};
+use jaunt_ca::{AgeIdentity, CaKind, ClientCa, FileBackend, InternalCa, Signer, TrustSet};
 use jaunt_control::{
     AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
     DeviceSettings, GateEndpoint, NodeAdmin, RecordingLimits, RecordingSettings, RequestLimits,
     SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
+use jaunt_proto::ClientTransport;
 use jaunt_store::Store;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -115,6 +116,10 @@ pub struct Options {
     pub recordings: Option<RecordingOptions>,
     pub host_sign_hook: Option<SignHook>,
     pub web: bool,
+    pub user_x509_root_age: Option<Duration>,
+    pub internal_root_age: Duration,
+    pub services_domain: Option<&'static str>,
+    pub client_transport: Option<ClientTransport>,
 }
 
 impl Default for Options {
@@ -129,6 +134,10 @@ impl Default for Options {
             recordings: None,
             host_sign_hook: None,
             web: false,
+            user_x509_root_age: None,
+            internal_root_age: Duration::ZERO,
+            services_domain: None,
+            client_transport: None,
         }
     }
 }
@@ -384,7 +393,21 @@ impl Harness {
             None => host_authority,
         };
         let host_ca = host_trust.active().clone();
-        let root = InternalCa::create_root(&internal_signer, SystemTime::now()).unwrap();
+        let root = InternalCa::create_root(
+            &internal_signer,
+            SystemTime::now() - options.internal_root_age,
+        )
+        .unwrap();
+        let user_x509 = options.user_x509_root_age.map(|age| {
+            ClientCa::init(
+                &ca_root,
+                CaKind::UserX509,
+                &identity.recipient(),
+                SystemTime::now() - age,
+            )
+            .unwrap();
+            ClientCa::load(&ca_root, CaKind::UserX509, &identity).unwrap()
+        });
         let root_der = root.certificate_der.clone();
         let internal_ca = InternalCa::new(Arc::new(internal_signer), root.certificate_der).unwrap();
 
@@ -447,6 +470,9 @@ impl Harness {
                 web_enabled: options.web,
                 clock: clock.clock(),
                 recordings,
+                user_x509,
+                services_domain: options.services_domain.map(str::to_owned),
+                client_transport: options.client_transport,
             },
             RequestLimits::default(),
             clock.ticker(),

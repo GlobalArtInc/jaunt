@@ -24,6 +24,8 @@ pub struct TrustedRoot {
     pub role: KeyRole,
     pub fingerprint: String,
     pub certificate_der: Vec<u8>,
+    pub not_before: SystemTime,
+    pub not_after: SystemTime,
 }
 
 impl fmt::Debug for TrustedRoot {
@@ -35,6 +37,8 @@ impl fmt::Debug for TrustedRoot {
                 "sha256",
                 &format_args!("{}", digest_hex(&Sha256::digest(&self.certificate_der))),
             )
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
             .finish()
     }
 }
@@ -169,10 +173,13 @@ impl ClientCa {
         let mut roots = Vec::with_capacity(trust.keys().len());
         for role in [KeyRole::Active, KeyRole::Next, KeyRole::Previous] {
             for (_, key) in trust.roles().filter(|(found, _)| *found == role) {
+                let (certificate_der, (not_before, not_after)) = read_root(&dir, key)?;
                 roots.push(TrustedRoot {
                     role,
                     fingerprint: fingerprint_hex(key),
-                    certificate_der: read_root(&dir, key)?,
+                    certificate_der,
+                    not_before,
+                    not_after,
                 });
             }
         }
@@ -201,7 +208,7 @@ impl ClientCa {
     }
 }
 
-fn read_root(dir: &Path, key: &PublicKey) -> Result<Vec<u8>, CaError> {
+fn read_root(dir: &Path, key: &PublicKey) -> Result<(Vec<u8>, (SystemTime, SystemTime)), CaError> {
     let path = dir.join(format!("{}{ROOT_SUFFIX}", fingerprint_hex(key)));
     if !exists(&path)? {
         return Err(corrupt(&path, "the key has no root certificate"));
@@ -209,11 +216,11 @@ fn read_root(dir: &Path, key: &PublicKey) -> Result<Vec<u8>, CaError> {
     let der = read_limited(&path, MAX_ROOT_LEN)?.to_vec();
     let subject = SubjectPublicKey::from_ssh_key(key)
         .map_err(|_| corrupt(&path, "the key is not an Ed25519 key"))?;
-    validate_root(&der, &subject).map_err(|err| match err {
+    let validity = validate_root(&der, &subject).map_err(|err| match err {
         CaError::InvalidRootCertificate { reason } => corrupt(&path, reason),
         other => other,
     })?;
-    Ok(der)
+    Ok((der, validity))
 }
 
 #[cfg(test)]

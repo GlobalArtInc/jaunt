@@ -67,6 +67,14 @@ pub struct ServerCertParams {
     pub validity: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct ServiceCertParams {
+    pub subject_public_key: SubjectPublicKey,
+    pub dns_names: Vec<String>,
+    pub serial: u64,
+    pub validity: Duration,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuedCertificate {
     pub certificate_der: Vec<u8>,
@@ -102,6 +110,14 @@ impl InternalCa {
 
     pub fn root_sha256_hex(&self) -> String {
         self.issuer.root_sha256_hex()
+    }
+
+    pub fn root_not_before(&self) -> SystemTime {
+        self.issuer.root_not_before()
+    }
+
+    pub fn root_not_after(&self) -> SystemTime {
+        self.issuer.root_not_after()
     }
 
     pub fn issue_node_certificate(
@@ -151,7 +167,7 @@ impl InternalCa {
 
     pub fn issue_service_certificate(
         &self,
-        params: ServerCertParams,
+        params: ServiceCertParams,
         now: SystemTime,
     ) -> Result<IssuedCertificate, CaError> {
         let dns_names: Vec<String> = params
@@ -168,7 +184,7 @@ impl InternalCa {
             common_name: None,
             usage: ExtendedKeyUsagePurpose::ServerAuth,
             names: dns_sans(&dns_names)?,
-            serial: random_serial()?,
+            serial: u128::from(params.serial),
         })
     }
 
@@ -240,6 +256,14 @@ impl LeafIssuer {
         sha256_hex(&self.root_der)
     }
 
+    fn root_not_before(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.root_validity.not_before())
+    }
+
+    fn root_not_after(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(self.root_validity.not_after())
+    }
+
     fn check_window(&self, now: SystemTime, window: &Window) -> Result<(), CaError> {
         let now_seconds = now
             .duration_since(UNIX_EPOCH)
@@ -291,8 +315,15 @@ impl LeafIssuer {
     }
 }
 
-pub(crate) fn validate_root(root_der: &[u8], key: &SubjectPublicKey) -> Result<(), CaError> {
-    root::validate(root_der, key.raw()).map(drop)
+pub(crate) fn validate_root(
+    root_der: &[u8],
+    key: &SubjectPublicKey,
+) -> Result<(SystemTime, SystemTime), CaError> {
+    let validity = root::validate(root_der, key.raw())?;
+    Ok((
+        UNIX_EPOCH + Duration::from_secs(validity.not_before()),
+        UNIX_EPOCH + Duration::from_secs(validity.not_after()),
+    ))
 }
 
 fn validate_server_names(names: &[String]) -> Result<(), CaError> {

@@ -7,6 +7,7 @@ mod device;
 mod enroll;
 mod error;
 mod host_account;
+mod issuance;
 mod kube_principal;
 mod login;
 mod plane;
@@ -30,8 +31,13 @@ pub use admin_token::{
     ADMIN_TOKEN_SECRET_BYTES, ADMIN_TOKEN_SECRET_LEN, ADMIN_TOKENS_PATH, admin_token_id,
     admin_token_path, is_admin_token_id, is_admin_token_name,
 };
-pub use agent_trust::{AgentTrust, AgentTrustV2};
-pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};
+pub use agent_trust::{
+    AGENT_TRUST_V3_PATH, AgentTrust, AgentTrustV2, AgentTrustV3, TrustRole, TrustedX509Root,
+};
+pub use client::{
+    CLIENT_CONFIG_V2_PATH, ClientConfig, ClientConfigV2, ClientTransport, GateEndpoint, NodeList,
+    NodeSummary, PinnedRoot, ServicesClient, SshGateClient,
+};
 pub use db_principal::{
     is_db_name, is_db_user, is_valid_substituted_db_name, is_valid_substituted_db_user,
 };
@@ -45,6 +51,11 @@ pub use host_account::{
     AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountEvent, AccountEventKind,
     AccountReference, AccountRefusal, AccountReport, AccountStage, AgentCapabilities,
     InvalidAccountReference, InvalidAccountReport, MAX_ACCOUNT_GROUPS, MAX_ACCOUNT_HOME_BYTES,
+};
+pub use issuance::{
+    AGENT_SERVICE_CERTIFICATE_PATH, GATE_ALPN_SSH, GATE_ALPN_SVC, GateTlsCertificate,
+    GateTlsIssueError, GateTlsIssuer, ServiceCertificateRequest, ServiceCertificateResponse,
+    X509_CERTIFICATES_PATH, X509CertificateRequest, X509CertificateResponse,
 };
 pub use kube_principal::{is_kube_principal, is_valid_substituted_kube_principal};
 pub use login::{FinishRequest, FinishResponse, StartRequest, StartResponse};

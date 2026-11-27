@@ -18,6 +18,8 @@ pub enum NamingError {
          from 1 to 65535 (an ipv6 address goes in square brackets)"
     )]
     GateEndpoint,
+    #[error("the services domain must be a lowercase dns name, not an ip address")]
+    ServicesDomain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,31 +40,59 @@ impl SshSuffix {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentEndpoint(String);
+pub struct AgentEndpoint {
+    text: String,
+    port: u16,
+}
 
 impl AgentEndpoint {
     pub fn parse(text: &str) -> Result<AgentEndpoint, NamingError> {
         let (host, port) = text.rsplit_once(':').ok_or(NamingError::AgentEndpoint)?;
         let host_ok = is_dns_name(host) && !ends_in_a_number(host);
-        let port_ok = !port.is_empty()
-            && port.len() <= 5
-            && port.bytes().all(|byte| byte.is_ascii_digit())
-            && port.parse::<u16>().is_ok_and(|number| number != 0);
-        if host_ok && port_ok {
-            Ok(AgentEndpoint(text.to_owned()))
+        let well_formed =
+            !port.is_empty() && port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit());
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|number| well_formed && *number != 0);
+        match port {
+            Some(port) if host_ok => Ok(AgentEndpoint {
+                text: text.to_owned(),
+                port,
+            }),
+            _ => Err(NamingError::AgentEndpoint),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn host(&self) -> &str {
+        self.text
+            .rsplit_once(':')
+            .map_or(self.text.as_str(), |(host, _)| host)
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicesDomain(String);
+
+impl ServicesDomain {
+    pub fn parse(text: &str) -> Result<ServicesDomain, NamingError> {
+        if is_dns_name(text) && !ends_in_a_number(text) {
+            Ok(ServicesDomain(text.to_owned()))
         } else {
-            Err(NamingError::AgentEndpoint)
+            Err(NamingError::ServicesDomain)
         }
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    pub fn host(&self) -> &str {
-        self.0
-            .rsplit_once(':')
-            .map_or(self.0.as_str(), |(host, _)| host)
     }
 }
 
@@ -164,7 +194,32 @@ fn ends_in_a_number(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEndpoint, GateEndpoint, SshSuffix, is_dns_label};
+    use super::{AgentEndpoint, GateEndpoint, ServicesDomain, SshSuffix, is_dns_label};
+
+    #[test]
+    fn the_services_domain_is_a_lowercase_dns_name_and_the_agent_port_is_read_back() {
+        for (text, ok) in [
+            ("svc.example.com", true),
+            ("svc", true),
+            ("Svc.example.com", false),
+            ("svc.example.com.", false),
+            ("*.example.com", false),
+            ("192.0.2.7", false),
+            ("", false),
+        ] {
+            assert_eq!(ServicesDomain::parse(text).is_ok(), ok, "{text:?}");
+        }
+        assert_eq!(
+            ServicesDomain::parse("svc.example.com").unwrap().as_str(),
+            "svc.example.com"
+        );
+        assert_eq!(
+            AgentEndpoint::parse("agents.example.com:8444")
+                .unwrap()
+                .port(),
+            8444
+        );
+    }
 
     #[test]
     fn dns_labels_follow_the_lowercase_rule() {

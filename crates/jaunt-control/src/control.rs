@@ -4,14 +4,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use axum::Router;
 use jaunt_ca::{
-    CaError, InternalCa, IssuedCertificate, MAX_USER_VALIDITY, ServerCertParams, Signer, TrustSet,
+    CaError, CaKind, ClientSlot, InternalCa, IssuedCertificate, MAX_USER_VALIDITY,
+    ServerCertParams, Signer, TrustSet,
 };
 use jaunt_limits::RateLimiter;
 use jaunt_oidc::OidcClient;
 use jaunt_policy::{PolicyHandle, PolicySet};
+use jaunt_proto::ClientTransport;
 use jaunt_store::{EnrollmentState, Store};
 use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
@@ -27,7 +29,7 @@ use crate::http;
 use crate::join_tokens::JoinTokenAdmin;
 use crate::killer::{KillerSlot, SessionKiller};
 use crate::limits::{NoiseLog, RequestLimiters, RequestLimits};
-use crate::naming::{AgentEndpoint, GateEndpoint, SshSuffix};
+use crate::naming::{AgentEndpoint, GateEndpoint, ServicesDomain, SshSuffix};
 use crate::node_audit;
 use crate::pending::PendingLogins;
 use crate::presence::{AgentPresence, PresenceSlot};
@@ -39,6 +41,7 @@ use crate::services;
 use crate::session_sweep::RevocationWatch;
 use crate::web::WebState;
 use crate::web::terminal::{End, TerminalGate, WebTerminalSettings};
+use crate::{service_cert, x509_cert};
 
 pub const PENDING_CAPACITY: usize = 10_000;
 
@@ -49,6 +52,7 @@ const EXPIRED_JOIN_TOKEN_RETENTION_SECS: i64 = 3600;
 const DEAD_ADMIN_TOKEN_RETENTION_SECS: i64 = 30 * 86_400;
 const STALE_DELIVERY_SECS: i64 = 120;
 const STALE_SESSION_RETENTION_SECS: i64 = 3600;
+const SERVICE_CERTIFICATE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 const CLOSE_POLL: Duration = Duration::from_millis(20);
 
 pub struct ControlParts {
@@ -70,6 +74,9 @@ pub struct ControlParts {
     pub web_enabled: bool,
     pub clock: Clock,
     pub recordings: Option<RecordingSettings>,
+    pub user_x509: Option<ClientSlot>,
+    pub services_domain: Option<String>,
+    pub client_transport: Option<ClientTransport>,
 }
 
 pub struct Inner {
@@ -99,6 +106,11 @@ pub struct Inner {
     pub(crate) presence: PresenceSlot,
     pub(crate) host_accounts: HostAccounts,
     pub(crate) service_announcements: RateLimiter<String>,
+    user_x509: ArcSwapOption<ClientSlot>,
+    pub(crate) services_domain: Option<ServicesDomain>,
+    pub(crate) client_transport: ClientTransport,
+    pub(crate) x509_issuance: RateLimiter<String>,
+    pub(crate) service_issuance: RateLimiter<String>,
 }
 
 #[derive(Clone)]
@@ -160,6 +172,20 @@ impl Control {
         {
             return Err(ControlError::RecordingLimits);
         }
+        let services_domain = parts
+            .services_domain
+            .as_deref()
+            .map(ServicesDomain::parse)
+            .transpose()
+            .map_err(ControlError::ServicesDomain)?;
+        let client_transport = client_transport(parts.client_transport, services_domain.is_some())?;
+        if parts
+            .user_x509
+            .as_ref()
+            .is_some_and(|slot| slot.ca.kind() != CaKind::UserX509)
+        {
+            return Err(ControlError::NotUserX509Authority);
+        }
         let web = WebState::new(parts.web_enabled, &parts.device.public_origin);
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
@@ -196,6 +222,11 @@ impl Control {
                 presence: PresenceSlot::default(),
                 host_accounts: HostAccounts::default(),
                 service_announcements: services::announcement_limiter(),
+                user_x509: ArcSwapOption::from(parts.user_x509.map(Arc::new)),
+                services_domain,
+                client_transport,
+                x509_issuance: x509_cert::issuance_limiter(),
+                service_issuance: service_cert::issuance_limiter(),
             }),
         })
     }
@@ -223,6 +254,18 @@ impl Control {
 
     pub fn replace_snapshot(&self, snapshot: CaSnapshot) -> Arc<CaSnapshot> {
         self.inner.ca.swap(Arc::new(snapshot))
+    }
+
+    pub fn user_x509(&self) -> Option<Arc<ClientSlot>> {
+        self.inner.user_x509.load_full()
+    }
+
+    pub fn replace_user_x509(&self, slot: ClientSlot) -> Result<(), ControlError> {
+        if slot.ca.kind() != CaKind::UserX509 {
+            return Err(ControlError::NotUserX509Authority);
+        }
+        self.inner.user_x509.store(Some(Arc::new(slot)));
+        Ok(())
     }
 
     pub(crate) fn policy_snapshot(&self) -> Arc<PolicySet> {
@@ -317,6 +360,8 @@ impl Control {
         let tick = self.tick();
         self.request_limits.sweep(tick);
         self.web.tokens.sweep(tick);
+        self.x509_issuance.sweep(tick);
+        self.service_issuance.sweep(tick);
         let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {
@@ -384,6 +429,15 @@ impl Control {
             .purge_expired_routed(now.secs.saturating_sub(STALE_SESSION_RETENTION_SECS))
             .await
             .map_err(ControlError::PurgeSessions)
+    }
+
+    pub async fn purge_service_certificates(&self) -> Result<u64, ControlError> {
+        let now = self.now().ok_or(ControlError::Clock)?;
+        self.store
+            .service_certificates()
+            .purge_expired(now.secs.saturating_sub(SERVICE_CERTIFICATE_RETENTION_SECS))
+            .await
+            .map_err(ControlError::PurgeServiceCertificates)
     }
 
     pub async fn recover_stale_deliveries(&self) -> Result<u64, ControlError> {
@@ -503,6 +557,18 @@ impl Control {
     }
 }
 
+fn client_transport(
+    configured: Option<ClientTransport>,
+    services_domain: bool,
+) -> Result<ClientTransport, ControlError> {
+    match (configured, services_domain) {
+        (Some(ClientTransport::Tls), false) => Err(ControlError::TlsTransportWithoutServicesDomain),
+        (Some(chosen), _) => Ok(chosen),
+        (None, true) => Ok(ClientTransport::Tls),
+        (None, false) => Ok(ClientTransport::Tcp),
+    }
+}
+
 async fn sweep_forever(control: Control, sweep_interval: Duration) {
     let mut ticker = tokio::time::interval(sweep_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -530,6 +596,9 @@ async fn sweep_forever(control: Control, sweep_interval: Duration) {
         if let Err(err) = control.purge_web_sessions().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired web sessions failed");
         }
+        if let Err(err) = control.purge_service_certificates().await {
+            tracing::warn!(target: "jaunt::control", error = %err, "purging expired service certificates failed");
+        }
         control.sweep_idle_recordings().await;
     }
 }
@@ -544,12 +613,36 @@ mod tests {
     use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa};
     use jaunt_oidc::{ClientSecret, OidcClient, OidcConfig};
     use jaunt_policy::{PolicyHandle, PolicySet};
+    use jaunt_proto::ClientTransport;
     use jaunt_store::Store;
 
-    use super::{Control, ControlParts};
+    use super::{Control, ControlParts, client_transport};
     use crate::clock::system_clock;
     use crate::device::DeviceSettings;
+    use crate::error::ControlError;
     use crate::naming::{AgentEndpoint, SshSuffix};
+
+    #[test]
+    fn the_client_transport_defaults_to_tls_only_with_a_services_domain() {
+        for (configured, domain, expected) in [
+            (None, false, Some(ClientTransport::Tcp)),
+            (None, true, Some(ClientTransport::Tls)),
+            (Some(ClientTransport::Tcp), true, Some(ClientTransport::Tcp)),
+            (
+                Some(ClientTransport::Tcp),
+                false,
+                Some(ClientTransport::Tcp),
+            ),
+            (Some(ClientTransport::Tls), true, Some(ClientTransport::Tls)),
+            (Some(ClientTransport::Tls), false, None),
+        ] {
+            match (client_transport(configured, domain), expected) {
+                (Ok(chosen), Some(expected)) => assert_eq!(chosen, expected),
+                (Err(ControlError::TlsTransportWithoutServicesDomain), None) => {}
+                (other, _) => panic!("{configured:?} {domain}: {other:?}"),
+            }
+        }
+    }
 
     const ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: ops }\nspec:\n  members: { groups: [ops] }\n  ssh: { nodes: { env: [prod] }, logins: [deploy] }\n";
 
@@ -644,6 +737,9 @@ mod tests {
             web_enabled: false,
             clock: system_clock(),
             recordings: None,
+            user_x509: None,
+            services_domain: None,
+            client_transport: None,
         })
         .unwrap();
 

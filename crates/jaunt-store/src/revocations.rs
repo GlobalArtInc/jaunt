@@ -118,6 +118,8 @@ const NEXT_PAGE: &str = concat!(
 
 const ANY_MATCH: &str = "SELECT 1 FROM revocations \
     WHERE (kind = 'user' AND subject = ?) OR (kind = 'serial' AND subject = ?) \
+    OR (kind = 'serial' AND subject = (SELECT CAST(c.parent_serial AS TEXT) \
+        FROM certificates c WHERE c.serial = ?)) \
     OR (kind = 'node' AND subject = ?) LIMIT 1";
 
 macro_rules! prune_expired_serials {
@@ -287,6 +289,7 @@ impl Revocations {
         let row = sqlx::query(ANY_MATCH)
             .bind(subjects.user_id)
             .bind(subjects.serial.map(|serial| serial.to_string()))
+            .bind(subjects.serial)
             .bind(subjects.node_id)
             .fetch_optional(&self.pool)
             .await?;

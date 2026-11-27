@@ -57,6 +57,14 @@ pub(super) struct RootValidity {
 }
 
 impl RootValidity {
+    pub(super) fn not_before(self) -> u64 {
+        self.not_before
+    }
+
+    pub(super) fn not_after(self) -> u64 {
+        self.not_after
+    }
+
     pub(super) fn check(self, now: u64, leaf_not_after: u64) -> Result<(), CaError> {
         if now < self.not_before || now > self.not_after {
             return Err(CaError::RootNotValid);

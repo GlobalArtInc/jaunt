@@ -29,11 +29,11 @@ pub struct NodeHostCertificate {
 
 const UNEXPIRED_BY_SIGNER: &str = "SELECT ca_fingerprint AS id, COUNT(*) AS count, \
     MIN(valid_before) AS nearest, MAX(valid_before) AS farthest \
-    FROM certificates WHERE valid_before > ? GROUP BY ca_fingerprint";
+    FROM certificates WHERE kind = 'user' AND valid_before > ? GROUP BY ca_fingerprint";
 
 const UNEXPIRED_BY_HOST_TRUST: &str = "SELECT host_trust_id AS id, COUNT(*) AS count, \
     MIN(valid_before) AS nearest, MAX(valid_before) AS farthest \
-    FROM certificates WHERE valid_before > ? GROUP BY host_trust_id";
+    FROM certificates WHERE kind = 'user' AND valid_before > ? GROUP BY host_trust_id";
 
 const NODE_TRUST: &str = "SELECT id, name, trust_served_id, trust_served_at FROM nodes \
     WHERE state = 'active' ORDER BY name, id";

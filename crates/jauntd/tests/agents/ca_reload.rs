@@ -854,3 +854,353 @@ async fn stopping_the_watcher_does_not_wait_for_a_gate_certificate_that_never_co
     assert_eq!(host_signer(&harness), next);
     assert_eq!(gate.host_certificate_signer(), first);
 }
+
+struct X509Session {
+    token: String,
+}
+
+async fn x509_session(harness: &Harness) -> X509Session {
+    use jaunt_ca::ssh_key::sha2::{Digest, Sha256};
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let user = harness
+        .store
+        .users()
+        .upsert(
+            &jaunt_store::NewUser {
+                issuer: "https://idp.example".to_owned(),
+                subject: "alice".to_owned(),
+                email: "alice@example.com".to_owned(),
+                username: "alice".to_owned(),
+                display_name: None,
+                groups: Vec::new(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let serial = harness
+        .store
+        .certificates()
+        .allocate_serial()
+        .await
+        .unwrap();
+    harness
+        .store
+        .certificates()
+        .record(&jaunt_store::NewCertificate {
+            serial,
+            user_id: user.id.clone(),
+            kind: "user".to_owned(),
+            key_id: format!("jaunt:alice@example.com:{serial}"),
+            valid_after: now - 120,
+            valid_before: now + 8 * 3600,
+            issued_at: now,
+            ca_fingerprint: None,
+            host_trust_id: None,
+            subject_fingerprint: None,
+        })
+        .await
+        .unwrap();
+    let token = format!("jt_{:A>43}", serial);
+    let token_hash: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    harness
+        .store
+        .api_tokens()
+        .create(&jaunt_store::NewApiToken {
+            token_hash,
+            user_id: user.id,
+            cert_serial: serial,
+            created_at: now,
+            expires_at: now + 8 * 3600,
+        })
+        .await
+        .unwrap();
+    X509Session { token }
+}
+
+struct Answer {
+    status: http::StatusCode,
+    body: serde_json::Value,
+}
+
+async fn answer(response: axum::response::Response) -> Answer {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    Answer {
+        status,
+        body: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+async fn x509_issue(harness: &Harness, session: &X509Session) -> Answer {
+    use tower::ServiceExt;
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let spki = rcgen::PublicKeyData::subject_public_key_info(&key);
+    let body = serde_json::json!({ "public_key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, spki) });
+    let mut request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("/v1/certificates/x509")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", session.token),
+        )
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    answer(harness.control.router().oneshot(request).await.unwrap()).await
+}
+
+async fn trust_v3(harness: &Harness, node_id: &str) -> serde_json::Value {
+    use tower::ServiceExt;
+    let mut request = http::Request::builder()
+        .method(http::Method::GET)
+        .uri("/v3/agent/trust")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(jaunt_control::AuthenticatedNode(node_id.to_owned()));
+    let served = answer(
+        harness
+            .control
+            .agent_router()
+            .oneshot(request)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(served.status, http::StatusCode::OK);
+    served.body
+}
+
+fn x509_roles(trust: &serde_json::Value) -> Vec<(String, String)> {
+    trust["user_x509_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| {
+            (
+                root["role"].as_str().unwrap().to_owned(),
+                root["fingerprint"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+async fn issued_by(harness: &Harness, answer: &Answer) -> String {
+    assert_eq!(answer.status, http::StatusCode::OK, "{}", answer.body);
+    let serial = answer.body["serial"].as_i64().unwrap();
+    harness
+        .store
+        .certificates()
+        .get(serial)
+        .await
+        .unwrap()
+        .unwrap()
+        .ca_fingerprint
+        .unwrap()
+}
+
+fn role(name: &str, fingerprint: &str) -> (String, String) {
+    (name.to_owned(), fingerprint.to_owned())
+}
+
+#[tokio::test]
+async fn the_user_x509_slot_follows_add_next_promote_and_retire_without_a_restart() {
+    let harness = Harness::start(Options::default()).await;
+    let keys = Keys::of(&harness);
+    let mut reloader = keys.reloader(&harness, None, None);
+    let node_id = harness.enroll("web-01").await.node_id;
+    let session = x509_session(&harness).await;
+    assert_eq!(reloader.tick(at(0)).await.reload, Reload::Unchanged);
+    assert!(harness.control.user_x509().is_none());
+    assert_eq!(
+        x509_issue(&harness, &session).await.status,
+        http::StatusCode::NOT_FOUND
+    );
+
+    let first = fingerprint_hex(
+        &jaunt_ca::ClientCa::init(
+            &keys.root,
+            CaKind::UserX509,
+            &keys.age().recipient(),
+            SystemTime::now(),
+        )
+        .unwrap()
+        .public_key,
+    );
+    assert_eq!(
+        reloader.tick(at(10)).await.reload,
+        applied(&[CaKind::UserX509], 0)
+    );
+    assert_eq!(
+        issued_by(&harness, &x509_issue(&harness, &session).await).await,
+        first
+    );
+    let initial = trust_v3(&harness, &node_id).await;
+    assert_eq!(x509_roles(&initial), [role("active", &first)]);
+
+    let second = {
+        let lock = CaLock::acquire(&keys.root).unwrap();
+        fingerprint_hex(
+            &jaunt_ca::ClientCa::add_next(&lock, CaKind::UserX509, &keys.age(), SystemTime::now())
+                .unwrap()
+                .public_key,
+        )
+    };
+    assert_eq!(
+        reloader.tick(at(20)).await.reload,
+        applied(&[CaKind::UserX509], 0)
+    );
+    let staged = trust_v3(&harness, &node_id).await;
+    assert_eq!(
+        x509_roles(&staged),
+        [role("active", &first), role("next", &second)]
+    );
+    assert_ne!(staged["trust_id"], initial["trust_id"]);
+    assert_eq!(
+        issued_by(&harness, &x509_issue(&harness, &session).await).await,
+        first
+    );
+
+    keys.promote(CaKind::UserX509);
+    let stale = x509_issue(&harness, &session).await;
+    assert_eq!(stale.status, http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(stale.body["error"], "authority_unavailable");
+    assert_eq!(
+        reloader.tick(at(30)).await.reload,
+        applied(&[CaKind::UserX509], 0)
+    );
+    assert_eq!(
+        issued_by(&harness, &x509_issue(&harness, &session).await).await,
+        second
+    );
+    assert_eq!(
+        x509_roles(&trust_v3(&harness, &node_id).await),
+        [role("active", &second), role("previous", &first)]
+    );
+
+    keys.retire(CaKind::UserX509);
+    assert_eq!(
+        reloader.tick(at(40)).await.reload,
+        applied(&[CaKind::UserX509], 0)
+    );
+    let retired = trust_v3(&harness, &node_id).await;
+    assert_eq!(x509_roles(&retired), [role("active", &second)]);
+    assert_ne!(retired["trust_id"], initial["trust_id"]);
+    assert_eq!(retired["user_ca_keys"], initial["user_ca_keys"]);
+    assert_eq!(
+        issued_by(&harness, &x509_issue(&harness, &session).await).await,
+        second
+    );
+    assert_eq!(reloader.tick(at(50)).await.reload, Reload::Unchanged);
+
+    let held = harness.control.user_x509().unwrap();
+    {
+        let lock = CaLock::acquire(&keys.root).unwrap();
+        jaunt_ca::ClientCa::add_next(&lock, CaKind::UserX509, &keys.age(), SystemTime::now())
+            .unwrap();
+    }
+    let broken_next = next_age(&keys, CaKind::UserX509);
+    spoil(&broken_next);
+    let failed = reloader.tick(at(60)).await.reload;
+    let Reload::Failed { reason, reported } = &failed else {
+        panic!("{failed:?}");
+    };
+    assert!(
+        reason.starts_with("user-x509 keys: could not decrypt"),
+        "{reason}"
+    );
+    assert!(*reported);
+    assert!(Arc::ptr_eq(&held, &harness.control.user_x509().unwrap()));
+    assert_eq!(
+        x509_roles(&trust_v3(&harness, &node_id).await),
+        [role("active", &second)]
+    );
+    assert_eq!(
+        issued_by(&harness, &x509_issue(&harness, &session).await).await,
+        second
+    );
+    unspoil(&broken_next);
+    assert_eq!(
+        reloader.tick(at(70)).await.reload,
+        applied(&[CaKind::UserX509], 0)
+    );
+    assert_eq!(x509_roles(&trust_v3(&harness, &node_id).await).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_of_only_the_user_x509_slot_is_audited_and_heard_by_every_agent() {
+    let harness = Harness::start(Options::default()).await;
+    let keys = Keys::of(&harness);
+    let (agents, counters) = counting_agents(&harness, &["web-01", "web-02"]).await;
+    let mut reloader = keys.reloader(&harness, None, Some(harness.server.registry().clone()));
+    let counts = || -> Vec<usize> {
+        counters
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .collect()
+    };
+    let user_before = user_signer(&harness);
+    let host_before = host_signer(&harness);
+
+    jaunt_ca::ClientCa::init(
+        &keys.root,
+        CaKind::UserX509,
+        &keys.age().recipient(),
+        SystemTime::now(),
+    )
+    .unwrap();
+    assert_eq!(
+        reloader.tick(at(0)).await.reload,
+        applied(&[CaKind::UserX509], 2)
+    );
+    eventually("both agents to hear the new slot", || counts() == [1, 1]).await;
+    {
+        let lock = CaLock::acquire(&keys.root).unwrap();
+        jaunt_ca::ClientCa::add_next(&lock, CaKind::UserX509, &keys.age(), SystemTime::now())
+            .unwrap();
+    }
+    assert_eq!(
+        reloader.tick(at(10)).await.reload,
+        applied(&[CaKind::UserX509], 2)
+    );
+    eventually("both agents to hear the next key", || counts() == [2, 2]).await;
+    assert_eq!(reloader.tick(at(20)).await.reload, Reload::Unchanged);
+    for agent in agents {
+        agent.stop().await;
+    }
+
+    assert_eq!(counts(), [2, 2]);
+    assert_eq!(user_signer(&harness), user_before);
+    assert_eq!(host_signer(&harness), host_before);
+    let reloaded = events_named("ca.reloaded");
+    let kinds: Vec<String> = reloaded
+        .iter()
+        .map(|event| field(event, "kind").to_string())
+        .collect();
+    assert_eq!(kinds, ["user-x509", "user-x509"]);
+    let slot = harness.control.user_x509().unwrap();
+    let last = reloaded.last().unwrap();
+    assert_eq!(field(last, "trust_id"), slot.trust.set_id());
+    assert_eq!(
+        field(last, "active_fp"),
+        fingerprint_hex(slot.trust.active())
+    );
+    assert!(slot.trust.next().is_some());
+}

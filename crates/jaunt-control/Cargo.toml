@@ -51,6 +51,7 @@ test-support = ["jaunt-ssh/test-support"]
 jaunt = { path = "../jaunt" }
 jaunt-control = { path = ".", features = ["test-support"] }
 jaunt-audit = { workspace = true, features = ["testing"] }
+jaunt-gate = { workspace = true }
 jaunt-recording-s3 = { path = "../jaunt-recording-s3", features = ["testing"] }
 axum = { version = "0.8.9", default-features = false, features = ["form", "http1", "json", "tokio"] }
 http-body-util = { version = "0.1.5", features = ["channel"] }
@@ -60,4 +61,5 @@ sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
+x509-parser = "0.18.1"
 zstd = { version = "0.14.4", default-features = false }

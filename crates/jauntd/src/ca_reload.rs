@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use jaunt_ca::{CaKind, FileBackend, Signer, TrustSet, fingerprint_hex};
+use jaunt_ca::{CaKind, ClientCa, ClientSlot, FileBackend, Signer, TrustSet, fingerprint_hex};
 use jaunt_control::{CaSnapshot, Clock, Control};
 use jaunt_gate::SshGate;
 use jaunt_ssh::UserCaKeys;
@@ -74,6 +74,7 @@ type Loaded = (TrustSet, FileBackend);
 struct Changes {
     user: Option<Loaded>,
     host: Option<Loaded>,
+    user_x509: Option<ClientSlot>,
 }
 
 #[derive(Default)]
@@ -124,10 +125,18 @@ impl CaReloader {
         let current = self.parts.control.ca_snapshot();
         let user = SlotState::of(current.user_trust());
         let host = SlotState::of(current.host_trust());
+        let user_x509 = self
+            .parts
+            .control
+            .user_x509()
+            .map(|slot| SlotState::of(&slot.trust));
+        let x509_before = user_x509.clone();
         let ca_dir = self.parts.ca_dir.clone();
         let env = Arc::clone(&self.parts.env);
-        let read =
-            tokio::task::spawn_blocking(move || read_changes(&ca_dir, &env, &user, &host)).await;
+        let read = tokio::task::spawn_blocking(move || {
+            read_changes(&ca_dir, &env, &user, &host, user_x509.as_ref())
+        })
+        .await;
         let changes = match read {
             Ok(Ok(Some(changes))) => changes,
             Ok(Ok(None)) => {
@@ -137,7 +146,7 @@ impl CaReloader {
             Ok(Err(reason)) => return self.reload_failed(reason, now),
             Err(_) => return self.reload_failed(READ_STOPPED.to_owned(), now),
         };
-        match self.apply(&current, changes) {
+        match self.apply(&current, x509_before.as_ref(), changes) {
             Ok(reload) => {
                 self.reload_failures.clear();
                 reload
@@ -146,13 +155,21 @@ impl CaReloader {
         }
     }
 
-    fn apply(&self, current: &CaSnapshot, changes: Changes) -> Result<Reload, String> {
+    fn apply(
+        &self,
+        current: &CaSnapshot,
+        x509_before: Option<&SlotState>,
+        changes: Changes,
+    ) -> Result<Reload, String> {
         let (user_signer, user_trust) =
             chosen(changes.user, current.user_signer(), current.user_trust());
         let (host_signer, host_trust) =
             chosen(changes.host, current.host_signer(), current.host_trust());
         let user_changed = SlotState::of(&user_trust) != SlotState::of(current.user_trust());
         let host_changed = SlotState::of(&host_trust) != SlotState::of(current.host_trust());
+        let user_x509 = changes
+            .user_x509
+            .filter(|slot| Some(&SlotState::of(&slot.trust)) != x509_before);
         let mut kinds = Vec::new();
         if user_changed {
             kinds.push(CaKind::User);
@@ -160,29 +177,50 @@ impl CaReloader {
         if host_changed {
             kinds.push(CaKind::Host);
         }
+        if user_x509.is_some() {
+            kinds.push(CaKind::UserX509);
+        }
         if kinds.is_empty() {
             return Ok(Reload::Unchanged);
         }
-        let gate_trust = match (&self.parts.gate, user_changed) {
-            (Some(_), true) => Some(gate_trust(current.user_trust(), &user_trust)?),
-            _ => None,
+        let swap = if user_changed || host_changed {
+            let gate_trust = match (&self.parts.gate, user_changed) {
+                (Some(_), true) => Some(gate_trust(current.user_trust(), &user_trust)?),
+                _ => None,
+            };
+            let snapshot = CaSnapshot::new(user_signer, user_trust, host_signer, host_trust)
+                .map_err(|err| format!("the new keys do not form a usable set: {err}"))?;
+            Some((snapshot, gate_trust))
+        } else {
+            None
         };
-        let snapshot = CaSnapshot::new(user_signer, user_trust, host_signer, host_trust)
-            .map_err(|err| format!("the new keys do not form a usable set: {err}"))?;
-        if let (Some(gate), Some(trust)) = (&self.parts.gate, &gate_trust) {
-            gate.replace_user_cas(trust.during.clone());
+        if let Some(slot) = user_x509 {
+            self.parts
+                .control
+                .replace_user_x509(slot)
+                .map_err(|err| format!("the new user-x509 keys are not usable: {err}"))?;
         }
-        self.parts.control.replace_snapshot(snapshot);
-        if let (Some(gate), Some(trust)) = (&self.parts.gate, gate_trust) {
-            gate.replace_user_cas(trust.after);
+        if let Some((snapshot, gate_trust)) = swap {
+            if let (Some(gate), Some(trust)) = (&self.parts.gate, &gate_trust) {
+                gate.replace_user_cas(trust.during.clone());
+            }
+            self.parts.control.replace_snapshot(snapshot);
+            if let (Some(gate), Some(trust)) = (&self.parts.gate, gate_trust) {
+                gate.replace_user_cas(trust.after);
+            }
         }
         let applied = self.parts.control.ca_snapshot();
+        let applied_x509 = self.parts.control.user_x509();
         for kind in &kinds {
-            let trust = match kind {
-                CaKind::User => applied.user_trust(),
-                _ => applied.host_trust(),
-            };
-            audit_reloaded(*kind, trust);
+            match kind {
+                CaKind::User => audit_reloaded(*kind, applied.user_trust()),
+                CaKind::Host => audit_reloaded(*kind, applied.host_trust()),
+                _ => {
+                    if let Some(slot) = &applied_x509 {
+                        audit_reloaded(*kind, &slot.trust);
+                    }
+                }
+            }
         }
         let notified = self.notify_agents();
         Ok(Reload::Applied { kinds, notified })
@@ -268,10 +306,16 @@ fn read_changes(
     env: &IdentityEnv,
     user: &SlotState,
     host: &SlotState,
+    user_x509: Option<&SlotState>,
 ) -> Result<Option<Changes>, String> {
     let user_changed = changed(ca_dir, CaKind::User, user)?;
     let host_changed = changed(ca_dir, CaKind::Host, host)?;
-    if !user_changed && !host_changed {
+    let x509_changed = match user_x509 {
+        Some(current) => changed(ca_dir, CaKind::UserX509, current)?,
+        None => FileBackend::is_initialized(ca_dir, CaKind::UserX509)
+            .map_err(|err| format!("{} keys: {err}", CaKind::UserX509))?,
+    };
+    if !user_changed && !host_changed && !x509_changed {
         return Ok(None);
     }
     let identity = resolve_identity(ca_dir, &**env)?;
@@ -283,9 +327,17 @@ fn read_changes(
             })
             .transpose()
     };
+    let user_x509 = x509_changed
+        .then(|| {
+            load(CaKind::UserX509, true)?;
+            ClientCa::load(ca_dir, CaKind::UserX509, &identity)
+                .map_err(|err| format!("{} keys: {err}", CaKind::UserX509))
+        })
+        .transpose()?;
     Ok(Some(Changes {
         user: load(CaKind::User, user_changed)?,
         host: load(CaKind::Host, host_changed)?,
+        user_x509,
     }))
 }
 

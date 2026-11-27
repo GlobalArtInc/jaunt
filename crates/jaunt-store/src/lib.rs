@@ -10,6 +10,7 @@ mod login_requests;
 mod nodes;
 mod recordings;
 mod revocations;
+mod service_certificates;
 mod services;
 mod sessions;
 mod users;
@@ -31,7 +32,7 @@ pub use audit_events::{
     AuditCursor, AuditEvents, AuditQuery, AuditRecord, MAX_AUDIT_PAGE, MAX_AUDIT_PAYLOAD_BYTES,
 };
 pub use ca_counters::{CaCounters, NodeHostCertificate, NodeTrustServed, UnexpiredGroup};
-pub use certificates::{Certificate, Certificates, NewCertificate};
+pub use certificates::{Certificate, Certificates, NewCertificate, Parent};
 pub use enrollments::{
     ApproveEnrollment, ApproveOutcome, Approved, CodeFailure, CreateOutcome, Enrollment,
     EnrollmentLimits, EnrollmentState, Enrollments, NewEnrollment, PurgedEnrollment, RejectOutcome,
@@ -57,6 +58,7 @@ pub use revocations::{
     MAX_REVOCATION_PAGE, NewRevocation, Revocation, RevocationCursor, RevocationKind,
     RevocationPage, Revocations, RevokeOutcome, Subjects,
 };
+pub use service_certificates::{NewServiceCertificate, ServiceCertificate, ServiceCertificates};
 pub use services::{
     AnnounceOutcome, Announced, AnnouncedService, Announcement, ApprovedHolder, ApprovedService,
     MAX_LIVE_SERVICES_PER_NODE, MAX_PENDING_SERVICES_PER_NODE, MAX_SERVICE_HISTORY,
@@ -149,6 +151,10 @@ impl Store {
 
     pub fn services(&self) -> Services {
         Services::new(self.pool.clone())
+    }
+
+    pub fn service_certificates(&self) -> ServiceCertificates {
+        ServiceCertificates::new(self.pool.clone())
     }
 
     pub fn sessions(&self) -> Sessions {

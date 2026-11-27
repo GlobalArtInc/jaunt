@@ -137,6 +137,11 @@ fn init_writes_a_root_beside_the_key_and_the_slot_loads() {
 
         let slot = ClientCa::load(dir.path(), kind, &identity).unwrap();
         assert_eq!(slot.ca.root_sha256_hex(), initialized.root.sha256_hex());
+        assert_eq!(slot.ca.root_not_before(), initialized.root.not_before);
+        assert_eq!(slot.ca.root_not_after(), initialized.root.not_after);
+        assert_eq!(slot.roots.len(), 1);
+        assert_eq!(slot.roots[0].not_before, initialized.root.not_before);
+        assert_eq!(slot.roots[0].not_after, initialized.root.not_after);
         assert_eq!(
             slot.ca.root_der(),
             fs::read(slot_dir.join(format!("{hex}.root.der"))).unwrap()
@@ -195,6 +200,10 @@ fn a_client_slot_rotates_and_every_trusted_key_keeps_its_root() {
         let old_cert = issue(&authority.slot.ca);
         let lock = acquire_lock(root).unwrap();
 
+        assert_eq!(
+            FileBackend::read_active(root, kind).unwrap(),
+            authority.slot.trust.active().fingerprint(HashAlg::Sha256)
+        );
         let added = ClientCa::add_next(&lock, kind, &authority.identity, now()).unwrap();
         let next = added.public_key.clone();
         let second = fingerprint_hex(&next);
@@ -223,6 +232,10 @@ fn a_client_slot_rotates_and_every_trusted_key_keeps_its_root() {
                 (KeyRole::Active, second.clone()),
                 (KeyRole::Previous, first.clone())
             ]
+        );
+        assert_eq!(
+            FileBackend::read_active(root, kind).unwrap(),
+            next.fingerprint(HashAlg::Sha256)
         );
         let promoted = ClientCa::load(root, kind, &authority.identity).unwrap();
         let new_cert = issue(&promoted.ca);

@@ -57,6 +57,7 @@ Top-level keys:
 | `trusted_proxies` | list of CIDR | empty | networks allowed to send that header. Needs `proxy_protocol: true` |
 | `max_unauthenticated` | integer | 512 | connections that have not authenticated yet, all addresses together, 1 to 1048576 |
 | `write_stall_secs` | integer | 900 | a client that accepts no data for this long is disconnected. 0 turns it off, at most 86400 |
+| `client_transport` | `tls` or `tcp` | `tls` with `services.domain`, otherwise `tcp` | how the CLI is told to reach the gate in `GET /v2/client/config`: `tls` through `services.domain` on the port of `agent_endpoint`, `tcp` straight to `gate_endpoint`. `tls` needs `services.domain` |
 
 ### services
 

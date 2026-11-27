@@ -23,6 +23,15 @@ const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_BLOCKED: u8 = 3;
 pub(crate) const LAST_LINE: &str = "applied within 10 s";
+pub(crate) const RESTART_LINE: &str =
+    "restart jauntd to apply: the running daemon reads the db-client keys only when it starts";
+
+pub(crate) const fn last_line(kind: RotationKind) -> &'static str {
+    match kind {
+        RotationKind::DbClient => RESTART_LINE,
+        RotationKind::User | RotationKind::Host | RotationKind::UserX509 => LAST_LINE,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationAction {
@@ -290,7 +299,10 @@ impl Change<'_> {
             .unwrap_or_default();
         say(
             streams,
-            &format!("{kind} key {fp} added as next\n{root_line}{LAST_LINE}\n"),
+            &format!(
+                "{kind} key {fp} added as next\n{root_line}{}\n",
+                last_line(self.kind)
+            ),
         )?;
         Ok(EXIT_OK)
     }
@@ -345,9 +357,10 @@ impl Change<'_> {
         say(
             streams,
             &format!(
-                "{} key {fp} is active, {} is previous\n{LAST_LINE}\n",
+                "{} key {fp} is active, {} is previous\n{}\n",
                 self.kind.as_str(),
-                fingerprint_hex(&promoted.previous)
+                fingerprint_hex(&promoted.previous),
+                last_line(self.kind)
             ),
         )?;
         Ok(EXIT_OK)
@@ -375,7 +388,7 @@ impl Change<'_> {
             if finished.is_empty() {
                 return Err(CaError::NoPreviousKey(ca_kind).into());
             }
-            say(streams, &format!("{LAST_LINE}\n"))?;
+            say(streams, &format!("{}\n", last_line(self.kind)))?;
             return Ok(EXIT_OK);
         }
         let counters = self.counters(&trust).await?;
@@ -407,7 +420,7 @@ impl Change<'_> {
                 &format!("{} key {fp} retired\n", self.kind.as_str()),
             )?;
         }
-        say(streams, &format!("{LAST_LINE}\n"))?;
+        say(streams, &format!("{}\n", last_line(self.kind)))?;
         Ok(EXIT_OK)
     }
 

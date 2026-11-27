@@ -2,6 +2,8 @@ use jaunt_ca::CaError;
 use jaunt_limits::UnusableProxy;
 use jaunt_store::StoreError;
 
+use crate::naming::NamingError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
     #[error("the signing authority is not a user certificate authority")]
@@ -53,6 +55,8 @@ pub enum ControlError {
     PurgeSessions(#[source] StoreError),
     #[error("purging expired web sessions failed: {0}")]
     PurgeWebSessions(#[source] StoreError),
+    #[error("purging expired service certificates failed: {0}")]
+    PurgeServiceCertificates(#[source] StoreError),
     #[error("closing ended sessions failed: {0}")]
     Sessions(#[source] StoreError),
     #[error("every recording limit must be positive")]
@@ -61,4 +65,12 @@ pub enum ControlError {
     ZeroSweepInterval,
     #[error("recovering the recordings interrupted by the last stop failed: {0}")]
     RecoverRecordings(#[source] StoreError),
+    #[error("services domain: {0}")]
+    ServicesDomain(#[source] NamingError),
+    #[error(
+        "ssh_gate.client_transport tls needs services.domain: clients reach the gate over tls at that name"
+    )]
+    TlsTransportWithoutServicesDomain,
+    #[error("the user x509 authority is not a user-x509 certificate authority")]
+    NotUserX509Authority,
 }

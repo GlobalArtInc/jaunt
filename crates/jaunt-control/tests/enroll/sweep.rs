@@ -14,15 +14,15 @@ use crate::web_support::plant_token;
 const RETENTION_SECS: u64 = 3600;
 const STALE_DELIVERY_SECS: u64 = 120;
 const SWEEP_INTERVAL: Duration = Duration::from_millis(20);
-const POLL_EVERY: Duration = Duration::from_millis(10);
-const DEADLINE: Duration = Duration::from_secs(30);
+pub const POLL_EVERY: Duration = Duration::from_millis(10);
+pub const DEADLINE: Duration = Duration::from_secs(30);
 
-struct RunningServer {
+pub struct RunningServer {
     stop: oneshot::Sender<()>,
     server: JoinHandle<Result<(), ControlError>>,
 }
 
-async fn serve_sweeping_often(harness: &Harness) -> RunningServer {
+pub async fn serve_sweeping_often(harness: &Harness) -> RunningServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(harness.control.clone().serve_with_sweep_interval(
@@ -36,7 +36,7 @@ async fn serve_sweeping_often(harness: &Harness) -> RunningServer {
 }
 
 impl RunningServer {
-    async fn shut_down(self) {
+    pub async fn shut_down(self) {
         self.stop.send(()).unwrap();
         self.server.await.unwrap().unwrap();
     }

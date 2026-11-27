@@ -28,7 +28,7 @@ impl ServiceKind {
         }
     }
 
-    fn parse(value: &str) -> Result<ServiceKind, StoreError> {
+    pub(crate) fn parse(value: &str) -> Result<ServiceKind, StoreError> {
         match value {
             "kubernetes" => Ok(ServiceKind::Kubernetes),
             "postgres" => Ok(ServiceKind::Postgres),

@@ -222,6 +222,7 @@ fn row(valid_after: i64, valid_before: i64) -> CertificateRow {
         ca_fingerprint: None,
         host_trust_id: None,
         subject_fingerprint: None,
+        parent_serial: None,
     }
 }
 

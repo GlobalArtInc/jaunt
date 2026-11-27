@@ -190,6 +190,9 @@ impl Harness {
             recordings: recordings
                 .as_ref()
                 .map(|prepared| prepared.settings.clone()),
+            user_x509: None,
+            services_domain: None,
+            client_transport: None,
         };
         let control = match options.control_ticker.clone() {
             Some(ticker) => {

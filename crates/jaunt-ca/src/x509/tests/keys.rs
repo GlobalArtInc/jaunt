@@ -36,6 +36,13 @@ fn subject_key_must_be_a_valid_ed25519_key() {
         SubjectPublicKey::from_spki_der(&spki).unwrap(),
         SubjectPublicKey::from_ssh_key(&good).unwrap()
     );
+    assert_eq!(
+        SubjectPublicKey::from_spki_der(&spki)
+            .unwrap()
+            .to_ssh_key()
+            .key_data(),
+        good.key_data()
+    );
 
     let p256 = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .unwrap()
