@@ -10,8 +10,9 @@ use rustix::io::Errno;
 use crate::clock::Clock;
 use crate::state::{MAX_STATE_BYTES, State, StateError};
 
+pub const STATE_DIR: &str = "/var/lib/jaunt-host-users";
 pub const STATE_FILE: &str = "accounts.json";
-pub const LOCK_WAIT: Duration = Duration::from_secs(5);
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 const TEMP_FILE: &str = ".accounts.json.tmp";
 const LOCK_FILE: &str = "lock";

@@ -53,6 +53,7 @@ fn the_argv_is_fixed_and_takes_only_operator_settings_and_the_login() {
         "  privileged_groups: [docker]\n",
         "  shell: /usr/bin/zsh\n",
         "  home_base: /srv/home\n",
+        "  home_mode: \"0700\"\n",
         "  uid_min: 40000\n",
         "  uid_max: 40999\n",
     ));
@@ -81,9 +82,7 @@ fn the_argv_is_fixed_and_takes_only_operator_settings_and_the_login() {
         "-K",
         "GID_MAX=40999",
         "-K",
-        "SUB_UID_COUNT=0",
-        "-K",
-        "SUB_GID_COUNT=0",
+        "HOME_MODE=0700",
         "--",
         "alice",
     ];
@@ -95,6 +94,11 @@ fn the_argv_is_fixed_and_takes_only_operator_settings_and_the_login() {
     let plain = enabled_config("");
     let args = useradd_args(&plain, &candidate(&plain, "bob"));
     assert!(!args.iter().any(|arg| arg == "--groups"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg.starts_with("SUB_")), "{args:?}");
+    assert!(
+        args.windows(2).any(|pair| pair == ["-K", "HOME_MODE=0750"]),
+        "{args:?}"
+    );
     assert_eq!(&args[args.len() - 2..], ["--", "bob"]);
 }
 

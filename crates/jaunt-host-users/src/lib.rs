@@ -1,21 +1,29 @@
+mod cli;
 mod clock;
 mod config;
+mod connection;
 mod directory;
+mod journal;
 mod line;
+mod list;
 mod names;
 mod paths;
 mod protocol;
 mod rate;
 mod rules;
+mod serve;
 mod state;
 mod store;
+mod sys;
 mod system;
+mod units;
 mod useradd;
 mod verify;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use cli::run;
 pub use clock::Clock;
 pub use config::{
     ConfigError, HomeMode, HostUsersConfig, HostUsersSection, MAX_CONFIG_BYTES, MAX_GROUPS,
@@ -34,14 +42,16 @@ pub use protocol::{
 };
 pub use rate::{ATTEMPTS_PER_DAY, ATTEMPTS_PER_MINUTE, Attempts};
 pub use rules::{Candidate, Decision, Facts, FactsError, Reason, check_login, decide, gather};
+pub use serve::HELPER_DEADLINE;
 pub use state::{AccountRecord, AccountState, MAX_RECORDS, Reconciliation, State, StateError};
-pub use store::{LOCK_WAIT, STATE_FILE, StateDir, StateLock, StoreError};
+pub use store::{LOCK_WAIT, STATE_DIR, STATE_FILE, StateDir, StateLock, StoreError};
 pub use system::{
     FileFacts, FileKind, Files, FilesError, GroupEntry, LookupError, PasswdEntry, Runner,
     RunnerError, ToolExit, Users,
 };
+pub use units::{SERVICE_UNIT_TEMPLATE, SOCKET_UNIT_TEMPLATE};
 pub use useradd::{
-    ACCOUNT_COMMENT, AfterFailure, RollbackPermit, SKEL_DIR, USERADD_TIMEOUT, UseraddOutcome,
-    after_failure, classify_useradd, useradd_args, userdel_args,
+    ACCOUNT_COMMENT, AfterFailure, RollbackPermit, SKEL_DIR, USERADD_TIMEOUT, USERDEL_TIMEOUT,
+    UseraddOutcome, after_failure, classify_useradd, useradd_args, userdel_args,
 };
 pub use verify::{Verified, VerifyProblem, verify_created};

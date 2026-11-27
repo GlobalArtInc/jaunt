@@ -8,7 +8,8 @@ use crate::system::{PasswdEntry, ToolExit};
 
 pub const SKEL_DIR: &str = "/etc/skel";
 pub const ACCOUNT_COMMENT: &str = "jaunt";
-pub const USERADD_TIMEOUT: Duration = Duration::from_secs(10);
+pub const USERADD_TIMEOUT: Duration = Duration::from_secs(5);
+pub const USERDEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 const LOCKED_BUT_NOT_DISABLED_PASSWORD: &str = "*";
 const UID_RANGE_EXHAUSTED: i32 = 4;
@@ -96,8 +97,7 @@ pub fn useradd_args(config: &HostUsersConfig, candidate: &Candidate) -> Vec<Stri
         format!("UID_MAX={high}"),
         format!("GID_MIN={low}"),
         format!("GID_MAX={high}"),
-        "SUB_UID_COUNT=0".to_owned(),
-        "SUB_GID_COUNT=0".to_owned(),
+        format!("HOME_MODE={:04o}", config.home_mode().bits()),
     ] {
         args.push("-K".to_owned());
         args.push(setting);

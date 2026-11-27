@@ -1,7 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io;
+use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -18,9 +21,29 @@ use crate::system::{
 use crate::verify::{Verified, verify_created};
 
 pub const NOW: u64 = 1_764_000_000;
+pub const BLOCKING_LIMIT: Duration = Duration::from_secs(10);
 
 pub fn name(value: &str) -> Name {
     Name::parse(value).unwrap()
+}
+
+pub fn within<T, F>(what: &str, work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || sender.send(work()).is_ok());
+    match receiver.recv_timeout(BLOCKING_LIMIT) {
+        Ok(value) => value,
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{what} still blocks after {BLOCKING_LIMIT:?}")
+        }
+        Err(RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(payload) => resume_unwind(payload),
+            Ok(_) => panic!("{what} ended without a result"),
+        },
+    }
 }
 
 pub fn enabled_config(extra: &str) -> HostUsersConfig {
@@ -202,9 +225,14 @@ impl Files for FakeFiles {
         Ok(self.entries.borrow().get(path).copied())
     }
 
-    fn chmod_directory_nofollow(&self, path: &Path, mode: u32) -> Result<(), FilesError> {
+    fn chmod_directory_nofollow(
+        &self,
+        path: &Path,
+        owner: u32,
+        mode: u32,
+    ) -> Result<(), FilesError> {
         match self.entries.borrow_mut().get_mut(path) {
-            Some(facts) if facts.kind == FileKind::Directory => {
+            Some(facts) if facts.kind == FileKind::Directory && facts.uid == owner => {
                 facts.mode = mode;
                 Ok(())
             }

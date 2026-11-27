@@ -120,7 +120,12 @@ pub(crate) fn lookup_many(
 
 pub trait Files {
     fn lstat(&self, path: &Path) -> Result<Option<FileFacts>, FilesError>;
-    fn chmod_directory_nofollow(&self, path: &Path, mode: u32) -> Result<(), FilesError>;
+    fn chmod_directory_nofollow(
+        &self,
+        path: &Path,
+        owner: u32,
+        mode: u32,
+    ) -> Result<(), FilesError>;
 }
 
 pub trait Runner {

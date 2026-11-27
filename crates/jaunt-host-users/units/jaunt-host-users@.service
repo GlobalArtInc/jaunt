@@ -1,0 +1,21 @@
+[Unit]
+Description=Jaunt host account helper
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart={{binary}} serve --config {{config}} --agent-user {{user}}
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=jaunt-host-users
+RuntimeMaxSec=30
+ProtectSystem=strict
+StateDirectory=jaunt-host-users
+StateDirectoryMode=0700
+ReadWritePaths=/etc {{home_base}} -/var/spool/mail /var/log
+PrivateNetwork=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID
+SystemCallFilter=@system-service
