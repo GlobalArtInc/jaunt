@@ -462,8 +462,36 @@ async fn a_live_session_survives_more_re_approvals_than_the_kept_history() {
     assert_eq!(row(harness, &tcp).await.end_reason, None);
 }
 
+async fn orders_reach(stand: &Stand, count: usize) -> Vec<jaunt_control::KillOrder> {
+    let started = std::time::Instant::now();
+    loop {
+        let orders = stand.killer.orders();
+        if orders.len() >= count {
+            return orders;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the killer received {} orders, not {count}",
+            orders.len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+fn cut(order: &jaunt_control::KillOrder) -> (KillReason, Vec<&str>) {
+    (
+        order.reason,
+        order
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect(),
+    )
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_reload_is_reviewed_only_once_it_settles_and_a_burst_of_reloads_cuts_once() {
+    let debounce = std::time::Duration::from_millis(250);
     let stand = stand_with_policy(&[OPS_ROLE.to_owned()]).await;
     let harness = &stand.harness;
     let alice = person(harness, "alice", &["ops"]).await;
@@ -472,58 +500,57 @@ async fn a_reload_is_reviewed_only_once_it_settles_and_a_burst_of_reloads_cuts_o
     let base = kube_base();
     apply_policy(harness, std::slice::from_ref(&base));
 
-    tokio::time::pause();
-    let spinner = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
     let control = harness.control.clone();
     let watch = tokio::spawn(async move {
         control
             .watch_access(
-                jaunt_control::ACCESS_REVIEW_POLL,
-                jaunt_control::ACCESS_REVIEW_INTERVAL,
-                jaunt_control::ACCESS_REVIEW_DEBOUNCE,
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_secs(3600),
+                debounce,
             )
             .await;
     });
-    settle().await;
-    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    let first = orders_reach(&stand, 1).await;
     assert_eq!(
-        ended(&stand, &canary).await,
-        SessionEndReason::AccessChanged
+        cut(&first[0]),
+        (KillReason::AccessChanged, vec![canary.as_str()])
     );
-    let orders_before = stand.killer.orders().len();
+    assert_eq!(
+        row(harness, &canary).await.end_reason,
+        Some(SessionEndReason::AccessChanged)
+    );
     let kube_first = open(&stand, &alice, ServiceKind::Kubernetes, KUBE).await;
 
+    let reloaded = std::time::Instant::now();
     apply_policy(harness, &[base.replace("team: [ops]", "team: [none]")]);
-    for _ in 0..2 {
-        tokio::time::advance(jaunt_control::ACCESS_REVIEW_POLL).await;
-        settle().await;
-        assert_eq!(row(harness, &tcp).await.end_reason, None);
-    }
     apply_policy(
         harness,
         &[format!(
             "{base}  deny: {{ kubernetes: {{ clusters: {{ env: [prod] }} }} }}\n"
         )],
     );
-    for _ in 0..5 {
-        tokio::time::advance(jaunt_control::ACCESS_REVIEW_POLL).await;
-        settle().await;
-        assert_eq!(row(harness, &tcp).await.end_reason, None);
-        assert_eq!(row(harness, &kube_first).await.end_reason, None);
-    }
-    tokio::time::advance(jaunt_control::ACCESS_REVIEW_POLL).await;
+    let orders = orders_reach(&stand, 2).await;
+    assert!(reloaded.elapsed() >= debounce, "{:?}", reloaded.elapsed());
+    watch.abort();
+    assert!(watch.await.unwrap_err().is_cancelled());
+
     assert_eq!(
-        ended(&stand, &kube_first).await,
-        SessionEndReason::AccessWithdrawn
+        cut(&orders[1]),
+        (KillReason::AccessWithdrawn, vec![kube_first.as_str()])
+    );
+    assert_eq!(
+        row(harness, &kube_first).await.end_reason,
+        Some(SessionEndReason::AccessWithdrawn)
     );
     assert_eq!(row(harness, &tcp).await.end_reason, None);
-    let orders = stand.killer.orders();
-    assert_eq!(orders.len(), orders_before + 1);
-    assert_eq!(orders.last().unwrap().reason, KillReason::AccessWithdrawn);
-    watch.abort();
-    spinner.abort();
+    assert_eq!(
+        harness.control.review_access().await.unwrap(),
+        AccessReview {
+            checked: 1,
+            withdrawn: 0,
+            changed: 0,
+            service_removed: 0,
+        }
+    );
+    assert_eq!(stand.killer.orders().len(), 2);
 }
