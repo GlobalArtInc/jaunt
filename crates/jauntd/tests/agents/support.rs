@@ -193,6 +193,7 @@ impl Harness {
             user_x509: None,
             services_domain: None,
             client_transport: None,
+            db_client: None,
         };
         let control = match options.control_ticker.clone() {
             Some(ticker) => {

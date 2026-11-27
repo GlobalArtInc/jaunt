@@ -54,7 +54,7 @@ pub(crate) async fn end(
     }
 }
 
-fn failure_response(err: PlaneError) -> Response {
+pub(crate) fn failure_response(err: PlaneError) -> Response {
     match err {
         PlaneError::InvalidRequest => error_response(StatusCode::BAD_REQUEST, "invalid_request"),
         PlaneError::Store | PlaneError::Clock => server_error(),

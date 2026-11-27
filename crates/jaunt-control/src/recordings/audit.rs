@@ -2,6 +2,7 @@
 pub(crate) enum Reason {
     UnknownSession,
     WrongNode,
+    WrongKind,
     BadState,
     BadChunk,
     Conflict,
@@ -15,6 +16,7 @@ impl Reason {
         match self {
             Reason::UnknownSession => "unknown_session",
             Reason::WrongNode => "wrong_node",
+            Reason::WrongKind => "wrong_kind",
             Reason::BadState => "bad_state",
             Reason::BadChunk => "bad_chunk",
             Reason::Conflict => "conflict",

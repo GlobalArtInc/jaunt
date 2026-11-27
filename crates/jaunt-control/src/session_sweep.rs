@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jaunt_store::{OpenSessions, Session, SessionEndReason, StoreError};
+use jaunt_store::{OpenSessions, Session, SessionEndReason, SessionKind, StoreError};
 use tokio::time::MissedTickBehavior;
 
 use crate::authorize::DEFAULT_MAX_SESSION_SECS;
@@ -115,6 +115,9 @@ impl Control {
         );
         self.closed_by_control(&expired, SessionEndReason::Expired, KillReason::Expired)
             .await;
+        if let Err(err) = self.mark_abandoned(&expired).await {
+            failure.get_or_insert(err);
+        }
         self.closed_by_control(
             &removed,
             SessionEndReason::NodeRemoved,
@@ -230,6 +233,9 @@ impl Control {
         for session in &closed {
             session_audit::closed(session, SessionEndReason::AgentRestarted);
         }
+        self.mark_abandoned(&closed)
+            .await
+            .map_err(ControlError::Sessions)?;
         Ok(closed.len())
     }
 
@@ -247,6 +253,9 @@ impl Control {
             .map_err(ControlError::Sessions)?;
         self.closed_by_control(&closed, SessionEndReason::AgentGone, KillReason::AgentGone)
             .await;
+        self.mark_abandoned(&closed)
+            .await
+            .map_err(ControlError::Sessions)?;
         Ok(closed.len())
     }
 
@@ -265,7 +274,21 @@ impl Control {
         for session in &closed {
             session_audit::closed(session, SessionEndReason::AgentGone);
         }
+        self.mark_abandoned(&closed)
+            .await
+            .map_err(ControlError::Sessions)?;
         Ok(closed.len())
+    }
+
+    async fn mark_abandoned(&self, closed: &[Session]) -> Result<(), StoreError> {
+        let sessions = self.store.service_sessions();
+        for session in closed
+            .iter()
+            .filter(|session| session.kind != SessionKind::Ssh && session.authorized_at.is_some())
+        {
+            sessions.mark_abandoned(&session.id).await?;
+        }
+        Ok(())
     }
 
     async fn closed_by_control(

@@ -280,6 +280,20 @@ const OFFERED: &str = concat!(
      ORDER BY kind, name, node_id, id"
 );
 
+const SERVING: &str = concat!(
+    "SELECT ",
+    service_columns!(),
+    " FROM services WHERE kind = ? AND name = ? AND state = 'approved' AND announced = 1 \
+     AND node_id IN (SELECT id FROM nodes WHERE state = 'active') ORDER BY approved_at, id"
+);
+
+const SERVING_ON: &str = concat!(
+    "SELECT ",
+    service_columns!(),
+    " FROM services WHERE node_id = ? AND kind = ? AND name = ? AND state = 'approved' \
+     AND announced = 1 AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active')"
+);
+
 const HOLDERS: &str = "SELECT s.id AS service_id, s.node_id AS node_id, n.name AS node_name, \
     s.kind AS kind, s.name AS name, s.revision AS revision, s.labels AS labels \
     FROM services s \
@@ -513,6 +527,31 @@ impl Services {
     pub async fn offered(&self) -> Result<Vec<Service>, StoreError> {
         let rows = sqlx::query(OFFERED).fetch_all(&self.pool).await?;
         rows.iter().map(service_from_row).collect()
+    }
+
+    pub async fn serving(&self, kind: ServiceKind, name: &str) -> Result<Vec<Service>, StoreError> {
+        let rows = sqlx::query(SERVING)
+            .bind(kind.as_str())
+            .bind(name)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(service_from_row).collect()
+    }
+
+    pub async fn serving_on(
+        &self,
+        node_id: &str,
+        kind: ServiceKind,
+        name: &str,
+    ) -> Result<Option<Service>, StoreError> {
+        let row = sqlx::query(SERVING_ON)
+            .bind(node_id)
+            .bind(kind.as_str())
+            .bind(name)
+            .bind(node_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(service_from_row).transpose()
     }
 
     pub async fn approved_holders(&self) -> Result<Vec<ApprovedHolder>, StoreError> {

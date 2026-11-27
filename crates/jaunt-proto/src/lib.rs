@@ -14,6 +14,7 @@ mod login;
 mod plane;
 mod recording;
 mod service;
+mod service_session;
 mod session;
 mod ssh_login;
 mod whoami;
@@ -76,6 +77,13 @@ pub use service::{
     MAX_SERVICES_PER_AGENT, MAX_TCP_IDLE_TIMEOUT_SECS, PostgresAudit, PostgresSettings,
     PostgresTls, QueryAudit, SERVICES_PATH, ServiceAnnouncement, ServiceKind, ServiceList,
     ServiceProblem, ServiceSettings, ServiceSummary, TcpSettings,
+};
+pub use service_session::{
+    AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_END_PATH, DbAccess, DbAccessRequest,
+    KUBE_SESSION_ID_HEX_LEN, KUBE_SESSION_ID_PREFIX, KubeAccess, LocateServiceRequest,
+    SERVICE_LOCATION_CACHE_SECS, ServiceAccess, ServiceAuthorizeDecision, ServiceAuthorizeRequest,
+    ServiceAuthorizeResponse, ServiceEnd, ServiceGrant, ServiceIdentity, ServiceLocation,
+    ServiceOutcome, ServiceRouteRequest, is_kube_session_id,
 };
 pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,

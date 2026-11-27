@@ -461,6 +461,7 @@ async fn start(
                     .as_ref()
                     .map(|services| services.domain.clone()),
                 client_transport: settings.client_transport,
+                db_client: authorities.db_client,
             },
             settings.limits.http,
         )?;

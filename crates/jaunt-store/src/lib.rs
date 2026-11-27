@@ -11,6 +11,7 @@ mod nodes;
 mod recordings;
 mod revocations;
 mod service_certificates;
+mod service_sessions;
 mod services;
 mod sessions;
 mod user_pins;
@@ -60,6 +61,12 @@ pub use revocations::{
     RevocationPage, Revocations, RevokeOutcome, Subjects,
 };
 pub use service_certificates::{NewServiceCertificate, ServiceCertificate, ServiceCertificates};
+pub use service_sessions::{
+    ABANDONED_OUTCOME, ActivateService, CurrentService, EndService, KubeOpened, LiveEntry,
+    LiveServiceSession, LiveSshSession, MAX_SESSION_LIST_BYTES, MAX_SESSION_OUTCOME_LEN,
+    MAX_SESSION_ROLES, MAX_SESSION_TARGET_LEN, NewServiceRoute, OpenKubeSession, ServiceRouted,
+    ServiceSessions,
+};
 pub use services::{
     AnnounceOutcome, Announced, AnnouncedService, Announcement, ApprovedHolder, ApprovedService,
     MAX_LIVE_SERVICES_PER_NODE, MAX_PENDING_SERVICES_PER_NODE, MAX_SERVICE_HISTORY,
@@ -70,8 +77,8 @@ pub use services::{
 pub use sessions::{
     ActivateSession, EndOutcome, EndRejection, EndSession, MAX_RECENT_PAIRS, MAX_SESSION_PAGE,
     NewSession, NodeSessionCounts, OpenSessions, RecentPair, Session, SessionCursor,
-    SessionEndReason, SessionListing, SessionOrigin, SessionPage, SessionQuery, SessionRecording,
-    SessionState, Sessions,
+    SessionEndReason, SessionKind, SessionListing, SessionOrigin, SessionPage, SessionQuery,
+    SessionRecording, SessionState, Sessions,
 };
 pub use user_pins::{PinOutcome, UserPins};
 pub use users::{NewUser, User, Users};
@@ -166,6 +173,10 @@ impl Store {
 
     pub fn user_pins(&self) -> UserPins {
         UserPins::new(self.pool.clone())
+    }
+
+    pub fn service_sessions(&self) -> ServiceSessions {
+        ServiceSessions::new(self.pool.clone())
     }
 
     pub fn revocations(&self) -> Revocations {

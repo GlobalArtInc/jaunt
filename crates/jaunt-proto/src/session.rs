@@ -52,6 +52,19 @@ pub enum DenyReason {
     UserMismatch,
     SerialMismatch,
     SubjectKeyMismatch,
+    IssuerMismatch,
+    IssuerUntrusted,
+    ServiceUnknown,
+    KindMismatch,
+    ServiceMismatch,
+    TooManySessions,
+    AuthorityUnavailable,
+    IssuanceLimited,
+    InvalidAgentKey,
+    RateLimited,
+    NoMatchingRole,
+    DeniedByRule,
+    TraitNotValid,
 }
 
 impl DenyReason {
@@ -72,6 +85,19 @@ impl DenyReason {
             DenyReason::UserMismatch => "user_mismatch",
             DenyReason::SerialMismatch => "serial_mismatch",
             DenyReason::SubjectKeyMismatch => "subject_key_mismatch",
+            DenyReason::IssuerMismatch => "issuer_mismatch",
+            DenyReason::IssuerUntrusted => "issuer_untrusted",
+            DenyReason::ServiceUnknown => "service_unknown",
+            DenyReason::KindMismatch => "kind_mismatch",
+            DenyReason::ServiceMismatch => "service_mismatch",
+            DenyReason::TooManySessions => "too_many_sessions",
+            DenyReason::AuthorityUnavailable => "authority_unavailable",
+            DenyReason::IssuanceLimited => "issuance_limited",
+            DenyReason::InvalidAgentKey => "invalid_agent_key",
+            DenyReason::RateLimited => "rate_limited",
+            DenyReason::NoMatchingRole => "no_matching_role",
+            DenyReason::DeniedByRule => "denied_by_rule",
+            DenyReason::TraitNotValid => "trait_not_valid",
         }
     }
 }

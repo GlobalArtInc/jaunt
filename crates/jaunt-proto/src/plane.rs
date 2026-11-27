@@ -1,6 +1,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::service_session::{
+    LocateServiceRequest, ServiceAuthorizeDecision, ServiceAuthorizeRequest, ServiceEnd,
+    ServiceLocation, ServiceRouteRequest,
+};
 use crate::session::{
     AuthorizeDecision, AuthorizeRequest, NodeCaller, RouteDecision, RouteRequest, SessionEnd,
     SessionEndOutcome,
@@ -32,4 +36,34 @@ pub trait ControlPlane: Send + Sync {
         node: NodeCaller,
         request: SessionEnd,
     ) -> BoxFuture<'_, Result<SessionEndOutcome, ControlError>>;
+
+    fn locate_service(
+        &self,
+        _request: LocateServiceRequest,
+    ) -> BoxFuture<'_, Result<Option<ServiceLocation>, ControlError>> {
+        Box::pin(async { Err(ControlError::InvalidRequest) })
+    }
+
+    fn route_service(
+        &self,
+        _request: ServiceRouteRequest,
+    ) -> BoxFuture<'_, Result<RouteDecision, ControlError>> {
+        Box::pin(async { Err(ControlError::InvalidRequest) })
+    }
+
+    fn authorize_service(
+        &self,
+        _node: NodeCaller,
+        _request: ServiceAuthorizeRequest,
+    ) -> BoxFuture<'_, Result<ServiceAuthorizeDecision, ControlError>> {
+        Box::pin(async { Err(ControlError::InvalidRequest) })
+    }
+
+    fn service_end(
+        &self,
+        _node: NodeCaller,
+        _request: ServiceEnd,
+    ) -> BoxFuture<'_, Result<SessionEndOutcome, ControlError>> {
+        Box::pin(async { Err(ControlError::InvalidRequest) })
+    }
 }

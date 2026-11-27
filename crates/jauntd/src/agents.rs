@@ -230,6 +230,7 @@ impl AgentServer {
                 revocation_watch_interval,
                 stop.clone(),
             )),
+            tokio::spawn(sessions::watch_access(control.clone(), stop.clone())),
             tokio::spawn(reconcile::run(
                 StoreNodes::new(store.nodes()),
                 hub.agents(),

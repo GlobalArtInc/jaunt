@@ -117,6 +117,7 @@ pub struct Options {
     pub host_sign_hook: Option<SignHook>,
     pub web: bool,
     pub user_x509_root_age: Option<Duration>,
+    pub db_client_root_age: Option<Duration>,
     pub internal_root_age: Duration,
     pub services_domain: Option<&'static str>,
     pub client_transport: Option<ClientTransport>,
@@ -135,6 +136,7 @@ impl Default for Options {
             host_sign_hook: None,
             web: false,
             user_x509_root_age: None,
+            db_client_root_age: None,
             internal_root_age: Duration::ZERO,
             services_domain: None,
             client_transport: None,
@@ -408,6 +410,16 @@ impl Harness {
             .unwrap();
             ClientCa::load(&ca_root, CaKind::UserX509, &identity).unwrap()
         });
+        let db_client = options.db_client_root_age.map(|age| {
+            ClientCa::init(
+                &ca_root,
+                CaKind::DbClient,
+                &identity.recipient(),
+                SystemTime::now() - age,
+            )
+            .unwrap();
+            ClientCa::load(&ca_root, CaKind::DbClient, &identity).unwrap()
+        });
         let root_der = root.certificate_der.clone();
         let internal_ca = InternalCa::new(Arc::new(internal_signer), root.certificate_der).unwrap();
 
@@ -473,6 +485,7 @@ impl Harness {
                 user_x509,
                 services_domain: options.services_domain.map(str::to_owned),
                 client_transport: options.client_transport,
+                db_client,
             },
             RequestLimits::default(),
             clock.ticker(),

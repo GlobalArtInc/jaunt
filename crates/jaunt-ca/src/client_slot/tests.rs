@@ -74,6 +74,7 @@ fn issue(ca: &ClientCa) -> Vec<u8> {
             DbClientParams {
                 subject_public_key,
                 role: "app".to_owned(),
+                serial: 9,
             },
             now(),
         ),

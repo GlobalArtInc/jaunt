@@ -2,7 +2,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
 use crate::StoreError;
-use crate::sessions::SessionState;
+use crate::sessions::{SessionKind, SessionState};
 
 pub const MAX_RECORDING_PAGE: u32 = 1000;
 pub const SESSION_ID_LEN: usize = 36;
@@ -81,6 +81,7 @@ pub struct UploadTarget {
     pub pty: Option<bool>,
     pub record_input: Option<bool>,
     pub recording: Option<Recording>,
+    pub kind: SessionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +156,7 @@ macro_rules! recording_columns {
 const TARGET: &str = concat!(
     "SELECT s.id AS s_id, s.node_id AS s_node_id, s.user_id AS s_user_id, s.state AS s_state, \
      s.authorized_at AS s_authorized_at, s.ended_at AS s_ended_at, s.login AS s_login, \
-     s.pty AS s_pty, s.record_input AS s_record_input, ",
+     s.pty AS s_pty, s.record_input AS s_record_input, s.kind AS s_kind, ",
     recording_columns!("r."),
     " FROM sessions s LEFT JOIN recordings r ON r.session_id = s.id WHERE s.id = ?"
 );
@@ -393,6 +394,7 @@ fn to_u64(value: i64, column: &str) -> Result<u64, StoreError> {
 
 fn target_from_row(row: &SqliteRow) -> Result<UploadTarget, StoreError> {
     let state: String = row.try_get("s_state")?;
+    let kind: String = row.try_get("s_kind")?;
     let recording_id: Option<String> = row.try_get("r_session_id")?;
     Ok(UploadTarget {
         session_id: row.try_get("s_id")?,
@@ -408,6 +410,7 @@ fn target_from_row(row: &SqliteRow) -> Result<UploadTarget, StoreError> {
             Some(_) => Some(recording_from_row(row)?),
             None => None,
         },
+        kind: SessionKind::parse(&kind)?,
     })
 }
 

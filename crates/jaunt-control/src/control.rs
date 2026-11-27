@@ -41,7 +41,7 @@ use crate::services;
 use crate::session_sweep::RevocationWatch;
 use crate::web::WebState;
 use crate::web::terminal::{End, TerminalGate, WebTerminalSettings};
-use crate::{service_cert, x509_cert};
+use crate::{db_client, service_authorize, service_cert, x509_cert};
 
 pub const PENDING_CAPACITY: usize = 10_000;
 
@@ -77,6 +77,7 @@ pub struct ControlParts {
     pub user_x509: Option<ClientSlot>,
     pub services_domain: Option<String>,
     pub client_transport: Option<ClientTransport>,
+    pub db_client: Option<ClientSlot>,
 }
 
 pub struct Inner {
@@ -111,6 +112,10 @@ pub struct Inner {
     pub(crate) client_transport: ClientTransport,
     pub(crate) x509_issuance: RateLimiter<String>,
     pub(crate) service_issuance: RateLimiter<String>,
+    db_client: ArcSwapOption<ClientSlot>,
+    pub(crate) db_client_user_issuance: RateLimiter<String>,
+    pub(crate) service_user_authorizations: RateLimiter<(String, String)>,
+    pub(crate) service_authorizations: RateLimiter<String>,
 }
 
 #[derive(Clone)]
@@ -186,6 +191,13 @@ impl Control {
         {
             return Err(ControlError::NotUserX509Authority);
         }
+        if parts
+            .db_client
+            .as_ref()
+            .is_some_and(|slot| slot.ca.kind() != CaKind::DbClient)
+        {
+            return Err(ControlError::NotDbClientAuthority);
+        }
         let web = WebState::new(parts.web_enabled, &parts.device.public_origin);
         let device = DeviceState::new(parts.device, parts.pending_capacity)?;
         let cert_ttl =
@@ -227,6 +239,10 @@ impl Control {
                 client_transport,
                 x509_issuance: x509_cert::issuance_limiter(),
                 service_issuance: service_cert::issuance_limiter(),
+                db_client: ArcSwapOption::from(parts.db_client.map(Arc::new)),
+                db_client_user_issuance: db_client::user_issuance_limiter(),
+                service_user_authorizations: service_authorize::user_authorization_limiter(),
+                service_authorizations: service_authorize::authorization_limiter(),
             }),
         })
     }
@@ -265,6 +281,18 @@ impl Control {
             return Err(ControlError::NotUserX509Authority);
         }
         self.inner.user_x509.store(Some(Arc::new(slot)));
+        Ok(())
+    }
+
+    pub fn db_client(&self) -> Option<Arc<ClientSlot>> {
+        self.inner.db_client.load_full()
+    }
+
+    pub fn replace_db_client(&self, slot: ClientSlot) -> Result<(), ControlError> {
+        if slot.ca.kind() != CaKind::DbClient {
+            return Err(ControlError::NotDbClientAuthority);
+        }
+        self.inner.db_client.store(Some(Arc::new(slot)));
         Ok(())
     }
 
@@ -373,6 +401,9 @@ impl Control {
         self.web.tokens.sweep(tick);
         self.x509_issuance.sweep(tick);
         self.service_issuance.sweep(tick);
+        self.db_client_user_issuance.sweep(tick);
+        self.service_user_authorizations.sweep(tick);
+        self.service_authorizations.sweep(tick);
         let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {
@@ -751,6 +782,7 @@ mod tests {
             user_x509: None,
             services_domain: None,
             client_transport: None,
+            db_client: None,
         })
         .unwrap();
 

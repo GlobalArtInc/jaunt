@@ -7,9 +7,7 @@ use rcgen::{ExtendedKeyUsagePurpose, SanType};
 use uuid::Uuid;
 
 use super::root::{self, RootProfile};
-use super::{
-    IssuedCertificate, Leaf, LeafIssuer, MAX_COMMON_NAME_LEN, SubjectPublicKey, random_serial,
-};
+use super::{IssuedCertificate, Leaf, LeafIssuer, MAX_COMMON_NAME_LEN, SubjectPublicKey};
 use crate::cert::{validate_email, window, window_backdated};
 use crate::error::CaError;
 use crate::kind::CaKind;
@@ -48,6 +46,7 @@ pub struct UserX509Params {
 pub struct DbClientParams {
     pub subject_public_key: SubjectPublicKey,
     pub role: String,
+    pub serial: u64,
 }
 
 pub struct ClientCa {
@@ -127,6 +126,9 @@ impl ClientCa {
     ) -> Result<IssuedCertificate, CaError> {
         self.require(CaKind::DbClient)?;
         validate_database_role(&params.role)?;
+        if params.serial == 0 {
+            return Err(CaError::InvalidSerial);
+        }
         let window = window_backdated(
             now,
             DB_CLIENT_VALIDITY,
@@ -140,7 +142,7 @@ impl ClientCa {
             common_name: Some(&params.role),
             usage: ExtendedKeyUsagePurpose::ClientAuth,
             names: Vec::new(),
-            serial: random_serial()?,
+            serial: u128::from(params.serial),
         })
     }
 
@@ -158,7 +160,7 @@ impl ClientCa {
             common_name: Some(common_name),
             usage,
             names: Vec::new(),
-            serial: random_serial()?,
+            serial: super::random_serial()?,
         })
     }
 

@@ -73,4 +73,6 @@ pub enum ControlError {
     TlsTransportWithoutServicesDomain,
     #[error("the user x509 authority is not a user-x509 certificate authority")]
     NotUserX509Authority,
+    #[error("the database client authority is not a db-client certificate authority")]
+    NotDbClientAuthority,
 }

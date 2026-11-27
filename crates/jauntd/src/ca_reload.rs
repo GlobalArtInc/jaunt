@@ -75,6 +75,13 @@ struct Changes {
     user: Option<Loaded>,
     host: Option<Loaded>,
     user_x509: Option<ClientSlot>,
+    db_client: Option<ClientSlot>,
+}
+
+#[derive(Clone)]
+struct ClientStates {
+    user_x509: Option<SlotState>,
+    db_client: Option<SlotState>,
 }
 
 #[derive(Default)]
@@ -125,16 +132,23 @@ impl CaReloader {
         let current = self.parts.control.ca_snapshot();
         let user = SlotState::of(current.user_trust());
         let host = SlotState::of(current.host_trust());
-        let user_x509 = self
-            .parts
-            .control
-            .user_x509()
-            .map(|slot| SlotState::of(&slot.trust));
-        let x509_before = user_x509.clone();
+        let clients = ClientStates {
+            user_x509: self
+                .parts
+                .control
+                .user_x509()
+                .map(|slot| SlotState::of(&slot.trust)),
+            db_client: self
+                .parts
+                .control
+                .db_client()
+                .map(|slot| SlotState::of(&slot.trust)),
+        };
+        let clients_before = clients.clone();
         let ca_dir = self.parts.ca_dir.clone();
         let env = Arc::clone(&self.parts.env);
         let read = tokio::task::spawn_blocking(move || {
-            read_changes(&ca_dir, &env, &user, &host, user_x509.as_ref())
+            read_changes(&ca_dir, &env, &user, &host, &clients)
         })
         .await;
         let changes = match read {
@@ -146,7 +160,7 @@ impl CaReloader {
             Ok(Err(reason)) => return self.reload_failed(reason, now),
             Err(_) => return self.reload_failed(READ_STOPPED.to_owned(), now),
         };
-        match self.apply(&current, x509_before.as_ref(), changes) {
+        match self.apply(&current, &clients_before, changes) {
             Ok(reload) => {
                 self.reload_failures.clear();
                 reload
@@ -158,7 +172,7 @@ impl CaReloader {
     fn apply(
         &self,
         current: &CaSnapshot,
-        x509_before: Option<&SlotState>,
+        clients_before: &ClientStates,
         changes: Changes,
     ) -> Result<Reload, String> {
         let (user_signer, user_trust) =
@@ -169,7 +183,10 @@ impl CaReloader {
         let host_changed = SlotState::of(&host_trust) != SlotState::of(current.host_trust());
         let user_x509 = changes
             .user_x509
-            .filter(|slot| Some(&SlotState::of(&slot.trust)) != x509_before);
+            .filter(|slot| Some(SlotState::of(&slot.trust)) != clients_before.user_x509);
+        let db_client = changes
+            .db_client
+            .filter(|slot| Some(SlotState::of(&slot.trust)) != clients_before.db_client);
         let mut kinds = Vec::new();
         if user_changed {
             kinds.push(CaKind::User);
@@ -179,6 +196,9 @@ impl CaReloader {
         }
         if user_x509.is_some() {
             kinds.push(CaKind::UserX509);
+        }
+        if db_client.is_some() {
+            kinds.push(CaKind::DbClient);
         }
         if kinds.is_empty() {
             return Ok(Reload::Unchanged);
@@ -194,11 +214,22 @@ impl CaReloader {
         } else {
             None
         };
+        if let Some(slot) = &db_client
+            && slot.ca.kind() != CaKind::DbClient
+        {
+            return Err("the new db-client keys are not a db-client authority".to_owned());
+        }
         if let Some(slot) = user_x509 {
             self.parts
                 .control
                 .replace_user_x509(slot)
                 .map_err(|err| format!("the new user-x509 keys are not usable: {err}"))?;
+        }
+        if let Some(slot) = db_client {
+            self.parts
+                .control
+                .replace_db_client(slot)
+                .map_err(|err| format!("the new db-client keys are not usable: {err}"))?;
         }
         if let Some((snapshot, gate_trust)) = swap {
             if let (Some(gate), Some(trust)) = (&self.parts.gate, &gate_trust) {
@@ -211,10 +242,16 @@ impl CaReloader {
         }
         let applied = self.parts.control.ca_snapshot();
         let applied_x509 = self.parts.control.user_x509();
+        let applied_db_client = self.parts.control.db_client();
         for kind in &kinds {
             match kind {
                 CaKind::User => audit_reloaded(*kind, applied.user_trust()),
                 CaKind::Host => audit_reloaded(*kind, applied.host_trust()),
+                CaKind::DbClient => {
+                    if let Some(slot) = &applied_db_client {
+                        audit_reloaded(*kind, &slot.trust);
+                    }
+                }
                 _ => {
                     if let Some(slot) = &applied_x509 {
                         audit_reloaded(*kind, &slot.trust);
@@ -222,7 +259,12 @@ impl CaReloader {
                 }
             }
         }
-        let notified = self.notify_agents();
+        let agents_trust_it = kinds.iter().any(|kind| *kind != CaKind::DbClient);
+        let notified = if agents_trust_it {
+            self.notify_agents()
+        } else {
+            0
+        };
         Ok(Reload::Applied { kinds, notified })
     }
 
@@ -301,21 +343,31 @@ fn report_broadcast(broadcast: &TrustBroadcast) -> usize {
     broadcast.sent
 }
 
+fn client_changed(
+    ca_dir: &Path,
+    kind: CaKind,
+    current: Option<&SlotState>,
+) -> Result<bool, String> {
+    match current {
+        Some(current) => changed(ca_dir, kind, current),
+        None => {
+            FileBackend::is_initialized(ca_dir, kind).map_err(|err| format!("{kind} keys: {err}"))
+        }
+    }
+}
+
 fn read_changes(
     ca_dir: &Path,
     env: &IdentityEnv,
     user: &SlotState,
     host: &SlotState,
-    user_x509: Option<&SlotState>,
+    clients: &ClientStates,
 ) -> Result<Option<Changes>, String> {
     let user_changed = changed(ca_dir, CaKind::User, user)?;
     let host_changed = changed(ca_dir, CaKind::Host, host)?;
-    let x509_changed = match user_x509 {
-        Some(current) => changed(ca_dir, CaKind::UserX509, current)?,
-        None => FileBackend::is_initialized(ca_dir, CaKind::UserX509)
-            .map_err(|err| format!("{} keys: {err}", CaKind::UserX509))?,
-    };
-    if !user_changed && !host_changed && !x509_changed {
+    let x509_changed = client_changed(ca_dir, CaKind::UserX509, clients.user_x509.as_ref())?;
+    let db_client_changed = client_changed(ca_dir, CaKind::DbClient, clients.db_client.as_ref())?;
+    if !user_changed && !host_changed && !x509_changed && !db_client_changed {
         return Ok(None);
     }
     let identity = resolve_identity(ca_dir, &**env)?;
@@ -327,17 +379,21 @@ fn read_changes(
             })
             .transpose()
     };
-    let user_x509 = x509_changed
-        .then(|| {
-            load(CaKind::UserX509, true)?;
-            ClientCa::load(ca_dir, CaKind::UserX509, &identity)
-                .map_err(|err| format!("{} keys: {err}", CaKind::UserX509))
-        })
-        .transpose()?;
+    let client = |kind: CaKind, wanted: bool| {
+        wanted
+            .then(|| {
+                load(kind, true)?;
+                ClientCa::load(ca_dir, kind, &identity).map_err(|err| format!("{kind} keys: {err}"))
+            })
+            .transpose()
+    };
+    let user_x509 = client(CaKind::UserX509, x509_changed)?;
+    let db_client = client(CaKind::DbClient, db_client_changed)?;
     Ok(Some(Changes {
         user: load(CaKind::User, user_changed)?,
         host: load(CaKind::Host, host_changed)?,
         user_x509,
+        db_client,
     }))
 }
 

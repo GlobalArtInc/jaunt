@@ -13,6 +13,9 @@ pub enum KillReason {
     AgentGone,
     NodeRemoved,
     Terminated,
+    ServiceRemoved,
+    AccessWithdrawn,
+    AccessChanged,
 }
 
 impl KillReason {
@@ -23,6 +26,9 @@ impl KillReason {
             KillReason::AgentGone => "agent_gone",
             KillReason::NodeRemoved => "node_removed",
             KillReason::Terminated => "terminated",
+            KillReason::ServiceRemoved => "service_removed",
+            KillReason::AccessWithdrawn => "access_withdrawn",
+            KillReason::AccessChanged => "access_changed",
         }
     }
 }

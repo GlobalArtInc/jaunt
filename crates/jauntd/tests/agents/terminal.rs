@@ -1274,3 +1274,40 @@ async fn an_administrator_terminate_sends_terminated_with_a_reference_and_closes
         .await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn the_access_review_closes_a_web_terminal_whose_login_the_policy_took_away_and_keeps_the_rest()
+ {
+    let stand = TerminalStand::start().await;
+    let (mut kept, kept_id) = stand.ready(&stand.alice, PLAIN_LOGIN).await;
+    let (mut cut, cut_id) = stand.ready(&stand.bob, RECORDED_LOGIN).await;
+    assert_eq!(
+        stand
+            .harness
+            .control
+            .review_access()
+            .await
+            .unwrap()
+            .withdrawn,
+        0
+    );
+
+    stand.deny_the_recorded_login();
+    let started = Instant::now();
+    let review = stand.harness.control.review_access().await.unwrap();
+    assert_eq!(review.withdrawn, 1);
+    ended_with(&mut cut, Some("revoked"), 4001).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let closed = audited("terminal.closed", closed_event(&cut_id)).await;
+    assert_eq!(field(&closed, "reason"), "revoked");
+    let sessions = stand.harness.store.sessions();
+    assert_eq!(
+        sessions.get(&cut_id).await.unwrap().unwrap().end_reason,
+        Some(jaunt_store::SessionEndReason::AccessWithdrawn)
+    );
+    pong(&mut kept).await;
+    assert_eq!(
+        sessions.get(&kept_id).await.unwrap().unwrap().end_reason,
+        None
+    );
+}

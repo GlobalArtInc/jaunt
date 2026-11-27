@@ -1204,3 +1204,128 @@ async fn a_change_of_only_the_user_x509_slot_is_audited_and_heard_by_every_agent
     );
     assert!(slot.trust.next().is_some());
 }
+
+fn db_client_active(harness: &Harness) -> Option<String> {
+    harness
+        .control
+        .db_client()
+        .map(|slot| fingerprint_hex(slot.trust.active()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_db_client_slot_follows_rotation_without_a_restart_and_is_not_announced_to_agents() {
+    let harness = Harness::start(Options::default()).await;
+    let keys = Keys::of(&harness);
+    let (agents, counters) = counting_agents(&harness, &["web-01"]).await;
+    let mut reloader = keys.reloader(&harness, None, Some(harness.server.registry().clone()));
+    assert_eq!(reloader.tick(at(0)).await.reload, Reload::Unchanged);
+    assert_eq!(db_client_active(&harness), None);
+
+    let first = fingerprint_hex(
+        &jaunt_ca::ClientCa::init(
+            &keys.root,
+            CaKind::DbClient,
+            &keys.age().recipient(),
+            SystemTime::now(),
+        )
+        .unwrap()
+        .public_key,
+    );
+    assert_eq!(
+        reloader.tick(at(10)).await.reload,
+        applied(&[CaKind::DbClient], 0)
+    );
+    assert_eq!(db_client_active(&harness), Some(first.clone()));
+
+    let second = {
+        let lock = CaLock::acquire(&keys.root).unwrap();
+        fingerprint_hex(
+            &jaunt_ca::ClientCa::add_next(&lock, CaKind::DbClient, &keys.age(), SystemTime::now())
+                .unwrap()
+                .public_key,
+        )
+    };
+    assert_eq!(
+        reloader.tick(at(20)).await.reload,
+        applied(&[CaKind::DbClient], 0)
+    );
+    let staged = harness.control.db_client().unwrap();
+    assert_eq!(
+        staged.trust.next().map(fingerprint_hex),
+        Some(second.clone())
+    );
+    assert_eq!(fingerprint_hex(staged.trust.active()), first);
+
+    keys.promote(CaKind::DbClient);
+    assert_eq!(
+        reloader.tick(at(30)).await.reload,
+        applied(&[CaKind::DbClient], 0)
+    );
+    assert_eq!(db_client_active(&harness), Some(second.clone()));
+    keys.retire(CaKind::DbClient);
+    assert_eq!(
+        reloader.tick(at(40)).await.reload,
+        applied(&[CaKind::DbClient], 0)
+    );
+    assert_eq!(harness.control.db_client().unwrap().trust.keys().len(), 1);
+    assert_eq!(reloader.tick(at(50)).await.reload, Reload::Unchanged);
+
+    let held = harness.control.db_client().unwrap();
+    {
+        let lock = CaLock::acquire(&keys.root).unwrap();
+        jaunt_ca::ClientCa::add_next(&lock, CaKind::DbClient, &keys.age(), SystemTime::now())
+            .unwrap();
+    }
+    let broken_next = next_age(&keys, CaKind::DbClient);
+    spoil(&broken_next);
+    let failed = reloader.tick(at(60)).await.reload;
+    let Reload::Failed { reason, reported } = &failed else {
+        panic!("{failed:?}");
+    };
+    assert!(
+        reason.starts_with("db-client keys: could not decrypt"),
+        "{reason}"
+    );
+    assert!(*reported);
+    assert!(Arc::ptr_eq(&held, &harness.control.db_client().unwrap()));
+    unspoil(&broken_next);
+    assert_eq!(
+        reloader.tick(at(70)).await.reload,
+        applied(&[CaKind::DbClient], 0)
+    );
+
+    jaunt_ca::ClientCa::init(
+        &keys.root,
+        CaKind::UserX509,
+        &keys.age().recipient(),
+        SystemTime::now(),
+    )
+    .unwrap();
+    assert_eq!(
+        reloader.tick(at(80)).await.reload,
+        applied(&[CaKind::UserX509], 1)
+    );
+    eventually("the agent to hear the user-x509 change", || {
+        counters[0].load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    for agent in agents {
+        agent.stop().await;
+    }
+    assert_eq!(counters[0].load(Ordering::SeqCst), 1);
+    let kinds: Vec<String> = events_named("ca.reloaded")
+        .iter()
+        .map(|event| field(event, "kind").to_owned())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "db-client",
+            "db-client",
+            "db-client",
+            "db-client",
+            "db-client",
+            "user-x509"
+        ]
+    );
+}

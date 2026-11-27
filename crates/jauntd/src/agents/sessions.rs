@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use jaunt_control::{Control, ControlError};
+use jaunt_control::{
+    ACCESS_REVIEW_DEBOUNCE, ACCESS_REVIEW_INTERVAL, ACCESS_REVIEW_POLL, Control, ControlError,
+};
 use jaunt_gate::ConnectedAgents;
 use jaunt_tunnel::{BoxFuture, NodeId, RegistryEvent};
 use tokio::sync::broadcast::Receiver;
@@ -106,6 +108,13 @@ pub(crate) async fn watch_revocations(control: Control, every: Duration, stop: C
     tokio::select! {
         () = stop.cancelled() => {}
         () = control.watch_revocations(every) => {}
+    }
+}
+
+pub(crate) async fn watch_access(control: Control, stop: CancellationToken) {
+    tokio::select! {
+        () = stop.cancelled() => {}
+        () = control.watch_access(ACCESS_REVIEW_POLL, ACCESS_REVIEW_INTERVAL, ACCESS_REVIEW_DEBOUNCE) => {}
     }
 }
 

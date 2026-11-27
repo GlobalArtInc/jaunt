@@ -23,13 +23,13 @@ const EXIT_OK: u8 = 0;
 const EXIT_FAILED: u8 = 1;
 const EXIT_BLOCKED: u8 = 3;
 pub(crate) const LAST_LINE: &str = "applied within 10 s";
-pub(crate) const RESTART_LINE: &str =
-    "restart jauntd to apply: the running daemon reads the db-client keys only when it starts";
 
 pub(crate) const fn last_line(kind: RotationKind) -> &'static str {
     match kind {
-        RotationKind::DbClient => RESTART_LINE,
-        RotationKind::User | RotationKind::Host | RotationKind::UserX509 => LAST_LINE,
+        RotationKind::User
+        | RotationKind::Host
+        | RotationKind::UserX509
+        | RotationKind::DbClient => LAST_LINE,
     }
 }
 

@@ -15,7 +15,8 @@ use jaunt_record::{
     VerifyError,
 };
 use jaunt_store::{
-    Recording, RecordingState, SessionState, StoreError, StoredRecording, UploadTarget,
+    Recording, RecordingState, SessionKind as StoredKind, SessionState, StoreError,
+    StoredRecording, UploadTarget,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -163,6 +164,9 @@ async fn load_target(
     };
     if target.node_id != node_id {
         return Err(refused(RecordingRefusal::SessionUnknown, Reason::WrongNode));
+    }
+    if target.kind != StoredKind::Ssh {
+        return Err(refused(RecordingRefusal::SessionUnknown, Reason::WrongKind));
     }
     let recordable = match target.state {
         SessionState::Routed => false,

@@ -1,5 +1,5 @@
 use jaunt_proto::{DenyReason, SessionPermissions};
-use jaunt_store::{Session, SessionEndReason};
+use jaunt_store::{Session, SessionEndReason, SessionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -132,6 +132,7 @@ pub(crate) fn ended(event: &Ended<'_>) {
 }
 
 pub(crate) fn closed(session: &Session, outcome: SessionEndReason) {
+    let service = session.kind != SessionKind::Ssh;
     tracing::info!(
         target: "jaunt::audit",
         event = "session.end",
@@ -141,6 +142,8 @@ pub(crate) fn closed(session: &Session, outcome: SessionEndReason) {
         serial = session.serial,
         node_id = session.node_id.as_str(),
         login = session.login.as_deref(),
+        kind = service.then(|| session.kind.as_str()),
+        service = session.service_name.as_deref().filter(|_| service),
         state_before = if session.authorized_at.is_some() { "active" } else { "routed" }
     );
 }

@@ -1,12 +1,14 @@
 use jaunt_policy::NodeInfo;
 use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, BoxFuture, ControlError as PlaneError, ControlPlane,
-    NodeCaller, RouteDecision, RouteRequest, SessionEnd, SessionEndOutcome,
+    LocateServiceRequest, NodeCaller, RouteDecision, RouteRequest, ServiceAuthorizeDecision,
+    ServiceAuthorizeRequest, ServiceEnd, ServiceLocation, ServiceRouteRequest, SessionEnd,
+    SessionEndOutcome,
 };
 use jaunt_store::{Node, StoreError};
 
 use crate::control::Control;
-use crate::{authorize, route, session_end};
+use crate::{authorize, route, service_authorize, service_end, service_route, session_end};
 
 const MAX_FIELD_BYTES: usize = 256;
 
@@ -29,6 +31,36 @@ impl ControlPlane for Control {
         request: SessionEnd,
     ) -> BoxFuture<'_, Result<SessionEndOutcome, PlaneError>> {
         Box::pin(session_end::session_end(self, node, request))
+    }
+
+    fn locate_service(
+        &self,
+        request: LocateServiceRequest,
+    ) -> BoxFuture<'_, Result<Option<ServiceLocation>, PlaneError>> {
+        Box::pin(service_route::locate(self, request))
+    }
+
+    fn route_service(
+        &self,
+        request: ServiceRouteRequest,
+    ) -> BoxFuture<'_, Result<RouteDecision, PlaneError>> {
+        Box::pin(service_route::route(self, request))
+    }
+
+    fn authorize_service(
+        &self,
+        node: NodeCaller,
+        request: ServiceAuthorizeRequest,
+    ) -> BoxFuture<'_, Result<ServiceAuthorizeDecision, PlaneError>> {
+        Box::pin(service_authorize::authorize_service(self, node, request))
+    }
+
+    fn service_end(
+        &self,
+        node: NodeCaller,
+        request: ServiceEnd,
+    ) -> BoxFuture<'_, Result<SessionEndOutcome, PlaneError>> {
+        Box::pin(service_end::service_end(self, node, request))
     }
 }
 

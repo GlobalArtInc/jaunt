@@ -17,6 +17,10 @@ impl PresenceSlot {
         *self.lock() = Some(presence);
     }
 
+    pub(crate) fn is_installed(&self) -> bool {
+        self.lock().is_some()
+    }
+
     pub(crate) fn connected_since(&self, node_id: &str) -> Option<SystemTime> {
         let presence = self.lock().clone()?;
         presence.connected_since(node_id)

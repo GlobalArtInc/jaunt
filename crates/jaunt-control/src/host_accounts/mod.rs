@@ -10,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use jaunt_limits::Rate;
 use jaunt_proto::{AccountReport, AgentCapabilities};
-use jaunt_store::{Session, SessionState};
+use jaunt_store::{Session, SessionKind, SessionState};
 
 use crate::agent::{AuthenticatedNode, refuse_unless_active};
 use crate::control::Control;
@@ -70,7 +70,9 @@ fn reported_session<'a>(
     login: &str,
     now: i64,
 ) -> Result<&'a Session, Mismatch> {
-    let session = session.ok_or(Mismatch::UnknownSession)?;
+    let session = session
+        .filter(|session| session.kind == SessionKind::Ssh)
+        .ok_or(Mismatch::UnknownSession)?;
     if session.node_id != node_id {
         return Err(Mismatch::WrongNode);
     }
@@ -211,7 +213,7 @@ pub(crate) async fn session_account(
 
 #[cfg(test)]
 mod tests {
-    use jaunt_store::{Session, SessionState};
+    use jaunt_store::{Session, SessionKind, SessionState};
 
     use super::{Mismatch, REPORT_WINDOW_SECS, reported_session};
 
@@ -235,6 +237,15 @@ mod tests {
             max_duration_secs: None,
             origin: jaunt_store::SessionOrigin::Ssh,
             record_input: None,
+            kind: SessionKind::Ssh,
+            service_id: None,
+            target: None,
+            roles: Vec::new(),
+            grant_ids: Vec::new(),
+            db_client_serial: None,
+            outcome: None,
+            decision_hash: None,
+            service_name: None,
         }
     }
 
@@ -255,7 +266,17 @@ mod tests {
         let routed = session(SessionState::Routed, None, None);
         let ended = session(SessionState::Ended, Some("alice"), Some(now));
         let unauthorized = session(SessionState::Active, Some("alice"), None);
+        let database = Session {
+            kind: SessionKind::Db,
+            ..active.clone()
+        };
         for (stored, node, login, expected) in [
+            (
+                Some(&database),
+                "n-1",
+                "alice",
+                Err(Mismatch::UnknownSession),
+            ),
             (Some(&active), "n-1", "alice", Ok(())),
             (Some(&edge), "n-1", "alice", Ok(())),
             (None, "n-1", "alice", Err(Mismatch::UnknownSession)),

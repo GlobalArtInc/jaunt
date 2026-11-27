@@ -34,9 +34,13 @@ pub(crate) enum End {
 impl End {
     fn of_kill(reason: KillReason) -> End {
         match reason {
-            KillReason::Revoked => End::Revoked,
+            KillReason::Revoked | KillReason::AccessWithdrawn | KillReason::AccessChanged => {
+                End::Revoked
+            }
             KillReason::Expired => End::MaxDuration,
-            KillReason::AgentGone | KillReason::NodeRemoved => End::Unavailable,
+            KillReason::AgentGone | KillReason::NodeRemoved | KillReason::ServiceRemoved => {
+                End::Unavailable
+            }
             KillReason::Terminated => End::Terminated,
         }
     }
@@ -403,6 +407,15 @@ mod tests {
             max_duration_secs: None,
             origin: jaunt_store::SessionOrigin::Web,
             record_input: None,
+            kind: jaunt_store::SessionKind::Ssh,
+            service_id: None,
+            target: None,
+            roles: Vec::new(),
+            grant_ids: Vec::new(),
+            db_client_serial: None,
+            outcome: None,
+            decision_hash: None,
+            service_name: None,
         }
     }
 }

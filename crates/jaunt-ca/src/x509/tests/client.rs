@@ -43,6 +43,7 @@ fn db_params(role: &str) -> DbClientParams {
     DbClientParams {
         subject_public_key: subject(),
         role: role.to_owned(),
+        serial: 77,
     }
 }
 
@@ -135,9 +136,26 @@ fn db_client_certificate_carries_the_database_profile() {
     );
     assert_eq!(issued.not_before, at(NOW_SECS - 60));
     assert_eq!(issued.not_after, at(NOW_SECS + 300));
-    assert_eq!(der_serial(&leaf), issued.serial);
-    assert!(issued.serial > 0 && issued.serial >> 127 == 0);
-    assert_ne!(db_cert(&authority).serial, issued.serial);
+    assert_eq!(der_serial(&leaf), 77);
+    assert_eq!(issued.serial, 77);
+
+    let mut params = db_params(ROLE);
+    params.serial = u64::MAX;
+    let highest = authority
+        .slot
+        .ca
+        .issue_db_client_certificate(params, now())
+        .unwrap();
+    assert_eq!(
+        der_serial(&parsed(&highest.certificate_der)),
+        u128::from(u64::MAX)
+    );
+    let mut params = db_params(ROLE);
+    params.serial = 0;
+    assert!(matches!(
+        authority.slot.ca.issue_db_client_certificate(params, now()),
+        Err(CaError::InvalidSerial)
+    ));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+mod access_review;
 mod admin;
 mod agent;
 mod agent_trust;
@@ -11,6 +12,7 @@ mod client_config;
 mod clock;
 mod completion;
 mod control;
+mod db_client;
 mod device;
 mod enroll;
 mod enroll_secrets;
@@ -49,7 +51,13 @@ mod route;
 mod serve;
 mod server_cert;
 mod service_audit;
+mod service_authorize;
 mod service_cert;
+mod service_end;
+mod service_http;
+mod service_identity;
+mod service_route;
+mod service_session_audit;
 mod services;
 mod session_audit;
 mod session_end;
@@ -63,6 +71,9 @@ mod web;
 mod whoami;
 mod x509_cert;
 
+pub use access_review::{
+    ACCESS_REVIEW_DEBOUNCE, ACCESS_REVIEW_INTERVAL, ACCESS_REVIEW_POLL, AccessReview,
+};
 pub use admin::{
     ApproveError, ApprovedNode, ListError, NodeAdmin, NodeListing, NodeSummary, PendingEnrollment,
     RejectedEnrollment, RemoveError,

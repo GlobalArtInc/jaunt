@@ -345,6 +345,7 @@ impl Harness {
                 user_x509: None,
                 services_domain: None,
                 client_transport: None,
+                db_client: None,
             },
             options.request_limits,
             options.ticker.unwrap_or_else(|| clock.ticker()),

@@ -110,7 +110,7 @@ async fn end_and_reconcile(
     }
 }
 
-const fn rejection_code(rejection: EndRejection) -> &'static str {
+pub(crate) const fn rejection_code(rejection: EndRejection) -> &'static str {
     match rejection {
         EndRejection::UnknownSession => "session_unknown",
         EndRejection::WrongNode => "wrong_node",

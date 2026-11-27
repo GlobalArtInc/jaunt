@@ -1,3 +1,4 @@
+mod access_review;
 mod admin;
 mod audit;
 mod audit_events;
@@ -19,6 +20,8 @@ mod renew;
 mod revoke;
 mod route;
 mod serve;
+mod service_sessions;
+mod service_support;
 mod services;
 mod session_http;
 mod session_support;

@@ -30,6 +30,35 @@ impl SessionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionKind {
+    Ssh,
+    Kube,
+    Db,
+    Tcp,
+}
+
+impl SessionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Ssh => "ssh",
+            SessionKind::Kube => "kube",
+            SessionKind::Db => "db",
+            SessionKind::Tcp => "tcp",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<SessionKind, StoreError> {
+        match value {
+            "ssh" => Ok(SessionKind::Ssh),
+            "kube" => Ok(SessionKind::Kube),
+            "db" => Ok(SessionKind::Db),
+            "tcp" => Ok(SessionKind::Tcp),
+            other => Err(StoreError::Corrupt(format!("sessions.kind: {other}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOrigin {
     Web,
@@ -62,6 +91,9 @@ pub enum SessionEndReason {
     AgentGone,
     NodeRemoved,
     Terminated,
+    ServiceRemoved,
+    AccessWithdrawn,
+    AccessChanged,
 }
 
 impl SessionEndReason {
@@ -74,6 +106,9 @@ impl SessionEndReason {
             SessionEndReason::AgentGone => "agent_gone",
             SessionEndReason::NodeRemoved => "node_removed",
             SessionEndReason::Terminated => "terminated",
+            SessionEndReason::ServiceRemoved => "service_removed",
+            SessionEndReason::AccessWithdrawn => "access_withdrawn",
+            SessionEndReason::AccessChanged => "access_changed",
         }
     }
 
@@ -86,6 +121,9 @@ impl SessionEndReason {
             "agent_gone" => Ok(SessionEndReason::AgentGone),
             "node_removed" => Ok(SessionEndReason::NodeRemoved),
             "terminated" => Ok(SessionEndReason::Terminated),
+            "service_removed" => Ok(SessionEndReason::ServiceRemoved),
+            "access_withdrawn" => Ok(SessionEndReason::AccessWithdrawn),
+            "access_changed" => Ok(SessionEndReason::AccessChanged),
             other => Err(StoreError::Corrupt(format!("sessions.end_reason: {other}"))),
         }
     }
@@ -196,6 +234,15 @@ pub struct Session {
     pub max_duration_secs: Option<i64>,
     pub origin: SessionOrigin,
     pub record_input: Option<bool>,
+    pub kind: SessionKind,
+    pub service_id: Option<String>,
+    pub target: Option<String>,
+    pub roles: Vec<String>,
+    pub grant_ids: Vec<String>,
+    pub db_client_serial: Option<i64>,
+    pub outcome: Option<String>,
+    pub decision_hash: Option<String>,
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,9 +317,12 @@ macro_rules! session_columns {
     () => {
         "id, user_id, serial, node_id, state, created_at, expires_at, authorized_at, ended_at, \
          login, exit_status, bytes_in, bytes_out, recording_incomplete, end_reason, \
-         max_duration_secs, origin, record_input"
+         max_duration_secs, origin, record_input, kind, service_id, target, roles, grant_ids, \
+         db_client_serial, outcome, decision_hash, service_name"
     };
 }
+
+pub(crate) use session_columns;
 
 macro_rules! close_open {
     ($($filter:tt)+) => {
@@ -298,7 +348,7 @@ const ACTIVATE: &str = concat!(
     "UPDATE sessions SET state = 'active', authorized_at = ?, login = ?, max_duration_secs = ?, \
      pty = ?, record_input = ?, origin = ? \
      WHERE id = ? AND node_id = ? AND user_id = ? AND serial = ? \
-     AND state = 'routed' AND expires_at > ? \
+     AND state = 'routed' AND expires_at > ? AND kind = 'ssh' \
      AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') RETURNING ",
     session_columns!()
 );
@@ -306,7 +356,7 @@ const ACTIVATE: &str = concat!(
 const END: &str = concat!(
     "UPDATE sessions SET state = 'ended', ended_at = ?, exit_status = ?, bytes_in = ?, \
      bytes_out = ?, recording_incomplete = ?, end_reason = 'closed' \
-     WHERE id = ? AND node_id = ? AND state = 'active' RETURNING ",
+     WHERE id = ? AND node_id = ? AND state = 'active' AND kind = 'ssh' RETURNING ",
     session_columns!()
 );
 
@@ -355,7 +405,7 @@ const LATE_END: &str = concat!(
     "UPDATE sessions SET exit_status = ?, bytes_in = ?, bytes_out = ?, \
      recording_incomplete = CASE WHEN ? OR recording_incomplete = 1 THEN 1 ELSE 0 END \
      WHERE id = ? AND node_id = ? AND state = 'ended' AND end_reason IS NOT NULL \
-     AND end_reason <> 'closed' AND authorized_at IS NOT NULL \
+     AND end_reason <> 'closed' AND authorized_at IS NOT NULL AND kind = 'ssh' \
      AND bytes_in IS NULL AND bytes_out IS NULL RETURNING ",
     session_columns!()
 );
@@ -366,7 +416,11 @@ const LISTING_SELECT: &str = "SELECT s.id AS id, s.user_id AS user_id, s.serial 
     s.login AS login, s.exit_status AS exit_status, s.bytes_in AS bytes_in, \
     s.bytes_out AS bytes_out, s.recording_incomplete AS recording_incomplete, \
     s.end_reason AS end_reason, s.max_duration_secs AS max_duration_secs, \
-    s.origin AS origin, s.record_input AS record_input, u.email AS user_email, n.name AS node_name, \
+    s.origin AS origin, s.record_input AS record_input, s.kind AS kind, s.service_id AS service_id, \
+    s.target AS target, s.roles AS roles, s.grant_ids AS grant_ids, \
+    s.db_client_serial AS db_client_serial, s.outcome AS outcome, \
+    s.decision_hash AS decision_hash, s.service_name AS service_name, \
+    u.email AS user_email, n.name AS node_name, \
     r.state AS recording_state, r.salvaged AS recording_salvaged \
     FROM sessions s JOIN users u ON u.id = s.user_id JOIN nodes n ON n.id = s.node_id \
     LEFT JOIN recordings r ON r.session_id = s.id \
@@ -470,7 +524,11 @@ impl Sessions {
         if let Some(row) = row {
             return Ok(EndOutcome::Ended(Box::new(session_from_row(&row)?)));
         }
-        let Some(stored) = self.get(end.id).await? else {
+        let Some(stored) = self
+            .get(end.id)
+            .await?
+            .filter(|stored| stored.kind == SessionKind::Ssh)
+        else {
             return Ok(EndOutcome::Rejected(EndRejection::UnknownSession));
         };
         if stored.node_id != end.node_id {
@@ -706,10 +764,11 @@ fn listing_from_row(row: &SqliteRow) -> Result<SessionListing, StoreError> {
     })
 }
 
-fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
+pub(crate) fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
     let state: String = row.try_get("state")?;
     let end_reason: Option<String> = row.try_get("end_reason")?;
     let origin: String = row.try_get("origin")?;
+    let kind: String = row.try_get("kind")?;
     Ok(Session {
         id: row.try_get("id")?,
         user_id: row.try_get("user_id")?,
@@ -733,7 +792,22 @@ fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
         origin: SessionOrigin::parse(&origin)
             .ok_or_else(|| StoreError::Corrupt(format!("sessions.origin: {origin}")))?,
         record_input: row.try_get("record_input")?,
+        kind: SessionKind::parse(&kind)?,
+        service_id: row.try_get("service_id")?,
+        target: row.try_get("target")?,
+        roles: names_from(row, "roles")?,
+        grant_ids: names_from(row, "grant_ids")?,
+        db_client_serial: row.try_get("db_client_serial")?,
+        outcome: row.try_get("outcome")?,
+        decision_hash: row.try_get("decision_hash")?,
+        service_name: row.try_get("service_name")?,
     })
+}
+
+fn names_from(row: &SqliteRow, column: &'static str) -> Result<Vec<String>, StoreError> {
+    let text: String = row.try_get(column)?;
+    serde_json::from_str(&text)
+        .map_err(|err| StoreError::Corrupt(format!("sessions.{column}: {err}")))
 }
 
 #[cfg(test)]
