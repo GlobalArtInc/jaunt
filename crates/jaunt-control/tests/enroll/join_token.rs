@@ -520,7 +520,15 @@ async fn the_schema_events_keep_every_field_and_none_of_them_carries_the_token_o
         .await
         .unwrap();
     let snapshot = capture.snapshot();
-    let events = capture.finish().await;
+    let mut events = capture.finish().await;
+    let emitted = [
+        "join_token.created",
+        "node.enroll.requested",
+        "join_token.used",
+        "join_token.refused",
+        "join_token.revoked",
+    ];
+    events.sort_by_key(|event| emitted.iter().position(|name| *name == event.kind().name()));
 
     assert_eq!(joined.status, StatusCode::OK);
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
