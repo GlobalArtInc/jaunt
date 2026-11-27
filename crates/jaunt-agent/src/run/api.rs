@@ -9,6 +9,7 @@ use h2::{Ping, PingPong};
 use http::header::{ACCEPT, CONTENT_TYPE, DATE, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
+    AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountReport, AgentCapabilities,
     AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody, RecordingAck,
     RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse, SessionEnd,
     SessionEndOutcome, recording_chunks_path, recording_complete_path,
@@ -260,6 +261,26 @@ impl AgentApi {
         })
     }
 
+    pub async fn account_report(&self, report: &AccountReport) -> Result<(), ApiError> {
+        self.send_without_reply(
+            Method::POST,
+            AGENT_SESSION_ACCOUNT_PATH,
+            report,
+            Retry::OnlyUnsent,
+        )
+        .await
+    }
+
+    pub async fn capabilities(&self, capabilities: &AgentCapabilities) -> Result<(), ApiError> {
+        self.send_without_reply(
+            Method::PUT,
+            AGENT_CAPABILITIES_PATH,
+            capabilities,
+            Retry::Idempotent,
+        )
+        .await
+    }
+
     pub async fn reset(&self) {
         let mut connection = self.connection.lock().await;
         connection.cached = None;
@@ -278,6 +299,24 @@ impl AgentApi {
             .map(|dated| dated.value)
     }
 
+    async fn send_without_reply<B: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+        retry: Retry,
+    ) -> Result<(), ApiError> {
+        let payload = Bytes::from(serde_json::to_vec(body).map_err(|_| ApiError::Request)?);
+        let answer = self.answer(method, path, Some(payload), retry).await?;
+        if answer.status.is_success() {
+            return Ok(());
+        }
+        Err(with_retry_after(
+            refusal(answer.status, &answer.body),
+            answer.retry_after,
+        ))
+    }
+
     async fn call<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -285,6 +324,22 @@ impl AgentApi {
         payload: Option<Bytes>,
         retry: Retry,
     ) -> Result<Dated<T>, ApiError> {
+        let answer = self.answer(method, path, payload, retry).await?;
+        interpret(answer.status, &answer.body)
+            .map(|value| Dated {
+                value,
+                server_time: answer.server_time,
+            })
+            .map_err(|error| with_retry_after(error, answer.retry_after))
+    }
+
+    async fn answer(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Bytes>,
+        retry: Retry,
+    ) -> Result<Answer, ApiError> {
         let uri = format!("https://{}{path}", self.authority);
         let mut retried = false;
         loop {
@@ -302,14 +357,7 @@ impl AgentApi {
                 outcome = timeout(CALL_TIMEOUT, exchange(sender, request, payload.clone())) => outcome,
             };
             let error = match outcome {
-                Ok(Ok(answer)) => {
-                    return interpret(answer.status, &answer.body)
-                        .map(|value| Dated {
-                            value,
-                            server_time: answer.server_time,
-                        })
-                        .map_err(|error| with_retry_after(error, answer.retry_after));
-                }
+                Ok(Ok(answer)) => return Ok(answer),
                 Ok(Err(exchange)) => exchange,
                 Err(_) => Exchange::Failed(ApiError::CallTimeout),
             };
@@ -513,6 +561,10 @@ fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, 
     if status.is_success() {
         return serde_json::from_slice(body).map_err(|_| ApiError::BadResponse);
     }
+    Err(refusal(status, body))
+}
+
+fn refusal(status: StatusCode, body: &[u8]) -> ApiError {
     let code: String = serde_json::from_slice::<ErrorBody>(body)
         .map(|error| {
             error
@@ -523,7 +575,7 @@ fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, 
                 .collect()
         })
         .unwrap_or_default();
-    Err(match (status, code.as_str()) {
+    match (status, code.as_str()) {
         (StatusCode::FORBIDDEN, "node_removed") => ApiError::NodeRemoved,
         (StatusCode::UNAUTHORIZED, _) => ApiError::Unauthorized,
         _ => ApiError::Status {
@@ -531,7 +583,7 @@ fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, 
             code,
             retry_after: None,
         },
-    })
+    }
 }
 
 #[cfg(test)]
@@ -541,8 +593,9 @@ mod tests {
 
     use http::StatusCode;
     use jaunt_proto::{
-        AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse,
-        SessionEnd, SessionEndOutcome, SessionPermissions,
+        AGENT_SESSION_ACCOUNT_PATH, AccountEvent, AccountReference, AccountReport, AgentTrust,
+        AgentTrustV2, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse, SessionEnd,
+        SessionEndOutcome, SessionPermissions,
     };
     use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
     use serde_json::json;
@@ -741,6 +794,49 @@ mod tests {
         assert!(matches!(outcome, Err(ApiError::Http2(_))), "{outcome:?}");
         assert_eq!(gate.api_connections(), 1);
         assert_eq!(gate.requests(AUTHORIZE_PATH).len(), 1);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn an_account_report_is_sent_again_only_when_it_never_left() {
+        let (_pki, gate, api) = gate_with(&[issue(), issue()]).await;
+        let report = AccountReport::new(
+            "session-1".to_owned(),
+            "alice".to_owned(),
+            AccountEvent::Missing {
+                reference: AccountReference::parse("H-0000000A").unwrap(),
+            },
+        );
+        api.renew(&EMPTY).await.unwrap();
+        gate.script(AGENT_SESSION_ACCOUNT_PATH, vec![ApiStep::RefuseStream]);
+        let outcome = api.account_report(&report).await;
+        assert!(matches!(outcome, Err(ApiError::Http2(_))), "{outcome:?}");
+        assert_eq!(gate.requests(AGENT_SESSION_ACCOUNT_PATH).len(), 1);
+
+        api.renew(&EMPTY).await.unwrap();
+        let stale = api
+            .connection
+            .lock()
+            .await
+            .cached
+            .as_ref()
+            .unwrap()
+            .sender
+            .clone();
+        let gate = gate.restart().await;
+        soon("the old connection to close", async {
+            while stale.clone().ready().await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        gate.script(
+            AGENT_SESSION_ACCOUNT_PATH,
+            vec![ApiStep::Json(200, json!({}))],
+        );
+        api.account_report(&report).await.unwrap();
+        assert_eq!(gate.requests(AGENT_SESSION_ACCOUNT_PATH).len(), 2);
+        assert_eq!(gate.api_connections(), 3);
         gate.stop().await;
     }
 

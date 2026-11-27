@@ -89,6 +89,7 @@ mod tests {
                     log_level: Some("info".to_owned()),
                     inner: InnerConfig::default(),
                     recording: RecordingConfig::default(),
+                    host_users: jaunt_host_users::HostUsersSection::default(),
                 },
                 "{state_dir}"
             );

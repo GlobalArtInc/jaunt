@@ -2,6 +2,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use jaunt_host_users::HostUsersSection;
 use serde::Deserialize;
 
 use crate::recording::{DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_SESSION_QUEUE_BYTES, RecordingLimits};
@@ -22,6 +23,8 @@ pub struct AgentConfig {
     pub inner: InnerConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
+    #[serde(default)]
+    pub host_users: HostUsersSection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -166,6 +169,8 @@ fn parse(text: &str) -> Result<AgentConfig, String> {
 mod tests {
     use std::path::PathBuf;
 
+    use jaunt_host_users::{HostUsersSection, Settings};
+
     use super::{AgentConfig, ConfigError, InnerConfig, RecordingConfig, load};
 
     type Expected = fn(&ConfigError) -> bool;
@@ -186,6 +191,7 @@ mod tests {
                     log_level: Some("debug".to_owned()),
                     inner: InnerConfig::default(),
                     recording: RecordingConfig::default(),
+                    host_users: HostUsersSection::default(),
                 },
             ),
         ] {
@@ -254,6 +260,30 @@ mod tests {
             let error = load(&path).unwrap_err();
             assert!(expected(&error), "{text:?}: {error}");
         }
+    }
+
+    #[test]
+    fn the_host_users_section_uses_the_shared_schema_and_leaves_validation_to_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        assert_eq!(load(&path).unwrap().host_users, HostUsersSection::default());
+        std::fs::write(
+            &path,
+            "host_users:\n  enabled: true\n  groups: [staff2]\n  uid_min: 40000\n  uid_max: 40099\n",
+        )
+        .unwrap();
+        let section = load(&path).unwrap().host_users;
+        assert!(section.enabled);
+        assert_eq!(section.groups, ["staff2"]);
+        let Settings::Enabled(config) = section.settings().unwrap() else {
+            panic!("the section is enabled");
+        };
+        assert_eq!((config.uid_min(), config.uid_max()), (40_000, 40_099));
+
+        std::fs::write(&path, "host_users:\n  enabled: true\n  uid_min: 10\n").unwrap();
+        assert!(load(&path).unwrap().host_users.settings().is_err());
+        std::fs::write(&path, "host_users:\n  enable: true\n").unwrap();
+        assert!(matches!(load(&path), Err(ConfigError::Parse { .. })));
     }
 
     #[test]

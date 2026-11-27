@@ -45,6 +45,6 @@ pub use observer::{
     OutputStream, Recording, SessionInfo, SessionObserver, Terminal, TerminalSize,
 };
 pub use terminate::{
-    AgentLimits, AuthorityError, EndReason, SessionAuthority, SessionOutcome, StreamContext,
-    Terminator,
+    AccountKeeper, AccountStep, AgentLimits, AuthorityError, EndReason, SessionAuthority,
+    SessionOutcome, StreamContext, Terminator,
 };

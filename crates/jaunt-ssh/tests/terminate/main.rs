@@ -1,3 +1,4 @@
+mod account;
 mod auth;
 mod channels;
 mod flow;

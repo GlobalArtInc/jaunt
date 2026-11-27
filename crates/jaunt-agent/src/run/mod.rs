@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, SshError};
+use jaunt_host_users::HostUsersSection;
+use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, ObserverFactory, SshError};
 use jaunt_tunnel::{
     BackoffPolicy, ClientError, ClientEvent, Keepalive, SwappableClientCert, TlsConfigError,
     TunnelClient, TunnelClientConfig, agent_client_config_swappable,
@@ -24,6 +25,10 @@ use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::AGENT_VERSION;
+use crate::accounts::{
+    ACCOUNT_TIMINGS, AccountParts, AccountService, AccountTimings, Availability,
+    ControlCapabilities, Getent, HostUsersPaths, announce_capabilities,
+};
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
@@ -101,6 +106,9 @@ pub struct RunSettings {
     pub trust: TrustTiming,
     pub api_keepalive: Keepalive,
     pub privileged: bool,
+    pub host_users: HostUsersSection,
+    pub host_users_paths: HostUsersPaths,
+    pub accounts: AccountTimings,
 }
 
 impl RunSettings {
@@ -116,6 +124,9 @@ impl RunSettings {
             trust: TRUST_TIMING,
             api_keepalive: API_KEEPALIVE,
             privileged: running_as_root(),
+            host_users: HostUsersSection::default(),
+            host_users_paths: HostUsersPaths::default(),
+            accounts: ACCOUNT_TIMINGS,
         }
     }
 }
@@ -172,10 +183,29 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
         let settings = RunSettings {
             inner: config.inner,
             recording: config.recording,
+            host_users: config.host_users,
             ..RunSettings::new(state_dir)
         };
         run(settings, env, shutdown).await
     })
+}
+
+fn ssh_service(
+    inner_ca: InnerCa,
+    target: InnerTarget,
+    api: Arc<AgentApi>,
+    limits: AgentLimits,
+    observers: Arc<dyn ObserverFactory>,
+    accounts: AccountParts,
+) -> SshService {
+    SshService::new(
+        Arc::new(inner_ca),
+        target,
+        Arc::new(ControlAuthority::new(api)),
+        limits,
+        observers,
+    )
+    .with_account_keeper(Arc::new(AccountService::new(accounts)))
 }
 
 pub async fn run(
@@ -235,12 +265,23 @@ pub async fn run(
         jitter: Arc::new(|| rand::random_range(0.0..=1.0)),
         cast_clocks: RecordingParts::system_cast_clocks(),
     });
-    let service = Arc::new(SshService::new(
-        Arc::new(inner_ca),
+    let availability = Arc::new(Availability::new(
+        &settings.host_users,
+        settings.host_users_paths.clone(),
+    ));
+    let service = Arc::new(ssh_service(
+        inner_ca,
         target,
-        Arc::new(ControlAuthority::new(api.clone())),
+        api.clone(),
         settings.ssh_limits,
         Arc::new(recordings.clone()),
+        AccountParts {
+            availability: availability.clone(),
+            lookup: Arc::new(Getent::system(settings.accounts.lookup)),
+            api: api.clone(),
+            clock: env.clock.clone(),
+            timings: settings.accounts,
+        },
     ));
     match ssh::load_host_identity(&state, now_unix(env.clock.as_ref())) {
         Ok(host) => service.install_host_identity(host),
@@ -252,6 +293,8 @@ pub async fn run(
     }
     let events = tunnel_config.subscribe();
     let trust_events = tunnel_config.subscribe();
+    let capability_events = tunnel_config.subscribe();
+    let capabilities = Arc::new(ControlCapabilities::new(api.clone()));
     tracing::info!(
         target: "jaunt::agent",
         node_id = %record.node_id,
@@ -301,6 +344,13 @@ pub async fn run(
     ));
     let event_log = tokio::spawn(log_tunnel_events(events, stop.child_token()));
     let renewal = tokio::spawn(renewer.run(stop.child_token()));
+    let announcer = tokio::spawn(announce_capabilities(
+        availability,
+        capabilities,
+        capability_events,
+        settings.accounts.announce_every,
+        stop.child_token(),
+    ));
 
     let outcome = tokio::select! {
         () = shutdown.cancelled() => None,
@@ -329,6 +379,9 @@ pub async fn run(
         Err(error) => {
             tracing::error!(target: "jaunt::agent", error = %error, "the trust loading task failed");
         }
+    }
+    if let Err(error) = announcer.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the capability announcement task failed");
     }
     if let Err(error) = event_log.await {
         tracing::error!(target: "jaunt::agent", error = %error, "the tunnel event task failed");

@@ -1,3 +1,5 @@
+mod accounts;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
@@ -9,7 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use jaunt_proto::RenewRequest;
+use jaunt_host_users::HostUsersSection;
+use jaunt_proto::{AGENT_CAPABILITIES_PATH, RenewRequest};
 use jaunt_ssh::SshError;
 use jaunt_tunnel::{BackoffPolicy, NodeId, RegistryEvent, SessionId, StreamKind, StreamMeta};
 use russh::keys::key::safe_rng;
@@ -28,6 +31,7 @@ use super::renew::host_signer;
 use super::{
     RunEnv, RunError, RunSettings, SSH_CONNECTION_WINDOW, SSH_STREAM_WINDOW, run, tunnel_config,
 };
+use crate::accounts::HostUsersPaths;
 use crate::clock::{SystemClock, at_unix_secs};
 use crate::endpoint::AgentEndpoint;
 use crate::enroll::{EnrollEnv, EnrollOptions, enroll};
@@ -191,6 +195,12 @@ async fn gate_and_node(
     let node = enrolled(&pki, &gate.endpoint(), not_before, not_after);
     gate.set_identity(node.identity());
     (pki, gate, node)
+}
+
+fn paths_besides_capabilities(gate: &FakeGate) -> Vec<String> {
+    let mut paths = gate.paths();
+    paths.retain(|path| path != AGENT_CAPABILITIES_PATH);
+    paths
 }
 
 fn node_id() -> NodeId {
@@ -573,7 +583,10 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
     })
     .await;
     assert_eq!(gate.renewals().len(), 1);
-    assert_eq!(gate.paths(), ["/v1/agent/renew", TRUST_PATH, TRUST_V2_PATH]);
+    assert_eq!(
+        paths_besides_capabilities(&gate),
+        ["/v1/agent/renew", TRUST_PATH, TRUST_V2_PATH]
+    );
 
     agent.stop().await;
     gate.stop().await;
@@ -599,7 +612,10 @@ async fn an_expired_certificate_asks_for_reenrollment_without_renewal() {
         })
         .await;
         assert!(gate.renewals().is_empty());
-        assert_eq!(gate.paths(), [TRUST_PATH, TRUST_V2_PATH]);
+        assert_eq!(
+            paths_besides_capabilities(&gate),
+            [TRUST_PATH, TRUST_V2_PATH]
+        );
 
         agent.stop().await;
         gate.stop().await;
@@ -744,6 +760,45 @@ async fn streams_are_refused_until_the_trust_set_loads_and_a_trust_update_refetc
     agent.stop().await;
     gate.stop().await;
     assert_no_key_material(&logs.text(), node.dir.path());
+}
+
+#[tokio::test]
+async fn the_agent_announces_its_capabilities_once_the_tunnel_is_up_and_keeps_repeating() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    let helper = tempfile::tempdir().unwrap();
+    let socket = helper.path().join("h.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let agent = Agent::start_with(
+        &node.path(),
+        ManualClock::new(SystemTime::now()),
+        1.0,
+        |settings| {
+            settings.host_users = HostUsersSection {
+                enabled: true,
+                ..HostUsersSection::default()
+            };
+            settings.host_users_paths = HostUsersPaths {
+                socket,
+                nsswitch: helper.path().join("nsswitch.conf"),
+                sssd_conf: helper.path().join("sssd.conf"),
+            };
+            settings.accounts.announce_every = Duration::from_millis(50);
+        },
+    );
+    gate.wait_connected().await;
+    eventually("repeated announcements despite 404 answers", || {
+        gate.requests(AGENT_CAPABILITIES_PATH).len() >= 3
+    })
+    .await;
+    assert!(gate.requests(AGENT_CAPABILITIES_PATH).iter().all(|seen| {
+        seen.node == node_id()
+            && seen.method == "PUT"
+            && serde_json::from_slice::<serde_json::Value>(&seen.body).unwrap()
+                == json!({"creates_accounts": true})
+    }));
+    agent.stop().await;
+    gate.stop().await;
 }
 
 #[tokio::test]

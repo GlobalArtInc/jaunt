@@ -8,9 +8,9 @@ use jaunt_proto::{
     SessionEndOutcome,
 };
 use jaunt_ssh::{
-    AgentLimits, AuthorityError, HostIdentity, InnerCa, InnerTarget, ObserverFactory,
-    ServerConfigCell, ServerProfile, SessionAuthority, SshError, StreamContext, Terminator,
-    UserCaKeys, UserCaSource, read_pinned_host_key,
+    AccountKeeper, AgentLimits, AuthorityError, HostIdentity, InnerCa, InnerTarget,
+    ObserverFactory, ServerConfigCell, ServerProfile, SessionAuthority, SshError, StreamContext,
+    Terminator, UserCaKeys, UserCaSource, read_pinned_host_key,
 };
 use jaunt_tunnel::{BoxFuture, H2Io, IncomingStream, StreamHandler, StreamMeta};
 use tokio::io::AsyncWriteExt;
@@ -156,6 +156,7 @@ pub struct SshService {
     trust_changed: Arc<Notify>,
     untrusted: Arc<UntrustedRefusals>,
     refused: AtomicU64,
+    accounts: Option<Arc<dyn AccountKeeper>>,
 }
 
 impl SshService {
@@ -177,7 +178,13 @@ impl SshService {
             trust_changed: Arc::new(Notify::new()),
             untrusted: Arc::new(UntrustedRefusals::default()),
             refused: AtomicU64::new(0),
+            accounts: None,
         }
+    }
+
+    pub fn with_account_keeper(mut self, keeper: Arc<dyn AccountKeeper>) -> Self {
+        self.accounts = Some(keeper);
+        self
     }
 
     pub fn trust_changed(&self) -> Arc<Notify> {
@@ -259,6 +266,10 @@ impl SshService {
             Arc::clone(&self.observers),
         )
         .on_untrusted_ca(move || untrusted.record());
+        let terminator = match &self.accounts {
+            Some(keeper) => terminator.with_account_keeper(Arc::clone(keeper)),
+            None => terminator,
+        };
         if self.ready.set(Arc::new(terminator)).is_ok() {
             tracing::info!(target: "jaunt::agent", "the agent now accepts SSH sessions");
         }

@@ -9,10 +9,10 @@ use jaunt_proto::{
     AuthorizeDecision, AuthorizeRequest, BoxFuture, DenyReason, SessionEnd, SessionPermissions,
 };
 use jaunt_ssh::{
-    AgentLimits, AuthorityError, ChannelExit, ChannelStart, ForwardTarget, HostKey, InnerCa,
-    InnerTarget, ObserverFactory, OutputStream, Recording, ServerConfigCell, ServerProfile,
-    SessionAuthority, SessionInfo, SessionObserver, SessionOutcome, StreamContext, TerminalSize,
-    Terminator, TunnelStream, UserCaKeys, UserCaSource,
+    AccountKeeper, AgentLimits, AuthorityError, ChannelExit, ChannelStart, ForwardTarget, HostKey,
+    InnerCa, InnerTarget, ObserverFactory, OutputStream, Recording, ServerConfigCell,
+    ServerProfile, SessionAuthority, SessionInfo, SessionObserver, SessionOutcome, StreamContext,
+    TerminalSize, Terminator, TunnelStream, UserCaKeys, UserCaSource,
 };
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::{Builder, CertType};
@@ -248,6 +248,7 @@ pub struct Options {
     pub slow_observer: bool,
     pub skip_outputs: usize,
     pub end_delay: Duration,
+    pub keeper: Option<Arc<dyn AccountKeeper>>,
 }
 
 impl Default for Options {
@@ -262,6 +263,7 @@ impl Default for Options {
             slow_observer: false,
             skip_outputs: 0,
             end_delay: Duration::ZERO,
+            keeper: None,
         }
     }
 }
@@ -344,6 +346,10 @@ impl Fixture {
             options.limits,
             recorder,
         );
+        let terminator = match options.keeper {
+            Some(keeper) => terminator.with_account_keeper(keeper),
+            None => terminator,
+        };
         let untrusted_ca = Arc::new(AtomicUsize::new(0));
         let refusals = Arc::clone(&untrusted_ca);
         let terminator = Arc::new(terminator.on_untrusted_ca(move || {

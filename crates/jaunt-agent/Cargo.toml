@@ -18,6 +18,7 @@ h2 = "0.4.20"
 hostname = "0.4.2"
 http = "1.5.0"
 httpdate = "1.0.3"
+jaunt-host-users = { workspace = true }
 jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
@@ -33,7 +34,7 @@ sha2 = "0.11.1"
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "getrandom"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7.20", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
@@ -49,4 +50,4 @@ rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "
 russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", default-features = false }
-tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "test-util", "time"] }

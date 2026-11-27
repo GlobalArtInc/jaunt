@@ -56,6 +56,18 @@ pub enum AuthorityError {
     InvalidResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStep {
+    Continue,
+    NoAccount,
+    Refused,
+    Failed,
+}
+
+pub trait AccountKeeper: Send + Sync + 'static {
+    fn ensure<'a>(&'a self, login: &'a str, session_id: &'a str) -> BoxFuture<'a, AccountStep>;
+}
+
 pub trait SessionAuthority: Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -101,6 +113,9 @@ pub enum EndReason {
     Unauthenticated,
     Denied,
     LoginTimeout,
+    NoAccount,
+    AccountRefused,
+    AccountFailed,
     InnerLoginFailed,
     NodeClosed,
     TimeLimit,
@@ -118,6 +133,9 @@ impl EndReason {
             Self::Unauthenticated => "unauthenticated",
             Self::Denied => "denied",
             Self::LoginTimeout => "login_timeout",
+            Self::NoAccount => "no_account",
+            Self::AccountRefused => "account_refused",
+            Self::AccountFailed => "account_failed",
             Self::InnerLoginFailed => "inner_login_failed",
             Self::NodeClosed => "node_closed",
             Self::TimeLimit => "time_limit",
@@ -148,6 +166,7 @@ pub struct Terminator {
     observers: Arc<dyn ObserverFactory>,
     inner_config: Arc<client::Config>,
     untrusted_ca: Option<RefusalHook>,
+    accounts: Option<Arc<dyn AccountKeeper>>,
 }
 
 impl Terminator {
@@ -170,7 +189,13 @@ impl Terminator {
             observers,
             inner_config: Arc::new(inner::client_config()),
             untrusted_ca: None,
+            accounts: None,
         }
+    }
+
+    pub fn with_account_keeper(mut self, keeper: Arc<dyn AccountKeeper>) -> Self {
+        self.accounts = Some(keeper);
+        self
     }
 
     pub fn on_untrusted_ca(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
@@ -219,6 +244,7 @@ impl Terminator {
             observers: Arc::clone(&self.observers),
             inner_config: Arc::clone(&self.inner_config),
             untrusted_ca: self.untrusted_ca.clone(),
+            accounts: self.accounts.clone(),
             limits: self.limits,
             window: config.window_size,
             attempted: false,
@@ -526,6 +552,7 @@ struct Gatekeeper {
     observers: Arc<dyn ObserverFactory>,
     inner_config: Arc<client::Config>,
     untrusted_ca: Option<RefusalHook>,
+    accounts: Option<Arc<dyn AccountKeeper>>,
     limits: AgentLimits,
     window: u32,
     attempted: bool,
@@ -568,6 +595,24 @@ impl Gatekeeper {
             Bounded::Done(Err(_)) => Err("authority_error"),
             Bounded::TimedOut => Err("authorize_timeout"),
             Bounded::Stopped => Err("stopped"),
+        }
+    }
+
+    async fn ensure_account(&self, login: &str) -> Result<(), (EndReason, &'static str)> {
+        let Some(keeper) = &self.accounts else {
+            return Ok(());
+        };
+        let step = self
+            .shared
+            .stop
+            .run_until_cancelled(keeper.ensure(login, &self.shared.session_id))
+            .await;
+        match step {
+            Some(AccountStep::Continue) => Ok(()),
+            Some(AccountStep::NoAccount) => Err((EndReason::NoAccount, "no_account")),
+            Some(AccountStep::Refused) => Err((EndReason::AccountRefused, "account_refused")),
+            Some(AccountStep::Failed) => Err((EndReason::AccountFailed, "account_failed")),
+            None => Err((EndReason::Unauthenticated, "stopped")),
         }
     }
 
@@ -725,6 +770,10 @@ impl server::Handler for Gatekeeper {
             }
         };
         self.shared.authorized.store(true, Ordering::Release);
+        if let Err((reason, code)) = self.ensure_account(login).await {
+            self.shared.end_with(reason);
+            return Ok(self.refuse(code, Some(&identity), login));
+        }
         let inner = match self.inner_login(&identity, login, &permissions).await {
             Ok(inner) => inner,
             Err(reason) => {
