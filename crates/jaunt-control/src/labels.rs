@@ -4,6 +4,7 @@ use std::fmt;
 pub const MAX_LABELS: usize = 16;
 const MAX_KEY_LEN: usize = 63;
 const MAX_VALUE_LEN: usize = 63;
+const RESERVED_KEYS: [&str; 1] = ["name"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum LabelError {
@@ -11,6 +12,10 @@ pub enum LabelError {
     TooMany,
     #[error("a label key must match [a-z][a-z0-9_.-]{{0,62}}")]
     InvalidKey,
+    #[error(
+        "the label key `name` is reserved: policy selectors match it against the resource name"
+    )]
+    ReservedKey,
     #[error("a label value must match [A-Za-z0-9._-]{{0,63}}")]
     InvalidValue,
     #[error("labels must be written as key=value pairs separated by commas")]
@@ -24,6 +29,13 @@ pub struct Labels(BTreeMap<String, String>);
 
 impl Labels {
     pub fn new(map: BTreeMap<String, String>) -> Result<Labels, LabelError> {
+        if map.keys().any(|key| RESERVED_KEYS.contains(&key.as_str())) {
+            return Err(LabelError::ReservedKey);
+        }
+        Labels::stored(map)
+    }
+
+    pub(crate) fn stored(map: BTreeMap<String, String>) -> Result<Labels, LabelError> {
         if map.len() > MAX_LABELS {
             return Err(LabelError::TooMany);
         }
@@ -140,6 +152,32 @@ mod tests {
     }
 
     #[test]
+    fn the_name_key_is_rejected_on_input_and_still_read_from_storage() {
+        assert_eq!(
+            Labels::new(one("name", "web-1")),
+            Err(LabelError::ReservedKey)
+        );
+        assert!(Labels::new(one("names", "x")).is_ok());
+        assert!(Labels::new(one("hostname", "x")).is_ok());
+        let stored = Labels::stored(one("name", "web-1")).expect("stored labels stay readable");
+        assert_eq!(
+            stored.as_map().get("name").map(String::as_str),
+            Some("web-1")
+        );
+        assert_eq!(
+            Labels::stored(one("Name", "x")),
+            Err(LabelError::InvalidKey)
+        );
+        assert!(
+            LabelError::ReservedKey
+                .to_string()
+                .contains("`name` is reserved"),
+            "{}",
+            LabelError::ReservedKey
+        );
+    }
+
+    #[test]
     fn at_most_sixteen_labels_are_accepted() {
         let many = |count: usize| {
             (0..count)
@@ -160,6 +198,7 @@ mod tests {
             ("env=prod,", LabelError::Malformed),
             ("env=a,env=b", LabelError::DuplicateKey),
             ("Env=a", LabelError::InvalidKey),
+            ("env=a,name=web-1", LabelError::ReservedKey),
             ("env=a b", LabelError::InvalidValue),
         ] {
             assert_eq!(Labels::parse_assignments(text), Err(error), "{text:?}");

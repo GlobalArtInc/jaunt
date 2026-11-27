@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 
 use common::{load_err, load_ok, write_dir};
-use jaunt_policy::{Expect, load_dir, run_access_tests};
+use jaunt_policy::{AccessTarget, Expect, load_dir, run_access_tests};
 
 const HEAD: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: r }\n";
 const EMPTY_SET_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -226,8 +226,12 @@ fn access_tests_run_and_catch_disagreement() {
     );
     let set = load_ok(&[("a.yaml", &roles), ("b.yaml", tests)]);
     assert_eq!(set.tests().len(), 5);
-    assert_eq!(set.tests()[0].node.name, "web-1");
-    assert!(!set.tests()[0].node.labels.contains_key("name"));
+    let AccessTarget::Ssh { node, login } = &set.tests()[0].target else {
+        panic!("the first case targets a node");
+    };
+    assert_eq!(node.name, "web-1");
+    assert!(!node.labels.contains_key("name"));
+    assert_eq!(login, "deploy");
     assert_eq!(set.tests()[1].username, "alice");
     assert_eq!(set.tests()[3].expect, Expect::Allow);
 

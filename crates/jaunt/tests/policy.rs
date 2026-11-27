@@ -156,3 +156,21 @@ fn a_literal_root_login_is_a_warning_that_does_not_fail_the_check() {
     assert_eq!(report["warnings"], Value::Array(Vec::new()));
     assert!(!stdout(&check(&[("a.yaml", ROLE)], &[])).contains("WARN"));
 }
+
+#[test]
+fn literal_system_masters_and_postgres_are_warnings_and_service_tests_run() {
+    let services = format!(
+        "{ROLE}  kubernetes: {{ clusters: {{ env: [prod] }}, groups: ['system:masters'] }}\n  databases: {{ servers: {{ env: [prod] }}, users: [postgres], names: ['*'] }}\n"
+    );
+    let tests = "apiVersion: jaunt/v1\nkind: AccessTest\nspec:\n  - { user: alice@example.com, kubernetes: { cluster: { name: prod-eu, env: prod }, groups: ['system:masters'] }, expect: allow }\n  - { user: alice@example.com, database: { server: { name: lk, env: prod }, user: postgres, name: app }, expect: allow }\n";
+    let text = check(&[("a.yaml", &services), ("b.yaml", tests)], &[]);
+    let shown = stdout(&text);
+    assert_eq!(text.status.code(), Some(0), "{shown}");
+    for line in [
+        "WARN role \"ops\": spec.kubernetes.groups grants the privileged literal \"system:masters\"",
+        "WARN role \"ops\": spec.databases.users grants the privileged literal \"postgres\"",
+        "2 tests, 2 passed, 0 failed",
+    ] {
+        assert!(shown.contains(line), "{line} in\n{shown}");
+    }
+}

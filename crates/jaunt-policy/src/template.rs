@@ -74,6 +74,24 @@ impl ValueSpec {
         })
     }
 
+    pub(crate) fn email() -> Self {
+        ValueSpec::Template {
+            prefix: String::new(),
+            source: Trait::Email,
+        }
+    }
+
+    pub(crate) fn drops_invalid(&self, identity: &Identity, target: Target) -> bool {
+        match self {
+            ValueSpec::Literal(_) => false,
+            ValueSpec::Template { prefix, source } => source
+                .values(identity)
+                .iter()
+                .filter(|value| !value.is_empty())
+                .any(|value| !(target.substituted)(&format!("{prefix}{value}"))),
+        }
+    }
+
     pub(crate) fn as_literal(&self) -> Option<&str> {
         match self {
             ValueSpec::Literal(value) => Some(value),

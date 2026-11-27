@@ -29,6 +29,10 @@ pub enum ApproveError {
     Clock,
     #[error("the stored enrollment is not valid")]
     CorruptEnrollment,
+    #[error(
+        "the stored enrollment carries a label key the server no longer accepts; approve it with labels that leave the key out"
+    )]
+    InvalidLabels,
     #[error("the database failed: {0}")]
     Store(#[source] StoreError),
 }
@@ -182,6 +186,9 @@ impl NodeAdmin {
             node_keys::parse_tls(&pending.tls_public_key).ok_or(ApproveError::CorruptEnrollment)?;
         let ssh = node_keys::parse_ssh(&pending.ssh_host_public_key)
             .ok_or(ApproveError::CorruptEnrollment)?;
+        if labels_override.is_none() && Labels::new(pending.labels.clone()).is_err() {
+            return Err(ApproveError::InvalidLabels);
+        }
         let override_map = labels_override.map(Labels::into_map);
 
         let outcome = self
@@ -396,7 +403,7 @@ fn is_valid_approver(approver: &str) -> bool {
 }
 
 fn summary(node: Node) -> Result<NodeSummary, StoreError> {
-    let labels = Labels::new(node.labels)
+    let labels = Labels::stored(node.labels)
         .map_err(|_| StoreError::Corrupt("nodes.labels: not valid".to_owned()))?;
     Ok(NodeSummary {
         id: node.id,
@@ -416,7 +423,7 @@ fn pending_view(enrollment: &Enrollment) -> Result<PendingEnrollment, ApproveErr
     let ssh = node_keys::parse_ssh(&enrollment.ssh_host_public_key)
         .ok_or(ApproveError::CorruptEnrollment)?;
     let labels =
-        Labels::new(enrollment.labels.clone()).map_err(|_| ApproveError::CorruptEnrollment)?;
+        Labels::stored(enrollment.labels.clone()).map_err(|_| ApproveError::CorruptEnrollment)?;
     Ok(PendingEnrollment {
         id: enrollment.id.clone(),
         name: enrollment.name.clone(),

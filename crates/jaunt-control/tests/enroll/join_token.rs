@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::audit::{Captured, start_recording, take_recording};
 use crate::session_support::{
-    LOGIN, NODE_NAME, apply_policy, authorize, holder, node, role, routed, stored,
+    LOGIN, NODE_NAME, apply_policy, authorize, holder, node, raw_pool, role, routed, stored,
 };
 use crate::support::{
     DEFAULT_PEER, Harness, Reply, new_agent, request, send, sha256_hex, verify_node_certificate,
@@ -622,4 +622,34 @@ async fn replacing_a_node_with_a_token_closes_the_old_node_sessions_at_once() {
         )
     );
     assert_eq!(orders[0].sessions[0].session_id, session_id);
+}
+
+#[tokio::test]
+async fn a_token_row_with_a_stored_name_label_enrols_nobody() {
+    let harness = Harness::new().await;
+    let issued = issue(&harness, prefix("web-"), 2, 3600, false).await;
+    sqlx::query("UPDATE join_tokens SET labels = ? WHERE id = ?")
+        .bind(r#"{"env":"prod","name":"legacy"}"#)
+        .bind(&issued.id)
+        .execute(&raw_pool(&harness).await)
+        .await
+        .unwrap();
+
+    let reply = join(&harness, "web-01", &issued.secret).await;
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (StatusCode::BAD_REQUEST, "invalid_labels"),
+        "{}",
+        reply.text()
+    );
+    assert!(
+        harness
+            .store
+            .nodes()
+            .get_active_by_name("web-01")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(token(&harness, &issued.id).await.uses_left, 2);
 }

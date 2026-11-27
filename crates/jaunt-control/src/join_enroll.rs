@@ -11,11 +11,13 @@ use crate::http::{error_response, json_response, server_error};
 use crate::join_secrets;
 use crate::join_token_audit::{self, Refused, Used};
 use crate::join_tokens::{Refusal, admits};
+use crate::labels::Labels;
 use crate::node_audit::{self, EnrollRequested};
 use crate::node_removal;
 use crate::source_ip::Source;
 
 pub(crate) const REFUSED: &str = "join_token_refused";
+const INVALID_LABELS: &str = "invalid_labels";
 const APPROVER_PREFIX: &str = "join-token:";
 
 pub(crate) async fn enroll(
@@ -61,6 +63,14 @@ pub(crate) async fn enroll(
     };
     if let Err(reason) = admits(&token, &valid.name, valid.labels.as_map()) {
         return refuse(reason, Some(&token.id));
+    }
+    if Labels::new(token.labels.clone()).is_err() {
+        tracing::warn!(
+            target: "jaunt::control",
+            join_id = %token.id,
+            "a join token carries a label key the server no longer accepts; the enrolment is refused"
+        );
+        return error_response(StatusCode::BAD_REQUEST, INVALID_LABELS);
     }
     let Ok(handle) = enroll_secrets::issue_handle() else {
         tracing::error!(target: "jaunt::control", "the system entropy source failed");

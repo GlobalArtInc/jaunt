@@ -1,7 +1,9 @@
 use axum::http::StatusCode;
+use jaunt_control::ApproveError;
 use serde_json::json;
 
 use crate::audit::{Captured, start_recording, take_recording};
+use crate::session_support::raw_pool;
 use crate::support::{APPROVER, Harness, new_agent};
 use crate::web_support::{Admin, admin, approve_with, looked_up, lookup, reject_with, web_harness};
 
@@ -380,4 +382,63 @@ async fn a_second_lookup_of_the_same_request_replaces_the_first_intent() {
         approve_with(&harness, &alice, &new, None).await.status,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn a_stored_name_label_is_shown_but_never_approved_onto_a_node() {
+    let harness = web_harness(&[]).await;
+    let alice = approver(&harness).await;
+    let enrolled = harness.enroll("web-01").await;
+    sqlx::query("UPDATE enrollments SET labels = ? WHERE name = ?")
+        .bind(r#"{"env":"prod","name":"legacy"}"#)
+        .bind("web-01")
+        .execute(&raw_pool(&harness).await)
+        .await
+        .unwrap();
+
+    let preview = lookup(&harness, &alice, &enrolled.code).await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.text());
+    assert_eq!(preview.json()["enrolment"]["labels"]["name"], "legacy");
+    let pending = harness.admin.pending(&enrolled.code).await.unwrap();
+    assert_eq!(
+        pending.labels.as_map().get("name").map(String::as_str),
+        Some("legacy")
+    );
+
+    let looked = looked_up(&harness, &alice, &enrolled).await;
+    let shadowing = approve_with(&harness, &alice, &looked, Some(json!({"name": "x"}))).await;
+    assert_eq!(
+        (shadowing.status, shadowing.error_code().as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "invalid_labels")
+    );
+    let as_stored = approve_with(&harness, &alice, &looked, None).await;
+    assert_eq!(
+        (as_stored.status, as_stored.error_code().as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "invalid_labels")
+    );
+    assert!(matches!(
+        harness.admin.approve(&enrolled.code, APPROVER, None).await,
+        Err(ApproveError::InvalidLabels)
+    ));
+    assert!(
+        harness
+            .store
+            .nodes()
+            .get_active_by_name("web-01")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let looked = looked_up(&harness, &alice, &enrolled).await;
+    let fixed = approve_with(&harness, &alice, &looked, Some(json!({"env": "prod"}))).await;
+    assert_eq!(fixed.status, StatusCode::OK, "{}", fixed.text());
+    let node = harness
+        .store
+        .nodes()
+        .get_active_by_name("web-01")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(node.labels, [("env".to_owned(), "prod".to_owned())].into());
 }

@@ -255,7 +255,7 @@ fn a_deny_applies_only_to_members_of_its_role() {
 }
 
 #[test]
-fn deny_rules_are_validated_and_other_kinds_are_unknown_fields() {
+fn ssh_deny_rules_are_validated_and_unknown_kinds_are_rejected() {
     let cases = [
         (
             "{ ssh: { logins: [root] } }",
@@ -290,16 +290,8 @@ fn deny_rules_are_validated_and_other_kinds_are_unknown_fields() {
             "unknown field `portForwarding`",
         ),
         (
-            "{ kubernetes: { clusters: { env: [prod] } } }",
-            "unknown field `kubernetes`",
-        ),
-        (
-            "{ databases: { servers: { env: [prod] } } }",
-            "unknown field `databases`",
-        ),
-        (
-            "{ tcp: { services: { env: [prod] } } }",
-            "unknown field `tcp`",
+            "{ http: { services: { env: [prod] } } }",
+            "unknown field `http`",
         ),
     ];
     for (deny, fragment) in cases {

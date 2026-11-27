@@ -205,6 +205,7 @@ fn lookup_refusal(err: &ApproveError) -> Option<Response> {
         | ApproveError::InvalidApprover
         | ApproveError::Clock
         | ApproveError::CorruptEnrollment
+        | ApproveError::InvalidLabels
         | ApproveError::Store(_) => None,
     }
 }
@@ -217,6 +218,7 @@ fn decision_refusal(err: &ApproveError) -> Option<Response> {
         ApproveError::Rejected => Some(conflict("enrolment_rejected")),
         ApproveError::AlreadyApproved => Some(conflict("already_approved")),
         ApproveError::NameTaken(_) => Some(conflict("name_taken")),
+        ApproveError::InvalidLabels => Some(invalid_value("invalid_labels")),
         ApproveError::InvalidApprover
         | ApproveError::Clock
         | ApproveError::CorruptEnrollment

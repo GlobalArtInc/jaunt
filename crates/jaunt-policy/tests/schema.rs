@@ -1,5 +1,8 @@
 #![cfg(feature = "schema")]
 
+use std::fs;
+use std::path::Path;
+
 use jaunt_policy::{policy_schema, policy_schema_pretty};
 use serde_json::Value;
 
@@ -59,7 +62,7 @@ fn schema_accepts_valid_documents_and_rejects_deviations() {
         ),
         (
             "deny of an unknown kind",
-            format!("{ROLE}  deny: {{ kubernetes: {{ clusters: {{ env: [prod] }} }} }}\n"),
+            format!("{ROLE}  deny: {{ http: {{ services: {{ env: [prod] }} }} }}\n"),
         ),
         (
             "deny with an allow-only field",
@@ -106,9 +109,99 @@ fn schema_definitions_have_public_names() {
         "RoleSpec",
         "RoleDeny",
         "RoleDenySsh",
+        "RoleKubernetes",
+        "RoleDatabases",
+        "RoleTcp",
+        "RoleDenyKubernetes",
+        "RoleDenyDatabases",
         "AccessTestCase",
+        "AccessTestKubernetes",
+        "AccessTestDatabase",
+        "AccessTestTcp",
         "AdminPermission",
     ] {
         assert!(definitions.contains_key(name), "{name} is missing");
+    }
+}
+
+const SERVICES_ROLE: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: platform }\nspec:\n  members: { groups: [platform] }\n  kubernetes: { clusters: { env: [prod] }, groups: [view, 'oidc:{groups}'], users: ['{email}'], recordExec: true, recordInput: false }\n  databases: { servers: { env: [prod] }, users: [readonly, '{username}'], names: ['*'] }\n  tcp: { services: { team: [ops] } }\n  deny:\n    kubernetes: { clusters: { name: [prod-ru] }, groups: ['system:masters'] }\n    databases: { servers: { env: [prod] }, users: [postgres] }\n    tcp: { services: { name: [vault] } }\n";
+const SERVICE_TESTS: &str = "apiVersion: jaunt/v1\nkind: AccessTest\nspec:\n  - { user: a@b.c, kubernetes: { cluster: { name: prod-eu, env: prod }, user: a@b.c, groups: [view] }, expect: allow }\n  - { user: a@b.c, database: { server: { name: lk, env: prod }, user: readonly, name: app }, grants: [], expect: allow }\n  - { user: a@b.c, tcp: { service: { name: grafana, team: ops } }, expect: allow }\n";
+
+#[test]
+fn schema_covers_the_service_blocks_and_one_target_per_access_test() {
+    let validator = jsonschema::validator_for(&policy_schema()).expect("schema must compile");
+    assert!(valid(&validator, SERVICES_ROLE));
+    assert!(valid(&validator, SERVICE_TESTS));
+
+    let tcp_case = "{ user: a@b.c, tcp: { service: { name: grafana, team: ops } }, expect: allow }";
+    let rejected = [
+        (
+            "unknown kubernetes field",
+            SERVICES_ROLE.replace("recordInput: false", "resources: [pods]"),
+        ),
+        (
+            "deny with an allow-only kubernetes field",
+            SERVICES_ROLE.replace(
+                "groups: ['system:masters']",
+                "groups: ['system:masters'], recordExec: false",
+            ),
+        ),
+        (
+            "non-empty grants",
+            SERVICE_TESTS.replace("grants: []", "grants: [dba]"),
+        ),
+        (
+            "two targets in one case",
+            SERVICE_TESTS.replace(
+                tcp_case,
+                "{ user: a@b.c, tcp: { service: { name: g } }, node: { env: prod }, login: deploy, expect: allow }",
+            ),
+        ),
+        (
+            "node without login",
+            SERVICE_TESTS.replace(tcp_case, "{ user: a@b.c, node: { env: prod }, expect: allow }"),
+        ),
+        (
+            "no target",
+            SERVICE_TESTS.replace(tcp_case, "{ user: a@b.c, expect: allow }"),
+        ),
+        (
+            "database case without a name",
+            SERVICE_TESTS.replace(", name: app }", " }"),
+        ),
+    ];
+    for (label, document) in rejected {
+        assert!(!valid(&validator, &document), "{label} must be rejected");
+    }
+}
+
+fn yaml_documents(text: &str) -> Vec<Value> {
+    serde_saphyr::from_multiple(text).expect("example file must parse")
+}
+
+#[test]
+fn repository_example_policy_files_validate_against_the_schema() {
+    let validator = jsonschema::validator_for(&policy_schema()).expect("schema must compile");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = [
+        "deploy/policy/roles.example.yaml",
+        "e2e/fixtures/policy/roles.yaml",
+        "e2e/fixtures/policy/access-tests.yaml",
+    ];
+    for file in files {
+        let text = fs::read_to_string(root.join(file)).expect("example file must exist");
+        let documents = yaml_documents(&text);
+        assert!(!documents.is_empty(), "{file} has no documents");
+        for (index, document) in documents.iter().enumerate() {
+            let errors: Vec<String> = validator
+                .iter_errors(document)
+                .map(|error| error.to_string())
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "{file} document {}: {errors:?}",
+                index + 1
+            );
+        }
     }
 }

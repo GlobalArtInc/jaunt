@@ -4,13 +4,32 @@ use std::collections::BTreeSet;
 use jaunt_proto::{is_portable_login, is_valid_substituted_login};
 
 use crate::access_test::AccessTest;
-use crate::model::{AdminPermission, Identity, NodeInfo, PolicyWarning, RoleAccess, SshDecision};
+use crate::model::{
+    AdminPermission, GrantPrincipals, Identity, NodeInfo, PolicyWarning, ResourceKind, RoleAccess,
+    SshDecision,
+};
+use crate::services::{DbDenyRule, DbRule, KubeDenyRule, KubeRule, TcpDenyRule, TcpRule};
 use crate::template::{Target, ValueSpec};
 
 pub(crate) const ANY_VALUE: &str = "*";
 pub(crate) const NAME_PSEUDO_LABEL: &str = "name";
 const SSH_LOGINS_FIELD: &str = "spec.ssh.logins";
+const KUBE_GROUPS_FIELD: &str = "spec.kubernetes.groups";
+const DB_USERS_FIELD: &str = "spec.databases.users";
 const PRIVILEGED_SSH_LOGINS: [&str; 1] = ["root"];
+const PRIVILEGED_KUBE_GROUPS: [&str; 3] =
+    ["system:masters", "system:authenticated", "system:nodes"];
+const PRIVILEGED_DB_USERS: [&str; 1] = ["postgres"];
+
+fn privileged<'a>(
+    specs: &'a [ValueSpec],
+    reserved: &'a [&'a str],
+) -> impl Iterator<Item = &'a str> + 'a {
+    specs
+        .iter()
+        .filter_map(ValueSpec::as_literal)
+        .filter(move |value| reserved.contains(value))
+}
 
 fn is_login_prefix(prefix: &str) -> bool {
     is_portable_login(&format!("{prefix}a"))
@@ -48,7 +67,7 @@ impl LabelRequirement {
     }
 }
 
-fn selector_matches(selector: &[LabelRequirement], node: &NodeInfo) -> bool {
+pub(crate) fn selector_matches(selector: &[LabelRequirement], node: &NodeInfo) -> bool {
     !selector.is_empty() && selector.iter().all(|req| req.matches(node))
 }
 
@@ -61,7 +80,7 @@ pub(crate) struct SshRule {
 }
 
 impl SshRule {
-    fn matches_node(&self, node: &NodeInfo) -> bool {
+    pub(crate) fn matches_node(&self, node: &NodeInfo) -> bool {
         selector_matches(&self.nodes, node)
     }
 
@@ -76,33 +95,49 @@ impl SshRule {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum DeniedLogins {
+pub(crate) enum DeniedValues {
     Any,
     Listed(BTreeSet<String>),
+}
+
+impl DeniedValues {
+    pub(crate) fn covers(&self, value: &str) -> bool {
+        match self {
+            DeniedValues::Any => true,
+            DeniedValues::Listed(values) => values.contains(value),
+        }
+    }
+
+    pub(crate) fn listed(&self) -> Option<Vec<String>> {
+        match self {
+            DeniedValues::Any => None,
+            DeniedValues::Listed(values) => Some(values.iter().cloned().collect()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SshDenyRule {
     pub(crate) nodes: Vec<LabelRequirement>,
-    pub(crate) logins: DeniedLogins,
+    pub(crate) logins: DeniedValues,
 }
 
 impl SshDenyRule {
-    fn matches_node(&self, node: &NodeInfo) -> bool {
+    pub(crate) fn matches_node(&self, node: &NodeInfo) -> bool {
         selector_matches(&self.nodes, node)
     }
 
     fn covers(&self, login: &str) -> bool {
-        match &self.logins {
-            DeniedLogins::Any => true,
-            DeniedLogins::Listed(logins) => logins.contains(login),
-        }
+        self.logins.covers(login)
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RoleDeny {
     pub(crate) ssh: Option<SshDenyRule>,
+    pub(crate) kubernetes: Option<KubeDenyRule>,
+    pub(crate) databases: Option<DbDenyRule>,
+    pub(crate) tcp: Option<TcpDenyRule>,
 }
 
 struct SshDenials<'a>(Vec<&'a SshDenyRule>);
@@ -119,6 +154,9 @@ pub(crate) struct Role {
     pub(crate) users: BTreeSet<String>,
     pub(crate) groups: BTreeSet<String>,
     pub(crate) ssh: Option<SshRule>,
+    pub(crate) kubernetes: Option<KubeRule>,
+    pub(crate) databases: Option<DbRule>,
+    pub(crate) tcp: Option<TcpRule>,
     pub(crate) deny: RoleDeny,
     pub(crate) admin: BTreeSet<AdminPermission>,
 }
@@ -149,7 +187,10 @@ impl PolicySet {
         }
     }
 
-    fn applicable_roles<'a>(&'a self, identity: &'a Identity) -> impl Iterator<Item = &'a Role> {
+    pub(crate) fn applicable_roles<'a>(
+        &'a self,
+        identity: &'a Identity,
+    ) -> impl Iterator<Item = &'a Role> {
         self.roles.iter().filter(|role| role.applies_to(identity))
     }
 
@@ -218,24 +259,26 @@ impl PolicySet {
     }
 
     pub fn roles_reaching(&self, node: &NodeInfo) -> Vec<RoleAccess> {
-        let mut reaching: Vec<RoleAccess> = self
-            .roles
-            .iter()
-            .filter_map(|role| {
-                let rule = role.ssh.as_ref().filter(|rule| rule.matches_node(node))?;
-                Some(RoleAccess {
-                    role: role.name.clone(),
-                    users: role.users.iter().cloned().collect(),
-                    groups: role.groups.iter().cloned().collect(),
-                    logins: rule.logins.iter().map(ValueSpec::as_written).collect(),
-                    port_forwarding: rule.port_forwarding,
-                    record_input: rule.record_input,
-                    admin: role.admin.iter().copied().collect(),
-                })
+        self.roles_reaching_resource(ResourceKind::Node, node)
+            .allows
+            .into_iter()
+            .filter_map(|grant| match grant.principals {
+                GrantPrincipals::Ssh {
+                    logins,
+                    port_forwarding,
+                    record_input,
+                } => Some(RoleAccess {
+                    role: grant.role,
+                    users: grant.users,
+                    groups: grant.groups,
+                    logins,
+                    port_forwarding,
+                    record_input,
+                    admin: grant.admin,
+                }),
+                _ => None,
             })
-            .collect();
-        reaching.sort_by(|left, right| left.role.cmp(&right.role));
-        reaching
+            .collect()
     }
 
     pub fn admin_can(&self, identity: &Identity, permission: AdminPermission) -> bool {
@@ -248,14 +291,27 @@ impl PolicySet {
         self.roles
             .iter()
             .flat_map(|role| {
-                role.ssh
+                let ssh = role
+                    .ssh
                     .iter()
-                    .flat_map(|rule| rule.logins.iter().filter_map(ValueSpec::as_literal))
-                    .filter(|login| PRIVILEGED_SSH_LOGINS.contains(login))
-                    .map(|login| PolicyWarning {
+                    .flat_map(|rule| privileged(&rule.logins, &PRIVILEGED_SSH_LOGINS))
+                    .map(|value| (SSH_LOGINS_FIELD, value));
+                let kube = role
+                    .kubernetes
+                    .iter()
+                    .flat_map(|rule| privileged(&rule.groups, &PRIVILEGED_KUBE_GROUPS))
+                    .map(|value| (KUBE_GROUPS_FIELD, value));
+                let db = role
+                    .databases
+                    .iter()
+                    .flat_map(|rule| privileged(&rule.users, &PRIVILEGED_DB_USERS))
+                    .map(|value| (DB_USERS_FIELD, value));
+                ssh.chain(kube)
+                    .chain(db)
+                    .map(|(field, value)| PolicyWarning {
                         role: role.name.clone(),
-                        field: SSH_LOGINS_FIELD,
-                        value: login.to_owned(),
+                        field,
+                        value: value.to_owned(),
                     })
             })
             .collect()

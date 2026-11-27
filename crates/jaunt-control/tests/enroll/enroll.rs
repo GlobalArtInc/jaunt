@@ -89,6 +89,7 @@ async fn invalid_requests_are_refused_with_the_field_that_failed() {
         json!({"env": "a b"}),
         json!({"1env": "x"}),
         json!({"env": "x".repeat(64)}),
+        json!({"env": "prod", "name": "web-01"}),
     ] {
         cases.push(("labels", with("labels", labels), "invalid_labels"));
     }

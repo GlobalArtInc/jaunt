@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::audit::{start_recording, take_recording};
 use crate::session_support::{
-    LOGIN, NODE_NAME, apply_policy, authorize, holder, node, role, routed, stored,
+    LOGIN, NODE_NAME, apply_policy, authorize, holder, node, raw_pool, role, routed, stored,
 };
 use crate::support::{APPROVER, Harness};
 use crate::web_support::{ADMIN_ROLES, admin, delete, get, web_harness};
@@ -400,5 +400,39 @@ async fn the_agent_version_outlives_the_enrolment_row_and_a_removed_node_has_no_
     assert_eq!(
         (removed.status, removed.error_code().as_str()),
         (StatusCode::NOT_FOUND, "not_found")
+    );
+}
+
+#[tokio::test]
+async fn a_node_with_a_stored_name_label_is_still_listed_shown_and_found() {
+    let harness = web_harness(&[]).await;
+    let alice = admin(&harness, "approver").await;
+    let node_id = node(&harness, "web-01").await;
+    node(&harness, "db-01").await;
+    sqlx::query("UPDATE nodes SET labels = ? WHERE id = ?")
+        .bind(r#"{"env":"prod","name":"legacy"}"#)
+        .bind(&node_id)
+        .execute(&raw_pool(&harness).await)
+        .await
+        .unwrap();
+
+    let all = list(&harness, &alice, "").await;
+    assert_eq!(names(&all), ["db-01", "web-01"]);
+    assert_eq!(
+        names(&list(&harness, &alice, "?label=name:legacy").await),
+        ["web-01"]
+    );
+    assert!(names(&list(&harness, &alice, "?label=name:other").await).is_empty());
+    let reply = get(&harness, &format!("/v1/admin/nodes/{node_id}"), &alice).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["labels"]["name"], "legacy");
+    let listed = harness.admin.list_nodes().await.unwrap();
+    let legacy = listed
+        .iter()
+        .find(|listing| listing.node.id == node_id)
+        .unwrap();
+    assert_eq!(
+        legacy.node.labels.as_map().get("name").map(String::as_str),
+        Some("legacy")
     );
 }

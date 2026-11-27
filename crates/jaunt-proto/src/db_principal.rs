@@ -45,14 +45,13 @@ pub fn is_valid_substituted_db_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_DB_IDENTIFIER_BYTES, is_db_name, is_db_user, is_valid_substituted_db_name,
-        is_valid_substituted_db_user,
+        is_db_name, is_db_user, is_valid_substituted_db_name, is_valid_substituted_db_user,
     };
 
     #[test]
     fn db_users_follow_the_literal_and_the_stricter_substituted_grammar() {
-        let longest = format!("a{}", "b".repeat(MAX_DB_IDENTIFIER_BYTES - 1));
-        let too_long = format!("a{}", "b".repeat(MAX_DB_IDENTIFIER_BYTES));
+        let longest = format!("a{}", "b".repeat(62));
+        let too_long = format!("a{}", "b".repeat(63));
         for (value, literal, substituted) in [
             ("readonly", true, true),
             ("_app", true, true),
@@ -92,8 +91,8 @@ mod tests {
 
     #[test]
     fn db_names_follow_the_literal_and_the_stricter_substituted_grammar() {
-        let longest = "a".repeat(MAX_DB_IDENTIFIER_BYTES);
-        let too_long = "a".repeat(MAX_DB_IDENTIFIER_BYTES + 1);
+        let longest = "a".repeat(63);
+        let too_long = "a".repeat(64);
         for (value, literal, substituted) in [
             ("app", true, true),
             ("_app.v2-x", true, true),

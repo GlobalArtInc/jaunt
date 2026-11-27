@@ -435,7 +435,7 @@ fn label_filter(value: &str) -> Result<(String, String), Refusal> {
     let (key, wanted) = value
         .split_once(':')
         .ok_or(Refusal::Invalid("invalid_label"))?;
-    Labels::new(BTreeMap::from([(key.to_owned(), wanted.to_owned())]))
+    Labels::stored(BTreeMap::from([(key.to_owned(), wanted.to_owned())]))
         .map_err(|_| Refusal::Invalid("invalid_label"))?;
     Ok((key.to_owned(), wanted.to_owned()))
 }

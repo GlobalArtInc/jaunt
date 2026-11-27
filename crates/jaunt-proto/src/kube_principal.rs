@@ -22,12 +22,12 @@ pub fn is_valid_substituted_kube_principal(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_KUBE_PRINCIPAL_BYTES, is_kube_principal, is_valid_substituted_kube_principal};
+    use super::{is_kube_principal, is_valid_substituted_kube_principal};
 
     #[test]
     fn kube_principals_follow_the_grammar_and_reserved_names_are_literal_only() {
-        let longest = "a".repeat(MAX_KUBE_PRINCIPAL_BYTES);
-        let too_long = "a".repeat(MAX_KUBE_PRINCIPAL_BYTES + 1);
+        let longest = "a".repeat(253);
+        let too_long = "a".repeat(254);
         for (value, literal, substituted) in [
             ("view", true, true),
             ("alice@example.com", true, true),

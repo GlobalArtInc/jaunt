@@ -17,12 +17,121 @@ pub struct NodeInfo {
     pub labels: BTreeMap<String, String>,
 }
 
+pub type ResourceInfo = NodeInfo;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Node,
+    KubernetesCluster,
+    DatabaseServer,
+    TcpService,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshDecision {
     pub allowed: bool,
     pub port_forwarding: bool,
     pub record_input: bool,
     pub roles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KubeDecision {
+    pub allowed: bool,
+    pub roles: Vec<String>,
+    pub denied_by: Vec<String>,
+    pub subtracted_by: Vec<String>,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+    pub record_exec: bool,
+    pub record_input: bool,
+    pub trait_not_valid: bool,
+    pub policy_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbDecision {
+    pub allowed: bool,
+    pub roles: Vec<String>,
+    pub denied_by: Vec<String>,
+    pub users: Vec<String>,
+    pub names: Vec<String>,
+    pub trait_not_valid: bool,
+    pub policy_hash: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TcpDecision {
+    pub allowed: bool,
+    pub roles: Vec<String>,
+    pub denied_by: Vec<String>,
+    pub policy_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantPrincipals {
+    Ssh {
+        logins: Vec<String>,
+        port_forwarding: bool,
+        record_input: bool,
+    },
+    Kubernetes {
+        users: Vec<String>,
+        groups: Vec<String>,
+        record_exec: bool,
+        record_input: bool,
+    },
+    Database {
+        users: Vec<String>,
+        names: Vec<String>,
+    },
+    Tcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeniedSet {
+    Absent,
+    Any,
+    Listed(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeniedPrincipals {
+    Ssh {
+        logins: Option<Vec<String>>,
+    },
+    Kubernetes {
+        users: DeniedSet,
+        groups: DeniedSet,
+    },
+    Database {
+        users: Option<Vec<String>>,
+        names: Option<Vec<String>>,
+    },
+    Tcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleGrant {
+    pub role: String,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+    pub admin: Vec<AdminPermission>,
+    pub principals: GrantPrincipals,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDenial {
+    pub role: String,
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+    pub principals: DeniedPrincipals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceReach {
+    pub allows: Vec<RoleGrant>,
+    pub denies: Vec<RoleDenial>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
