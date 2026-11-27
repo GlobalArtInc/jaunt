@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::AGENT_VERSION;
 use crate::accounts::{
     ACCOUNT_TIMINGS, AccountParts, AccountService, AccountTimings, Availability,
-    ControlCapabilities, Getent, HostUsersPaths, announce_capabilities,
+    ControlCapabilities, Getent, HostUsersPaths, PasswdLookup, announce_capabilities,
 };
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
@@ -144,6 +144,7 @@ impl RunSettings {
 pub struct RunEnv {
     pub clock: Arc<dyn Clock>,
     pub jitter: Box<dyn FnMut() -> f64 + Send + Sync>,
+    pub passwd: Option<Arc<dyn PasswdLookup>>,
 }
 
 pub fn command(args: &RunArgs) -> ExitCode {
@@ -198,6 +199,7 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
         let env = RunEnv {
             clock: Arc::new(SystemClock),
             jitter: Box::new(|| rand::random_range(0.0..=1.0)),
+            passwd: None,
         };
         let settings = RunSettings {
             inner: config.inner,
@@ -285,6 +287,9 @@ pub async fn run(
         jitter: Arc::new(|| rand::random_range(0.0..=1.0)),
         cast_clocks: RecordingParts::system_cast_clocks(),
     });
+    let passwd = env
+        .passwd
+        .unwrap_or_else(|| Arc::new(Getent::system(settings.accounts.lookup)));
     let availability = Arc::new(Availability::new(
         &settings.host_users,
         settings.host_users_paths.clone(),
@@ -297,7 +302,7 @@ pub async fn run(
         Arc::new(recordings.clone()),
         AccountParts {
             availability: availability.clone(),
-            lookup: Arc::new(Getent::system(settings.accounts.lookup)),
+            lookup: passwd,
             api: api.clone(),
             clock: env.clock.clone(),
             timings: settings.accounts,

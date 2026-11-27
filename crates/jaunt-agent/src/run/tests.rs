@@ -11,12 +11,14 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use jaunt_host_users::HostUsersSection;
+use jaunt_host_users::{HostUsersSection, Name};
 use jaunt_proto::{
     AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, RenewRequest, ServiceAnnouncement,
 };
 use jaunt_ssh::SshError;
-use jaunt_tunnel::{BackoffPolicy, NodeId, RegistryEvent, SessionId, StreamKind, StreamMeta};
+use jaunt_tunnel::{
+    BackoffPolicy, BoxFuture, NodeId, RegistryEvent, SessionId, StreamKind, StreamMeta,
+};
 use russh::keys::key::safe_rng;
 use russh::keys::ssh_key::certificate::{Builder, CertType};
 use russh::keys::{Algorithm, Certificate, PrivateKey, PublicKeyOrCertificate};
@@ -33,7 +35,7 @@ use super::renew::host_signer;
 use super::{
     RunEnv, RunError, RunSettings, SSH_CONNECTION_WINDOW, SSH_STREAM_WINDOW, run, tunnel_config,
 };
-use crate::accounts::HostUsersPaths;
+use crate::accounts::{HostUsersPaths, LookupError, PasswdLookup, Presence};
 use crate::clock::{SystemClock, at_unix_secs};
 use crate::endpoint::AgentEndpoint;
 use crate::enroll::{EnrollEnv, EnrollOptions, enroll};
@@ -49,6 +51,14 @@ use crate::testkit::{
 use crate::trust::TrustTiming;
 
 const HOUR: i64 = 3600;
+
+struct EveryoneExists;
+
+impl PasswdLookup for EveryoneExists {
+    fn passwd<'a>(&'a self, _login: &'a Name) -> BoxFuture<'a, Result<Presence, LookupError>> {
+        Box::pin(async { Ok(Presence::Present) })
+    }
+}
 
 struct Agent {
     shutdown: CancellationToken,
@@ -101,6 +111,7 @@ impl Agent {
         let env = RunEnv {
             clock,
             jitter: Box::new(move || sample),
+            passwd: Some(Arc::new(EveryoneExists)),
         };
         let shutdown = CancellationToken::new();
         let join = tokio::spawn(run(settings, env, shutdown.clone()));
@@ -312,6 +323,7 @@ async fn run_refuses_to_start_without_an_enrollment() {
     let env = RunEnv {
         clock: Arc::new(SystemClock),
         jitter: Box::new(|| 0.5),
+        passwd: None,
     };
     let error = run(
         RunSettings::new(dir.path().to_path_buf()),
@@ -651,6 +663,7 @@ async fn run_refuses_to_start_without_a_usable_sshd_host_key() {
     let env = || RunEnv {
         clock: Arc::new(SystemClock),
         jitter: Box::new(|| 0.5),
+        passwd: None,
     };
     let missing = settings(&node.path(), sshd.path().join("missing.pub"));
     let error = soon("the refusal", run(missing, env(), CancellationToken::new()))
