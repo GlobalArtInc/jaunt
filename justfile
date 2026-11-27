@@ -5,7 +5,7 @@ lint:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
 test:
-    cargo test --workspace --locked
+    cargo test --workspace --locked --no-fail-fast
     cargo test --release -p jaunt-ca --locked
 
 deny:
