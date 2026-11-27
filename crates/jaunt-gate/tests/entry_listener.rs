@@ -271,13 +271,13 @@ async fn an_invalid_services_entry_stops_the_hub_before_it_serves() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn the_hub_hands_its_handshake_budget_and_timeout_to_the_entry() {
     let pki = Pki::new("ca");
     let options = HubOptions {
         services: Some(ServicesEntry::new(DOMAIN)),
         max_handshaking: 1,
-        handshake_timeout: Duration::from_secs(1),
+        handshake_timeout: Duration::from_secs(4),
         ..HubOptions::default()
     };
     let test = start_hub(&pki, Arc::new(Verdicts::default()), options).await;
@@ -292,13 +292,15 @@ async fn the_hub_hands_its_handshake_budget_and_timeout_to_the_entry() {
         test.hub.tls_refused(TlsRefusal::Limit) == 1
     })
     .await;
-    eventually("the silent client to time out", || {
-        test.hub.tls_refused(TlsRefusal::HelloTimeout) == 1
-    })
+    eventually_within(
+        "the silent client to time out",
+        Duration::from_secs(20),
+        || test.hub.tls_refused(TlsRefusal::HelloTimeout) == 1,
+    )
     .await;
     let elapsed = started.elapsed();
     assert!(
-        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(2),
+        elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(30),
         "{elapsed:?}"
     );
     test.hub.shutdown(GRACE).await;

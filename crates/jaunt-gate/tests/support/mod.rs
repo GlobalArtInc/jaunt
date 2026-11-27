@@ -433,8 +433,12 @@ pub fn node(name: &str) -> NodeId {
     NodeId::new(name).unwrap()
 }
 
-pub async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT_LIMIT;
+pub async fn eventually(what: &str, condition: impl FnMut() -> bool) {
+    eventually_within(what, WAIT_LIMIT, condition).await;
+}
+
+pub async fn eventually_within(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(5)).await;
