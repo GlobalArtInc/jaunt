@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -248,6 +248,15 @@ async fn the_creates_accounts_flag_lives_only_as_long_as_the_connection_it_was_a
     assert_eq!(flag().await, false);
     *presence.0.lock().unwrap() = Some(SystemTime::now() + Duration::from_secs(3600));
     assert_eq!(flag().await, false);
+
+    *presence.0.lock().unwrap() = None;
+    send(harness.agent_router.clone(), announce(&node_id, true)).await;
+    assert_eq!(flag().await, false);
+    let registered = UNIX_EPOCH
+        + Duration::from_secs(u64::try_from(harness.clock.now_secs()).unwrap())
+        + Duration::from_millis(5);
+    *presence.0.lock().unwrap() = Some(registered);
+    assert_eq!(flag().await, true);
 
     let mut unsigned = announce(&node_id, true);
     unsigned.extensions_mut().remove::<AuthenticatedNode>();

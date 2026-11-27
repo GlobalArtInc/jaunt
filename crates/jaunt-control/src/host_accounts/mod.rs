@@ -138,10 +138,13 @@ pub(crate) async fn capabilities(
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return server_error();
     };
-    control
-        .host_accounts
-        .capabilities
-        .announce(&node_id, request.creates_accounts, now.system);
+    let connection = control.presence.connected_since(&node_id);
+    control.host_accounts.capabilities.announce(
+        &node_id,
+        request.creates_accounts,
+        connection,
+        now.system,
+    );
     empty_response(StatusCode::NO_CONTENT)
 }
 
