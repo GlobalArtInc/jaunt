@@ -13,7 +13,7 @@ use ipnet::IpNet;
 use jaunt_ca::CaError;
 use jaunt_control::{Clock, Control, REVOCATION_WATCH_INTERVAL, SESSION_SWEEP_INTERVAL};
 use jaunt_gate::{
-    AgentHub, AgentHubConfig, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS,
+    AgentHub, AgentHubConfig, ClassHandlers, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS,
     DEFAULT_KUBE_CLIENT_LIMITS, HubError, HubStatsSnapshot, ServicesEntry, ShutdownReport,
     TlsRefusal,
 };
@@ -277,6 +277,10 @@ impl AgentServer {
 
     pub fn tls_refused(&self, reason: TlsRefusal) -> u64 {
         self.hub.tls_refused(reason)
+    }
+
+    pub fn install_class_handlers(&self, handlers: ClassHandlers) -> bool {
+        self.hub.install_class_handlers(handlers)
     }
 
     pub fn certificate_not_after(&self) -> SystemTime {

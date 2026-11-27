@@ -22,7 +22,7 @@ use jaunt_gate::{
 };
 use jaunt_tunnel::{
     ALPN_TUNNEL, BackoffPolicy, BoxFuture, IncomingStream, NodeId, PeerAuthenticator, RejectReason,
-    Rejection, StreamHandler, TunnelClient, TunnelClientConfig, agent_client_config,
+    Rejection, ServedKinds, StreamHandler, TunnelClient, TunnelClientConfig, agent_client_config,
     agent_server_config,
 };
 use rcgen::{
@@ -301,9 +301,20 @@ pub fn spawn_agent_with(
     leaf: &Leaf,
     handler: Arc<dyn StreamHandler>,
 ) -> TestAgent {
+    spawn_agent_serving(addr, pki, leaf, handler, ServedKinds::default())
+}
+
+pub fn spawn_agent_serving(
+    addr: SocketAddr,
+    pki: &Pki,
+    leaf: &Leaf,
+    handler: Arc<dyn StreamHandler>,
+    served: ServedKinds,
+) -> TestAgent {
     let tls = agent_client_config(pki.roots(), leaf.chain.clone(), leaf.key()).unwrap();
     let mut config =
         TunnelClientConfig::new(Arc::new(tls), addr.to_string(), AGENT_SNI, "test-agent/1");
+    config.served_kinds = served;
     config.backoff = BackoffPolicy {
         initial: Duration::from_millis(20),
         max: Duration::from_millis(200),

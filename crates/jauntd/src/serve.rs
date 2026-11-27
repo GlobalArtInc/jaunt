@@ -10,6 +10,7 @@ use jaunt_ca::{Signer, TrustSet};
 use jaunt_control::{
     Control, ControlError, ControlParts, PENDING_CAPACITY, WebTerminalSettings, system_clock,
 };
+use jaunt_gate::ServiceGateError;
 use jaunt_limits::AddressLimits;
 use jaunt_oidc::{OidcClient, OidcError};
 use jaunt_policy::Watcher;
@@ -20,6 +21,7 @@ use jauntd::agents::{
     AgentServer, AgentServerParts, AgentsError, AgentsSettings, SHUTDOWN_GRACE, ServicesSettings,
 };
 use jauntd::ca_reload::{CaReloadParts, CaReloader, CaWatcher, IdentityEnv, RELOAD_INTERVAL};
+use jauntd::gate_services::{GateServices, GateServicesParts};
 use jauntd::gate_ssh::{
     GateSshError, GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer,
 };
@@ -83,6 +85,8 @@ pub enum ServeError {
     GateTrust(String),
     #[error(transparent)]
     Gate(#[from] GateSshError),
+    #[error("cannot start the gate services on the agents' listener: {0}")]
+    Services(#[from] ServiceGateError),
     #[error("cannot start the audit pipeline: {0}")]
     Audit(#[from] AuditStartError),
     #[error(transparent)]
@@ -166,6 +170,10 @@ async fn serve(
             return Err(err);
         }
     };
+    let services_domain = entry
+        .services
+        .as_ref()
+        .map(|services| services.domain.clone());
     let agents = match start_agents(agents, entry, &control, store).await {
         Ok(agents) => agents,
         Err(err) => {
@@ -185,6 +193,21 @@ async fn serve(
             return Err(err);
         }
     };
+    let services =
+        match start_services(services_domain, agents.as_ref(), gate.as_ref(), &control).await {
+            Ok(services) => services,
+            Err(err) => {
+                if let Some(gate) = gate {
+                    gate.shutdown(SHUTDOWN_GRACE).await;
+                }
+                if let Some(agents) = agents {
+                    agents.shutdown(SHUTDOWN_GRACE).await;
+                }
+                policy::stop_watcher(watcher).await;
+                audit.shutdown(audit::FLUSH_DEADLINE).await;
+                return Err(err);
+            }
+        };
     install_killer(&control, agents.as_ref(), gate.as_ref());
     let maintenance = recordings::start_maintenance(
         recordings.as_ref(),
@@ -215,6 +238,11 @@ async fn serve(
             .await;
         if let Some(gate) = gate {
             gate.shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        if let Some(services) = services {
+            services
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
                 .await;
         }
         if let Some(agents) = agents {
@@ -306,6 +334,38 @@ async fn start_gate(
         "serving ssh"
     );
     Ok(Some(server))
+}
+
+async fn start_services(
+    domain: Option<String>,
+    agents: Option<&AgentServer>,
+    gate: Option<&GateSshServer>,
+    control: &Control,
+) -> Result<Option<GateServices>, ServeError> {
+    let (Some(domain), Some(agents)) = (domain, agents) else {
+        return Ok(None);
+    };
+    let services = GateServices::start(GateServicesParts {
+        domain,
+        control: control.clone(),
+        registry: agents.registry().clone(),
+        ssh: gate.map(|server| Arc::clone(server.gate())),
+        clock: system_clock(),
+    })
+    .await?;
+    if !agents.install_class_handlers(services.handlers()) {
+        tracing::error!(
+            target: "jaunt::daemon",
+            "the agents' listener has no services entry, so the gate services are not reachable"
+        );
+    }
+    tracing::info!(
+        target: "jaunt::daemon",
+        ssh_over_tls = gate.is_some(),
+        certificate_valid_before = services.gate().certificate_valid_before(),
+        "the gate serves kubernetes, databases, tcp and ssh over tls on the agents' listener"
+    );
+    Ok(Some(services))
 }
 
 fn install_killer(control: &Control, agents: Option<&AgentServer>, gate: Option<&GateSshServer>) {
@@ -552,6 +612,7 @@ mod tests {
     use jauntd::ca_reload::IdentityEnv;
     use jauntd::config;
 
+    mod services;
     mod trust;
 
     fn no_identity() -> IdentityEnv {

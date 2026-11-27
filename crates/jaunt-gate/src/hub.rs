@@ -27,7 +27,9 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 
 use crate::audit;
-use crate::entry::{Admitted, ClassHandlers, TlsEntry, TlsEntryConfig, TlsEntryError, TlsRefusal};
+use crate::entry::{
+    Admitted, ClassHandlers, EntryClass, TlsEntry, TlsEntryConfig, TlsEntryError, TlsRefusal,
+};
 use crate::ssh::DEFAULT_SSH_CLIENT_LIMITS;
 
 pub const DEFAULT_MAX_API_SESSIONS_PER_NODE: usize = 4;
@@ -40,6 +42,9 @@ pub const DEFAULT_AGENT_CLIENT_LIMITS: AddressLimits = AddressLimits {
 pub const DEFAULT_KUBE_CLIENT_LIMITS: AddressLimits = DEFAULT_SSH_CLIENT_LIMITS;
 const API_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
 const API_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const CLIENT_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
+const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const CLIENT_KEEPALIVE_RETRIES: u32 = 3;
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 pub trait AgentApiHandler: Send + Sync {
@@ -396,6 +401,12 @@ impl Front for EntryFront {
             let Ok(admitted) = admitted else {
                 return;
             };
+            if matches!(
+                admitted.route.class,
+                EntryClass::Gate(_) | EntryClass::Kube(_)
+            ) {
+                enable_client_keepalive(admitted.stream.get_ref());
+            }
             let Some(admitted) = entry.serve_class(admitted, shutdown.clone()).await else {
                 return;
             };
@@ -431,6 +442,20 @@ fn entry_config(config: &AgentHubConfig, services: ServicesEntry) -> TlsEntryCon
     entry.max_handshaking = config.max_handshaking;
     entry.handlers = services.handlers;
     entry
+}
+
+fn enable_client_keepalive(tcp: &TcpStream) {
+    let keepalive = TcpKeepalive::new()
+        .with_time(CLIENT_KEEPALIVE_TIME)
+        .with_interval(CLIENT_KEEPALIVE_INTERVAL)
+        .with_retries(CLIENT_KEEPALIVE_RETRIES);
+    if let Err(error) = SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(
+            target: "jaunt::gate",
+            error = %error,
+            "tcp keepalive could not be enabled on a gate client connection"
+        );
+    }
 }
 
 fn enable_keepalive(tcp: &TcpStream) {
@@ -553,6 +578,16 @@ impl AgentHub {
 
     pub fn services_domain(&self) -> Option<&str> {
         self.entry.as_ref().and_then(|entry| entry.names().domain())
+    }
+
+    pub fn install_class_handlers(&self, handlers: ClassHandlers) -> bool {
+        match &self.entry {
+            Some(entry) => {
+                entry.install_handlers(handlers);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn entry_handshaking(&self) -> usize {

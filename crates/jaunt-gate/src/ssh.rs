@@ -146,6 +146,11 @@ enum Entry {
     InProcess(InProcessEvents),
 }
 
+pub(crate) struct SshAdmission {
+    permit: OwnedSemaphorePermit,
+    slot: Option<ConcurrencyGuard<ClientKey>>,
+}
+
 fn check_trusted_proxies(
     proxy_protocol: bool,
     proxies: Vec<IpNet>,
@@ -386,6 +391,39 @@ impl SshGate {
         })
     }
 
+    pub(crate) fn admit_network(&self, client: SocketAddr, local: bool) -> Option<SshAdmission> {
+        let Ok(permit) = Arc::clone(&self.shared.pre_auth).try_acquire_owned() else {
+            tracing::debug!(target: "jaunt::gate", client_addr = %client, "too many unauthenticated ssh connections");
+            return None;
+        };
+        let slot = if local {
+            None
+        } else {
+            Some(self.shared.admit_client(client.ip())?)
+        };
+        Some(SshAdmission { permit, slot })
+    }
+
+    pub(crate) async fn serve_network<S: TunnelStream>(
+        &self,
+        admission: SshAdmission,
+        stream: S,
+        origin: NetworkOrigin,
+        token: CancellationToken,
+    ) {
+        audit::ssh_connected(origin.client, origin.peer, origin.proxied);
+        Arc::clone(&self.shared)
+            .serve_admitted(
+                stream,
+                origin.client,
+                admission.permit,
+                admission.slot,
+                token,
+                Entry::Network,
+            )
+            .await;
+    }
+
     pub fn terminate(
         &self,
         user_id: &str,
@@ -571,6 +609,13 @@ impl Shared {
         drop(live);
         end.reason
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NetworkOrigin {
+    pub(crate) client: SocketAddr,
+    pub(crate) peer: SocketAddr,
+    pub(crate) proxied: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

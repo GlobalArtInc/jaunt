@@ -40,9 +40,9 @@ pub enum HostCertError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Window {
-    valid_after: u64,
-    valid_before: u64,
+pub(crate) struct Window {
+    pub(crate) valid_after: u64,
+    pub(crate) valid_before: u64,
 }
 
 impl Window {
@@ -53,7 +53,7 @@ impl Window {
         }
     }
 
-    fn renewal_due(self, now: u64) -> bool {
+    pub(crate) fn renewal_due(self, now: u64) -> bool {
         let half = self.valid_before.saturating_sub(self.valid_after) / 2;
         now >= self.valid_after.saturating_add(half)
     }
@@ -208,7 +208,7 @@ async fn issue(
         .map_err(HostCertError::Certificate)
 }
 
-fn retry_delay(initial: Duration, failures: u32) -> Duration {
+pub(crate) fn retry_delay(initial: Duration, failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(16);
     initial
         .checked_mul(1 << doublings)
@@ -216,7 +216,7 @@ fn retry_delay(initial: Duration, failures: u32) -> Duration {
         .min(MAX_RENEWAL_RETRY)
 }
 
-fn unix_secs(time: SystemTime) -> u64 {
+pub(crate) fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
 }

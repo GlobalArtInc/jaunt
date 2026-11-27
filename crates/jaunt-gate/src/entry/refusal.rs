@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -23,10 +24,13 @@ pub enum TlsRefusal {
     UnknownSni,
     AlpnUnsupported,
     UnsupportedClass,
+    ClientCertificate,
+    TlsHandshake,
+    GateCertificateExpired,
 }
 
 impl TlsRefusal {
-    pub const ALL: [TlsRefusal; 11] = [
+    pub const ALL: [TlsRefusal; 14] = [
         Self::ProxyUntrusted,
         Self::ProxyMalformed,
         Self::ProxyTimeout,
@@ -38,6 +42,9 @@ impl TlsRefusal {
         Self::UnknownSni,
         Self::AlpnUnsupported,
         Self::UnsupportedClass,
+        Self::ClientCertificate,
+        Self::TlsHandshake,
+        Self::GateCertificateExpired,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -53,6 +60,9 @@ impl TlsRefusal {
             Self::UnknownSni => "unknown_sni",
             Self::AlpnUnsupported => "alpn_unsupported",
             Self::UnsupportedClass => "unsupported_class",
+            Self::ClientCertificate => "client_certificate",
+            Self::TlsHandshake => "tls_handshake",
+            Self::GateCertificateExpired => "gate_certificate_expired",
         }
     }
 
@@ -68,6 +78,19 @@ impl From<HelloError> for TlsRefusal {
             HelloError::Timeout => Self::HelloTimeout,
             HelloError::Malformed | HelloError::Truncated | HelloError::Io(_) => Self::BadHello,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct RefusalLog(Arc<Refusals>);
+
+impl RefusalLog {
+    pub(super) fn new(refusals: Arc<Refusals>) -> Self {
+        Self(refusals)
+    }
+
+    pub fn refuse(&self, reason: TlsRefusal, client: SocketAddr) {
+        self.0.record(reason, client);
     }
 }
 

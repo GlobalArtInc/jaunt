@@ -63,7 +63,7 @@ Top-level keys:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `services.domain` | DNS name | none | `<D>`. On `agents_listen` the TLS server name `<D>` is the gate class (ALPN `jaunt-ssh/1` or `jaunt-svc/1`), `<cluster>.kube.<D>` with exactly one label is passed to the cluster agent without decryption, and the host of `agent_endpoint` keeps the agent path. Any other name, or none, is refused with the audit event `gate.tls.refused`. Labels are matched case-insensitively: the value and the names clients send are normalised to lower case, with one trailing dot dropped. No IP address; it must not equal the host of `agent_endpoint` nor make that host a `<cluster>.kube.<D>` name. Needs `agents_listen` |
+| `services.domain` | DNS name | none | `<D>`. On `agents_listen` the TLS server name `<D>` is the gate class (ALPN `jaunt-ssh/1` or `jaunt-svc/1`), `<cluster>.kube.<D>` with exactly one label is passed to the cluster agent without decryption, and the host of `agent_endpoint` keeps the agent path. Any other name, or none, is refused with the audit event `gate.tls.refused`. The gate holds a certificate for `<D>` from the internal authority in memory and renews it at half of its 7 days. `jaunt-ssh/1` needs `ssh_gate` and is then the same SSH gate as on `ssh_gate.listen`; `jaunt-svc/1` needs a client certificate from the `user-x509` authority and carries the inner TLS of a database or TCP service, named `<service>.db.<D>` or `<service>.tcp.<D>`, to its agent without decrypting it. Labels are matched case-insensitively: the value and the names clients send are normalised to lower case, with one trailing dot dropped. No IP address; it must not equal the host of `agent_endpoint` nor make that host a `<cluster>.kube.<D>` name. Needs `agents_listen` |
 | `services.proxy_protocol` | boolean | `false` | expect a PROXY protocol v2 header on every connection to `agents_listen`, sent within 5 seconds. The address in the header is the client address for the per-address limits and the audit. Needs `services.domain` and `services.trusted_proxies` |
 | `services.trusted_proxies` | list of CIDR | empty | networks allowed to send that header; connections from any other address are closed. Needs `services.domain` and `services.proxy_protocol: true`. A block that would trust the whole internet is refused |
 
@@ -120,6 +120,8 @@ The keys below sit in the sections `limits.http`, `limits.ssh`, `limits.agents` 
 | `agents.handshaking_per_address` | 64 | handshakes in progress per address on `agents_listen`, 1 to 1048576. A connection stops counting once its class is decided (`services`) or the agent handshake ends |
 | `kube.handshakes` | burst 600, 600 per minute | connections to `<cluster>.kube.<services.domain>`, counted in addition to `agents.handshakes` |
 | `kube.handshaking_per_address` | 128 | open pass-through connections per address to `<cluster>.kube.<services.domain>`; each one counts for as long as it is open, 1 to 1048576 |
+
+Kubernetes connections reach the cluster agent before anyone has logged in, so 2 to 16 source addresses can fill its 64 unfinished handshakes or the 512 streams of one cluster (32 per address); such slots come back within the agent's 10 s handshake timeout plus the gate's 30 s grace after one side has closed.
 
 ### recordings
 

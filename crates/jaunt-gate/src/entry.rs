@@ -2,8 +2,9 @@ mod hello;
 mod names;
 mod refusal;
 
+use std::any::Any;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -25,7 +26,7 @@ pub use hello::{
     parse_client_hello,
 };
 pub use names::{EntryNames, EntryNamesError, SniClass};
-pub use refusal::TlsRefusal;
+pub use refusal::{RefusalLog, TlsRefusal};
 
 use crate::ssh::DEFAULT_PROXY_HEADER_TIMEOUT;
 use refusal::Refusals;
@@ -34,9 +35,9 @@ pub const ALPN_SSH: &[u8] = b"jaunt-ssh/1";
 pub const ALPN_SVC: &[u8] = b"jaunt-svc/1";
 pub const DEFAULT_ENTRY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub trait EntryIo: AsyncRead + AsyncWrite + Send + Unpin {}
+pub trait EntryIo: AsyncRead + AsyncWrite + Send + Unpin + Any {}
 
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> EntryIo for T {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + Any> EntryIo for T {}
 
 pub type EntryStream = Replay<Box<dyn EntryIo>>;
 
@@ -81,6 +82,7 @@ pub struct Route {
     pub client_addr: SocketAddr,
     pub peer_addr: SocketAddr,
     pub proxied: bool,
+    pub local: bool,
     pub handshake_deadline: Instant,
 }
 
@@ -100,6 +102,7 @@ pub struct ClassConnection<IO> {
     pub route: Route,
     pub stream: Replay<IO>,
     pub stream_slot: Option<ConcurrencyGuard<ClientKey>>,
+    pub refusals: RefusalLog,
 }
 
 pub trait ClassHandler: Send + Sync {
@@ -188,8 +191,8 @@ pub struct TlsEntry {
     handshakes: Arc<Semaphore>,
     front: AddressGate,
     kube: AddressGate,
-    handlers: ClassHandlers,
-    refusals: Refusals,
+    handlers: RwLock<ClassHandlers>,
+    refusals: Arc<Refusals>,
     started: Instant,
 }
 
@@ -215,8 +218,8 @@ impl TlsEntry {
             handshakes: Arc::new(Semaphore::new(config.max_handshaking)),
             front: AddressGate::new(config.front_limits),
             kube: AddressGate::new(config.kube_limits),
-            handlers: config.handlers,
-            refusals: Refusals::new(),
+            handlers: RwLock::new(config.handlers),
+            refusals: Arc::new(Refusals::new()),
             started: Instant::now(),
         })
     }
@@ -227,6 +230,13 @@ impl TlsEntry {
 
     pub fn refused(&self, reason: TlsRefusal) -> u64 {
         self.refusals.count(reason)
+    }
+
+    pub fn install_handlers(&self, handlers: ClassHandlers) {
+        *self
+            .handlers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = handlers;
     }
 
     pub fn handshaking(&self) -> usize {
@@ -275,6 +285,7 @@ impl TlsEntry {
                 client_addr: origin.client,
                 peer_addr: peer,
                 proxied: origin.proxied,
+                local: origin.local,
                 handshake_deadline,
             },
             stream: Replay::new(bytes, io),
@@ -291,10 +302,13 @@ impl TlsEntry {
     where
         IO: EntryIo + 'static,
     {
-        let handler = match &admitted.route.class {
-            EntryClass::Agents | EntryClass::Main => return Some(admitted),
-            EntryClass::Gate(_) => self.handlers.gate.clone(),
-            EntryClass::Kube(_) => self.handlers.kube.clone(),
+        let handler = {
+            let handlers = self.handlers.read().unwrap_or_else(PoisonError::into_inner);
+            match &admitted.route.class {
+                EntryClass::Agents | EntryClass::Main => return Some(admitted),
+                EntryClass::Gate(_) => handlers.gate.clone(),
+                EntryClass::Kube(_) => handlers.kube.clone(),
+            }
         };
         let Some(handler) = handler else {
             self.refuse(TlsRefusal::UnsupportedClass, admitted.route.client_addr);
@@ -311,6 +325,7 @@ impl TlsEntry {
             route,
             stream: stream.map(|io| Box::new(io) as Box<dyn EntryIo>),
             stream_slot,
+            refusals: RefusalLog::new(Arc::clone(&self.refusals)),
         };
         handler.serve(connection, shutdown).await;
         None

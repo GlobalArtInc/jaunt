@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use jaunt_limits::{ClientKey, Refused};
 use jaunt_ssh::OuterEvent;
@@ -33,6 +34,103 @@ pub(crate) fn tls_refused(client: ClientKey, reason: &'static str, suppressed: u
         client = %client,
         reason,
         suppressed
+    );
+}
+
+pub(crate) struct KubeStream<'a> {
+    pub(crate) client_addr: SocketAddr,
+    pub(crate) cluster: &'a str,
+    pub(crate) node_id: Option<&'a str>,
+    pub(crate) session_id: Option<&'a str>,
+}
+
+pub(crate) struct SvcStream<'a> {
+    pub(crate) client_addr: SocketAddr,
+    pub(crate) user_id: &'a str,
+    pub(crate) serial: u64,
+    pub(crate) kind: Option<&'static str>,
+    pub(crate) service: Option<&'a str>,
+    pub(crate) node_id: Option<&'a str>,
+    pub(crate) session_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Carried {
+    pub(crate) reason: &'static str,
+    pub(crate) bytes_up: u64,
+    pub(crate) bytes_down: u64,
+    pub(crate) duration: Duration,
+}
+
+impl Carried {
+    fn duration_ms(&self) -> u64 {
+        u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+pub(crate) fn kube_stream_refused(stream: &KubeStream<'_>, reason: &'static str, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.kube.stream",
+        outcome = "refused",
+        reason,
+        client_addr = %stream.client_addr,
+        service = stream.cluster,
+        node_id = stream.node_id,
+        session_id = stream.session_id,
+        suppressed
+    );
+}
+
+pub(crate) fn kube_stream_closed(stream: &KubeStream<'_>, carried: Carried) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.kube.stream",
+        outcome = "closed",
+        reason = carried.reason,
+        client_addr = %stream.client_addr,
+        service = stream.cluster,
+        node_id = stream.node_id,
+        session_id = stream.session_id,
+        bytes_up = carried.bytes_up,
+        bytes_down = carried.bytes_down,
+        duration_ms = carried.duration_ms()
+    );
+}
+
+pub(crate) fn svc_stream_refused(stream: &SvcStream<'_>, reason: &'static str, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.svc.stream",
+        outcome = "refused",
+        reason,
+        client_addr = %stream.client_addr,
+        user_id = stream.user_id,
+        serial = stream.serial,
+        kind = stream.kind,
+        service = stream.service,
+        node_id = stream.node_id,
+        session_id = stream.session_id,
+        suppressed
+    );
+}
+
+pub(crate) fn svc_stream_closed(stream: &SvcStream<'_>, carried: Carried) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.svc.stream",
+        outcome = "closed",
+        reason = carried.reason,
+        client_addr = %stream.client_addr,
+        user_id = stream.user_id,
+        serial = stream.serial,
+        kind = stream.kind,
+        service = stream.service,
+        node_id = stream.node_id,
+        session_id = stream.session_id,
+        bytes_up = carried.bytes_up,
+        bytes_down = carried.bytes_down,
+        duration_ms = carried.duration_ms()
     );
 }
 
