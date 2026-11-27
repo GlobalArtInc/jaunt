@@ -4,6 +4,7 @@ use jaunt_store::{NewSession, Subjects};
 use crate::control::Control;
 use crate::holder::{self, Absent, Presented};
 use crate::identity::policy_identity;
+use crate::nodes::is_ssh_target;
 use crate::plane::{check_fields, clock_failure, node_info, store_failure};
 use crate::revocation::revoked;
 use crate::session_audit::{self, Denied, Phase, Routed};
@@ -40,6 +41,7 @@ pub(crate) async fn route(
         .get_active_by_name(&request.node_name)
         .await
         .map_err(store_failure("loading the node"))?
+        .filter(is_ssh_target)
     else {
         return Ok(denied(
             &request,

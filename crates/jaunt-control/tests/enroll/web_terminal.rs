@@ -473,6 +473,85 @@ async fn targets_list_the_active_nodes_the_current_policy_reaches_with_their_log
 }
 
 #[tokio::test]
+async fn a_node_that_turned_ssh_off_is_neither_a_target_nor_given_a_ticket() {
+    let stand = stand().await;
+    let harness = &stand.harness;
+    let dev = harness
+        .store
+        .nodes()
+        .get_active_by_name("dev-01")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut announcement = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/agent/services")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"ssh_enabled":false,"services":[]}"#))
+        .unwrap();
+    announcement
+        .extensions_mut()
+        .insert(AuthenticatedNode(dev.id.clone()));
+    let reply = send(harness.agent_router.clone(), announcement).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text());
+
+    let listed = targets(harness, Some(&stand.alice)).await.json();
+    let nodes: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|target| target["node"].as_str().unwrap())
+        .collect();
+    assert_eq!(nodes, ["web-01", "web-02"]);
+    let refused = ticket_reply(
+        harness,
+        &stand.alice,
+        &json!({"node": "dev-01", "login": "app"}),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_ticket_issued_before_ssh_was_turned_off_opens_nothing() {
+    let stand = stand().await;
+    let harness = &stand.harness;
+    let issued = ticket(harness, &stand.alice, "web-01", LOGIN).await;
+    let web = harness
+        .store
+        .nodes()
+        .get_active_by_name("web-01")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut announcement = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/agent/services")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"ssh_enabled":false,"services":[]}"#))
+        .unwrap();
+    announcement
+        .extensions_mut()
+        .insert(AuthenticatedNode(web.id.clone()));
+    let reply = send(harness.agent_router.clone(), announcement).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{}", reply.text());
+    crate::audit::start_recording();
+
+    let reply = Handshake::of(&stand.alice, &issued)
+        .send(harness, None)
+        .await;
+
+    let denials: Vec<String> = crate::audit::take_recording()
+        .into_iter()
+        .filter(|event| event.get("event").map(String::as_str) == Some("terminal.denied"))
+        .map(|event| event["reason"].clone())
+        .collect();
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(denials, ["node_gone"]);
+    assert_eq!(stand.gate.connects.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn the_terminal_routes_are_absent_until_a_terminal_is_installed() {
     let harness = Harness::with(Options {
         web: true,

@@ -35,6 +35,7 @@ use crate::rate_limit;
 use crate::recordings::{self, RecordingSettings, RecoveredRecordings, RejectionLog, Uploads};
 use crate::revocation::RevocationAdmin;
 use crate::serve;
+use crate::services;
 use crate::session_sweep::RevocationWatch;
 use crate::web::WebState;
 use crate::web::terminal::{End, TerminalGate, WebTerminalSettings};
@@ -96,6 +97,7 @@ pub struct Inner {
     pub(crate) recording_rejections: RejectionLog,
     pub(crate) presence: PresenceSlot,
     pub(crate) host_accounts: HostAccounts,
+    pub(crate) service_announcements: RateLimiter<String>,
 }
 
 #[derive(Clone)]
@@ -192,6 +194,7 @@ impl Control {
                 recording_rejections: RejectionLog::default(),
                 presence: PresenceSlot::default(),
                 host_accounts: HostAccounts::default(),
+                service_announcements: services::announcement_limiter(),
             }),
         })
     }

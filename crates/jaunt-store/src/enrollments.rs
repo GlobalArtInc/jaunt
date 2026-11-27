@@ -204,7 +204,7 @@ const ACTIVE_NODE_NAME_TAKEN: &str = "SELECT id FROM nodes WHERE name = ? AND st
 pub(crate) const INSERT_NODE: &str = concat!(
     "INSERT INTO nodes (",
     node_columns!(),
-    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?) RETURNING ",
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, 1) RETURNING ",
     node_columns!()
 );
 

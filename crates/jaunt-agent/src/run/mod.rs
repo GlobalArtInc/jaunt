@@ -2,6 +2,7 @@ pub(crate) mod api;
 pub(crate) mod config;
 pub mod logging;
 mod renew;
+pub(crate) mod services;
 #[cfg(test)]
 mod tests;
 
@@ -14,6 +15,7 @@ use std::time::Duration;
 
 use clap::Args;
 use jaunt_host_users::HostUsersSection;
+use jaunt_proto::ServiceAnnouncement;
 use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, ObserverFactory, SshError};
 use jaunt_tunnel::{
     BackoffPolicy, ClientError, ClientEvent, Keepalive, SwappableClientCert, TlsConfigError,
@@ -41,6 +43,7 @@ use api::{API_KEEPALIVE, AgentApi, ApiError};
 use config::{ConfigError, InnerConfig, RecordingConfig};
 use logging::LoggingError;
 use renew::{HOST_CA_RENEWAL_SPREAD, RENEWAL_BACKOFF, Renewer};
+use services::{ANNOUNCE_TIMING, AnnounceTiming, ControlServices, announce_services};
 
 const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 const FILTER_VAR: &str = "RUST_LOG";
@@ -109,6 +112,8 @@ pub struct RunSettings {
     pub host_users: HostUsersSection,
     pub host_users_paths: HostUsersPaths,
     pub accounts: AccountTimings,
+    pub services: ServiceAnnouncement,
+    pub announce_timing: AnnounceTiming,
 }
 
 impl RunSettings {
@@ -127,6 +132,11 @@ impl RunSettings {
             host_users: HostUsersSection::default(),
             host_users_paths: HostUsersPaths::default(),
             accounts: ACCOUNT_TIMINGS,
+            services: ServiceAnnouncement {
+                ssh_enabled: true,
+                services: Vec::new(),
+            },
+            announce_timing: ANNOUNCE_TIMING,
         }
     }
 }
@@ -141,7 +151,9 @@ pub fn command(args: &RunArgs) -> ExitCode {
 }
 
 fn run_command(args: &RunArgs) -> Result<(), RunError> {
-    let config = config::load(&args.config)?;
+    let loaded = config::load_reporting(&args.config)?;
+    let config = loaded.config;
+    let announcement = config.announcement();
     let state_dir = args
         .state_dir
         .clone()
@@ -159,6 +171,13 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
         env_filter.as_deref(),
         config.log_level.as_deref(),
     ))?;
+    if !loaded.file_found {
+        tracing::warn!(
+            target: "jaunt::agent",
+            config = %args.config.display(),
+            "the configuration file does not exist; running with the defaults: SSH enabled and no services"
+        );
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -184,6 +203,7 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
             inner: config.inner,
             recording: config.recording,
             host_users: config.host_users,
+            services: announcement,
             ..RunSettings::new(state_dir)
         };
         run(settings, env, shutdown).await
@@ -294,6 +314,11 @@ pub async fn run(
     let events = tunnel_config.subscribe();
     let trust_events = tunnel_config.subscribe();
     let capability_events = tunnel_config.subscribe();
+    let service_events = tunnel_config.subscribe();
+    let service_sink = Arc::new(ControlServices::new(
+        api.clone(),
+        settings.announce_timing.call_timeout,
+    ));
     let capabilities = Arc::new(ControlCapabilities::new(api.clone()));
     tracing::info!(
         target: "jaunt::agent",
@@ -351,6 +376,13 @@ pub async fn run(
         settings.accounts.announce_every,
         stop.child_token(),
     ));
+    let service_announcer = tokio::spawn(announce_services(
+        Arc::new(settings.services),
+        service_sink,
+        service_events,
+        settings.announce_timing,
+        stop.child_token(),
+    ));
 
     let outcome = tokio::select! {
         () = shutdown.cancelled() => None,
@@ -382,6 +414,9 @@ pub async fn run(
     }
     if let Err(error) = announcer.await {
         tracing::error!(target: "jaunt::agent", error = %error, "the capability announcement task failed");
+    }
+    if let Err(error) = service_announcer.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the service announcement task failed");
     }
     if let Err(error) = event_log.await {
         tracing::error!(target: "jaunt::agent", error = %error, "the tunnel event task failed");

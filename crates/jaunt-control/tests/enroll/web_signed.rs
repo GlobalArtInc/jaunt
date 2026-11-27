@@ -18,12 +18,12 @@ use crate::web_support::web_harness;
 const REVOKERS: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: revokers }\nspec:\n  \
      members: { users: [approver@example.com] }\n  admin: [revocations.write]\n";
 
-struct Signer {
+pub struct Signer {
     key: PrivateKey,
     certificate: String,
 }
 
-async fn issue(harness: &Harness, user_id: &str) -> Signer {
+pub async fn issue(harness: &Harness, user_id: &str) -> Signer {
     let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
     let serial = harness
         .store
@@ -71,7 +71,7 @@ async fn issue(harness: &Harness, user_id: &str) -> Signer {
     }
 }
 
-async fn signed(
+pub async fn signed(
     harness: &Harness,
     signer: &Signer,
     method: Method,

@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_host_users::HostUsersSection;
-use jaunt_proto::{AGENT_CAPABILITIES_PATH, RenewRequest};
+use jaunt_proto::{
+    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, RenewRequest, ServiceAnnouncement,
+};
 use jaunt_ssh::SshError;
 use jaunt_tunnel::{BackoffPolicy, NodeId, RegistryEvent, SessionId, StreamKind, StreamMeta};
 use russh::keys::key::safe_rng;
@@ -197,9 +199,9 @@ async fn gate_and_node(
     (pki, gate, node)
 }
 
-fn paths_besides_capabilities(gate: &FakeGate) -> Vec<String> {
+fn paths_besides_announcements(gate: &FakeGate) -> Vec<String> {
     let mut paths = gate.paths();
-    paths.retain(|path| path != AGENT_CAPABILITIES_PATH);
+    paths.retain(|path| path != AGENT_CAPABILITIES_PATH && path != AGENT_SERVICES_PATH);
     paths
 }
 
@@ -584,7 +586,7 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
     .await;
     assert_eq!(gate.renewals().len(), 1);
     assert_eq!(
-        paths_besides_capabilities(&gate),
+        paths_besides_announcements(&gate),
         ["/v1/agent/renew", TRUST_PATH, TRUST_V2_PATH]
     );
 
@@ -613,7 +615,7 @@ async fn an_expired_certificate_asks_for_reenrollment_without_renewal() {
         .await;
         assert!(gate.renewals().is_empty());
         assert_eq!(
-            paths_besides_capabilities(&gate),
+            paths_besides_announcements(&gate),
             [TRUST_PATH, TRUST_V2_PATH]
         );
 
@@ -797,6 +799,41 @@ async fn the_agent_announces_its_capabilities_once_the_tunnel_is_up_and_keeps_re
             && serde_json::from_slice::<serde_json::Value>(&seen.body).unwrap()
                 == json!({"creates_accounts": true})
     }));
+    agent.stop().await;
+    gate.stop().await;
+}
+
+#[tokio::test]
+async fn the_agent_announces_its_services_once_the_tunnel_is_up() {
+    let t0 = unix_now();
+    let (_pki, mut gate, node) = gate_and_node(&[], t0 - HOUR, t0 + HOUR).await;
+    gate.set_standing(AGENT_SERVICES_PATH, ApiStep::Json(204, json!({})));
+    let declared: ServiceAnnouncement = serde_json::from_value(json!({
+        "ssh_enabled": false,
+        "services": [{"kind": "tcp", "name": "grafana", "labels": {"team": "ops"},
+                      "address": "10.0.0.5:3000"}],
+    }))
+    .unwrap();
+    let expected = serde_json::to_value(&declared).unwrap();
+    let agent = Agent::start_with(
+        &node.path(),
+        ManualClock::new(SystemTime::now()),
+        1.0,
+        |settings| settings.services = declared,
+    );
+    gate.wait_connected().await;
+    eventually("the service announcement", || {
+        !gate.requests(AGENT_SERVICES_PATH).is_empty()
+    })
+    .await;
+    let seen = gate.requests(AGENT_SERVICES_PATH);
+    assert_eq!(seen[0].node, node_id());
+    assert_eq!(seen[0].method, "POST");
+    assert_eq!(seen[0].content_type.as_deref(), Some("application/json"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap(),
+        expected
+    );
     agent.stop().await;
     gate.stop().await;
 }

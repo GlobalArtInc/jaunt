@@ -13,7 +13,7 @@ use crate::state::DEFAULT_STATE_DIR;
 
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60;
-const MAX_LABELS: usize = 16;
+pub(crate) const MAX_LABELS: usize = 16;
 const MAX_LABEL_KEY_LEN: usize = 63;
 const MAX_LABEL_VALUE_LEN: usize = 63;
 const MAX_HOSTNAME_LEN: usize = 253;
@@ -160,7 +160,7 @@ impl FromStr for Labels {
     }
 }
 
-fn is_label_key(key: &str) -> bool {
+pub(crate) fn is_label_key(key: &str) -> bool {
     let bytes = key.as_bytes();
     bytes.len() <= MAX_LABEL_KEY_LEN
         && bytes.first().is_some_and(u8::is_ascii_lowercase)
@@ -169,7 +169,7 @@ fn is_label_key(key: &str) -> bool {
         })
 }
 
-fn is_label_value(value: &str) -> bool {
+pub(crate) fn is_label_value(value: &str) -> bool {
     value.len() <= MAX_LABEL_VALUE_LEN
         && value
             .bytes()

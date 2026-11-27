@@ -152,6 +152,7 @@ mod tests {
                     inner: InnerConfig::default(),
                     recording: RecordingConfig::default(),
                     host_users: jaunt_host_users::HostUsersSection::default(),
+                    ..AgentConfig::default()
                 },
                 "{state_dir}"
             );

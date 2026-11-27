@@ -3,8 +3,11 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use jaunt_host_users::HostUsersSection;
+use jaunt_proto::{AnnouncedService, ServiceAnnouncement, ServiceProblem};
+use jaunt_tunnel::ServiceName;
 use serde::Deserialize;
 
+use crate::enroll::args::{MAX_LABELS, is_label_key, is_label_value};
 use crate::recording::{DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_SESSION_QUEUE_BYTES, RecordingLimits};
 
 pub const DEFAULT_SSHD_PORT: u16 = 22;
@@ -25,6 +28,90 @@ pub struct AgentConfig {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub host_users: HostUsersSection,
+    #[serde(default)]
+    pub ssh: SshConfig,
+    #[serde(default)]
+    pub services: Vec<AnnouncedService>,
+}
+
+impl AgentConfig {
+    pub fn announcement(&self) -> ServiceAnnouncement {
+        ServiceAnnouncement {
+            ssh_enabled: self.ssh.enabled,
+            services: self.services.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshConfig {
+    #[serde(default = "ssh_enabled_by_default")]
+    pub enabled: bool,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: ssh_enabled_by_default(),
+        }
+    }
+}
+
+fn ssh_enabled_by_default() -> bool {
+    true
+}
+
+const RESERVED_LABEL_KEY: &str = "name";
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ServiceConfigError {
+    #[error("{0}")]
+    Set(ServiceProblem),
+    #[error(
+        "services[{index}]: the name must be a DNS label of at most 63 lowercase letters, digits and hyphens"
+    )]
+    Name { index: usize },
+    #[error("services[{index}]: at most {MAX_LABELS} labels are allowed")]
+    TooManyLabels { index: usize },
+    #[error("services[{index}]: a label key must match [a-z][a-z0-9_.-]{{0,62}}")]
+    LabelKey { index: usize },
+    #[error("services[{index}]: a label value must match [A-Za-z0-9._-]{{0,63}}")]
+    LabelValue { index: usize },
+    #[error(
+        "services[{index}]: the label key `name` is reserved: policy selectors match it against the service name"
+    )]
+    ReservedLabel { index: usize },
+    #[error("services[{index}]: {problem}")]
+    Settings {
+        index: usize,
+        problem: ServiceProblem,
+    },
+}
+
+pub fn check_services(announcement: &ServiceAnnouncement) -> Result<(), ServiceConfigError> {
+    announcement.check_set().map_err(ServiceConfigError::Set)?;
+    for (index, service) in announcement.services.iter().enumerate() {
+        ServiceName::new(service.name.as_str()).map_err(|_| ServiceConfigError::Name { index })?;
+        if service.labels.len() > MAX_LABELS {
+            return Err(ServiceConfigError::TooManyLabels { index });
+        }
+        for (key, value) in &service.labels {
+            if key == RESERVED_LABEL_KEY {
+                return Err(ServiceConfigError::ReservedLabel { index });
+            }
+            if !is_label_key(key) {
+                return Err(ServiceConfigError::LabelKey { index });
+            }
+            if !is_label_value(value) {
+                return Err(ServiceConfigError::LabelValue { index });
+            }
+        }
+        service
+            .settings()
+            .map_err(|problem| ServiceConfigError::Settings { index, problem })?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -114,13 +201,31 @@ pub enum ConfigError {
         "{path}: recording.memory_budget_bytes must be between 1 MiB and 64 GiB and recording.session_queue_bytes between 1 MiB and the memory budget"
     )]
     Recording { path: String },
+    #[error("{path}: {source}")]
+    Services {
+        path: String,
+        #[source]
+        source: ServiceConfigError,
+    },
+}
+
+pub struct LoadedConfig {
+    pub config: AgentConfig,
+    pub file_found: bool,
 }
 
 pub fn load(path: &Path) -> Result<AgentConfig, ConfigError> {
+    load_reporting(path).map(|loaded| loaded.config)
+}
+
+pub fn load_reporting(path: &Path) -> Result<LoadedConfig, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(AgentConfig::default());
+            return Ok(LoadedConfig {
+                config: AgentConfig::default(),
+                file_found: false,
+            });
         }
         Err(source) => {
             return Err(ConfigError::Read {
@@ -150,7 +255,14 @@ pub fn load(path: &Path) -> Result<AgentConfig, ConfigError> {
     if !config.recording.usable() {
         return Err(ConfigError::Recording { path: shown() });
     }
-    Ok(config)
+    check_services(&config.announcement()).map_err(|source| ConfigError::Services {
+        path: shown(),
+        source,
+    })?;
+    Ok(LoadedConfig {
+        config,
+        file_found: true,
+    })
 }
 
 fn parse(text: &str) -> Result<AgentConfig, String> {
@@ -171,9 +283,15 @@ mod tests {
 
     use jaunt_host_users::{HostUsersSection, Settings};
 
-    use super::{AgentConfig, ConfigError, InnerConfig, RecordingConfig, load};
+    use jaunt_proto::ServiceProblem;
+
+    use super::{
+        AgentConfig, ConfigError, InnerConfig, RecordingConfig, ServiceConfigError, SshConfig,
+        load, load_reporting,
+    };
 
     type Expected = fn(&ConfigError) -> bool;
+    type Check = Box<dyn Fn(&ConfigError) -> bool>;
 
     #[test]
     fn the_config_file_is_optional_and_strict() {
@@ -192,6 +310,8 @@ mod tests {
                     inner: InnerConfig::default(),
                     recording: RecordingConfig::default(),
                     host_users: HostUsersSection::default(),
+                    ssh: SshConfig::default(),
+                    services: Vec::new(),
                 },
             ),
         ] {
@@ -321,6 +441,73 @@ mod tests {
                     "{text:?}"
                 ),
             }
+        }
+    }
+
+    #[test]
+    fn services_and_ssh_are_declared_strictly_and_checked_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        assert!(!load_reporting(&path).unwrap().file_found);
+        let defaults = load(&path).unwrap();
+        assert_eq!(defaults.ssh, SshConfig { enabled: true });
+        assert!(defaults.services.is_empty());
+
+        let example = "ssh: { enabled: false }\nservices:\n  - kind: kubernetes\n    name: prod-eu\n    labels: { env: prod, region: eu }\n    kubernetes: { api: in-cluster, audit: mutating }\n  - kind: postgres\n    name: lk-ru-prod\n    labels: { env: prod }\n    address: 127.0.0.1:5432\n    postgres:\n      tls: { ca_file: /etc/jaunt/pg-ca.pem, server_name: lk-ru-prod-01 }\n      audit: { queries: text, max_query_bytes: 4096 }\n  - kind: tcp\n    name: grafana\n    labels: { team: ops }\n    address: 10.0.0.5:3000\n    tcp: { idle_timeout_secs: 3600 }\n";
+        std::fs::write(&path, example).unwrap();
+        assert!(load_reporting(&path).unwrap().file_found);
+        let config = load(&path).unwrap();
+        assert!(!config.ssh.enabled);
+        let announcement = config.announcement();
+        assert!(!announcement.ssh_enabled);
+        let names: Vec<&str> = announcement
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect();
+        assert_eq!(names, ["prod-eu", "lk-ru-prod", "grafana"]);
+
+        let item = |body: &str| format!("services:\n  - {body}\n");
+        let labels = |pairs: &str| {
+            item(&format!(
+                "{{ kind: kubernetes, name: k, labels: {{ {pairs} }} }}"
+            ))
+        };
+        let seventeen: Vec<String> = (0..17).map(|n| format!("k{n}: v")).collect();
+        let many: String = (0..65)
+            .map(|n| format!("  - {{ kind: kubernetes, name: k{n} }}\n"))
+            .collect();
+        let long_name = "a".repeat(64);
+        let parse = |error: &ConfigError| matches!(error, ConfigError::Parse { .. });
+        let service = |expected: fn(&ServiceConfigError) -> bool| move |error: &ConfigError| matches!(error, ConfigError::Services { source, .. } if expected(source));
+        let cases: Vec<(String, Check)> = vec![
+            ("ssh: { enable: false }\n".to_owned(), Box::new(parse)),
+            (item("{ kind: kubernetes, name: k, port: 1 }"), Box::new(parse)),
+            (item("{ kind: kubernetes, name: k, kubernetes: { api: kubeconfig } }"), Box::new(parse)),
+            (item("{ kind: kubernetes, name: k, kubernetes: { verbs: all } }"), Box::new(parse)),
+            (item("{ kind: ssh, name: k }"), Box::new(parse)),
+            (item("{ kind: postgres, name: p, address: 'h:1', postgres: {} }"), Box::new(parse)),
+            (item("{ kind: kubernetes, name: Bad_Name }"), Box::new(service(|e| matches!(e, ServiceConfigError::Name { index: 0 })))),
+            (item(&format!("{{ kind: kubernetes, name: {long_name} }}")), Box::new(service(|e| matches!(e, ServiceConfigError::Name { .. })))),
+            (labels("name: web"), Box::new(service(|e| matches!(e, ServiceConfigError::ReservedLabel { .. })))),
+            (labels("Env: prod"), Box::new(service(|e| matches!(e, ServiceConfigError::LabelKey { .. })))),
+            (labels("env: 'a b'"), Box::new(service(|e| matches!(e, ServiceConfigError::LabelValue { .. })))),
+            (labels(&seventeen.join(", ")), Box::new(service(|e| matches!(e, ServiceConfigError::TooManyLabels { .. })))),
+            (
+                "services:\n  - { kind: tcp, name: t, address: 'h:1' }\n  - { kind: tcp, name: t, address: 'h:2' }\n".to_owned(),
+                Box::new(service(|e| matches!(e, ServiceConfigError::Set(ServiceProblem::Duplicate { .. })))),
+            ),
+            (format!("services:\n{many}"), Box::new(service(|e| matches!(e, ServiceConfigError::Set(ServiceProblem::TooMany))))),
+            (item("{ kind: tcp, name: t }"), Box::new(service(|e| matches!(e, ServiceConfigError::Settings { problem: ServiceProblem::AddressRequired(_), .. })))),
+            (item("{ kind: kubernetes, name: k, address: 'h:1' }"), Box::new(service(|e| matches!(e, ServiceConfigError::Settings { problem: ServiceProblem::AddressNotAllowed, .. })))),
+            (item("{ kind: tcp, name: t, address: 'h:1', kubernetes: {} }"), Box::new(service(|e| matches!(e, ServiceConfigError::Settings { problem: ServiceProblem::ForeignBlock { .. }, .. })))),
+            (item("{ kind: postgres, name: p, address: 'h:1' }"), Box::new(service(|e| matches!(e, ServiceConfigError::Settings { problem: ServiceProblem::PostgresTlsMissing, .. })))),
+            (item("{ kind: tcp, name: t, address: 'h:1', tcp: { idle_timeout_secs: 0 } }"), Box::new(service(|e| matches!(e, ServiceConfigError::Settings { problem: ServiceProblem::InvalidIdleTimeout, .. })))),
+        ];
+        for (text, expected) in cases {
+            std::fs::write(&path, &text).unwrap();
+            let error = load(&path).unwrap_err();
+            assert!(expected(&error), "{text:?}: {error}");
         }
     }
 }

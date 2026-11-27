@@ -33,6 +33,10 @@ pub(crate) async fn handle(State(control): State<Control>, headers: HeaderMap) -
     )
 }
 
+pub(crate) fn is_ssh_target(node: &Node) -> bool {
+    node.state == NodeState::Active && node.ssh_enabled
+}
+
 fn reachable(
     nodes: &[Node],
     policy: &PolicySet,
@@ -42,7 +46,7 @@ fn reachable(
 ) -> NodeList {
     let mut visible: Vec<&Node> = nodes
         .iter()
-        .filter(|node| node.state == NodeState::Active)
+        .filter(|node| is_ssh_target(node))
         .filter(|node| {
             policy.route(
                 identity,
@@ -110,6 +114,7 @@ mod tests {
             created_at: 0,
             removed_at: None,
             agent_version: None,
+            ssh_enabled: true,
         }
     }
 

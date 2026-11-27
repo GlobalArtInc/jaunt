@@ -18,7 +18,7 @@ use crate::device::net::ClientAddress;
 use crate::http::{error_response, json_body, json_response, server_error};
 use crate::identity::policy_identity;
 use crate::naming::is_dns_label;
-use crate::nodes::MAX_NODES;
+use crate::nodes::{MAX_NODES, is_ssh_target};
 use crate::plane::node_info;
 use crate::serve::SocketWrites;
 use crate::web::session::WebSession;
@@ -85,7 +85,7 @@ async fn reachable_node(
             tracing::error!(target: "jaunt::control", error = %err, "loading a terminal node failed");
             StoreFailed
         })?;
-    let Some(found) = found else {
+    let Some(found) = found.filter(is_ssh_target) else {
         return Ok(None);
     };
     let policy = control.policy_snapshot();
@@ -266,8 +266,8 @@ pub(crate) async fn open(State(control): State<Control>, request: Request) -> Re
         return deny(&control, &denial(problem.reason()));
     }
     let node = match control.store.nodes().get_active_by_name(&query.node).await {
-        Ok(Some(node)) => node,
-        Ok(None) => return deny(&control, &denial("node_gone")),
+        Ok(Some(node)) if is_ssh_target(&node) => node,
+        Ok(_) => return deny(&control, &denial("node_gone")),
         Err(err) => {
             tracing::error!(target: "jaunt::control", error = %err, "loading a terminal node failed");
             return server_error();
@@ -328,7 +328,7 @@ pub(crate) async fn targets(State(control): State<Control>, session: WebSession)
     let identity = policy_identity(session.user());
     let mut listed: Vec<TargetBody> = nodes
         .iter()
-        .filter(|node| node.state == jaunt_store::NodeState::Active)
+        .filter(|node| is_ssh_target(node))
         .filter_map(|node| {
             let info = node_info(node);
             let logins = policy.ssh_logins(&identity, &info);

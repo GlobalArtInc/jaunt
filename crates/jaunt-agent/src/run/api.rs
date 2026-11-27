@@ -9,10 +9,11 @@ use h2::{Ping, PingPong};
 use http::header::{ACCEPT, CONTENT_TYPE, DATE, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
-    AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountReport, AgentCapabilities,
-    AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody, RecordingAck,
-    RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse, SessionEnd,
-    SessionEndOutcome, recording_chunks_path, recording_complete_path,
+    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountReport,
+    AgentCapabilities, AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody,
+    RecordingAck, RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse,
+    ServiceAnnouncement, SessionEnd, SessionEndOutcome, recording_chunks_path,
+    recording_complete_path,
 };
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
@@ -276,6 +277,16 @@ impl AgentApi {
             Method::PUT,
             AGENT_CAPABILITIES_PATH,
             capabilities,
+            Retry::Idempotent,
+        )
+        .await
+    }
+
+    pub async fn services(&self, announcement: &ServiceAnnouncement) -> Result<(), ApiError> {
+        self.send_without_reply(
+            Method::POST,
+            AGENT_SERVICES_PATH,
+            announcement,
             Retry::Idempotent,
         )
         .await

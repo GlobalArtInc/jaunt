@@ -320,6 +320,54 @@ impl PolicySet {
         decision
     }
 
+    fn db_denials<'a>(
+        &'a self,
+        identity: &'a Identity,
+        server: &'a ResourceInfo,
+    ) -> impl Iterator<Item = (&'a Role, &'a DbDenyRule)> + 'a {
+        self.applicable_roles(identity).filter_map(move |role| {
+            role.deny
+                .databases
+                .as_ref()
+                .filter(|rule| rule.matches(server))
+                .map(|rule| (role, rule))
+        })
+    }
+
+    fn db_rules<'a>(
+        &'a self,
+        identity: &'a Identity,
+        server: &'a ResourceInfo,
+    ) -> impl Iterator<Item = (&'a Role, &'a DbRule)> + 'a {
+        self.applicable_roles(identity).filter_map(move |role| {
+            role.databases
+                .as_ref()
+                .filter(|rule| rule.matches(server))
+                .map(|rule| (role, rule))
+        })
+    }
+
+    pub fn reaches_database_server(&self, identity: &Identity, server: &ResourceInfo) -> bool {
+        let denials: Vec<&DbDenyRule> = self
+            .db_denials(identity, server)
+            .map(|(_, rule)| rule)
+            .collect();
+        self.db_rules(identity, server).any(|(_, rule)| {
+            rule.resolved_users(identity)
+                .filter(|user| is_db_user(user))
+                .any(|user| {
+                    rule.resolved_names(identity).any(|name| {
+                        if name == ANY_VALUE {
+                            !denials.iter().any(|deny| deny.removes_user(&user))
+                        } else {
+                            is_db_name(&name)
+                                && !denials.iter().any(|deny| deny.covers(&user, &name))
+                        }
+                    })
+                })
+        })
+    }
+
     pub fn authorize_db(
         &self,
         identity: &Identity,
@@ -331,25 +379,8 @@ impl PolicySet {
             policy_hash: self.hash.clone(),
             ..DbDecision::default()
         };
-        let denials: Vec<(&Role, &DbDenyRule)> = self
-            .applicable_roles(identity)
-            .filter_map(|role| {
-                role.deny
-                    .databases
-                    .as_ref()
-                    .filter(|rule| rule.matches(server))
-                    .map(|rule| (role, rule))
-            })
-            .collect();
-        let rules: Vec<(&Role, &DbRule)> = self
-            .applicable_roles(identity)
-            .filter_map(|role| {
-                role.databases
-                    .as_ref()
-                    .filter(|rule| rule.matches(server))
-                    .map(|rule| (role, rule))
-            })
-            .collect();
+        let denials: Vec<(&Role, &DbDenyRule)> = self.db_denials(identity, server).collect();
+        let rules: Vec<(&Role, &DbRule)> = self.db_rules(identity, server).collect();
 
         decision.trait_not_valid = rules.iter().any(|(_, rule)| rule.drops_invalid(identity));
         if !is_db_user(user) || !is_db_name(name) {

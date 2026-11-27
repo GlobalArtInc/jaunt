@@ -20,7 +20,7 @@ async fn get(harness: &Harness, path: &str, authorization: Option<&str>) -> Repl
     send(harness.router.clone(), builder.body(Body::empty()).unwrap()).await
 }
 
-async fn bearer(harness: &Harness, email: &str, groups: &[&str]) -> String {
+pub async fn bearer(harness: &Harness, email: &str, groups: &[&str]) -> String {
     let now = harness.clock.now_secs();
     let user = harness
         .store

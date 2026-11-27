@@ -76,6 +76,7 @@ pub struct Node {
     pub created_at: i64,
     pub removed_at: Option<i64>,
     pub agent_version: Option<String>,
+    pub ssh_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +164,8 @@ pub struct CertificateExpiry {
 macro_rules! node_columns {
     () => {
         "id, name, labels, hostname, tls_public_key, ssh_host_public_key, tls_spki_sha256, \
-         ssh_host_key_fingerprint, state, approved_by, created_at, removed_at, agent_version"
+         ssh_host_key_fingerprint, state, approved_by, created_at, removed_at, agent_version, \
+         ssh_enabled"
     };
 }
 
@@ -542,6 +544,7 @@ pub(crate) fn node_from_row(row: &SqliteRow) -> Result<Node, StoreError> {
         created_at: row.try_get("created_at")?,
         removed_at: row.try_get("removed_at")?,
         agent_version: row.try_get("agent_version")?,
+        ssh_enabled: row.try_get("ssh_enabled")?,
     })
 }
 

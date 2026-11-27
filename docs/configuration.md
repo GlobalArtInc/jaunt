@@ -185,6 +185,19 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 | `inner.sshd_host_key` | absolute path | `/etc/ssh/ssh_host_ed25519_key.pub` | the host key the agent pins for the local `sshd` |
 | `recording.session_queue_bytes` | integer | 67108864 | recording data one session may hold in memory while the tunnel is down; 1 MiB to `memory_budget_bytes` |
 | `recording.memory_budget_bytes` | integer | 268435456 | the same, for all sessions on the node; 1 MiB to 64 GiB |
+| `ssh.enabled` | boolean | `true` | whether the node is an SSH target. With `false` the server neither routes SSH to it nor lists it as an SSH node |
+| `services` | list | empty | at most 64 Kubernetes clusters, PostgreSQL servers and TCP services this agent offers. The agent announces them at every connection; each new service, and each change of its kind, name or labels, waits for an administrator with `nodes.approve` |
+| `services[].kind` | string | required | `kubernetes`, `postgres` or `tcp` |
+| `services[].name` | string | required | a DNS label of at most 63 characters, unique per kind on this agent |
+| `services[].labels` | map | empty | the same rules as node labels; the key `name` is rejected |
+| `services[].address` | host:port | required for `postgres` and `tcp`, refused for `kubernetes` | where the agent connects; shown to the administrator as a hint |
+| `services[].kubernetes.api` | string | `in-cluster` | how the agent reaches the API server |
+| `services[].kubernetes.audit` | string | `mutating` | `mutating` or `all` |
+| `services[].postgres.tls.ca_file` | absolute path | none | the CA that signs the database certificate; at most 1024 bytes. `ca_file` or `server_name` is required |
+| `services[].postgres.tls.server_name` | DNS name or IP | none | the name the database certificate must carry |
+| `services[].postgres.audit.queries` | string | `text` | `text` or `digest` |
+| `services[].postgres.audit.max_query_bytes` | integer | 4096 | 1 to 65536 |
+| `services[].tcp.idle_timeout_secs` | integer | 3600 | 1 to 86400 |
 
 Command-line flags:
 
@@ -303,7 +316,7 @@ There is no key for pseudo-terminals, session length or command filtering. A rol
 
 | Permission | Gates |
 |---|---|
-| `nodes.approve` | `GET /v1/admin/whoami`; `GET /v1/admin/nodes`, `GET`/`DELETE /v1/admin/nodes/{id}`; `POST /v1/admin/enrolments/lookup`, `/v1/admin/enrolments/{id}/approve` and `/reject` |
+| `nodes.approve` | `GET /v1/admin/whoami`; `GET /v1/admin/nodes`, `GET`/`DELETE /v1/admin/nodes/{id}`; `POST /v1/admin/enrolments/lookup`, `/v1/admin/enrolments/{id}/approve` and `/reject`; `GET /v1/admin/services`, `POST /v1/admin/services/{id}/approve` and `/reject`, `DELETE /v1/admin/services/{id}` |
 | `sessions.read` | `GET /v1/admin/sessions`, `GET /v1/admin/sessions/{id}`, `GET /v1/admin/nodes/{id}/access` (who may reach a node), `GET /v1/admin/revocations` |
 | `recordings.read` | `GET /v1/admin/sessions/{id}/recording` and `/recording/manifest` |
 | `revocations.write` | `POST /v1/admin/revocations`, `DELETE /v1/admin/revocations/{id}` |

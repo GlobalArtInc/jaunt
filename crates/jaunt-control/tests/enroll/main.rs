@@ -16,6 +16,7 @@ mod renew;
 mod revoke;
 mod route;
 mod serve;
+mod services;
 mod session_http;
 mod session_support;
 mod subject_key;

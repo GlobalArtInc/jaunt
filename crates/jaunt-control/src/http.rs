@@ -9,7 +9,10 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use http_body_util::BodyExt;
-use jaunt_proto::{AGENT_CAPABILITIES_PATH, AGENT_SESSION_ACCOUNT_PATH, ErrorBody};
+use jaunt_proto::{
+    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, ErrorBody,
+    SERVICES_PATH,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -17,7 +20,7 @@ use crate::control::Control;
 use crate::recordings::{self, MAX_COMPLETE_BODY_BYTES};
 use crate::{
     agent_trust, callback, client_config, device, enroll, finish, host_accounts, limits, nodes,
-    poll, renew, session_http, start, web, whoami,
+    poll, renew, services, session_http, start, web, whoami,
 };
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -32,6 +35,7 @@ pub(crate) fn router(control: Control, extra_web_routes: Router<Control>) -> Rou
         .route("/v1/whoami", get(whoami::handle))
         .route("/v1/client-config", get(client_config::handle))
         .route("/v1/nodes", get(nodes::handle))
+        .route(SERVICES_PATH, get(services::list))
         .route("/v1/agent/enroll", post(enroll::handle))
         .route("/v1/agent/enroll/poll", post(poll::handle));
     let routes = device::mount(routes, &control);
@@ -57,6 +61,11 @@ pub(crate) fn agent_router(control: Control) -> Router {
             post(host_accounts::session_account),
         )
         .route("/v1/agent/trust", get(agent_trust::handle))
+        .route(
+            AGENT_SERVICES_PATH,
+            post(services::announce)
+                .layer(DefaultBodyLimit::max(services::ANNOUNCEMENT_BODY_BYTES)),
+        )
         .route(
             "/v1/agent/recordings/{session_id}/chunks",
             post(recordings::chunk).layer(DefaultBodyLimit::max(recordings::chunk_route_limit(

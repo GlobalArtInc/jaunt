@@ -16,6 +16,7 @@ mod nodes;
 pub(crate) mod pages;
 mod recording_view;
 mod revocations;
+mod services;
 mod session;
 mod signed;
 pub(crate) mod terminal;
@@ -137,6 +138,10 @@ pub(crate) fn mount(
             post(enrolments::approve),
         )
         .route("/v1/admin/enrolments/{id}/reject", post(enrolments::reject))
+        .route("/v1/admin/services", get(services::list))
+        .route("/v1/admin/services/{id}", delete(services::remove))
+        .route("/v1/admin/services/{id}/approve", post(services::approve))
+        .route("/v1/admin/services/{id}/reject", post(services::reject))
         .route("/v1/admin/sessions", get(admin_sessions::list))
         .route("/v1/admin/sessions/{id}", get(admin_sessions::detail))
         .route("/v1/web/terminal", get(terminal::open))

@@ -1,4 +1,4 @@
-mod args;
+pub(crate) mod args;
 mod client;
 #[cfg(test)]
 mod tests;

@@ -9,6 +9,7 @@ mod login_requests;
 mod nodes;
 mod recordings;
 mod revocations;
+mod services;
 mod sessions;
 mod users;
 mod web_sessions;
@@ -50,6 +51,13 @@ pub use recordings::{
 pub use revocations::{
     MAX_REVOCATION_PAGE, NewRevocation, Revocation, RevocationCursor, RevocationKind,
     RevocationPage, Revocations, RevokeOutcome, Subjects,
+};
+pub use services::{
+    AnnounceOutcome, Announced, AnnouncedService, Announcement, ApprovedHolder, ApprovedService,
+    MAX_LIVE_SERVICES_PER_NODE, MAX_PENDING_SERVICES_PER_NODE, MAX_SERVICE_HISTORY,
+    MAX_SERVICE_PAGE, Service, ServiceApproval, ServiceApproveOutcome, ServiceChange,
+    ServiceCursor, ServiceDecisionOutcome, ServiceKind, ServicePage, ServiceQuery, ServiceState,
+    Services,
 };
 pub use sessions::{
     ActivateSession, EndOutcome, EndRejection, EndSession, MAX_SESSION_PAGE, NewSession,
@@ -128,6 +136,10 @@ impl Store {
 
     pub fn recordings(&self) -> Recordings {
         Recordings::new(self.pool.clone())
+    }
+
+    pub fn services(&self) -> Services {
+        Services::new(self.pool.clone())
     }
 
     pub fn sessions(&self) -> Sessions {

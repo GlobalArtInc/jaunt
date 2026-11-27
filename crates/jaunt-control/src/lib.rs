@@ -45,6 +45,8 @@ mod revocation;
 mod revocation_audit;
 mod route;
 mod serve;
+mod service_audit;
+mod services;
 mod session_audit;
 mod session_end;
 mod session_http;

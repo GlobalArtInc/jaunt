@@ -415,3 +415,184 @@ fn database_blocks_are_validated() {
         );
     }
 }
+
+const CANDIDATE_USERS: [&str; 7] = [
+    "readonly",
+    "app_owner",
+    "a_user",
+    "b_user",
+    "alice",
+    "u_alice",
+    "postgres",
+];
+const CANDIDATE_NAMES: [&str; 6] = ["app", "billing", "secrets", "x", "y", "probe_db"];
+
+fn deny(name: &str, members: &str, body: &str) -> String {
+    role(name, members, &format!("  deny: {{ databases: {body} }}\n"))
+}
+
+fn some_pair_allowed(set: &PolicySet, who: &Identity, target: &ResourceInfo) -> bool {
+    CANDIDATE_USERS.iter().any(|user| {
+        CANDIDATE_NAMES
+            .iter()
+            .any(|name| set.authorize_db(who, target, user, name).allowed)
+    })
+}
+
+#[test]
+fn a_server_is_reached_exactly_when_some_pair_is_allowed() {
+    let grant = |users: &str, names: &str| {
+        databases(
+            "grant",
+            &format!("{{ servers: {{ env: [prod] }}, users: [{users}], names: [{names}] }}"),
+        )
+    };
+    let cases: Vec<(&str, Vec<String>, bool)> = vec![
+        ("a plain grant", vec![grant("readonly", "app")], true),
+        (
+            "a deny of the whole server",
+            vec![
+                grant("readonly", "'*'"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] } }",
+                ),
+            ],
+            false,
+        ),
+        (
+            "a deny of some names",
+            vec![
+                grant("readonly", "app, secrets"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, names: [secrets] }",
+                ),
+            ],
+            true,
+        ),
+        (
+            "a deny of every granted name",
+            vec![
+                grant("readonly", "secrets"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, names: [secrets] }",
+                ),
+            ],
+            false,
+        ),
+        (
+            "a deny of some names under any name",
+            vec![
+                grant("readonly", "'*'"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, names: [secrets] }",
+                ),
+            ],
+            true,
+        ),
+        (
+            "a deny of the only user under any name",
+            vec![
+                grant("readonly", "'*'"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, users: [readonly] }",
+                ),
+            ],
+            false,
+        ),
+        (
+            "a deny of the only user on some names under any name",
+            vec![
+                grant("readonly", "'*'"),
+                deny(
+                    "limits",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, users: [readonly], names: [app] }",
+                ),
+            ],
+            true,
+        ),
+        (
+            "pairs of two roles do not mix",
+            vec![
+                databases(
+                    "first",
+                    "{ servers: { env: [prod] }, users: [a_user], names: [x] }",
+                ),
+                databases(
+                    "second",
+                    "{ servers: { env: [prod] }, users: [b_user], names: [y] }",
+                ),
+                deny(
+                    "no-ax",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, users: [a_user], names: [x] }",
+                ),
+                deny(
+                    "no-by",
+                    "{ groups: [ops] }",
+                    "{ servers: { env: [prod] }, users: [b_user], names: [y] }",
+                ),
+            ],
+            false,
+        ),
+        (
+            "a deny for other members",
+            vec![
+                grant("readonly", "app"),
+                deny(
+                    "others",
+                    "{ groups: [dev] }",
+                    "{ servers: { env: [prod] } }",
+                ),
+            ],
+            true,
+        ),
+        (
+            "a template user",
+            vec![grant("'u_{username}'", "app")],
+            true,
+        ),
+        (
+            "a server outside the selector",
+            vec![databases(
+                "grant",
+                "{ servers: { env: [dev] }, users: [readonly], names: ['*'] }",
+            )],
+            false,
+        ),
+    ];
+    let invalid = person("Not Valid", &["ops"]);
+    let outsider = person("bob", &[]);
+    for (name, parts, expected) in cases {
+        let set = roles(&parts);
+        assert_eq!(
+            set.reaches_database_server(&alice(), &lk()),
+            expected,
+            "{name}"
+        );
+        for who in [alice(), invalid.clone(), outsider.clone()] {
+            for target in [lk(), server("dev-1", "dev")] {
+                assert_eq!(
+                    set.reaches_database_server(&who, &target),
+                    some_pair_allowed(&set, &who, &target),
+                    "{name}: {} on {}",
+                    who.username,
+                    target.name
+                );
+            }
+        }
+        assert!(!set.reaches_database_server(&outsider, &lk()), "{name}");
+    }
+    let template = roles(&[grant("'u_{username}'", "app")]);
+    assert!(!template.reaches_database_server(&invalid, &lk()));
+}

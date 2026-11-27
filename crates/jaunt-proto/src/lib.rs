@@ -10,6 +10,7 @@ mod kube_principal;
 mod login;
 mod plane;
 mod recording;
+mod service;
 mod session;
 mod ssh_login;
 mod whoami;
@@ -43,6 +44,13 @@ pub use recording::{
     RECORDING_CHUNKS_SUFFIX, RECORDING_COMPLETE_SUFFIX, RECORDINGS_PATH_PREFIX, RecordingAck,
     RecordingChunk, RecordingComplete, RecordingKind, RecordingManifest, RecordingReceipt,
     RecordingRefusal, RecordingState, recording_chunks_path, recording_complete_path,
+};
+pub use service::{
+    AGENT_SERVICES_PATH, AnnouncedService, DEFAULT_MAX_QUERY_BYTES, DEFAULT_TCP_IDLE_TIMEOUT_SECS,
+    KubernetesApi, KubernetesAudit, KubernetesSettings, MAX_QUERY_BYTES, MAX_SERVICE_PATH_BYTES,
+    MAX_SERVICES_PER_AGENT, MAX_TCP_IDLE_TIMEOUT_SECS, PostgresAudit, PostgresSettings,
+    PostgresTls, QueryAudit, SERVICES_PATH, ServiceAnnouncement, ServiceKind, ServiceList,
+    ServiceProblem, ServiceSettings, ServiceSummary, TcpSettings,
 };
 pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
