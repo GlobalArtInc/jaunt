@@ -35,13 +35,13 @@ pub use admin_token::{
 pub use agent_trust::{
     AGENT_TRUST_V3_PATH, AgentTrust, AgentTrustV2, AgentTrustV3, TrustRole, TrustedX509Root,
 };
-pub use client::{
-    CLIENT_CONFIG_V2_PATH, ClientConfig, ClientConfigV2, ClientTransport, GateEndpoint, NodeList,
-    NodeSummary, PinnedRoot, ServicesClient, SshGateClient,
-};
 pub use audit_ref::{
     ACCOUNT_REFERENCE_PREFIX, AUDIT_REFERENCE_DIGITS, DENIAL_REFERENCE_PREFIX, is_audit_reference,
     is_denial_reference,
+};
+pub use client::{
+    CLIENT_CONFIG_V2_PATH, ClientConfig, ClientConfigV2, ClientTransport, GateEndpoint, NodeList,
+    NodeSummary, PinnedRoot, ServicesClient, SshGateClient,
 };
 pub use db_principal::{
     is_db_name, is_db_user, is_valid_substituted_db_name, is_valid_substituted_db_user,
