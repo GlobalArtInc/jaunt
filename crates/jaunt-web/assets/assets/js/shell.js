@@ -56,9 +56,11 @@ function initialOf(name) {
 export function createShell({ root, onSignOut }) {
   let drawerOpen = false;
   let collapsed = readCollapsed();
-  let model = { session: null, current: { area: null, page: null }, counts: {}, terminal: null };
+  let model = { session: null, current: { area: null, page: null }, counts: {}, terminal: null, terminals: 0 };
 
-  const main = el("main", { id: "main", tabindex: "-1" });
+  const view = el("div", { class: "view" });
+  const workspaceHost = el("div", { class: "workspace-host" });
+  const main = el("main", { id: "main", tabindex: "-1" }, view, workspaceHost);
   const live = el("div", { class: "visually-hidden", role: "status", "aria-live": "polite" });
   const skip = el("button", { type: "button", class: "skip", on: { click: () => main.focus({ preventScroll: true }) } }, S.skip);
 
@@ -178,11 +180,18 @@ export function createShell({ root, onSignOut }) {
     }
   });
 
-  function railItem(entry, active) {
+  function railItem(entry, active, openCount = 0) {
     return el(
       "li",
       {},
-      el("a", { class: "rail-item", href: entry.href, "aria-current": active ? "page" : null }, icon(entry.icon), el("span", { class: "rail-label", text: entry.label })),
+      el(
+        "a",
+        { class: "rail-item", href: entry.href, "aria-current": active ? "page" : null },
+        icon(entry.icon),
+        el("span", { class: "rail-label", text: entry.label }),
+        openCount > 0 ? el("span", { class: "rail-count", "aria-hidden": "true", text: openCount > 99 ? "99+" : String(openCount) }) : null,
+        openCount > 0 ? el("span", { class: "visually-hidden", text: S.shell.terminalsOpen(openCount) }) : null,
+      ),
     );
   }
 
@@ -234,7 +243,7 @@ export function createShell({ root, onSignOut }) {
     const entries = visibleAreas(session, { terminal: model.terminal });
     replace(
       railList,
-      entries.map(({ area, pages }) => railItem({ href: pages[0].href, icon: area.icon, label: area.label }, area.id === current.area)),
+      entries.map(({ area, pages }) => railItem({ href: pages[0].href, icon: area.icon, label: area.label }, area.id === current.area, area.id === "terminal" ? model.terminals : 0)),
     );
     replace(railFoot, hasPermission(session, ADD_NEW.permission) ? railItem(ADD_NEW, false) : null);
     const active = entries.find(({ area }) => area.id === current.area) || null;
@@ -295,6 +304,8 @@ export function createShell({ root, onSignOut }) {
 
   return {
     main,
+    view,
+    workspaceHost,
     live,
     update(next) {
       const held = heldFocus();

@@ -61,6 +61,7 @@ function seedSessions() {
     node_id: "n-1",
     node_name: "web-01",
     login: "deploy",
+    origin: index % 2 === 0 ? "ssh" : "web",
     created_at: t - 600 * (index + 1),
     authorized_at: t - 600 * (index + 1) + 1,
     ended_at: state === "ended" ? t - 300 * index : null,
@@ -82,8 +83,10 @@ export async function startStub({ permissions }) {
     sessionsTokens: new Map(),
     lookupLimited: false,
     targets: null,
+    recent: [],
     recordings: new Map(),
     recordingRequests: [],
+    terminations: [],
     log: [],
   };
   const origin = { value: "" };
@@ -148,6 +151,7 @@ export async function startStub({ permissions }) {
       send(response, 200, { ssh_suffix: "jaunt.example.com", gate: { host: "gate.example.com", port: 22 }, host_ca_keys: [] });
       return;
     }
+    let match;
     const current = sessionOf(request);
     if (!current) {
       send(response, 401, { error: "unauthorized" });
@@ -168,6 +172,21 @@ export async function startStub({ permissions }) {
       if (state.targets === null) return send(response, 404, { error: "not_found" });
       return send(response, 200, state.targets);
     }
+    if (path === "/v1/web/terminal/limits" && method === "GET") {
+      if (state.targets === null) return send(response, 404, { error: "not_found" });
+      return send(response, 200, { max_per_user: terminal.control.maxPerUser, idle_timeout_secs: 1800 });
+    }
+    if (path === "/v1/web/terminal/recent" && method === "GET") {
+      if (state.targets === null) return send(response, 404, { error: "not_found" });
+      return send(response, 200, state.recent);
+    }
+    if ((match = /^\/v1\/web\/pins\/([^/]+)$/.exec(path)) && (method === "PUT" || method === "DELETE")) {
+      const entry = (state.targets || []).find((target) => target.node === decodeURIComponent(match[1]));
+      if (!entry) return send(response, 404, { error: "not_found" });
+      if (method === "PUT" && !entry.pinned && state.targets.filter((target) => target.pinned).length >= 50) return send(response, 409, { error: "too_many_pins" });
+      entry.pinned = method === "PUT";
+      return send(response, 204, undefined);
+    }
     if (path === "/v1/web/terminal/ticket" && method === "POST") {
       const reply = terminal.issue(current, await body(request), state.targets);
       return send(response, reply.status, reply.body);
@@ -183,7 +202,6 @@ export async function startStub({ permissions }) {
       }
       return true;
     };
-    let match;
     if (path === "/v1/admin/nodes" && method === "GET") {
       if (!need("nodes.approve")) return;
       const wanted = url.searchParams.get("state") || "active";
@@ -263,8 +281,25 @@ export async function startStub({ permissions }) {
     if (path === "/v1/admin/sessions" && method === "GET") {
       if (!need("sessions.read")) return;
       const wanted = url.searchParams.get("state");
-      const items = state.sessions.filter((entry) => !wanted || entry.state === wanted);
+      const origin = url.searchParams.get("origin");
+      if (origin !== null && origin !== "web" && origin !== "ssh") return send(response, 400, { error: "invalid_origin" });
+      const items = state.sessions.filter((entry) => (!wanted || entry.state === wanted) && (!origin || entry.origin === origin));
       return send(response, 200, page(items, url, "sessions"));
+    }
+    if ((match = /^\/v1\/admin\/sessions\/([^/]+)\/terminate$/.exec(path)) && method === "POST") {
+      if (!need("sessions.terminate")) return;
+      const input = await body(request);
+      const keys = input === undefined ? [] : Object.keys(input);
+      const reasonOk = (value) => typeof value === "string" && Array.from(value).length <= 200 && !/[\u0000-\u001f\u007f-\u009f]/.test(value) && !/\b(bearer|basic)\s+\S+|\b(password|passwd|secret|token|api[_-]?key)\s*[:=]/i.test(value);
+      if (keys.some((key) => key !== "reason") || (input && input.reason !== undefined && !reasonOk(input.reason))) return send(response, 422, { error: "invalid_reason" });
+      const entry = state.sessions.find((candidate) => candidate.id === decodeURIComponent(match[1]));
+      if (!entry) return send(response, 404, { error: "not_found" });
+      if (entry.state === "ended") return send(response, 409, { error: "already_ended" });
+      entry.state = "ended";
+      entry.ended_at = now();
+      entry.end_reason = "terminated";
+      state.terminations.push({ id: entry.id, reason: input && input.reason !== undefined ? input.reason : null });
+      return send(response, 204, undefined);
     }
     if ((match = /^\/v1\/admin\/sessions\/([^/]+)$/.exec(path)) && method === "GET") {
       if (!need("sessions.read")) return;
@@ -348,6 +383,9 @@ export async function startStub({ permissions }) {
     },
     setTargets(targets) {
       state.targets = targets;
+    },
+    setRecent(recent) {
+      state.recent = recent;
     },
     setNodes(nodes) {
       state.nodes = nodes;

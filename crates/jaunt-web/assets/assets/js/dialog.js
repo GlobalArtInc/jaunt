@@ -1,4 +1,5 @@
 import { el, uniqueId } from "./dom.js";
+import { icon } from "./icons.js";
 import { S } from "./strings.js";
 import { genericMessage } from "./errors.js";
 import { button, errorLine } from "./ui.js";
@@ -19,14 +20,14 @@ function focusableIn(container) {
   return Array.from(container.querySelectorAll(FOCUSABLE)).filter((node) => !node.closest("[hidden]"));
 }
 
-export function openDialog({ title, body, footer, danger, drawer, dismissable = true, onClose }) {
+export function openDialog({ title, body, footer, danger, drawer, dismissable = true, onClose, className, closeIcon, closeLabel, closeButton = true }) {
   const opener = document.activeElement;
   const titleId = uniqueId("dialog-title");
   const heading = el("h2", { id: titleId, text: title });
   const header = el("header", {}, heading);
   const modal = el(
     "div",
-    { class: "modal" + (danger ? " danger" : ""), role: "dialog", "aria-modal": "true", "aria-labelledby": titleId, tabindex: "-1" },
+    { class: "modal" + (danger ? " danger" : "") + (className ? " " + className : ""), role: "dialog", "aria-modal": "true", "aria-labelledby": titleId, tabindex: "-1" },
     header,
     el("div", { class: "body" }, body),
   );
@@ -64,7 +65,11 @@ export function openDialog({ title, body, footer, danger, drawer, dismissable = 
   }
 
   if (dismissable) {
-    header.appendChild(button(S.close, { small: true, onClick: close }));
+    if (closeButton && closeIcon) {
+      header.appendChild(el("button", { type: "button", class: "icon-btn", "aria-label": closeLabel || S.close, on: { click: close } }, icon("close")));
+    } else if (closeButton) {
+      header.appendChild(button(S.close, { small: true, onClick: close }));
+    }
     scrim.addEventListener("mousedown", (event) => {
       if (event.target === scrim) {
         close();
@@ -109,14 +114,20 @@ export function openDialog({ title, body, footer, danger, drawer, dismissable = 
   return handle;
 }
 
-export function openConfirm({ title, intro, effects, danger, confirmLabel, cancelLabel, typed, check, onConfirm, onError, onDone }) {
+export function openConfirm({ title, intro, effects, extra, danger, confirmLabel, cancelLabel, typed, check, onConfirm, onError, onDone, closeButton, focusCancel }) {
   const errorSlot = el("div", {});
   const children = [];
   if (intro) {
     children.push(el("p", {}, intro));
   }
+  if (extra) {
+    children.push(...extra.before);
+  }
   if (effects && effects.length > 0) {
     children.push(el("ul", { class: "effects" }, effects.map((line) => el("li", {}, line))));
+  }
+  if (extra) {
+    children.push(...extra.after);
   }
   let typedInput = null;
   let checkInput = null;
@@ -133,7 +144,10 @@ export function openConfirm({ title, intro, effects, danger, confirmLabel, cance
   children.push(errorSlot);
   const confirm = button(confirmLabel, { kind: danger ? "danger" : "primary", disabled: Boolean(typed || check) });
   const cancel = button(cancelLabel || S.cancel, { onClick: () => dialog.close() });
-  const dialog = openDialog({ title, body: children, footer: [cancel, confirm], danger });
+  if (focusCancel) {
+    cancel.setAttribute("data-autofocus", "");
+  }
+  const dialog = openDialog({ title, body: children, footer: [cancel, confirm], danger, closeButton });
 
   function satisfied() {
     const typedOk = !typedInput || typedInput.value === typed.expected;

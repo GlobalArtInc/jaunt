@@ -99,3 +99,49 @@ test("reset forgets the suffix and the targets so the next user gets fresh infor
   assert.equal(info.command("n"), "ssh YOUR_LOGIN@n.b.example");
   assert.deepEqual(info.loginsFor("n"), ["bob"]);
 });
+
+test("a pin counts only after the server answered, and its path escapes the node name", async () => {
+  installDom();
+  const { createConnectInfo } = await import(JS + "connect.js");
+  const api = fakeApi({ "/v1/web/terminal/targets": [{ node: "a%b/c", logins: ["ok"], pinned: false }, { node: "plain", logins: ["ok"], pinned: true }] });
+  const seen = [];
+  let outcome = "refuse";
+  api.put = async (path) => {
+    seen.push(["PUT", path, info.isPinned("a%b/c")]);
+    if (outcome === "refuse") {
+      throw Object.assign(new Error("full"), { status: 409 });
+    }
+  };
+  api.del = async (path) => {
+    seen.push(["DELETE", path, info.isPinned("plain")]);
+    if (outcome === "refuse") {
+      throw Object.assign(new Error("down"), { status: 500 });
+    }
+  };
+  const info = createConnectInfo(api);
+  await info.load();
+  await assert.rejects(info.setPinned("a%b/c", true));
+  assert.equal(info.isPinned("a%b/c"), false);
+  await assert.rejects(info.setPinned("plain", false));
+  assert.equal(info.isPinned("plain"), true);
+  outcome = "accept";
+  await info.setPinned("a%b/c", true);
+  assert.equal(info.isPinned("a%b/c"), true);
+  await info.setPinned("plain", false);
+  assert.equal(info.isPinned("plain"), false);
+  assert.deepEqual(seen.map(([method, path, during]) => [method, path, during]), [
+    ["PUT", "/v1/web/pins/a%25b%2Fc", false],
+    ["DELETE", "/v1/web/pins/plain", true],
+    ["PUT", "/v1/web/pins/a%25b%2Fc", false],
+    ["DELETE", "/v1/web/pins/plain", true],
+  ]);
+});
+
+test("the terminal limits are read only when they are whole numbers in a sensible range", async () => {
+  installDom();
+  const { readTerminalConfig } = await import(JS + "connect.js");
+  assert.deepEqual(readTerminalConfig({ max_per_user: 4, idle_timeout_secs: 1800 }), { maxPerUser: 4, idleTimeoutSecs: 1800 });
+  for (const bad of [null, [], "x", { max_per_user: 0, idle_timeout_secs: 0 }, { max_per_user: "4", idle_timeout_secs: "9" }, { max_per_user: 1e9, idle_timeout_secs: 1e12 }, { max_per_user: 1.5 }]) {
+    assert.deepEqual(readTerminalConfig(bad), { maxPerUser: null, idleTimeoutSecs: null }, JSON.stringify(bad));
+  }
+});

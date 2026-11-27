@@ -14,6 +14,7 @@
     "smoke:csi": "node smoke/csi-sweep.mjs",
     "smoke:before": "node smoke/before.mjs",
     "smoke:terminal": "node smoke/terminal.mjs",
+    "smoke:workspace": "node smoke/workspace.mjs",
     "smoke:c0": "node smoke/c0-sweep.mjs",
     "smoke:marks": "node smoke/marks-oracle.mjs"
   },

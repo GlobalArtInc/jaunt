@@ -7,6 +7,7 @@ import { closeOpenMenu } from "./menu.js";
 import { createConnectInfo } from "./connect.js";
 import { firstAllowedHref, hasPermission } from "./nav.js";
 import { createShell } from "./shell.js";
+import { createWorkspace } from "./terminal/workspace.js";
 import { button } from "./ui.js";
 import { auditView } from "./views/audit.js";
 import { approveView } from "./views/approve.js";
@@ -136,13 +137,28 @@ export function start(root) {
   }
 
   function currentModel() {
-    return { session: state.session, current: state.current, counts: state.counts, terminal: connect.terminalEnabled() };
+    return { session: state.session, current: state.current, counts: state.counts, terminal: connect.terminalEnabled(), terminals: state.shell && state.shell.workspace ? state.shell.workspace.count() : 0 };
   }
 
   function buildShell() {
     connect.reset();
     const shell = createShell({ root, onSignOut: signOutNow });
-    state.shell = { main: shell.main, live: shell.live, handle: shell };
+    state.shell = { main: shell.view, focus: shell.main, live: shell.live, handle: shell, workspace: null };
+    state.shell.workspace = createWorkspace({
+      host: shell.workspaceHost,
+      api,
+      connect,
+      announce: (message) => {
+        shell.live.textContent = message;
+      },
+      markTerminalOff: () => connect.markTerminal(false),
+      onChange: () => refreshNav(),
+      setTitle: (label) => {
+        if (state.current.area === "terminal") {
+          document.title = label + " · " + S.product;
+        }
+      },
+    });
     state.counts = {};
     state.pendingAt = 0;
     state.current = { area: null, page: null };
@@ -188,6 +204,7 @@ export function start(root) {
     runCleanups();
     state.session = null;
     state.wasSignedIn = false;
+    state.shell.workspace.destroy();
     state.shell.handle.destroy();
     state.shell = null;
     renderSignIn(root, { notice: S.signIn.signedOut });
@@ -203,7 +220,8 @@ export function start(root) {
     state.shell.handle.closeDrawer();
     state.token += 1;
     const mine = state.token;
-    const { main } = state.shell;
+    const view = state.shell.main;
+    const main = state.shell.focus;
     const { path, query } = parseHash();
     if (path === "/") {
       const target = firstAllowedHref(state.session);
@@ -222,16 +240,16 @@ export function start(root) {
       state.current = { area: null, page: null };
       refreshNav();
       document.title = S.titles.notAllowed + " · " + S.product;
-      renderForbidden(main, { session: state.session, permission: null, path: null });
+      renderForbidden(view, { session: state.session, permission: null, path: null });
       return;
     }
     const matched = matchRoute(path);
-    main.replaceChildren();
+    view.replaceChildren();
     if (!matched) {
       state.current = { area: null, page: null };
       refreshNav();
       document.title = S.titles.notFound + " · " + S.product;
-      renderNotFound(main);
+      renderNotFound(view);
       main.focus({ preventScroll: true });
       return;
     }
@@ -241,13 +259,14 @@ export function start(root) {
     document.title = route.title + " · " + S.product;
     if (!hasPermission(state.session, route.permission)) {
       document.title = S.titles.notAllowed + " · " + S.product;
-      renderForbidden(main, { session: state.session, permission: route.permission, path: "#" + path });
+      renderForbidden(view, { session: state.session, permission: route.permission, path: "#" + path });
       main.focus({ preventScroll: true });
       return;
     }
     const ctx = {
       api,
-      main,
+      main: view,
+      workspace: state.shell.workspace,
       query,
       params,
       path: "#" + path,
@@ -340,6 +359,7 @@ export function start(root) {
       root.removeEventListener("click", onLinkClick);
       runCleanups();
       if (state.shell) {
+        state.shell.workspace.destroy();
         state.shell.handle.destroy();
       }
     },

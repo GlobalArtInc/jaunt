@@ -9,6 +9,7 @@ const HOOKS = "../../crates/jaunt-web/assets/assets/js/terminal/hooks.js";
 const TICKET_ROUTE = "POST /v1/web/terminal/ticket";
 const TARGETS_ROUTE = "GET /v1/web/terminal/targets";
 const NODES_ROUTE = "GET /v1/admin/nodes";
+const BASE = { "GET /v1/web/terminal/recent": json(200, []), "GET /v1/client-config": json(200, { ssh_suffix: "jaunt.example.com" }), "GET /v1/web/terminal/limits": json(200, { max_per_user: 4, idle_timeout_secs: 1800 }) };
 const FLEET = [
   { node: "db-02", labels: {}, connected: true, creates_accounts: true, logins: ["alice"] },
   { node: "web-01", labels: {}, connected: true, creates_accounts: false, logins: ["alice"] },
@@ -34,8 +35,8 @@ afterEach(() => {
 });
 
 async function begin(nodeName = "db-02", fleet = FLEET) {
-  ui = await mount({ ...signedIn([]), [TARGETS_ROUTE]: json(200, fleet), [TICKET_ROUTE]: GRANT }, "#/terminal?node=" + encodeURIComponent(nodeName) + "&login=alice");
-  click(byText(ui.root, "button", "Open terminal"));
+  ui = await mount({ ...signedIn([]), ...BASE, [TARGETS_ROUTE]: json(200, fleet), [TICKET_ROUTE]: GRANT }, "#/terminal?node=" + encodeURIComponent(nodeName) + "&login=alice");
+  click(ui.root.querySelector(".panel.quick footer .btn-primary"));
   for (let round = 0; round < 50 && rig.sockets.length === 0; round += 1) {
     await settle();
   }
@@ -47,10 +48,10 @@ async function begin(nodeName = "db-02", fleet = FLEET) {
 const bannerText = () => ui.root.querySelector(".term-banner").textContent;
 const states = () => ui.root.querySelector(".statusbar [role=status]").textContent;
 
-test("the Creates accounts marker shows for true and not for false or a missing field, in the picker and on the node cards", async () => {
-  ui = await mount({ ...signedIn([]), [TARGETS_ROUTE]: json(200, FLEET) }, "#/terminal");
-  const marked = Array.from(ui.main().querySelectorAll(".pick-card")).filter((card) => card.textContent.includes("Creates accounts"));
-  assert.deepEqual(marked.map((card) => card.querySelector("input").value), ["db-02"]);
+test("the Creates accounts marker shows for true and not for false or a missing field, in quick open and on the node cards", async () => {
+  ui = await mount({ ...signedIn([]), ...BASE, [TARGETS_ROUTE]: json(200, FLEET) }, "#/terminal");
+  const marked = Array.from(ui.main().querySelectorAll(".quick-row")).filter((row) => row.textContent.includes("Creates accounts"));
+  assert.deepEqual(marked.map((row) => row.querySelector(".name").textContent), ["db-02"]);
   ui.stop();
 
   const nodes = [node({ id: "n-1", name: "db-02", creates_accounts: true }), node({ id: "n-2", name: "web-01", creates_accounts: false }), node({ id: "n-3", name: "web-02", connected_since: NOW - 5 })];
@@ -64,7 +65,7 @@ test("the Creates accounts marker shows for true and not for false or a missing 
 
 test("the Connect menu explains account creation only for a node that creates accounts", async () => {
   const nodes = [node({ id: "n-1", name: "db-02", creates_accounts: true }), node({ id: "n-2", name: "web-01" })];
-  ui = await mount({ ...signedIn(), [TARGETS_ROUTE]: json(200, FLEET), [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes");
+  ui = await mount({ ...signedIn(), ...BASE, [TARGETS_ROUTE]: json(200, FLEET), [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes");
   await settle();
   const trigger = (label) => Array.from(ui.root.querySelectorAll("button")).find((button) => button.getAttribute("aria-label") === label);
   click(trigger("Connect to db-02"));
@@ -194,17 +195,20 @@ test("each account error code has its own text, shows the reference and the righ
   ui = null;
 });
 
-test("Choose another login returns to the picker with the node selected", async () => {
+test("Choose another login opens quick open with the node unfolded", async () => {
   const socket = await begin();
   socket.control({ t: "error", code: "account_refused", ref: "H-9D0311FE" });
   socket.drop(1008);
   await settle();
-  const link = ui.root.querySelector(".term-banner a.btn");
-  assert.equal(link.getAttribute("href"), "#/terminal?node=db-02");
+  click(byText(ui.root, "button", "Choose another login"));
+  const dialog = document.querySelector("[role=dialog]");
+  assert.ok(dialog);
+  assert.equal(dialog.querySelector(".quick-row.is-open .name").textContent, "db-02");
+  assert.equal(dialog.querySelector('input[name="quick-login"]').value, "alice");
 });
 
-test("a reference that does not match H- and eight capital hex digits is never rendered, and the cause text stays", async () => {
-  const bad = ["D-0B77E310", "H-9d0311fe", "H-9D0311F", "H-9D0311FE0", "h-9D0311FE", " H-9D0311FE", "H-9D0311FE\n", HOSTILE.tag, "<b>H-9D0311FE</b>", LONG, 5, null, ["H-9D0311FE"]];
+test("a reference that does not match D- or H- and eight capital hex digits is never rendered, and the cause text stays", async () => {
+  const bad = ["X-0B77E310", "D-0b77e310", "H-9d0311fe", "H-9D0311F", "H-9D0311FE0", "h-9D0311FE", " H-9D0311FE", "H-9D0311FE\n", HOSTILE.tag, "<b>H-9D0311FE</b>", LONG, 5, null, ["H-9D0311FE"]];
   for (const reference of bad) {
     const socket = await begin();
     socket.control({ t: "error", code: "account_refused", ref: reference });
@@ -253,7 +257,7 @@ test("the three account causes are in the strings module with a title, a text an
 test("the Connect menu has no account explanation for a node without the field or with false", async () => {
   const targets = [{ node: "web-02", labels: {}, connected: true, logins: ["alice"] }, { node: "web-01", labels: {}, connected: true, creates_accounts: false, logins: ["alice"] }];
   const nodes = [node({ id: "n-1", name: "web-01" }), node({ id: "n-2", name: "web-02" })];
-  ui = await mount({ ...signedIn(), [TARGETS_ROUTE]: json(200, targets), [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes");
+  ui = await mount({ ...signedIn(), ...BASE, [TARGETS_ROUTE]: json(200, targets), [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes");
   await settle();
   const trigger = (label) => Array.from(ui.root.querySelectorAll("button")).find((button) => button.getAttribute("aria-label") === label);
   for (const name of ["web-02", "web-01"]) {
@@ -281,7 +285,8 @@ test("Choose another login keeps a node name with spaces and separators intact i
   socket.control({ t: "error", code: "no_account", ref: "H-0000000D" });
   socket.drop(1008);
   await settle();
-  assert.equal(ui.root.querySelector(".term-banner a.btn").getAttribute("href"), "#/terminal?node=a%20b%26c%23d");
+  click(byText(ui.root, "button", "Choose another login"));
+  assert.equal(document.querySelector("[role=dialog] .quick-row.is-open .name").textContent, "a b&c#d");
 });
 
 test("control characters in the home path are replaced one by one and nothing else changes", async () => {
@@ -297,7 +302,7 @@ test("a node that is not active or not connected shows no creates accounts marke
     node({ id: "n-2", name: "waiting", state: "pending", creates_accounts: true }),
     node({ id: "n-3", name: "live", creates_accounts: true }),
   ];
-  ui = await mount({ ...signedIn(), [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes?state=");
+  ui = await mount({ ...signedIn(), ...BASE, [NODES_ROUTE]: json(200, { nodes, next: null, pending_enrolments: 0 }) }, "#/nodes?state=");
   const marked = Array.from(ui.root.querySelectorAll(".node-card")).filter((card) => card.querySelector(".badge.b-acct")).map((card) => card.querySelector(".node-name").textContent);
   const shown = Array.from(ui.root.querySelectorAll(".node-card .node-name")).map((link) => link.textContent);
   assert.deepEqual(shown.sort(), ["gone", "live", "waiting"]);
@@ -305,15 +310,15 @@ test("a node that is not active or not connected shows no creates accounts marke
   ui.stop();
 
   const targets = [{ node: "off-01", labels: {}, connected: false, creates_accounts: true, logins: ["alice"] }, { node: "on-01", labels: {}, connected: true, creates_accounts: true, logins: ["alice"] }];
-  ui = await mount({ ...signedIn([]), [TARGETS_ROUTE]: json(200, targets) }, "#/terminal");
-  const cards = Array.from(ui.main().querySelectorAll(".pick-card")).filter((card) => card.querySelector(".badge.b-acct"));
-  assert.deepEqual(cards.map((card) => card.querySelector("input").value), ["on-01"]);
+  ui = await mount({ ...signedIn([]), ...BASE, [TARGETS_ROUTE]: json(200, targets) }, "#/terminal");
+  const rows = Array.from(ui.main().querySelectorAll(".quick-row")).filter((row) => row.querySelector(".badge.b-acct"));
+  assert.deepEqual(rows.map((row) => row.querySelector(".name").textContent), ["on-01"]);
 });
 
 test("every refusal carries the reference when it is valid, also for the older error codes, and an invalid one is not shown", async () => {
   const cases = [["denied", 1008], ["limit", 1008], ["revoked", 4001]];
   for (const [code, close] of cases) {
-    for (const [reference, shown] of [["H-4C1E82A9", true], ["D-4C1E82A9", false], ["<b>x</b>", false]]) {
+    for (const [reference, shown] of [["H-4C1E82A9", true], ["D-4C1E82A9", true], ["<b>x</b>", false]]) {
       const socket = await begin();
       socket.control({ t: "error", code, ref: reference });
       socket.drop(close);

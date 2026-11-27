@@ -200,17 +200,25 @@ async function webTerminal(browser, width) {
   await priming.close();
   const page = await browserContext.newPage();
   const problems = [];
+  const frames = [];
+  page.on("websocket", (socket) =>
+    socket.on("framereceived", (event) => {
+      if (typeof event.payload === "string") {
+        frames.push(event.payload);
+      }
+    }),
+  );
   watch(page, problems);
   await page.goto(`${ORIGIN}/`);
   await page.waitForSelector("a.btn-primary");
   await page.click("a.btn-primary");
   await page.waitForSelector(".rail a", { state: "attached" });
   await page.goto(`${ORIGIN}/#/terminal`);
-  await page.waitForSelector('input[name="terminal-node"]');
-  await page.click('label.pick-card:has(input[value="node-a"])');
-  await page.click('label.pick-login:has(input[value="deploy"])');
+  await page.waitForSelector(".panel.quick");
+  await page.click('.quick-row:has(.name:text-is("node-a")) button:has-text("Choose login")');
+  await page.click('.quick-row:has(.name:text-is("node-a")) label.pick-login:has(input[value="deploy"])');
   await shot(page, context, "terminal-picker");
-  await page.click("button:has-text('Open terminal')");
+  await page.click(".panel.quick footer .btn-primary");
   await page.waitForSelector(".term-host canvas");
   await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: TERMINAL_WAIT_MS });
   await page.click(".term-host");
@@ -245,19 +253,20 @@ async function webTerminal(browser, width) {
   if (!/exited with status 0/.test(ended)) {
     fail(context, `the ended banner says: ${ended.slice(0, 160)}`);
   }
-  const session = await page.evaluate(() => {
-    for (const paragraph of document.querySelectorAll("p")) {
-      const id = paragraph.querySelector(".mono");
-      if (id && /^Session: /.test(paragraph.textContent)) {
-        return id.textContent.trim();
+  const session = frames
+    .map((payload) => {
+      try {
+        return JSON.parse(payload);
+      } catch {
+        return {};
       }
-    }
-    return null;
-  });
-  if (!session) {
-    fail(context, "the ended screen does not name the session");
+    })
+    .find((frame) => frame.t === "ready" && typeof frame.session_id === "string");
+  const sessionId = session ? session.session_id : null;
+  if (!sessionId) {
+    fail(context, "the server sent no session id in the ready frame");
   } else {
-    terminals.push({ width, session });
+    terminals.push({ width, session: sessionId });
   }
   await shot(page, context, "terminal-ended");
   for (const violation of await page.evaluate(() => window.__csp)) {

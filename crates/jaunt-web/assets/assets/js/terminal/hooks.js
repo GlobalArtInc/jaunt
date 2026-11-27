@@ -17,6 +17,7 @@ export const terminalHooks = {
   createWriter: (terminal, timers) => createGuardedWriter(terminal, timers),
   connection: realHooks(),
   observeResize,
+  isGesture: (event) => Boolean(event) && event.isTrusted === true,
   clipboard: () => (typeof navigator !== "undefined" && navigator.clipboard ? navigator.clipboard : null),
   prefersKeyBar: () => typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse), (max-width: 760px)").matches,
 };

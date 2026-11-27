@@ -6,7 +6,7 @@ import { chromium } from "playwright";
 import { startStub } from "./stub.mjs";
 
 const OUT = (process.env.SCREENSHOT_DIR || fileURLToPath(new URL("../screenshots-out/after/", import.meta.url))).replace(/\/?$/, "/");
-const ALL = ["nodes.approve", "sessions.read", "recordings.read", "revocations.write", "audit.read"];
+const ALL = ["nodes.approve", "sessions.read", "sessions.terminate", "recordings.read", "revocations.write", "audit.read"];
 const WIDTHS = process.env.SMOKE_WIDTHS ? process.env.SMOKE_WIDTHS.split(",").map(Number) : [380, 900, 1440];
 const THEMES = process.env.SMOKE_THEMES ? process.env.SMOKE_THEMES.split(",") : ["light", "dark"];
 
@@ -310,7 +310,7 @@ async function runMatrix(browser, stub, width, theme) {
   const page = await browserContext.newPage();
   const problems = [];
   page.on("console", (message) => {
-    const optional = /\/v1\/(web\/terminal\/targets|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
+    const optional = /\/v1\/(web\/terminal\/(targets|recent|limits)|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
     if (message.type() === "error" && !optional && !/status of (401|429)/.test(message.text())) problems.push("console: " + message.text());
   });
   page.on("pageerror", (error) => problems.push("pageerror: " + error.message));
@@ -355,7 +355,7 @@ async function runMatrix(browser, stub, width, theme) {
   await page.waitForSelector(".node-card");
   await page.waitForTimeout(150);
   await page.click(".node-card:has(a.node-name:text-is('web-01')) button[aria-label^='Connect to']");
-  await page.waitForSelector(".menu a[role=menuitem]:has-text('Open terminal as deploy')");
+  await page.waitForSelector(".menu [role=menuitem]:has-text('deploy')");
   await shot(page, "nodes-connect-targets", context, { focus: false, fullPage: false });
   await page.keyboard.press("Escape");
   stub.setTargets(null);

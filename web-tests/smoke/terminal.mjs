@@ -3,18 +3,18 @@ import { fileURLToPath } from "node:url";
 
 import { chromium } from "playwright";
 
+import { PANE, clickTool, closeAllTabs, fail, failures, instrument, layout, quickOpen, until, waitConnected } from "./kit.mjs";
 import { startStub } from "./stub.mjs";
 
 const OUT = fileURLToPath(new URL("../screenshots-out/", import.meta.url));
 const WIDTHS = [380, 1440];
 const THEMES = ["light", "dark"];
 const FLEET = [
-  { node: "web-01", labels: { env: "prod", team: "web" }, connected: true, logins: ["deploy", "alice"] },
-  { node: "web-02", labels: { env: "prod" }, connected: true, creates_accounts: true, logins: ["deploy"] },
-  { node: "db-replica-02", labels: { env: "prod", team: "data" }, connected: false, logins: ["deploy"] },
+  { node: "web-01", labels: { env: "prod", team: "web" }, connected: true, pinned: false, logins: ["deploy", "alice"], hidden_logins: [] },
+  { node: "web-02", labels: { env: "prod" }, connected: true, pinned: false, creates_accounts: true, logins: ["deploy"], hidden_logins: [] },
+  { node: "db-replica-02", labels: { env: "prod", team: "data" }, connected: false, pinned: false, logins: ["deploy"], hidden_logins: [] },
 ];
 const ALLOWED_REPLY = /^(\u001b\[\?1;2c|\u001b\[>0;276;0c|\u001b\[0n|\u001b\[\d+;\d+R|\u001b\[\?\d+;\d+R)+$/;
-const failures = [];
 const notes = [];
 const RUN_LIMIT_MS = 15 * 60 * 1000;
 
@@ -26,145 +26,8 @@ function fatal(message) {
 
 setTimeout(() => fatal(`the run exceeded ${RUN_LIMIT_MS / 1000} s and was stopped`), RUN_LIMIT_MS).unref();
 
-function fail(context, message) {
-  failures.push(context + ": " + message);
-}
-
 async function shot(page, name, context) {
   await page.screenshot({ path: `${OUT}terminal-${name}-${context}.png`, fullPage: true });
-}
-
-async function instrument(browserContext, origin) {
-  await browserContext.addInitScript(() => {
-    window.__csp = [];
-    window.__clipboard = 0;
-    window.__opened = 0;
-    window.__long = [];
-    window.__sockets = [];
-    window.__drift = 0;
-    let lastTick = performance.now();
-    setInterval(() => {
-      const now = performance.now();
-      window.__drift = Math.max(window.__drift, now - lastTick - 20);
-      lastTick = now;
-    }, 20);
-    new PerformanceObserver((list) => {
-      for (const entry of list.getEntries()) window.__long.push(entry.duration);
-    }).observe({ type: "longtask", buffered: true });
-    document.addEventListener("securitypolicyviolation", (event) => window.__csp.push(event.violatedDirective + " " + event.blockedURI));
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      const original = navigator.clipboard.writeText.bind(navigator.clipboard);
-      navigator.clipboard.writeText = (...args) => {
-        window.__clipboard += 1;
-        return original(...args);
-      };
-    }
-    if (navigator.clipboard && navigator.clipboard.readText) {
-      const original = navigator.clipboard.readText.bind(navigator.clipboard);
-      navigator.clipboard.readText = (...args) => {
-        window.__clipboard += 1;
-        return original(...args);
-      };
-    }
-    const execCommand = document.execCommand.bind(document);
-    document.execCommand = (name, ...rest) => {
-      if (["copy", "cut", "paste"].includes(String(name).toLowerCase())) window.__clipboard += 1;
-      return execCommand(name, ...rest);
-    };
-    const open = window.open.bind(window);
-    window.open = (...args) => {
-      window.__opened += 1;
-      return open(...args);
-    };
-    const NativeSocket = window.WebSocket;
-    window.WebSocket = function (url, protocols) {
-      window.__sockets.push({ url: String(url), protocols: Array.isArray(protocols) ? protocols.slice() : [protocols] });
-      return new NativeSocket(url, protocols);
-    };
-    window.WebSocket.prototype = NativeSocket.prototype;
-    for (const name of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) window.WebSocket[name] = NativeSocket[name];
-  });
-  const page = await browserContext.newPage();
-  const problems = [];
-  const requests = [];
-  page.on("console", (message) => {
-    const optional = /\/v1\/(client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
-    const refused = /status of (401|403)/.test(message.text()) || /WebSocket connection/.test(message.text());
-    if ((message.type() === "error" || message.type() === "warning") && !optional && !refused) {
-      problems.push("console " + message.type() + ": " + message.text().slice(0, 200));
-    }
-  });
-  page.on("pageerror", (error) => problems.push("page error: " + String((error && error.stack) || error).replace(/\s+/g, " ").slice(0, 600)));
-  page.on("dialog", async (dialog) => {
-    problems.push("dialog: " + dialog.message().slice(0, 80));
-    await dialog.dismiss();
-  });
-  page.on("request", (request) => requests.push(request.url()));
-  page.on("requestfailed", (request) => problems.push("request failed: " + request.url()));
-  return { page, problems, requests };
-}
-
-async function layout(page, context, label, narrow) {
-  const result = await page.evaluate((isNarrow) => {
-    const parse = (value) => {
-      const match = /rgba?\(([^)]+)\)/.exec(value);
-      if (!match) return null;
-      const parts = match[1].split(/[ ,\/]+/).filter(Boolean).map(Number);
-      return { rgb: parts.slice(0, 3), alpha: parts.length > 3 ? parts[3] : 1 };
-    };
-    const backgroundOf = (element) => {
-      for (let node = element; node; node = node.parentElement) {
-        const color = parse(getComputedStyle(node).backgroundColor);
-        if (color && color.alpha === 1) return color.rgb;
-      }
-      return [255, 255, 255];
-    };
-    const lum = (rgb) => {
-      const [r, g, b] = rgb.map((value) => value / 255).map((value) => (value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4));
-      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    };
-    const small = [];
-    const lowContrast = [];
-    const walker = document.createTreeWalker(document.querySelector("main"), NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-      const text = walker.currentNode;
-      const parent = text.parentElement;
-      if (!parent || text.data.trim() === "" || parent.closest(".term-host, .visually-hidden")) continue;
-      const style = getComputedStyle(parent);
-      if (style.display === "none" || style.visibility === "hidden") continue;
-      if (parseFloat(style.fontSize) < 13) small.push(text.data.trim().slice(0, 30) + " " + style.fontSize);
-      const foreground = parse(style.color);
-      if (foreground) {
-        const [high, low] = [lum(foreground.rgb), lum(backgroundOf(parent))].sort((a, b) => b - a);
-        const ratio = (high + 0.05) / (low + 0.05);
-        if (ratio < 4.5) lowContrast.push(text.data.trim().slice(0, 30) + " " + ratio.toFixed(2));
-      }
-    }
-    const targets = [];
-    if (isNarrow) {
-      for (const element of document.querySelectorAll(".term-tools button, .keybar button, .statusbar button, .term-banner button, .term-banner a, .pick-card, .pick-login, .term-picker button")) {
-        const box = element.getBoundingClientRect();
-        if (box.width > 0 && box.height > 0 && box.height < 43.5) targets.push((element.textContent || element.getAttribute("aria-label") || element.className).trim().slice(0, 20) + " " + Math.round(box.height));
-      }
-    }
-    const frame = document.querySelector(".term-frame");
-    const box = frame ? frame.getBoundingClientRect() : null;
-    return {
-      overflow: document.documentElement.scrollWidth - window.innerWidth,
-      small,
-      lowContrast,
-      targets,
-      frameRight: box ? Math.round(box.right) : null,
-      frameHeight: box ? Math.round(box.height) : null,
-      width: window.innerWidth,
-    };
-  }, narrow);
-  if (result.overflow > 0) fail(context, `${label}: the page scrolls horizontally by ${result.overflow}px`);
-  for (const entry of result.small) fail(context, `${label}: text under 13px: ${entry}`);
-  for (const entry of result.lowContrast) fail(context, `${label}: contrast under 4.5: ${entry}`);
-  for (const entry of result.targets) fail(context, `${label}: touch target under 44px: ${entry}`);
-  if (result.frameRight !== null && result.frameRight > result.width) fail(context, `${label}: the terminal sticks out of the viewport`);
-  return result;
 }
 
 const screenText = (page) =>
@@ -214,16 +77,6 @@ async function painted(page) {
   });
 }
 
-async function until(check, description, context, timeout = 6000) {
-  const end = Date.now() + timeout;
-  while (Date.now() < end) {
-    if (await check()) return true;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  fail(context, "timed out waiting for " + description);
-  return false;
-}
-
 async function trackTerminals(page) {
   await page.evaluate(async () => {
     const { terminalHooks } = await import("/assets/js/terminal/hooks.js");
@@ -239,57 +92,59 @@ async function trackTerminals(page) {
   });
 }
 
-async function openSession(page, stub, context, node, login) {
+async function openSession(page, stub, context, node, login, narrow = false) {
   await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
+  await page.waitForSelector(".panel.quick, .ws:not([hidden])");
   await trackTerminals(page);
-  await page.click(`label.pick-card:has(input[value="${node}"])`);
-  if (login !== null) await page.click(`label.pick-login:has(input[value="${login}"])`);
-  await page.click("button:has-text('Open terminal')");
-  await page.waitForSelector(".term-host canvas");
-  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: 8000 });
+  await quickOpen(page, node, login, narrow);
+  await page.waitForSelector(".term-pane:not([hidden]) .term-host canvas");
+  await waitConnected(page);
 }
 
-async function pickAndOpen(page, node) {
-  await page.waitForSelector('input[name="terminal-node"]');
-  await page.click(`label.pick-card:has(input[value="${node}"])`);
-  await page.click("button:has-text('Open terminal')");
-  await page.waitForSelector(".term-host canvas");
-  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: 8000 });
+async function pickAndOpen(page, node, narrow = false) {
+  await page.waitForSelector(".panel.quick, .ws:not([hidden])");
+  await quickOpen(page, node, node === "web-02" ? "deploy" : null, narrow);
+  await page.waitForSelector(".term-pane:not([hidden]) .term-host canvas");
+  await waitConnected(page);
+}
+
+async function endViaExit(page, context, name) {
+  await page.keyboard.type("exit");
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(`${PANE} .term-banner:has-text('Session ended')`, { timeout: 6000 }).catch(() => fail(context, `${name}: no ended banner`));
 }
 
 async function navigationChecks(page, stub, context, width) {
+  const narrow = width <= 520;
   await page.goto(stub.origin + "/#/nodes");
   await page.waitForSelector(".node-card");
   await page.goto(stub.origin + "/#/terminal");
-  const links = [
-    ["breadcrumb", async () => page.click(".crumbs a")],
-    ["choose another node", async () => page.click("a:has-text('Choose another node')")],
+  const exits = [
+    ["Close terminal in the banner", async () => page.click(`${PANE} .term-banner button:has-text('Close terminal')`)],
     [
-      "rail",
+      "tab close button",
       async () => {
-        if (width <= 900) await page.click("button[aria-label='Open navigation']");
-        await page.click('.rail a[href="#/terminal"]');
+        if (narrow) {
+          await page.click(`${PANE} .term-banner button:has-text('Close terminal')`);
+        } else {
+          await page.click(".ttab.is-active button[aria-label^='Close ']");
+        }
       },
     ],
   ];
-  for (const [name, click] of links) {
-    await pickAndOpen(page, "web-02");
-    await page.keyboard.type("exit");
-    await page.keyboard.press("Enter");
-    await page.waitForSelector(".term-banner:has-text('Session ended')", { timeout: 6000 }).catch(() => fail(context, `${name}: no ended banner`));
+  for (const [name, close] of exits) {
+    await pickAndOpen(page, "web-02", narrow);
+    await endViaExit(page, context, name);
     if ((await page.evaluate(() => location.hash)) !== "#/terminal") fail(context, `${name}: the address is not #/terminal`);
-    await click();
-    const back = await page.waitForSelector('input[name="terminal-node"]', { timeout: 4000 }).catch(() => null);
+    await close();
+    const back = await page.waitForSelector(".panel.quick", { timeout: 4000 }).catch(() => null);
     if (!back) {
-      fail(context, `${name}: the picker did not come back`);
+      fail(context, `${name}: quick open did not come back`);
       await page.goto(stub.origin + "/#/nodes");
       await page.goto(stub.origin + "/#/terminal");
       continue;
     }
-    const focused = await page.evaluate(() => document.activeElement && document.activeElement.id);
-    if (focused !== "main") fail(context, `${name}: focus is on ${focused || "nothing"} instead of the page`);
-    if ((await page.locator(".term-page").count()) !== 0) fail(context, `${name}: the session screen is still there`);
+    if ((await page.locator(".term-pane").count()) !== 0) fail(context, `${name}: the session screen is still there`);
   }
 }
 
@@ -301,22 +156,22 @@ const LONG_FLEET = [
 
 async function runLongNames(browser, stub, width, theme) {
   const context = `long-${theme}-${width}`;
-  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1 });
+  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1, reducedMotion: "reduce" });
   const { page, problems } = await instrument(browserContext, stub.origin);
-  stub.setTargets(LONG_FLEET);
+  stub.setTargets(LONG_FLEET.map((entry) => ({ ...entry, pinned: false, hidden_logins: [] })));
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");
   await page.waitForSelector(".rail a", { state: "attached" });
   await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
+  await page.waitForSelector(".panel.quick");
   await shot(page, "picker-long", context);
   await layout(page, context, "picker-long", width <= 520);
   for (const entry of LONG_FLEET) {
-    await page.click(`label.pick-card:has(input[value="${entry.node}"])`);
+    await page.click(`.quick-row:has(.name:text-is("${entry.node}")) button:has-text("Choose login")`);
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-    if (overflow > 0) fail(context, `${entry.node.length}-character node: the picker scrolls horizontally by ${overflow}px`);
+    if (overflow > 0) fail(context, `${entry.node.length}-character node: quick open scrolls horizontally by ${overflow}px`);
   }
-  await pickAndOpen(page, "x".repeat(200));
+  await pickAndOpen(page, "x".repeat(200), width <= 520);
   await shot(page, "session-long", context);
   await layout(page, context, "session-long", width <= 520);
   stub.setTargets(FLEET);
@@ -327,7 +182,7 @@ async function runLongNames(browser, stub, width, theme) {
 async function runContext(browser, stub, width, theme) {
   const context = `${theme}-${width}`;
   const narrow = width <= 520;
-  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1 });
+  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1, reducedMotion: "reduce" });
   await browserContext.grantPermissions(["clipboard-read", "clipboard-write"], { origin: stub.origin });
   const { page, problems, requests } = await instrument(browserContext, stub.origin);
   const sockets = [];
@@ -338,19 +193,19 @@ async function runContext(browser, stub, width, theme) {
   await page.waitForSelector(".rail a", { state: "attached" });
 
   await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
+  await page.waitForSelector(".panel.quick");
   await shot(page, "picker", context);
   await layout(page, context, "picker", narrow);
-  const offline = await page.getAttribute('input[value="db-replica-02"]', "disabled");
-  if (offline === null) fail(context, "an offline node can be selected");
+  if ((await page.locator('.quick-row:has(.name:text-is("db-replica-02")) button').count()) !== 0) fail(context, "an offline node can be opened");
 
-  await page.click('label.pick-card:has(input[value="web-01"])');
-  await page.waitForSelector('input[name="terminal-login"]');
+  await page.click('.quick-row:has(.name:text-is("web-01")) button:has-text("Choose login")');
+  await page.waitForSelector('input[name="quick-login"]');
   await shot(page, "picker-login", context);
   await layout(page, context, "picker-login", narrow);
   await page.keyboard.press("Tab");
+  await page.click('.quick-row:has(.name:text-is("web-01")) button:has-text("Hide logins")');
 
-  await openSession(page, stub, context, "web-01", "deploy");
+  await openSession(page, stub, context, "web-01", "deploy", narrow);
   const session = stub.terminal.sessions.at(-1);
   await waitForText(page, "deploy@web-01", context);
   await shot(page, "session", context);
@@ -400,7 +255,7 @@ async function runContext(browser, stub, width, theme) {
   const keyBarShown = await page.isVisible(".keybar");
   if (narrow && !keyBarShown) fail(context, "the key bar is not shown on a narrow screen");
   if (!narrow && keyBarShown) fail(context, "the key bar is shown on a wide screen without being asked");
-  if (!keyBarShown) await page.click("button:has-text('Key bar')");
+  if (!keyBarShown) await page.click("button[data-action=keys]");
   await page.waitForSelector(".keybar button");
   const inputBefore = session.input.length;
   await page.click('.key-btn[data-key="esc"]');
@@ -415,12 +270,12 @@ async function runContext(browser, stub, width, theme) {
   if (JSON.stringify(keyBytes) !== JSON.stringify(expected)) fail(context, "key bar bytes " + JSON.stringify(keyBytes));
   await shot(page, "keybar", context);
   await layout(page, context, "keybar", narrow);
-  if (!narrow) await page.click("button:has-text('Key bar')");
+  if (!narrow) await page.click("button[data-action=keys]");
 
   await page.click(".term-host");
   await page.keyboard.press("Control+Alt+Escape");
   const left = await page.evaluate(() => document.activeElement && document.activeElement.className);
-  if (left !== "statusbar") fail(context, "Ctrl+Alt+Esc did not move focus out of the terminal: " + left);
+  if (!String(left).startsWith("statusbar")) fail(context, "Ctrl+Alt+Esc did not move focus out of the terminal: " + left);
   await page.keyboard.press("Tab");
   const ring = await page.evaluate(() => {
     const style = getComputedStyle(document.activeElement);
@@ -445,7 +300,7 @@ async function runContext(browser, stub, width, theme) {
   await page.keyboard.press("Control+c");
 
   await page.evaluate(() => window.__terms.at(-1).selectAll());
-  await page.click("button:has-text('Copy selection')");
+  await clickTool(page, "Copy selection", narrow);
   await page.waitForFunction(() => /Selection copied/.test(document.querySelector(".term-note")?.textContent || ""), null, { timeout: 4000 }).catch(() => fail(context, "the Copy selection button did not copy"));
   const copied = await page.evaluate(() => navigator.clipboard.readText());
   if (!copied.includes("echo hello")) fail(context, "the copied text was " + JSON.stringify(copied.slice(0, 80)));
@@ -536,7 +391,7 @@ async function runContext(browser, stub, width, theme) {
     notes.push(`${context}: ${command} took ${Date.now() - started} ms end to end, longest task ${Math.round(flood.task)} ms, longest timer delay ${Math.round(flood.drift)} ms`);
   }
 
-  await page.click('button:has-text("Disconnect")');
+  await clickTool(page, "Disconnect", narrow);
   const dialog = await page.waitForSelector("[role=dialog]", { timeout: 2000 }).catch(() => null);
   if (!dialog) fail(context, "no confirmation after typing");
   else {
@@ -578,25 +433,44 @@ async function runContext(browser, stub, width, theme) {
   await page.waitForSelector(".term-banner:has-text('Access revoked')", { timeout: 6000 }).catch(() => fail(context, "no revoked banner"));
   await shot(page, "revoked", context);
   await layout(page, context, "revoked", narrow);
+  const revokedActions = await page.locator(`${PANE} .term-banner .actions .btn`).allTextContents();
+  if (revokedActions.join() !== "Close terminal") fail(context, "the revoked banner offers " + revokedActions.join());
+  await page.click(`${PANE} .term-banner button:has-text('Close terminal')`);
+  await page.waitForSelector(".panel.quick");
 
-  stub.terminal.denyNext = { status: 403, body: { error: "denied" } };
-  await page.click("button:has-text('Reconnect')");
+  stub.terminal.denyNext = { status: 403, body: { error: "denied", ref: "D-4C1E82A9" } };
+  await quickOpen(page, "web-01", "deploy", narrow);
   await page.waitForSelector(".term-banner:has-text('Access denied')", { timeout: 6000 }).catch(() => fail(context, "no denied banner"));
+  const deniedRef = await page.locator(".term-banner .ref .mono").textContent().catch(() => null);
+  if (deniedRef !== "D-4C1E82A9") fail(context, "the denied banner shows the reference " + JSON.stringify(deniedRef));
   await shot(page, "denied", context);
   await layout(page, context, "denied", narrow);
 
   await page.click("button:has-text('Try again')");
   await until(() => stub.terminal.sessions.length === sessionsBefore + 2, "the third session", context);
-  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""));
+  await waitConnected(page);
   const third = stub.terminal.sessions.at(-1);
   await page.goto(stub.origin + "/#/nodes");
-  await until(() => third.closed !== null, "the server to see the close", context);
-  if (third.closed !== 1000) fail(context, "leaving the page closed the socket with " + third.closed);
+  await page.waitForSelector(".node-card");
+  await page.waitForTimeout(400);
+  if (third.closed !== null) fail(context, "moving to the nodes page closed the session with " + third.closed);
+  const railCount = await page.locator(".rail-count").textContent().catch(() => null);
+  if (railCount !== "1") fail(context, "the rail count is " + JSON.stringify(railCount));
+  await page.goto(stub.origin + "/#/terminal");
+  await page.waitForSelector(`${PANE} .term-host canvas`);
+  await waitConnected(page);
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  await until(() => third.closed !== null, "the pagehide close of the third session", context);
+  if (third.closed !== 1000) fail(context, "pagehide closed the socket with " + third.closed);
+  await page.reload();
+  await page.waitForSelector(".panel.quick");
 
-  await openSession(page, stub, context, "web-02", null);
+  await openSession(page, stub, context, "web-02", null, narrow);
   const fourth = stub.terminal.sessions.at(-1);
   await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
   await until(() => fourth.closed !== null, "the pagehide close", context);
+  await page.reload();
+  await page.waitForSelector(".panel.quick");
 
   await navigationChecks(page, stub, context, width);
 
@@ -616,14 +490,15 @@ const REFUSALS = [
   ["no_account", "H-0000000D", "There is no account deploy on web-02.", "no-account"],
 ];
 
-async function openWeb02(page, stub, context) {
+async function openWeb02(page, stub, context, narrow) {
   const before = stub.terminal.sessions.length;
   await page.goto(stub.origin + "/#/nodes");
   await page.waitForSelector(".node-card");
   await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
-  await page.click('label.pick-card:has(input[value="web-02"])');
-  await page.click("button:has-text('Open terminal')");
+  await page.waitForSelector(".panel.quick, .ws:not([hidden])");
+  await closeAllTabs(page, narrow);
+  await page.waitForSelector(".panel.quick");
+  await quickOpen(page, "web-02", "deploy", narrow);
   await until(() => stub.terminal.sessions.length === before + 1, "the account session", context);
   return stub.terminal.sessions.at(-1);
 }
@@ -631,7 +506,7 @@ async function openWeb02(page, stub, context) {
 async function runAccount(browser, stub, width, theme) {
   const context = `account-${theme}-${width}`;
   const narrow = width <= 520;
-  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1 });
+  const browserContext = await browser.newContext({ viewport: { width, height: width < 600 ? 800 : 900 }, colorScheme: theme, deviceScaleFactor: 1, reducedMotion: "reduce" });
   await browserContext.grantPermissions(["clipboard-read", "clipboard-write"], { origin: stub.origin });
   const { page, problems } = await instrument(browserContext, stub.origin);
   await page.goto(stub.origin + "/");
@@ -639,13 +514,13 @@ async function runAccount(browser, stub, width, theme) {
   await page.waitForSelector(".rail a", { state: "attached" });
 
   await page.goto(stub.origin + "/#/terminal");
-  await page.waitForSelector('input[name="terminal-node"]');
-  const marked = await page.locator("label.pick-card .badge.b-acct").evaluateAll((nodes) => nodes.map((node) => node.closest("label").querySelector("input").value));
+  await page.waitForSelector(".panel.quick");
+  const marked = await page.locator(".quick-row:has(.badge.b-acct) .name").allTextContents();
   if (marked.join(",") !== "web-02") fail(context, "the Creates accounts marker is on " + JSON.stringify(marked));
   await trackTerminals(page);
   await shot(page, "account-picker", context);
   await layout(page, context, "account-picker", narrow);
-  await page.click('label.pick-card:has(input[value="web-02"])');
+  await page.click('.quick-row:has(.name:text-is("web-02")) button:has-text("Choose login")');
   await shot(page, "account-picker-chosen", context);
   await layout(page, context, "account-picker-chosen", narrow);
 
@@ -660,13 +535,13 @@ async function runAccount(browser, stub, width, theme) {
   await page.keyboard.press("Escape");
 
   stub.terminal.plan = { account: { home: "/home/deploy" } };
-  const held = await openWeb02(page, stub, context);
+  const held = await openWeb02(page, stub, context, narrow);
   await page.waitForSelector(".term-banner:has-text('Creating your account deploy on web-02…')", { timeout: 6000 }).catch(() => fail(context, "no progress banner"));
   await shot(page, "account-creating", context);
   await layout(page, context, "account-creating", narrow);
   held.release();
   await page.waitForSelector(".term-banner:has-text('Account created.')", { timeout: 6000 }).catch(() => fail(context, "no created banner"));
-  await page.waitForFunction(() => /Connected/.test(document.querySelector(".statusbar [role=status]")?.textContent || ""), null, { timeout: 8000 });
+  await waitConnected(page);
   const createdText = await page.locator(".term-banner").textContent();
   if (!createdText.includes("/home/deploy")) fail(context, "the created banner lacks the home path: " + createdText);
   await waitForText(page, "deploy@web-02", context);
@@ -678,7 +553,7 @@ async function runAccount(browser, stub, width, theme) {
 
   for (const [code, reference, title, name] of REFUSALS) {
     stub.terminal.plan = { refuse: { code, ref: reference } };
-    await openWeb02(page, stub, context);
+    await openWeb02(page, stub, context, narrow);
     await page.waitForSelector(`.term-banner:has-text('${title}')`, { timeout: 6000 }).catch(() => fail(context, "no banner for " + code));
     const shown = await page.locator(".term-banner .ref .mono").textContent().catch(() => null);
     if (shown !== reference) fail(context, `${code} shows the reference ${JSON.stringify(shown)}`);
@@ -700,7 +575,7 @@ async function runAccount(browser, stub, width, theme) {
 async function runDisabled(browser, width) {
   const context = `disabled-${width}`;
   const stub = await startStub({ permissions: ["nodes.approve"] });
-  const browserContext = await browser.newContext({ viewport: { width, height: 800 }, deviceScaleFactor: 1 });
+  const browserContext = await browser.newContext({ viewport: { width, height: 800 }, deviceScaleFactor: 1, reducedMotion: "reduce" });
   const { page, problems } = await instrument(browserContext, stub.origin);
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");
@@ -719,7 +594,7 @@ async function runEmpty(browser, width) {
   const context = `empty-${width}`;
   const stub = await startStub({ permissions: [] });
   stub.setTargets([]);
-  const browserContext = await browser.newContext({ viewport: { width, height: 800 }, deviceScaleFactor: 1 });
+  const browserContext = await browser.newContext({ viewport: { width, height: 800 }, deviceScaleFactor: 1, reducedMotion: "reduce" });
   const { page, problems } = await instrument(browserContext, stub.origin);
   await page.goto(stub.origin + "/");
   await page.click("a.btn-primary");

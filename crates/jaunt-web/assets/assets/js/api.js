@@ -3,12 +3,13 @@ const SESSION_PATH = "/v1/web/session";
 const MAX_RETRY_AFTER = 3600;
 
 export class ApiError extends Error {
-  constructor(status, code, retryAfter) {
+  constructor(status, code, retryAfter, body) {
     super("api error " + status);
     this.name = "ApiError";
     this.status = status;
     this.code = code || null;
     this.retryAfter = retryAfter || null;
+    this.body = body && typeof body === "object" && !Array.isArray(body) ? body : null;
   }
 }
 
@@ -79,7 +80,7 @@ export function createApi({ onUnauthorized, onSession }) {
 
   function fail({ response, body }) {
     const code = body && typeof body.error === "string" ? body.error : null;
-    return new ApiError(response.status, code, retryAfterOf(response, body));
+    return new ApiError(response.status, code, retryAfterOf(response, body), body);
   }
 
   async function readSession() {
@@ -165,6 +166,7 @@ export function createApi({ onUnauthorized, onSession }) {
     stream,
     get: (path, query) => request("GET", path, { query }),
     post: (path, body) => request("POST", path, { body }),
+    put: (path, body) => request("PUT", path, { body }),
     del: (path, body) => request("DELETE", path, { body }),
   };
 }

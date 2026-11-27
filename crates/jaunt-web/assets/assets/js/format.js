@@ -13,6 +13,13 @@ export function clean(value) {
   return text.replace(UNSAFE_TEXT, "�");
 }
 
+export function singleLine(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, "")
+    .trim();
+}
+
 function pad(number) {
   return String(number).padStart(2, "0");
 }
@@ -78,6 +85,26 @@ export function ago(seconds, nowMs) {
     return "Now";
   }
   return span(delta) + " ago";
+}
+
+export function recentAgo(seconds, nowMs) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
+    return "";
+  }
+  const delta = Math.floor(nowMs / 1000) - seconds;
+  if (delta < 60) {
+    return "just now";
+  }
+  if (delta < 3600) {
+    return Math.floor(delta / 60) + " min ago";
+  }
+  if (delta < 86400) {
+    return Math.floor(delta / 3600) + " h ago";
+  }
+  if (delta < 172800) {
+    return "yesterday";
+  }
+  return Math.floor(delta / 86400) + " days ago";
 }
 
 export function bytes(count) {

@@ -88,7 +88,7 @@ async function instrument(browserContext, origin, context) {
   const problems = [];
   const requests = [];
   page.on("console", (message) => {
-    const optional = /\/v1\/(web\/terminal\/targets|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
+    const optional = /\/v1\/(web\/terminal\/(targets|recent|limits)|client-config)$/.test(message.location().url || "") && /status of 404/.test(message.text());
     if ((message.type() === "error" || message.type() === "warning") && !optional && !/status of 401/.test(message.text())) {
       problems.push("console " + message.type() + ": " + message.text().slice(0, 200));
     }
@@ -101,7 +101,7 @@ async function instrument(browserContext, origin, context) {
   page.on("request", (request) => requests.push(request.url()));
   page.on("requestfailed", (request) => problems.push("request failed: " + request.url()));
   page.on("response", (response) => {
-    if (response.status() >= 400 && !/\/v1\/(web\/session|web\/terminal\/targets|client-config)$/.test(response.url())) {
+    if (response.status() >= 400 && !/\/v1\/(web\/session|web\/terminal\/(targets|recent|limits)|client-config)$/.test(response.url())) {
       problems.push("http " + response.status() + ": " + response.url().replace(origin, ""));
     }
   });

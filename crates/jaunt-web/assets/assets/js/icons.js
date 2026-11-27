@@ -77,6 +77,13 @@ const SHAPES = {
     ["path", { d: "M8 20h8M12 16v4" }],
   ],
   alert: [["path", { d: "M12 3l10 18H2zM12 10v5M12 18h.01" }]],
+  pin: [["path", { d: "M9 3h6l-1 6 3.5 3.5V15h-11v-2.5L10 9zM12 15v6" }]],
+  plus: [["path", { d: "M12 5v14M5 12h14" }]],
+  list: [["path", { d: "M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" }]],
+  keyboard: [
+    ["rect", { x: 2, y: 6, width: 20, height: 12, rx: 2 }],
+    ["path", { d: "M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10" }],
+  ],
   key: [
     ["circle", { cx: 8, cy: 14, r: 4 }],
     ["path", { d: "M11 11l9-9M16 6l3 3" }],

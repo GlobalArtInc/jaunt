@@ -5,6 +5,10 @@ const SUBPROTOCOL = "jaunt-terminal.v1";
 const TICKET_PREFIX = "jaunt-ticket.";
 const ESC = "\u001b";
 const MAX_FRAME = 65536;
+const REFERENCE = /^[DH]-[0-9A-F]{8}$/;
+const STAGES = new Set(["node", "account", "shell"]);
+const RECORDING = new Set(["full", "output", "off"]);
+const MIN_ACTIVE_GAP_MS = 10000;
 
 function encodeFrame(opcode, payload) {
   const length = payload.length;
@@ -89,12 +93,29 @@ export function queryStream() {
 export function createTerminalBackend({ origin }) {
   const tickets = new Map();
   const sessions = [];
-  const control = { sessions, tickets, denyNext: null, handshakeFailures: [], plan: null };
+  const control = { sessions, tickets, denyNext: null, handshakeFailures: [], plan: null, violations: [], nodeMs: null, recording: "full", maxPerUser: 4, openOverride: null };
+
+  function openCount() {
+    return control.openOverride !== null ? control.openOverride : sessions.filter((record) => record.alive).length;
+  }
+
+  function violate(message) {
+    control.violations.push(message);
+  }
+
+  function checkReference(value) {
+    if (value !== undefined && !REFERENCE.test(value)) {
+      violate("reference " + JSON.stringify(value) + " does not match the contract");
+    }
+  }
 
   function issue(current, input, targets) {
     if (control.denyNext) {
       const reply = control.denyNext;
       control.denyNext = null;
+      if (reply.body && reply.body.ref !== undefined) {
+        checkReference(reply.body.ref);
+      }
       return reply;
     }
     const node = input && typeof input.node === "string" ? input.node : null;
@@ -104,7 +125,10 @@ export function createTerminalBackend({ origin }) {
     }
     const target = (targets || []).find((entry) => entry.node === node);
     if (!target || !target.logins.includes(login) || !target.connected) {
-      return { status: 403, body: { error: "denied" } };
+      return { status: 403, body: { error: "denied", ref: "D-" + randomBytes(4).toString("hex").toUpperCase() } };
+    }
+    if (openCount() >= control.maxPerUser) {
+      return { status: 429, body: { error: "limit", open: openCount(), max: control.maxPerUser, ref: "D-" + randomBytes(4).toString("hex").toUpperCase() } };
     }
     const ticket = randomBytes(32).toString("base64url");
     tickets.set(ticket, { node, login, session: current, used: false });
@@ -160,7 +184,7 @@ export function createTerminalBackend({ origin }) {
   }
 
   function startSession(socket, query) {
-    const record = { query, input: [], resizes: [], pings: 0, closed: null, line: "", escape: null, muted: false, oversized: 0 };
+    const record = { query, input: [], resizes: [], pings: 0, actives: [], closed: null, line: "", escape: null, muted: false, oversized: 0 };
     const state = { buffer: Buffer.alloc(0) };
     const sendText = (message) => socket.write(encodeFrame(1, Buffer.from(JSON.stringify(message))));
     const sendBinary = (bytes) => {
@@ -183,19 +207,51 @@ export function createTerminalBackend({ origin }) {
     const plan = control.plan;
     control.plan = null;
     const greet = (fields) => {
-      sendText({ t: "ready", session_id: "stub-session-" + sessions.length, ...fields });
+      if (!RECORDING.has(control.recording)) {
+        violate("recording " + JSON.stringify(control.recording) + " is not in the contract");
+      }
+      sendText({ t: "ready", session_id: "stub-session-" + sessions.length, recording: control.recording, ...fields });
       sendBinary(`Connected to ${query.node} as ${query.login}\r\n`);
       prompt();
     };
+    const progress = (stage) => {
+      if (!STAGES.has(stage)) {
+        violate("progress stage " + JSON.stringify(stage) + " is not in the contract");
+      }
+      sendText({ t: "progress", stage });
+    };
+    record.progress = progress;
     if (plan && plan.refuse) {
+      checkReference(plan.refuse.ref);
+      progress("node");
+      if (plan.refuse.code.startsWith("account_")) {
+        progress("account");
+      }
       sendText({ t: "error", code: plan.refuse.code, ref: plan.refuse.ref });
-      close(1008, plan.refuse.code);
+      close(plan.refuse.close || 1008, plan.refuse.code);
     } else if (plan && plan.account) {
-      sendText({ t: "progress", stage: "account" });
-      record.release = () => greet({ account_created: true, home: plan.account.home });
+      progress("node");
+      progress("account");
+      record.release = () => {
+        progress("shell");
+        greet({ account_created: true, home: plan.account.home });
+      };
+    } else if (plan && plan.hold) {
+      progress("node");
+      record.release = () => {
+        progress("shell");
+        greet({});
+      };
     } else {
+      progress("node");
+      progress("shell");
       greet({});
     }
+    record.idle = (secondsLeft) => sendText({ t: "idle", seconds_left: secondsLeft });
+    record.terminate = () => {
+      sendText({ t: "error", code: "terminated" });
+      close(4004, "terminated");
+    };
 
     function sendBypass(kind) {
       const finals = ["L", "S", "T", "M", "Z", "@", "P", "X", "b"];
@@ -302,13 +358,25 @@ export function createTerminalBackend({ origin }) {
             close(1008, "malformed");
             return;
           }
-          if (message.t === "resize") {
+          const keys = message !== null && typeof message === "object" ? Object.keys(message).sort().join(",") : "";
+          if (message && message.t === "resize" && keys === "cols,rows,t" && Number.isInteger(message.cols) && Number.isInteger(message.rows)) {
             record.resizes.push([message.cols, message.rows]);
-          } else if (message.t === "ping") {
+          } else if (message && message.t === "ping" && keys === "t") {
             record.pings += 1;
             if (!record.muted) {
-              sendText({ t: "pong" });
+              sendText(control.nodeMs === null ? { t: "pong" } : { t: "pong", node_ms: control.nodeMs });
             }
+          } else if (message && message.t === "active" && keys === "t") {
+            const at = Date.now();
+            const last = record.actives.at(-1);
+            if (last !== undefined && at - last < MIN_ACTIVE_GAP_MS) {
+              violate("active frames closer than " + MIN_ACTIVE_GAP_MS + " ms");
+            }
+            record.actives.push(at);
+          } else {
+            violate("unknown message " + JSON.stringify(message).slice(0, 80));
+            close(1008, "unknown message");
+            return;
           }
         } else if (frame.opcode === 8) {
           record.closed = record.closed === null ? 1000 : record.closed;

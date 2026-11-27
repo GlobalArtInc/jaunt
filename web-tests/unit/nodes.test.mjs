@@ -168,11 +168,13 @@ test("the Connect menu with targets lists the allowed logins as terminal links a
   ui = await mount({ ...signedIn(), ...config, "GET /v1/web/terminal/targets": json(200, targets), "GET /v1/admin/nodes": page(FLEET) }, "#/nodes");
   await settle();
   click(trigger("Connect to beta"));
-  assert.deepEqual(menuLabels(), ["Open terminal as deploy", "Open terminal as root", "Copy SSH command", "Details"]);
-  assert.deepEqual(Array.from(ui.root.querySelectorAll('.menu a[role="menuitem"]')).map((link) => link.getAttribute("href")), ["#/terminal?node=beta&login=deploy", "#/terminal?node=beta&login=root", "#/nodes/n-b"]);
+  assert.deepEqual(menuLabels(), ["deploy", "root", "Copy SSH command", "Details"]);
+  assert.deepEqual(Array.from(ui.root.querySelectorAll('.menu a[role="menuitem"]')).map((link) => link.getAttribute("href")), ["#/nodes/n-b"]);
   click(trigger("Connect to beta"));
   click(trigger("Connect to alpha"));
-  assert.deepEqual(menuLabels(), ["Open terminal as ops", "Copy SSH command as ops", "Details"]);
+  assert.deepEqual(menuLabels(), ["ops", "Copy SSH command as ops", "Details"]);
+  assert.equal(ui.root.querySelector('.menu [role="menuitem"]').getAttribute("aria-disabled"), "true");
+  assert.match(ui.root.querySelector(".menu-note").textContent, /alpha is offline, so a terminal cannot open now/);
   click(trigger("Connect to gamma"));
   assert.match(ui.root.querySelector(".menu").textContent, /Your roles allow no login on this node/);
 });
@@ -187,7 +189,7 @@ test("a node name or login that is not safe for a shell never produces a command
   assert.equal(copy.getAttribute("aria-disabled"), "true");
   click(trigger("Connect to web; rm -rf ~"));
   click(trigger("Connect to ok-node"));
-  assert.deepEqual(menuLabels(), ["Open terminal as good", "Copy SSH command as good", "Details"]);
+  assert.deepEqual(menuLabels(), ["good", "Copy SSH command as good", "Details"]);
 });
 
 test("without a configured ssh address the copy action is disabled and says why", async () => {

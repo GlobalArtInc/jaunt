@@ -171,22 +171,26 @@ async function nodeMarkers(browser, width) {
 }
 
 async function openTerminal(page, node, login) {
+  await page.goto(`${ORIGIN}/#/terminal`);
+  await page.reload();
+  await page.waitForSelector(".panel.quick");
   await page.goto(`${ORIGIN}/#/terminal?node=${node}&login=${login}`);
-  await page.waitForSelector('input[name="terminal-node"]');
-  await page.waitForSelector(`input[name="terminal-login"][value="${login}"]`);
-  await page.click("button:has-text('Open terminal')");
+  await page.waitForSelector(".panel.quick footer .btn-primary:not([disabled])");
+  await page.click(".panel.quick footer .btn-primary");
 }
 
-async function sessionOf(page) {
-  return page.evaluate(() => {
-    for (const paragraph of document.querySelectorAll("p")) {
-      const id = paragraph.querySelector(".mono");
-      if (id && /^Session: /.test(paragraph.textContent)) {
-        return id.textContent.trim();
+function sessionOf(frames) {
+  for (const payload of frames.slice().reverse()) {
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed.t === "ready" && typeof parsed.session_id === "string") {
+        return parsed.session_id;
       }
+    } catch {
+      continue;
     }
-    return null;
-  });
+  }
+  return null;
 }
 
 function errorFrame(frames, from) {
@@ -205,14 +209,14 @@ function errorFrame(frames, from) {
 
 async function picker(page, context) {
   await page.goto(`${ORIGIN}/#/terminal`);
-  await page.waitForSelector('input[name="terminal-node"]');
-  const marked = await page.locator("label.pick-card .badge.b-acct").evaluateAll((nodes) => nodes.map((node) => node.closest("label").querySelector("input").value));
+  await page.waitForSelector(".panel.quick");
+  const marked = await page.locator(".quick-row:has(.badge.b-acct) .name").allTextContents();
   if (marked.join(",") !== CREATING_NODE) {
-    fail(context, `the Creates accounts marker on the picker is on ${JSON.stringify(marked)}`);
+    fail(context, `the Creates accounts marker in quick open is on ${JSON.stringify(marked)}`);
   }
-  await page.click(`label.pick-card:has(input[value="${CREATING_NODE}"])`);
-  await page.waitForSelector("p.muted.small:has-text('creates your account at your first login')", { timeout: WAIT_MS })
-    .catch(() => fail(context, "the picker does not explain the first login"));
+  await page.click(`.quick-row:has(.name:text-is("${CREATING_NODE}")) button:has-text("Choose login")`);
+  await page.waitForSelector(".quick-row.is-open .menu-info:has-text('creates your account at your first login')", { timeout: WAIT_MS })
+    .catch(() => fail(context, "quick open does not explain the first login"));
   await shot(page, context, "picker");
 }
 
@@ -268,7 +272,7 @@ async function createdLogin(session, width, login) {
       fail(context, `the console wrote ${JSON.stringify(word)} into the terminal area at the end`);
     }
   }
-  results.push({ width, kind: "created", node: CREATING_NODE, login, session: await sessionOf(page), uid: uid ? Number(uid[1]) : null });
+  results.push({ width, kind: "created", node: CREATING_NODE, login, session: sessionOf(frames.slice(before)), uid: uid ? Number(uid[1]) : null });
 }
 
 async function refusedLogin(session, width, node, login, code, title) {
@@ -292,7 +296,7 @@ async function refusedLogin(session, width, node, login, code, title) {
     }
   }
   await shot(page, context, "refused");
-  results.push({ width, kind: code, node, login, ref: frame ? frame.ref : null, banner_ref: shown, session: await sessionOf(page) });
+  results.push({ width, kind: code, node, login, ref: frame ? frame.ref : null, banner_ref: shown, session: sessionOf(frames.slice(before)) });
 }
 
 async function terminals(browser, width) {

@@ -64,12 +64,13 @@ export function iconButton({ name, label, onClick, pressed, id }) {
   );
 }
 
-export function dropdown({ label, items, align, className, icon: iconName }) {
+export function dropdown({ label, items, align, className, icon: iconName, onOpen }) {
   return menuButton({
     className: className || "btn btn-menu",
     align,
     content: [iconName ? icon(iconName, { size: "sm" }) : null, el("span", { class: "btn-text", text: label }), icon("chevronDown", { size: "sm" })],
     items,
+    onOpen,
   });
 }
 

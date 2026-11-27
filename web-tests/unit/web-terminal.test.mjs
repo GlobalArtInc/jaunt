@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 
-import { byText, click, json, mount, press, setHidden, settle, signedIn, type, until } from "./support.mjs";
+import { byText, click, json, mount, setHidden, settle, signedIn, until } from "./support.mjs";
 import { PROTOCOL, TICKET, installTerminalHooks } from "./terminal-support.mjs";
 
 const HOOKS = "../../crates/jaunt-web/assets/assets/js/terminal/hooks.js";
 const TICKET_ROUTE = "POST /v1/web/terminal/ticket";
 const TARGETS_ROUTE = "GET /v1/web/terminal/targets";
+const RECENT_ROUTE = "GET /v1/web/terminal/recent";
+const CONFIG_ROUTE = "GET /v1/client-config";
+const CONFIG = { ssh_suffix: "jaunt.example.com" };
+const LIMITS_ROUTE = "GET /v1/web/terminal/limits";
+const LIMITS = { max_per_user: 4, idle_timeout_secs: 1800 };
 const FLEET = [
   { node: "web-01", labels: { env: "prod", team: "web" }, connected: true, logins: ["deploy", "alice"] },
   { node: "web-02", labels: { env: "prod" }, connected: true, logins: ["deploy"] },
@@ -31,12 +36,12 @@ afterEach(() => {
 });
 
 function open(routes = {}, hash = "#/terminal", permissions = []) {
-  return mount({ ...signedIn(permissions), [TARGETS_ROUTE]: json(200, FLEET), [TICKET_ROUTE]: GRANT, ...routes }, hash);
+  return mount({ ...signedIn(permissions), [TARGETS_ROUTE]: json(200, FLEET), [RECENT_ROUTE]: json(200, []), [CONFIG_ROUTE]: json(200, CONFIG), [LIMITS_ROUTE]: json(200, LIMITS), [TICKET_ROUTE]: GRANT, ...routes }, hash);
 }
 
 async function begin(routes, hash = "#/terminal?node=web-02&login=deploy") {
   ui = await open(routes, hash);
-  click(byText(ui.root, "button", "Open terminal"));
+  click(start());
   await until(() => rig.sockets.length > 0, "the socket");
   return rig.sockets[0];
 }
@@ -47,70 +52,9 @@ async function ready(socket = rig.sockets[0]) {
   await settle();
 }
 
+const start = () => ui.root.querySelector(".panel.quick footer .btn-primary");
 const states = () => ui.root.querySelector(".statusbar [role=status]").textContent;
 const bannerText = () => ui.root.querySelector(".term-banner").textContent;
-
-test("an empty list says no nodes are available and a disabled terminal hides the area", async () => {
-  ui = await open({ [TARGETS_ROUTE]: json(200, []) });
-  assert.match(ui.main().textContent, /No nodes available to you/);
-  ui.stop();
-  ui = await open({ [TARGETS_ROUTE]: json(404, { error: "not_found" }) });
-  assert.match(ui.main().textContent, /The web terminal is turned off/);
-  assert.equal(ui.root.querySelector('.rail a[href="#/terminal"]'), null);
-});
-
-test("the picker walks through node, login and open, preselects a single login and keeps offline nodes unselectable", async () => {
-  ui = await open();
-  const radios = Array.from(ui.main().querySelectorAll('input[name="terminal-node"]'));
-  assert.deepEqual(radios.map((radio) => [radio.value, radio.disabled]), [["web-01", false], ["web-02", false], ["db-replica-02", true]]);
-  assert.match(ui.main().textContent, /Not connected/);
-  assert.match(ui.main().textContent, /env:\s*prod/);
-  assert.equal(byText(ui.root, "button", "Open terminal").disabled, true);
-  assert.equal(ui.main().querySelector(".step-list [aria-current]").textContent, "1Choose a node");
-
-  radios[0].checked = true;
-  radios[0].dispatchEvent(new window.Event("change", { bubbles: true }));
-  assert.equal(ui.main().querySelector(".step-list [aria-current]").textContent, "2Choose a login");
-  assert.equal(byText(ui.root, "button", "Open terminal").disabled, true);
-  const logins = Array.from(ui.main().querySelectorAll('input[name="terminal-login"]'));
-  assert.deepEqual(logins.map((radio) => radio.value), ["deploy", "alice"]);
-  logins[1].checked = true;
-  logins[1].dispatchEvent(new window.Event("change", { bubbles: true }));
-  assert.equal(byText(ui.root, "button", "Open terminal").disabled, false);
-  assert.match(ui.main().textContent, /A shell as alice on web-01 will open/);
-
-  radios[1].checked = true;
-  radios[1].dispatchEvent(new window.Event("change", { bubbles: true }));
-  assert.equal(ui.main().querySelector('input[name="terminal-login"]').checked, true);
-  assert.match(ui.main().textContent, /Your roles allow one login on this node: deploy/);
-  assert.equal(ui.main().querySelector(".step-list [aria-current]").textContent, "3Open the terminal");
-});
-
-test("searching filters nodes by name and label, and the address can preselect a node and a login", async () => {
-  ui = await open({}, "#/terminal?node=web-01&login=alice");
-  assert.equal(ui.main().querySelector('input[name="terminal-node"]:checked').value, "web-01");
-  assert.equal(ui.main().querySelector('input[name="terminal-login"]:checked').value, "alice");
-  assert.equal(byText(ui.root, "button", "Open terminal").disabled, false);
-  type(ui.main().querySelector("input[type=search]"), "team:web");
-  assert.deepEqual(Array.from(ui.main().querySelectorAll('input[name="terminal-node"]')).map((radio) => radio.value), ["web-01"]);
-  type(ui.main().querySelector("input[type=search]"), "nothing like it");
-  assert.match(ui.main().textContent, /No node matches your search/);
-});
-
-test("an offline or unknown node in the address is not preselected", async () => {
-  ui = await open({}, "#/terminal?node=db-replica-02&login=deploy");
-  assert.equal(ui.main().querySelector('input[name="terminal-node"]:checked'), null);
-  assert.equal(byText(ui.root, "button", "Open terminal").disabled, true);
-});
-
-test("hostile node, label and login data is shown as text and unsafe logins are dropped", async () => {
-  const hostile = [{ node: '<img src=x onerror="window.__pwned=1">', labels: { '"><script>1</script>': "evil‮txt.exe" }, connected: true, logins: ["ok", "no way", "a;b"] }];
-  ui = await open({ [TARGETS_ROUTE]: json(200, hostile) });
-  assert.equal(ui.main().querySelector("img, script"), null);
-  assert.match(ui.main().textContent, /<img src=x/);
-  ui.main().querySelector('input[name="terminal-node"]').dispatchEvent(new window.Event("change", { bubbles: true }));
-  assert.deepEqual(Array.from(ui.main().querySelectorAll('input[name="terminal-login"]')).map((radio) => radio.value), ["ok"]);
-});
 
 test("opening sends the ticket request with the CSRF header and opens the socket with the exact protocols and no ticket in the address", async () => {
   const socket = await begin();
@@ -132,14 +76,15 @@ test("opening sends the ticket request with the CSRF header and opens the socket
 test("a CSRF refusal is retried once but a denial is not, and the denial shows one generic message", async () => {
   const replies = [json(403, { error: "forbidden" }), GRANT];
   ui = await open({ [TICKET_ROUTE]: replies }, "#/terminal?node=web-02&login=deploy");
-  click(byText(ui.root, "button", "Open terminal"));
+  click(start());
   await until(() => rig.sockets.length > 0, "the retried ticket");
   assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 2);
   ui.stop();
   rig.sockets.length = 0;
 
   ui = await open({ [TICKET_ROUTE]: json(403, { error: "denied" }) }, "#/terminal?node=web-02&login=deploy");
-  click(byText(ui.root, "button", "Open terminal"));
+
+  click(start());
   await until(() => bannerText().includes("Access denied"), "the denial");
   assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 1);
   assert.equal(rig.sockets.length, 0);
@@ -160,8 +105,8 @@ test("every ticket refusal has its own text and none of them opens a socket", as
   ];
   for (const [reply, expected] of cases) {
     ui = await open({ [TICKET_ROUTE]: reply }, "#/terminal?node=web-02&login=deploy");
-    click(byText(ui.root, "button", "Open terminal"));
-    await until(() => ui.root.querySelector(".term-banner").textContent !== "", String(expected));
+    click(start());
+      await until(() => ui.root.querySelector(".term-banner").textContent !== "", String(expected));
     assert.match(bannerText(), expected);
     assert.equal(rig.sockets.length, 0);
     ui.stop();
@@ -171,7 +116,7 @@ test("every ticket refusal has its own text and none of them opens a socket", as
 
 test("a signed-out session on the ticket request shows the expired dialog and the ended state", async () => {
   ui = await open({ [TICKET_ROUTE]: json(401, { error: "unauthorized" }) }, "#/terminal?node=web-02&login=deploy");
-  click(byText(ui.root, "button", "Open terminal"));
+  click(start());
   await until(() => document.querySelector("[role=dialog]"), "the expired dialog");
   assert.match(document.querySelector("[role=dialog]").textContent, /Session expired/);
   assert.match(bannerText(), /Signed out/);
@@ -194,7 +139,7 @@ test("nothing is sent before ready, and after it input goes out as binary frames
   assert.deepEqual(socket.input(), [[108, 115, 13], [195, 169]]);
   assert.equal(socket.sent.every((item) => typeof item === "string" || item instanceof Uint8Array), true);
   terminal.type("x".repeat(65536 * 2 + 5));
-  assert.deepEqual(socket.sent.slice(2).map((item) => item.length), [65536, 65536, 5]);
+  assert.deepEqual(socket.sent.filter((item) => typeof item !== "string").slice(2).map((item) => item.length), [65536, 65536, 5]);
 });
 
 test("input is refused with a notice when the socket buffer is full", async () => {
@@ -224,19 +169,20 @@ test("output goes to the terminal as bytes and never into the page", async () =>
 test("a window resize is debounced into one resize frame and an unchanged size sends nothing", async () => {
   const socket = await begin();
   await ready(socket);
-  assert.deepEqual(socket.frames(), []);
+  const sizes = () => socket.frames().filter((frame) => frame.t === "resize");
+  assert.deepEqual(sizes(), []);
   rig.layout = { width: 1000, height: 500 };
   rig.observers[0]();
   rig.observers[0]();
   rig.layout = { width: 1200, height: 600 };
   rig.observers[0]();
   rig.clock.advance(149);
-  assert.equal(socket.frames().length, 0);
+  assert.equal(sizes().length, 0);
   rig.clock.advance(2);
-  assert.deepEqual(socket.frames(), [{ t: "resize", cols: 120, rows: 30 }]);
+  assert.deepEqual(sizes(), [{ t: "resize", cols: 120, rows: 30 }]);
   rig.observers[0]();
   rig.clock.advance(200);
-  assert.equal(socket.frames().length, 1);
+  assert.equal(sizes().length, 1);
 });
 
 test("the first size comes from the fitted terminal and is in the address", async () => {
@@ -251,36 +197,67 @@ test("a ping goes out every 20 seconds and the pong shows the round trip", async
   const socket = await begin();
   await ready(socket);
   rig.clock.advance(20000);
-  assert.deepEqual(socket.frames().filter((frame) => frame.t === "ping").length, 1);
+  assert.deepEqual(socket.frames().filter((frame) => frame.t === "ping").length, 2);
   rig.clock.advance(38);
   socket.control({ t: "pong" });
   assert.match(ui.root.querySelector(".statusbar").textContent, /Latency38 ms/);
   rig.clock.advance(20000);
-  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 2);
+  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 3);
   assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 1);
+});
+
+test("the first ping goes out as soon as the session is ready, so the latency shows at once", async () => {
+  const socket = await begin();
+  socket.accept();
+  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 0);
+  socket.control({ t: "ready", session_id: "s-1" });
+  await settle();
+  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 1);
+  assert.equal(ui.root.querySelector(".statusbar .lat").closest(".item").hidden, true);
+  rig.clock.advance(12);
+  socket.control({ t: "pong", node_ms: 30 });
+  assert.match(ui.root.querySelector(".statusbar").textContent, /Latency42 ms/);
+  assert.equal(ui.root.querySelector(".statusbar .lat").closest(".item").hidden, false);
+});
+
+test("pings are not user input: after only pings Disconnect closes without asking", async () => {
+  const socket = await begin();
+  await ready(socket);
+  for (let step = 0; step < 4; step += 1) {
+    rig.clock.advance(5000);
+    socket.control({ t: "pong" });
+  }
+  assert.ok(socket.frames().filter((frame) => frame.t === "ping").length >= 2);
+  click(byText(ui.root, "button", "Disconnect"));
+  assert.equal(document.querySelector("[role=dialog]"), null);
+  assert.deepEqual(socket.closed, [1000, ""]);
 });
 
 test("the shell exit and every close code or error code end the session with its own text and never reconnect by themselves", async () => {
   const cases = [
-    [[{ t: "exit", status: 3, signal: null }], 1000, /exited with status 3/],
-    [[{ t: "exit", status: null, signal: "SIGKILL" }], 1000, /ended on signal SIGKILL/],
-    [[], 1000, /server closed the session/],
-    [[{ t: "error", code: "denied" }], 1008, /Access denied/],
-    [[{ t: "error", code: "limit" }], 1008, /Too many terminals/],
-    [[{ t: "error", code: "timeout" }], 1008, /Time limit reached/],
-    [[{ t: "error", code: "unavailable" }], 1001, /node became unavailable/],
-    [[{ t: "error", code: "revoked" }], 4001, /Access revoked/],
-    [[], 4001, /Access revoked/],
-    [[], 4002, /Closed for inactivity/],
-    [[{ t: "error", code: "stalled" }], 4003, /server closed the session/],
-    [[], 1001, /node became unavailable/],
-    [[], 1011, /node became unavailable/],
-    [[{ t: "error", code: "unavailable" }], 1011, /connection to the node was lost/],
-    [[], 1008, /refused a message from this page/],
-    [[], 1009, /message was too large/],
-    [[], 1006, /Connection lost/],
+    [[{ t: "exit", status: 3, signal: null }], 1000, /exited with status 3/, "Session ended"],
+    [[{ t: "exit", status: null, signal: "SIGKILL" }], 1000, /ended on signal SIGKILL/, "Session ended"],
+    [[], 1000, /server closed the session/, "Session ended"],
+    [[{ t: "error", code: "denied" }], 1008, /Access denied/, "Session ended"],
+    [[{ t: "error", code: "limit" }], 1008, /Too many terminals/, "Session ended"],
+    [[{ t: "error", code: "timeout" }], 1008, /Time limit reached/, "Session ended"],
+    [[{ t: "error", code: "timeout" }], 4002, /Closed for inactivity/, "Session ended"],
+    [[{ t: "error", code: "unavailable" }], 1001, /node became unavailable/, "Connection lost"],
+    [[{ t: "error", code: "revoked" }], 4001, /Access revoked/, "Cut"],
+    [[], 4001, /Access revoked/, "Cut"],
+    [[], 4002, /Closed for inactivity/, "Session ended"],
+    [[{ t: "error", code: "stalled" }], 4003, /this page stopped taking output/, "Session ended"],
+    [[], 4003, /this page stopped taking output/, "Session ended"],
+    [[{ t: "error", code: "terminated" }], 4004, /Ended by an administrator/, "Ended"],
+    [[], 4004, /Ended by an administrator/, "Ended"],
+    [[], 1001, /node became unavailable/, "Connection lost"],
+    [[], 1011, /node became unavailable/, "Connection lost"],
+    [[{ t: "error", code: "unavailable" }], 1011, /connection to web-02 was lost/, "Connection lost"],
+    [[], 1008, /refused a message from this page/, "Session ended"],
+    [[], 1009, /message was too large/, "Session ended"],
+    [[], 1006, /Connection lost/, "Connection lost"],
   ];
-  for (const [frames, code, expected] of cases) {
+  for (const [frames, code, expected, state] of cases) {
     const socket = await begin();
     await ready(socket);
     for (const frame of frames) {
@@ -289,8 +266,8 @@ test("the shell exit and every close code or error code end the session with its
     socket.drop(code);
     await settle();
     assert.match(bannerText(), expected, String(code) + " " + JSON.stringify(frames));
-    assert.equal(states(), String(expected).includes("node") || code === 1006 ? "Connection lost" : "Session ended");
-    if (String(expected).includes("node")) {
+    assert.equal(states(), state, String(code) + " " + JSON.stringify(frames));
+    if (state === "Connection lost") {
       assert.equal(bannerText().includes("Session ended"), false);
     }
     assert.equal(rig.terminals[0].options.disableStdin, true);
@@ -325,7 +302,7 @@ test("reconnect opens a new session with a new ticket and clears the old screen"
   socket.control({ t: "exit", status: 0, signal: null });
   socket.drop(1000);
   await settle();
-  assert.match(bannerText(), /Session: s-1/);
+  assert.equal(ui.root.querySelector(".sid .mono").textContent, "s-1");
   assert.match(bannerText(), /not resumed/);
   click(byText(ui.root, "button", "Reconnect"));
   await until(() => rig.sockets.length === 2, "the second socket");
@@ -418,7 +395,7 @@ test("the key bar sends control codes, escape sequences by cursor mode, and stic
 
 test("the key bar can be shown or hidden by hand", async () => {
   await begin();
-  const toggle = byText(ui.root, "button", "Key bar");
+  const toggle = ui.root.querySelector('button[data-action="keys"]');
   assert.equal(ui.root.querySelector(".keybar").hidden, true);
   assert.equal(toggle.getAttribute("aria-pressed"), "false");
   click(toggle);
@@ -508,13 +485,17 @@ test("Ctrl+Alt+Esc and the Leave terminal button move focus out of the terminal"
   assert.equal(terminal.keyHandler(new window.KeyboardEvent("keydown", { key: "Escape", cancelable: true })), true);
   click(byText(ui.root, "button", "Leave terminal"));
   assert.equal(terminal.blurred, 2);
-  assert.match(ui.root.querySelector(".term-help").textContent, /Ctrl\+Alt\+Esc/);
+  assert.match(ui.root.querySelector(".term-status").textContent, /Ctrl\+Alt\+Esc/);
 });
 
-test("closing the tab or leaving the page closes the socket cleanly and nothing stays behind", async () => {
+test("closing the browser tab asks while a terminal is live, pagehide closes the socket and moving around the console keeps the terminal", async () => {
   let socket = await begin();
   await ready(socket);
-  window.dispatchEvent(new window.Event("beforeunload"));
+  const ask = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(ask);
+  assert.equal(ask.defaultPrevented, true);
+  assert.equal(socket.closed, null);
+  window.dispatchEvent(new window.Event("pagehide"));
   assert.deepEqual(socket.closed, [1000, ""]);
   ui.stop();
   rig.sockets.length = 0;
@@ -525,10 +506,24 @@ test("closing the tab or leaving the page closes the socket cleanly and nothing 
   const terminal = rig.terminals[0];
   window.location.hash = "#/nodes";
   await settle();
+  assert.equal(socket.closed, null);
+  assert.equal(terminal.disposed, false);
+  assert.equal(ui.root.querySelector(".ws").hidden, true);
+  assert.equal(ui.root.querySelector(".rail-count").textContent, "1");
+  window.location.hash = "#/terminal";
+  await settle();
+  assert.equal(ui.root.querySelector(".ws").hidden, false);
+  assert.equal(states(), "Connected");
+  assert.equal(rig.sockets.length, 1);
+  ui.stop();
   assert.deepEqual(socket.closed, [1000, ""]);
   assert.equal(terminal.disposed, true);
   assert.equal(rig.observers.length, 0);
   assert.equal(rig.clock.state.timers.length, 0);
+  const idle = new window.Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(idle);
+  assert.equal(idle.defaultPrevented, false);
+  ui = null;
 });
 
 test("a terminal that cannot be loaded is reported and offers a retry", async () => {
@@ -537,7 +532,7 @@ test("a terminal that cannot be loaded is reported and offers a retry", async ()
     throw new Error("missing");
   };
   ui = await open({}, "#/terminal?node=web-02&login=deploy");
-  click(byText(ui.root, "button", "Open terminal"));
+  click(start());
   await until(() => bannerText().includes("could not be loaded"), "the failure");
   assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 0);
   assert.ok(byText(ui.root, "button", "Try again"));
@@ -551,7 +546,7 @@ test("a terminal that cannot switch on its output protection does not open, says
     throw new UnsafeTerminalError("the print path of the terminal library was not found");
   };
   ui = await open({}, "#/terminal?node=web-02&login=deploy");
-  click(byText(ui.root, "button", "Open terminal"));
+  click(start());
   await until(() => bannerText().includes("cannot start safely"), "the failure");
   assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 0);
   assert.equal(rig.sockets.length, 0);
@@ -570,21 +565,13 @@ test("the session id, ticket and typed bytes never reach the address, storage or
   assert.equal(document.title.includes("deploy@web-02"), true);
 });
 
-test("the keyboard reaches the picker controls and enter in the search field does not submit anything", async () => {
-  ui = await open();
-  const search = ui.main().querySelector("input[type=search]");
-  const event = press(search, "Enter");
-  assert.equal(event.defaultPrevented, false);
-  assert.equal(ui.server.count("POST", "/v1/web/terminal/ticket"), 0);
-  assert.ok(ui.main().querySelectorAll("input[type=radio]").length > 0);
-});
-
 test("every cause a session can end with has a title, a text and a banner kind in the strings module", async () => {
   const { S } = await import("../../crates/jaunt-web/assets/assets/js/strings.js");
-  const causes = ["exit", "closed", "user", "denied", "unavailable", "limit", "revoked", "timeout", "idle", "too_large", "policy", "lost", "connect_failed", "protocol", "expired", "disabled", "invalid", "busy", "network", "library", "unsafe"];
+  const causes = ["exit", "closed", "user", "denied", "unavailable", "limit", "revoked", "terminated", "stalled", "timeout", "idle", "too_large", "policy", "lost", "connect_failed", "protocol", "expired", "disabled", "invalid", "busy", "network", "library", "unsafe"];
   for (const cause of causes) {
     const [title, body, kind] = S.terminal.session.causes[cause];
-    assert.ok(title.length > 0 && body.length > 0, cause);
+    const text = typeof body === "function" ? body("alice", "web-01", { limit: null, idleMinutes: null }) : body;
+    assert.ok(title.length > 0 && text.length > 0, cause);
     assert.ok(["info", "warn", "danger"].includes(kind), cause);
   }
 });
@@ -612,59 +599,12 @@ test("the fitted size follows the cell size, leaves room for the scrollbar and s
   assert.equal(fitSize(host(400, 400), { cols: 80, rows: 24, element: document.createElement("div") }), null);
 });
 
-async function beginFromPicker() {
-  ui = ui || (await open());
-  const radio = ui.main().querySelector('input[value="web-02"]');
-  radio.checked = true;
-  radio.dispatchEvent(new window.Event("change", { bubbles: true }));
-  click(byText(ui.root, "button", "Open terminal"));
-  await until(() => rig.sockets.length > 0, "the socket");
-  return rig.sockets.at(-1);
-}
-
-test("after a session ended the breadcrumb, Choose another node and the rail Terminal item each bring the picker back", async () => {
-  const links = [
-    () => ui.root.querySelector(".crumbs a"),
-    () => byText(ui.root, "a", "Choose another node"),
-    () => ui.root.querySelector('.rail a[href="#/terminal"]'),
-  ];
-  for (const link of links) {
-    ui = await open({}, "#/terminal");
-    const socket = await beginFromPicker();
-    await ready(socket);
-    socket.control({ t: "exit", status: 0, signal: null });
-    socket.drop(1000);
-    await settle();
-    assert.equal(window.location.hash, "#/terminal");
-    click(link());
-    await until(() => ui.main().querySelector('input[name="terminal-node"]'), "the picker");
-    assert.equal(document.activeElement, ui.main());
-    assert.equal(ui.main().querySelector(".term-page"), null);
-    assert.equal(rig.terminals.at(-1).disposed, true);
-    ui.stop();
-    ui = null;
-    rig.sockets.length = 0;
-    rig.terminals.length = 0;
-  }
-});
-
 test("a modified click on the current page link is left to the browser", async () => {
   ui = await open({}, "#/terminal");
   const link = ui.root.querySelector('.rail a[href="#/terminal"]');
   const event = new window.MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true });
   link.dispatchEvent(event);
   assert.equal(event.defaultPrevented, false);
-});
-
-test("a login in the address that the node does not offer preselects nothing, even when the node has one login", async () => {
-  for (const [node, login] of [["web-01", "root"], ["web-02", "root"], ["web-02", ""]]) {
-    ui = await open({}, "#/terminal?node=" + node + "&login=" + login);
-    assert.equal(ui.main().querySelector('input[name="terminal-node"]:checked').value, node);
-    assert.equal(ui.main().querySelector('input[name="terminal-login"]:checked'), null);
-    assert.equal(byText(ui.root, "button", "Open terminal").disabled, true);
-    ui.stop();
-    ui = null;
-  }
 });
 
 test("a pending sticky modifier is not used up by focus or mouse reports and later keys still get it", async () => {
@@ -695,20 +635,6 @@ test("replies stay byte-exact with a sticky modifier on, keep it pending and do 
   assert.deepEqual(socket.closed, [1000, ""]);
 });
 
-test("a hostile node name is text in the status bar, the breadcrumb and the title of an open session", async () => {
-  const name = '<img src=x onerror="window.__pwned=1">';
-  ui = await open({ [TARGETS_ROUTE]: json(200, [{ node: name, labels: {}, connected: true, logins: ["ok"] }]) }, "#/terminal");
-  const radio = ui.main().querySelector('input[name="terminal-node"]');
-  radio.checked = true;
-  radio.dispatchEvent(new window.Event("change", { bubbles: true }));
-  click(byText(ui.root, "button", "Open terminal"));
-  await until(() => rig.sockets.length > 0, "the socket");
-  assert.equal(ui.root.querySelector(".statusbar img, .crumbs img, .term-page img"), null);
-  assert.ok(ui.root.querySelector(".statusbar").textContent.includes(name));
-  assert.ok(ui.root.querySelector(".crumbs").textContent.includes(name));
-  assert.ok(document.title.includes(name));
-});
-
 test("a second ready frame does not start a second ping timer", async () => {
   const socket = await begin();
   await ready(socket);
@@ -716,7 +642,7 @@ test("a second ready frame does not start a second ping timer", async () => {
   socket.control({ t: "ready", session_id: "s-2" });
   assert.equal(rig.clock.state.timers.length, timers);
   rig.clock.advance(20000);
-  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 1);
+  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 2);
 });
 
 test("an exit frame wins over an error frame in either order", async () => {
@@ -745,7 +671,7 @@ test("a hostile session id on the first ready frame is never shown or kept", asy
   socket.drop(1000);
   await settle();
   assert.equal(ui.root.querySelector("main b"), null);
-  assert.equal(bannerText().includes("Session:"), false);
+  assert.equal(ui.root.querySelector(".sid").hidden, true);
 });
 
 test("pagehide closes the socket with a normal close", async () => {
@@ -890,7 +816,7 @@ test("a throttled tick in a hidden tab never declares the peer lost, whatever th
   }
   assert.equal(socket.closed, null);
   assert.equal(states(), "Connected");
-  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 12);
+  assert.equal(socket.frames().filter((frame) => frame.t === "ping").length, 13);
   setHidden(false);
   document.dispatchEvent(new window.Event("visibilitychange"));
   rig.clock.advance(59000);

@@ -11,6 +11,7 @@ export const NORMAL_TICK_MS = 30000;
 export const NORMAL_TICKS_BEFORE_VERDICT = 2;
 export const MAX_INPUT_FRAME = 65536;
 export const MAX_BUFFERED_BYTES = 1048576;
+export const ACTIVE_MIN_GAP_MS = 10000;
 
 const MAX_CONTROL_TEXT = 4096;
 const MAX_SIGNAL_LENGTH = 32;
@@ -18,10 +19,14 @@ const OPEN = 1;
 const TICKET_SHAPE = /^[A-Za-z0-9._~-]{16,128}$/;
 const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 const SIGNAL_SHAPE = /^[A-Za-z0-9_+-]+$/;
-const ERROR_CODES = new Set(["denied", "unavailable", "limit", "revoked", "timeout", "account_refused", "account_failed", "no_account"]);
-const REFERENCE_SHAPE = /^H-[0-9A-F]{8}$/;
-const ACCOUNT_STAGE = "account";
+const ERROR_CODES = new Set(["denied", "unavailable", "limit", "revoked", "timeout", "stalled", "terminated", "account_refused", "account_failed", "no_account"]);
+const REFERENCE_SHAPE = /^[DH]-[0-9A-F]{8}$/;
+const STAGES = new Set(["node", "account", "shell"]);
+const RECORDING_MODES = new Set(["full", "output", "off"]);
 const MAX_HOME_CHARS = 256;
+const MAX_NODE_MS = 3600000;
+const MAX_IDLE_SECONDS = 86400;
+const MAX_LIMIT_NUMBER = 1000;
 
 export function realHooks() {
   return {
@@ -77,16 +82,22 @@ function closeCause({ code, exit, errorCode, ready }) {
   if (exit !== null) {
     return "exit";
   }
+  if (code === 4002) {
+    return "idle";
+  }
   if (errorCode !== null) {
     return errorCode;
   }
   if (code === 4001) {
     return "revoked";
   }
-  if (code === 4002) {
-    return "idle";
+  if (code === 4003) {
+    return "stalled";
   }
-  if (code === 1000 || code === 4003) {
+  if (code === 4004) {
+    return "terminated";
+  }
+  if (code === 1000) {
     return "closed";
   }
   if (code === 1001 || code === 1011) {
@@ -101,8 +112,29 @@ function closeCause({ code, exit, errorCode, ready }) {
   return ready ? "lost" : "connect_failed";
 }
 
-function readReference(message) {
-  return typeof message.ref === "string" && REFERENCE_SHAPE.test(message.ref) ? message.ref : null;
+export function readReference(value) {
+  return typeof value === "string" && REFERENCE_SHAPE.test(value) ? value : null;
+}
+
+function readCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_LIMIT_NUMBER ? value : null;
+}
+
+export function readLimit(body) {
+  if (!body || typeof body !== "object") {
+    return null;
+  }
+  const open = readCount(body.open);
+  const max = readCount(body.max);
+  return open === null || max === null ? null : { open, max };
+}
+
+function readNodeMs(message) {
+  return typeof message.node_ms === "number" && Number.isFinite(message.node_ms) && message.node_ms >= 0 && message.node_ms <= MAX_NODE_MS ? Math.round(message.node_ms) : null;
+}
+
+function readSecondsLeft(message) {
+  return Number.isInteger(message.seconds_left) && message.seconds_left >= 0 && message.seconds_left <= MAX_IDLE_SECONDS ? message.seconds_left : null;
 }
 
 function readHome(message) {
@@ -132,6 +164,7 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
   let pingTimer = null;
   let pingSentAt = null;
   let lastInputAt = null;
+  let lastActiveAt = null;
   let readyAt = null;
   let endedAt = null;
   let sentSize = null;
@@ -173,7 +206,16 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     stopPing();
     closeSocket();
     phase = "ended";
-    handlers.onEnd({ cause, exit, reference, sessionId, wasReady: readyAt !== null, retryAfter: extra.retryAfter || null, closeCode: extra.closeCode === undefined ? null : extra.closeCode });
+    handlers.onEnd({
+      cause,
+      exit,
+      reference: extra.reference === undefined ? reference : extra.reference,
+      sessionId,
+      wasReady: readyAt !== null,
+      retryAfter: extra.retryAfter || null,
+      limit: extra.limit || null,
+      closeCode: extra.closeCode === undefined ? null : extra.closeCode,
+    });
   }
 
   function sendText(payload) {
@@ -212,6 +254,11 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     sendText({ t: "ping" });
   }
 
+  function sendPing() {
+    pingSentAt = clock.now();
+    sendText({ t: "ping" });
+  }
+
   function onReady(message) {
     if (ready || ended) {
       return;
@@ -223,6 +270,9 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     lastTickAt = readyAt;
     normalTicks = 0;
     pingTimer = clock.setInterval(tick, PING_INTERVAL_MS);
+    if (handlers.onReadyInfo) {
+      handlers.onReadyInfo({ recording: RECORDING_MODES.has(message.recording) ? message.recording : null });
+    }
     setPhase("ready");
     if (message.account_created === true && handlers.onAccountCreated) {
       handlers.onAccountCreated({ home: readHome(message) });
@@ -231,6 +281,7 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     if (current !== null) {
       sendResize(current.cols, current.rows);
     }
+    sendPing();
   }
 
   function onControl(text) {
@@ -249,19 +300,24 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     if (message.t === "ready") {
       onReady(message);
     } else if (message.t === "progress") {
-      if (message.stage === ACCOUNT_STAGE && !ready && !ended && handlers.onAccountProgress) {
-        handlers.onAccountProgress();
+      if (STAGES.has(message.stage) && !ready && !ended && handlers.onProgress) {
+        handlers.onProgress(message.stage);
+      }
+    } else if (message.t === "idle") {
+      const left = readSecondsLeft(message);
+      if (left !== null && ready && !ended && handlers.onIdle) {
+        handlers.onIdle(left);
       }
     } else if (message.t === "exit") {
       exit = readExit(message);
     } else if (message.t === "error") {
       if (typeof message.code === "string" && ERROR_CODES.has(message.code)) {
         errorCode = message.code;
-        reference = readReference(message);
+        reference = readReference(message.ref);
       }
     } else if (message.t === "pong") {
       if (pingSentAt !== null && handlers.onLatency) {
-        handlers.onLatency(Math.max(0, clock.now() - pingSentAt));
+        handlers.onLatency(Math.max(0, clock.now() - pingSentAt), readNodeMs(message));
       }
       pingSentAt = null;
     }
@@ -320,7 +376,13 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     try {
       reply = await api.post(TICKET_PATH, { node, login });
     } catch (error) {
-      finish(ticketCause(error), { retryAfter: error && error.retryAfter });
+      const cause = ticketCause(error);
+      const body = error && error.body ? error.body : null;
+      finish(cause, {
+        retryAfter: error && error.retryAfter,
+        reference: body ? readReference(body.ref) : null,
+        limit: cause === "limit" ? readLimit(body) : null,
+      });
       return;
     }
     if (ended) {
@@ -357,10 +419,24 @@ export function createConnection({ api, node, login, size, hooks = realHooks(), 
     return true;
   }
 
+  function sendActive() {
+    if (!ready || ended || socket === null || socket.readyState !== OPEN) {
+      return false;
+    }
+    const now = clock.now();
+    if (lastActiveAt !== null && now - lastActiveAt < ACTIVE_MIN_GAP_MS) {
+      return false;
+    }
+    lastActiveAt = now;
+    sendText({ t: "active" });
+    return true;
+  }
+
   return {
     start,
     sendInput,
     sendResize,
+    sendActive,
     close: () => finish("user"),
     resume() {
       if (ready && !ended) {

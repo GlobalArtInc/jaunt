@@ -18,7 +18,11 @@ function itemNode(entry, close) {
   } else if (entry.icon) {
     children.push(el("span", { class: "menu-icon" }, icon(entry.icon, { size: "sm" })));
   }
-  children.push(el("span", { class: "menu-text" }, el("span", { class: "menu-label", text: entry.text }), entry.hint ? el("span", { class: "menu-hint", text: entry.hint }) : null));
+  const label = entry.content ? el("span", { class: "menu-label" }, ...entry.content) : el("span", { class: "menu-label" + (entry.mono ? " mono" : ""), text: entry.text });
+  children.push(el("span", { class: "menu-text" }, label, entry.hint ? el("span", { class: "menu-hint", text: entry.hint }) : null));
+  if (entry.meta) {
+    children.push(el("span", { class: "menu-meta", text: entry.meta }));
+  }
   const props = {
     class: "menu-item" + (entry.danger ? " menu-danger" : ""),
     role,
@@ -70,7 +74,9 @@ export function menuButton({ content, ariaLabel, className, items, align, onOpen
     ...content,
   );
   let popup = null;
-  const handle = { element: host, button: trigger, isOpen: () => popup !== null, open, close, setDisabled };
+  let searchWrap = null;
+  let searchInput = null;
+  const handle = { element: host, button: trigger, isOpen: () => popup !== null, open, close, setDisabled, refresh };
   host.appendChild(trigger);
 
   function setDisabled(value) {
@@ -92,12 +98,20 @@ export function menuButton({ content, ariaLabel, className, items, align, onOpen
   function onKey(event) {
     const list = focusables();
     const index = list.indexOf(document.activeElement);
+    const inSearch = searchInput !== null && event.target === searchInput;
+    if (inSearch && event.key !== "ArrowDown" && event.key !== "Escape" && event.key !== "Tab") {
+      return;
+    }
     if (event.key === "ArrowDown") {
       event.preventDefault();
       focusAt(index + 1);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      focusAt(index === -1 ? -1 : index - 1);
+      if (index === 0 && searchInput !== null) {
+        searchInput.focus();
+      } else {
+        focusAt(index === -1 ? -1 : index - 1);
+      }
     } else if (event.key === "Home") {
       event.preventDefault();
       focusAt(0);
@@ -119,6 +133,52 @@ export function menuButton({ content, ariaLabel, className, items, align, onOpen
     }
   }
 
+  function buildEntry(entry) {
+    if (entry.type === "separator") {
+      return el("div", { class: "menu-sep", role: "separator" });
+    }
+    if (entry.type === "info") {
+      return el("div", { class: "menu-info", role: "presentation" }, icon("info", { size: "sm" }), el("span", {}, el("strong", { text: entry.title }), " ", entry.text));
+    }
+    if (entry.type === "heading") {
+      return el("div", { class: "menu-heading", role: "presentation", text: entry.text });
+    }
+    if (entry.type === "note") {
+      return el("p", { class: "menu-note", role: "presentation" }, entry.before || "", (entry.names || []).map((name, index) => [index > 0 ? ", " : null, el("span", { class: "mono", text: name })]), entry.after || entry.text || "");
+    }
+    if (entry.type === "search") {
+      if (searchWrap === null) {
+        searchInput = el("input", { type: "search", class: "search-input search-solo", placeholder: entry.placeholder, "aria-label": entry.label, autocomplete: "off", spellcheck: "false", value: entry.value || "", maxlength: "128" });
+        searchInput.addEventListener("input", () => entry.onInput(searchInput.value));
+        searchWrap = el("div", { class: "menu-search" }, el("label", { class: "search-field" }, icon("search"), searchInput));
+      }
+      return searchWrap;
+    }
+    if (entry.type === "scroll") {
+      return el("div", { class: "menu-scroll" }, entry.entries.map(buildEntry));
+    }
+    return itemNode(entry, close);
+  }
+
+  function build(entries) {
+    return entries.map(buildEntry);
+  }
+
+  function refresh() {
+    if (!popup) {
+      return;
+    }
+    const hadFocus = searchInput !== null && document.activeElement === searchInput;
+    const caret = hadFocus ? searchInput.selectionStart : null;
+    popup.replaceChildren(...build(items()));
+    if (hadFocus) {
+      searchInput.focus();
+      if (caret !== null) {
+        searchInput.setSelectionRange(caret, caret);
+      }
+    }
+  }
+
   function open({ focus = "first" } = {}) {
     if (popup || trigger.disabled) {
       return;
@@ -127,23 +187,9 @@ export function menuButton({ content, ariaLabel, className, items, align, onOpen
     if (onOpen) {
       onOpen();
     }
-    const entries = items();
-    popup = el(
-      "div",
-      { class: "menu" + (align === "end" ? " menu-end" : ""), id: menuId, role: "menu", "aria-label": ariaLabel || trigger.textContent.trim() },
-      entries.map((entry) => {
-        if (entry.type === "separator") {
-          return el("div", { class: "menu-sep", role: "separator" });
-        }
-        if (entry.type === "info") {
-          return el("div", { class: "menu-info", role: "presentation" }, icon("info", { size: "sm" }), el("span", {}, el("strong", { text: entry.title }), " ", entry.text));
-        }
-        if (entry.type === "heading") {
-          return el("div", { class: "menu-heading", role: "presentation", text: entry.text });
-        }
-        return itemNode(entry, close);
-      }),
-    );
+    searchWrap = null;
+    searchInput = null;
+    popup = el("div", { class: "menu" + (align === "end" ? " menu-end" : ""), id: menuId, role: "menu", "aria-label": ariaLabel || trigger.textContent.trim() }, build(items()));
     popup.addEventListener("keydown", onKey);
     host.appendChild(popup);
     keepInView(popup);
