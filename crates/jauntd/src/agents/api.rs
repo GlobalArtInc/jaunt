@@ -17,11 +17,9 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use jaunt_control::AuthenticatedNode;
 use jaunt_gate::AgentApiHandler;
-use jaunt_tunnel::{BoxFuture, NodeId};
+use jaunt_tunnel::{BoxFuture, GateTlsStream, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
-use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, ServiceExt};
 
@@ -70,7 +68,7 @@ impl AgentApiHandler for AgentApi {
     fn serve(
         &self,
         node: NodeId,
-        stream: TlsStream<TcpStream>,
+        stream: GateTlsStream,
         shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()> {
         let service =
@@ -200,7 +198,7 @@ enum Ending {
 }
 
 async fn serve_connection(
-    stream: TlsStream<TcpStream>,
+    stream: GateTlsStream,
     service: AddExtension<Router, AuthenticatedNode>,
     limits: ApiLimits,
     shutdown: CancellationToken,

@@ -1,18 +1,26 @@
 mod audit;
+mod entry;
 mod host_cert;
 mod hub;
 mod live;
 mod route;
 mod ssh;
 
+pub use entry::{
+    ALPN_SSH, ALPN_SVC, Admitted, CapturedHello, ClassConnection, ClassHandler, ClassHandlers,
+    DEFAULT_ENTRY_HANDSHAKE_TIMEOUT, EntryClass, EntryIo, EntryNames, EntryNamesError, EntryStream,
+    GateProtocol, HandshakeSlot, HelloError, HelloInfo, MAX_CLIENT_HELLO_BYTES, Replay, Route,
+    SniClass, TlsEntry, TlsEntryConfig, TlsEntryError, TlsRefusal, capture_client_hello,
+    parse_client_hello,
+};
 pub use host_cert::{Clock, HostCertError, HostCertIssuer, IssueError};
 pub use hub::{
     AgentApiHandler, AgentHub, AgentHubConfig, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS,
-    DEFAULT_MAX_API_SESSIONS, DEFAULT_MAX_API_SESSIONS_PER_NODE, HubError, HubStatsSnapshot,
-    ShutdownReport,
+    DEFAULT_KUBE_CLIENT_LIMITS, DEFAULT_MAX_API_SESSIONS, DEFAULT_MAX_API_SESSIONS_PER_NODE,
+    HubError, HubStatsSnapshot, ServicesEntry, ShutdownReport,
 };
 pub use jaunt_limits::{TrustedProxyProblem, trusted_proxy_problem};
-pub use jaunt_tunnel::DisconnectReason;
+pub use jaunt_tunnel::{DisconnectReason, GateTlsStream};
 pub use live::TerminationReason;
 pub use route::DEFAULT_MAX_STREAMS_PER_USER_NODE;
 pub use ssh::{

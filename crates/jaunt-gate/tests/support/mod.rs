@@ -175,12 +175,12 @@ impl AgentApiHandler for HeldSessions {
     fn serve(
         &self,
         node: NodeId,
-        stream: tokio_rustls::server::TlsStream<TcpStream>,
+        stream: jaunt_tunnel::GateTlsStream,
         shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()> {
         let opened = self.opened.clone();
         Box::pin(async move {
-            let keepalive = socket2::SockRef::from(stream.get_ref().0)
+            let keepalive = socket2::SockRef::from(stream.get_ref().0.get_ref())
                 .keepalive()
                 .unwrap();
             opened
@@ -212,7 +212,7 @@ impl AgentApiHandler for Unused {
     fn serve(
         &self,
         _node: NodeId,
-        _stream: tokio_rustls::server::TlsStream<TcpStream>,
+        _stream: jaunt_tunnel::GateTlsStream,
         _shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
@@ -230,6 +230,8 @@ pub struct HubOptions {
     pub sessions_per_node: usize,
     pub sessions: usize,
     pub client_limits: jaunt_limits::AddressLimits,
+    pub services: Option<jaunt_gate::ServicesEntry>,
+    pub max_handshaking: usize,
 }
 
 impl Default for HubOptions {
@@ -239,6 +241,8 @@ impl Default for HubOptions {
             sessions_per_node: DEFAULT_MAX_API_SESSIONS_PER_NODE,
             sessions: DEFAULT_MAX_API_SESSIONS,
             client_limits: jaunt_gate::DEFAULT_AGENT_CLIENT_LIMITS,
+            services: None,
+            max_handshaking: jaunt_tunnel::DEFAULT_MAX_HANDSHAKING,
         }
     }
 }
@@ -255,6 +259,8 @@ where
     config.max_api_sessions_per_node = options.sessions_per_node;
     config.max_api_sessions = options.sessions;
     config.client_limits = options.client_limits;
+    config.services = options.services;
+    config.max_handshaking = options.max_handshaking;
     let (opened, sessions) = mpsc::unbounded_channel();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let hub = AgentHub::start(listener, config, auth, Arc::new(HeldSessions { opened })).unwrap();
@@ -327,7 +333,7 @@ pub async fn dial(
     dial_over(tcp, pki, leaf, name, alpn).await
 }
 
-async fn dial_over(
+pub async fn dial_over(
     tcp: TcpStream,
     pki: &Pki,
     leaf: Option<&Leaf>,

@@ -483,6 +483,10 @@ mod tests {
                 target: "jaunt::audit", event = "login.callback_refused", reason = "unknown_state",
                 client = %"198.51.100.7", suppressed = 0_u64
             );
+            tracing::info!(
+                target: "jaunt::audit", event = "gate.tls.refused", client = %"192.0.2.44",
+                reason = "unsupported_class", suppressed = 5_u64
+            );
         });
 
         let events = drained(&stand).await;
@@ -495,7 +499,8 @@ mod tests {
                 "http.client_ip_header_ignored",
                 "gate.limited",
                 "agent.limited",
-                "login.callback_refused"
+                "login.callback_refused",
+                "gate.tls.refused"
             ]
         );
         for event in &events {
@@ -516,6 +521,9 @@ mod tests {
         assert_eq!(events[3].text("client"), Some("203.0.113.9"));
         assert_eq!(events[4].text("reason"), Some("concurrent"));
         assert_eq!(events[5].text("reason"), Some("unknown_state"));
+        assert_eq!(events[6].text("client"), Some("192.0.2.44"));
+        assert_eq!(events[6].text("reason"), Some("unsupported_class"));
+        assert_eq!(events[6].int("suppressed"), Some(5));
         assert_eq!(stand.tap.snapshot().fields_dropped, 0);
     }
 

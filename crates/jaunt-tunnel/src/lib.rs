@@ -11,6 +11,7 @@ mod h2io;
 mod options;
 mod proto;
 mod registry;
+mod replay;
 mod server;
 mod session;
 mod stats;
@@ -22,7 +23,10 @@ pub use client::{
     StreamHandler, TunnelClient, TunnelClientConfig,
 };
 pub use control::ControlError;
-pub use gate::{AgentApiConnection, Gate, GateError, GateObserver, Handover, MainConnection};
+pub use gate::{
+    AgentApiConnection, Front, Gate, GateError, GateObserver, GateTlsStream, Handover,
+    MainConnection,
+};
 pub use h2io::{H2Io, StreamAborted};
 pub use options::{
     DEFAULT_CONNECTION_WINDOW, DEFAULT_MAX_CONCURRENT_STREAMS, DEFAULT_MAX_HEADER_LIST_SIZE,
@@ -38,6 +42,7 @@ pub use proto::{
 pub use registry::{
     AgentRegistry, DisconnectReason, RegisterError, RegistryEvent, RegistryObserver, TrustBroadcast,
 };
+pub use replay::Replay;
 pub use server::{ConnectionId, OpenError, SendError, TunnelConnection, TunnelError};
 pub use session::SessionRegistry;
 pub use stats::{GateStats, GateStatsSnapshot};

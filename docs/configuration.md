@@ -27,7 +27,7 @@ Top-level keys:
 |---|---|---|---|
 | `data_dir` | path | required | holds `jaunt.db`, `ca/`, the default policy and staging directories. Should be mode 0700 and owned by the `jauntd` account; a mode that is open to others is logged as a warning |
 | `listen` | address:port | `127.0.0.1:8443` | the plain HTTP listener of the console and the API. Put a TLS terminator in front of it |
-| `agents_listen` | address:port or empty | `0.0.0.0:8444` | TLS 1.3 listener for agents (client certificates required). An empty string turns it off, which also rules out `ssh_gate` |
+| `agents_listen` | address:port or empty | `0.0.0.0:8444` | TLS 1.3 listener for agents (client certificates required). With `services.domain` it is also the entry for services, sorted by TLS server name. An empty string turns it off, which also rules out `ssh_gate` and `services.domain` |
 | `public_url` | URL | required | the `https` origin users type. No path, no trailing slash, no credentials. The OIDC redirect URI is this value plus `/v1/login/callback` |
 | `cert_ttl_secs` | integer | 28800 | user certificate lifetime, 60 to 86400. Certificates start valid two minutes in the past |
 | `device_login` | boolean | `true` | serves the device-code endpoints and the verification page. The `jaunt login --device` command does not exist yet |
@@ -40,6 +40,7 @@ Top-level keys:
 | `policy_poll_secs` | integer | 5 | how often the directory is checked, 1 to 3600 |
 | `gate_endpoint` | `host[:port]` | none | the SSH gate address that clients learn from the server (port default 22). Required when `ssh_gate` is set. An IPv6 literal goes in square brackets, but not with `ssh_gate` |
 | `ssh_gate` | map | none | the SSH gate. Without it no one can connect with `ssh` |
+| `services` | map | none | the services entry on `agents_listen`. Without `services.domain` the listener serves agents only, exactly as before |
 | `oidc` | map | required | the identity provider |
 | `audit` | map | see below | where audit events go |
 | `limits` | map | see below | rate and connection limits |
@@ -56,6 +57,16 @@ Top-level keys:
 | `trusted_proxies` | list of CIDR | empty | networks allowed to send that header. Needs `proxy_protocol: true` |
 | `max_unauthenticated` | integer | 512 | connections that have not authenticated yet, all addresses together, 1 to 1048576 |
 | `write_stall_secs` | integer | 900 | a client that accepts no data for this long is disconnected. 0 turns it off, at most 86400 |
+
+### services
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `services.domain` | DNS name | none | `<D>`. On `agents_listen` the TLS server name `<D>` is the gate class (ALPN `jaunt-ssh/1` or `jaunt-svc/1`), `<cluster>.kube.<D>` with exactly one label is passed to the cluster agent without decryption, and the host of `agent_endpoint` keeps the agent path. Any other name, or none, is refused with the audit event `gate.tls.refused`. Labels are matched case-insensitively: the value and the names clients send are normalised to lower case, with one trailing dot dropped. No IP address; it must not equal the host of `agent_endpoint` nor make that host a `<cluster>.kube.<D>` name. Needs `agents_listen` |
+| `services.proxy_protocol` | boolean | `false` | expect a PROXY protocol v2 header on every connection to `agents_listen`, sent within 5 seconds. The address in the header is the client address for the per-address limits and the audit. Needs `services.domain` and `services.trusted_proxies` |
+| `services.trusted_proxies` | list of CIDR | empty | networks allowed to send that header; connections from any other address are closed. Needs `services.domain` and `services.proxy_protocol: true`. A block that would trust the whole internet is refused |
+
+With `services.domain`, admission to `agents_listen` takes at most 15 seconds: 5 for the PROXY header when `services.proxy_protocol` is on, then 10 for the ClientHello and the TLS handshake together. The ClientHello may be at most 16 KiB. The handshake budget (all addresses together and `limits.agents` per address) counts a connection only until its class is decided, or until the agent handshake ends; a gate or pass-through connection that is being served no longer counts.
 
 ### oidc
 
@@ -85,7 +96,7 @@ At least one of `jsonl` and `database` must be on.
 
 Every rate is a map `{burst: N, per_minute: M}`: a token bucket per client address (IPv6 addresses count per /64) that holds `burst` tokens and gains `M` per minute. `burst` is 1 to 1000000, `per_minute` 1 to 6000000. A refused request gets HTTP 429 with `Retry-After`.
 
-The keys below sit in the sections `limits.http`, `limits.ssh` and `limits.agents`; `tracked_addresses` sits directly in `limits`.
+The keys below sit in the sections `limits.http`, `limits.ssh`, `limits.agents` and `limits.kube`; `tracked_addresses` sits directly in `limits`.
 
 | Key | Default | Applies to |
 |---|---|---|
@@ -104,8 +115,10 @@ The keys below sit in the sections `limits.http`, `limits.ssh` and `limits.agent
 | `http.max_connections_per_address` | 256 | open HTTP connections per address, 1 to 1048576 |
 | `ssh.connections` | burst 600, 600 per minute | new SSH connections to the gate |
 | `ssh.unauthenticated_per_address` | 128 | SSH connections per address that have not authenticated, 1 to 1048576 |
-| `agents.handshakes` | burst 128, 1200 per minute | TLS handshakes on `agents_listen` |
-| `agents.handshaking_per_address` | 64 | handshakes in progress per address, 1 to 1048576 |
+| `agents.handshakes` | burst 128, 1200 per minute | TLS handshakes on `agents_listen`: every connection to it, agents and the `services` classes alike |
+| `agents.handshaking_per_address` | 64 | handshakes in progress per address on `agents_listen`, 1 to 1048576. A connection stops counting once its class is decided (`services`) or the agent handshake ends |
+| `kube.handshakes` | burst 600, 600 per minute | connections to `<cluster>.kube.<services.domain>`, counted in addition to `agents.handshakes` |
+| `kube.handshaking_per_address` | 128 | open pass-through connections per address to `<cluster>.kube.<services.domain>`; each one counts for as long as it is open, 1 to 1048576 |
 
 ### recordings
 

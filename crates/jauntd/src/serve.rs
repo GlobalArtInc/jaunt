@@ -16,7 +16,9 @@ use jaunt_policy::Watcher;
 use jaunt_proto::ControlPlane;
 use jaunt_ssh::{UserCaKeys, UserCaSource};
 use jaunt_store::{Store, StoreError};
-use jauntd::agents::{AgentServer, AgentServerParts, AgentsError, AgentsSettings, SHUTDOWN_GRACE};
+use jauntd::agents::{
+    AgentServer, AgentServerParts, AgentsError, AgentsSettings, SHUTDOWN_GRACE, ServicesSettings,
+};
 use jauntd::ca_reload::{CaReloadParts, CaReloader, CaWatcher, IdentityEnv, RELOAD_INTERVAL};
 use jauntd::gate_ssh::{
     GateSshError, GateSshParts, GateSshServer, GateSshSettings, HostAuthorityIssuer,
@@ -113,11 +115,18 @@ struct Started {
     listen: SocketAddr,
     store: Store,
     agents: Option<AgentsSettings>,
-    agent_limits: AddressLimits,
+    entry: AgentEntry,
     gate: Option<GatePlan>,
     web_terminal: Option<WebTerminalSettings>,
     audit: AuditRuntime,
     recordings: Option<recordings::PreparedRecordings>,
+}
+
+#[derive(Clone)]
+struct AgentEntry {
+    client_limits: AddressLimits,
+    kube_limits: AddressLimits,
+    services: Option<ServicesSettings>,
 }
 
 struct GatePlan {
@@ -143,7 +152,7 @@ async fn serve(
         listen,
         store,
         agents,
-        agent_limits,
+        entry,
         gate,
         web_terminal,
         audit,
@@ -157,7 +166,7 @@ async fn serve(
             return Err(err);
         }
     };
-    let agents = match start_agents(agents, agent_limits, &control, store).await {
+    let agents = match start_agents(agents, entry, &control, store).await {
         Ok(agents) => agents,
         Err(err) => {
             policy::stop_watcher(watcher).await;
@@ -242,7 +251,7 @@ async fn serve(
 
 async fn start_agents(
     settings: Option<AgentsSettings>,
-    client_limits: AddressLimits,
+    entry: AgentEntry,
     control: &Control,
     store: Store,
 ) -> Result<Option<AgentServer>, ServeError> {
@@ -251,11 +260,14 @@ async fn start_agents(
         return Ok(None);
     };
     let mut parts = AgentServerParts::new(settings, control.clone(), store, system_clock());
-    parts.client_limits = client_limits;
+    parts.client_limits = entry.client_limits;
+    parts.kube_limits = entry.kube_limits;
+    parts.services = entry.services;
     let server = AgentServer::start(parts).await?;
     tracing::info!(
         target: "jaunt::daemon",
         listen = %server.local_addr(),
+        services_domain = server.services_domain(),
         "serving agents"
     );
     Ok(Some(server))
@@ -460,7 +472,11 @@ async fn start(
             listen: settings.listen,
             store: agents_store,
             agents: settings.agents,
-            agent_limits: settings.limits.agents,
+            entry: AgentEntry {
+                client_limits: settings.limits.agents,
+                kube_limits: settings.limits.kube,
+                services: settings.services,
+            },
             gate,
             web_terminal: settings.web_terminal,
             audit: audit.clone(),
@@ -977,11 +993,11 @@ mod tests {
         let (_dir, runtime, started) = started_with(
             "agents_listen: 127.0.0.1:0\nlimits:\n  agents:\n    handshaking_per_address: 1\n",
         );
-        assert_eq!(started.agent_limits.concurrent, 1);
+        assert_eq!(started.entry.client_limits.concurrent, 1);
         runtime.block_on(async {
             let agents = super::start_agents(
                 started.agents.clone(),
-                started.agent_limits,
+                started.entry.clone(),
                 &started.control,
                 started.store.clone(),
             )
@@ -999,6 +1015,65 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            agents.shutdown(Duration::from_secs(5)).await;
+        });
+        started.watcher.stop();
+    }
+
+    #[test]
+    fn the_services_domain_and_the_kube_limits_reach_the_agents_listener() {
+        let (_dir, runtime, started) = started_with(
+            "agents_listen: 127.0.0.1:0\nservices:\n  domain: Svc.Example.com\nlimits:\n  \
+             kube:\n    handshakes: { burst: 1, per_minute: 1 }\n",
+        );
+        assert_eq!(
+            started.entry.kube_limits.rate,
+            jaunt_limits::Rate::new(1, 1).unwrap()
+        );
+        runtime.block_on(async {
+            let agents = super::start_agents(
+                started.agents.clone(),
+                started.entry.clone(),
+                &started.control,
+                started.store.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(agents.services_domain(), Some("svc.example.com"));
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut client = rustls::ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            client.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            for _ in 0..2 {
+                let tcp = tokio::net::TcpStream::connect(agents.local_addr())
+                    .await
+                    .unwrap();
+                let cluster =
+                    rustls::pki_types::ServerName::try_from("prod.kube.svc.example.com").unwrap();
+                let refused =
+                    tokio::time::timeout(Duration::from_secs(10), connector.connect(cluster, tcp))
+                        .await
+                        .unwrap();
+                assert!(refused.is_err());
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while agents.tls_refused(jaunt_gate::TlsRefusal::Limit) != 1 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the second kube hello was not refused by the kube limit"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                agents.tls_refused(jaunt_gate::TlsRefusal::UnsupportedClass),
+                1
+            );
+            assert_eq!(agents.stats().snapshot().handshake_failures, 0);
             agents.shutdown(Duration::from_secs(5)).await;
         });
         started.watcher.stop();

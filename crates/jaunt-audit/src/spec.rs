@@ -234,6 +234,8 @@ events! {
         [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
     AgentLimited => ("agent.limited", "agent.limited", ActorRule::Anonymous, None, None, None,
         [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
+    GateTlsRefused => ("gate.tls.refused", "gate.tls.refused", ActorRule::Anonymous, None, None, None,
+        [("client", ADDR), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
     CaKeyAdded => ("ca.key.added", "ca.key.added", ActorRule::User("changed_by"), None, None, None,
         [("kind", SHORT), ("fp", ID)]),
     CaKeyPromoted => ("ca.key.promoted", "ca.key.promoted", ActorRule::User("changed_by"), None, None, None,
@@ -405,6 +407,7 @@ mod tests {
                 "http.client_ip_header_ignored",
                 "gate.limited",
                 "agent.limited",
+                "gate.tls.refused",
                 "terminal.denied",
                 "host_user.refused",
                 "host_user.helper_failed"

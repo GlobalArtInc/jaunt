@@ -4,13 +4,14 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN};
+use crate::agents::{AgentsSettings, DEFAULT_AGENTS_LISTEN, ServicesSettings};
 use crate::gate_ssh::GateSshSettings;
 use ipnet::IpNet;
 use jaunt_control::{AgentEndpoint, DeviceSettings, GateEndpoint, NamingError, SshSuffix};
 use jaunt_gate::{
-    DEFAULT_MAX_UNAUTHENTICATED, DEFAULT_SSH_CLIENT_LIMITS, MAX_HOSTNAMES,
-    MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem, normalize_dns_name, trusted_proxy_problem,
+    DEFAULT_MAX_UNAUTHENTICATED, DEFAULT_SSH_CLIENT_LIMITS, EntryNames, EntryNamesError,
+    MAX_HOSTNAMES, MAX_UNAUTHENTICATED_LIMIT, TrustedProxyProblem, normalize_dns_name,
+    trusted_proxy_problem,
 };
 use jaunt_oidc::{ClientSecret, DEFAULT_SCOPES, OidcConfig};
 use serde::Deserialize;
@@ -63,6 +64,7 @@ pub struct Config {
     pub policy_poll_secs: u64,
     pub gate_endpoint: Option<String>,
     pub ssh_gate: Option<SshGateSection>,
+    pub services: Option<ServicesSection>,
     pub oidc: Option<OidcSection>,
     #[serde(default)]
     pub audit: AuditSection,
@@ -91,6 +93,16 @@ pub struct SshGateSection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ServicesSection {
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcSection {
     pub issuer_url: String,
     pub client_id: String,
@@ -114,6 +126,7 @@ pub struct RunSettings {
     pub policy_poll: Duration,
     pub web: bool,
     pub agents: Option<AgentsSettings>,
+    pub services: Option<ServicesSettings>,
     pub ssh_gate: Option<GateSshSettings>,
     pub oidc: OidcConfig,
     pub audit: AuditSettings,
@@ -210,6 +223,28 @@ pub enum ConfigError {
     GateUnauthenticatedOutOfRange,
     #[error("ssh_gate.write_stall_secs must be at most {MAX_WRITE_STALL_SECS} (0 turns it off)")]
     WriteStallOutOfRange,
+    #[error("services.proxy_protocol and services.trusted_proxies need services.domain")]
+    ServicesProxyWithoutDomain,
+    #[error("services.domain needs the agents' listener: set agents_listen as well")]
+    ServicesWithoutAgents,
+    #[error("services.domain must be a dns name such as svc.example.com, not an ip address")]
+    InvalidServicesDomain,
+    #[error(
+        "services.domain must not be the host of agent_endpoint and must not make it a name under \
+         kube.<services.domain>"
+    )]
+    ServicesDomainCoversAgents,
+    #[error("services.trusted_proxies[{0}] is not a cidr block such as 10.0.0.0/8")]
+    InvalidServicesTrustedProxy(usize),
+    #[error("services.trusted_proxies[{index}]: {problem}")]
+    UnusableServicesTrustedProxy {
+        index: usize,
+        problem: TrustedProxyProblem,
+    },
+    #[error("services.proxy_protocol needs at least one entry in services.trusted_proxies")]
+    MissingServicesTrustedProxies,
+    #[error("services.trusted_proxies is set but services.proxy_protocol is false")]
+    ServicesTrustedProxiesWithoutProxyProtocol,
     #[error("the oidc section is required to run the daemon")]
     MissingOidc,
     #[error(
@@ -309,6 +344,11 @@ impl Config {
             .map(|text| GateEndpoint::parse(&text).map_err(ConfigError::InvalidGateEndpoint))
             .transpose()?;
         let agents = agents_settings(self.agents_listen.as_deref(), &agent_endpoint)?;
+        let services = self
+            .services
+            .map(|section| services_settings(section, agents.as_ref()))
+            .transpose()?
+            .flatten();
         let limits = self.limits.into_settings()?;
         let ssh_gate = self
             .ssh_gate
@@ -380,6 +420,7 @@ impl Config {
             policy_poll: Duration::from_secs(self.policy_poll_secs),
             web: self.web,
             agents,
+            services,
             ssh_gate,
             oidc,
             audit,
@@ -403,6 +444,51 @@ fn agents_settings(
     Ok(Some(AgentsSettings {
         listen,
         server_name: endpoint.host().to_owned(),
+    }))
+}
+
+fn services_settings(
+    section: ServicesSection,
+    agents: Option<&AgentsSettings>,
+) -> Result<Option<ServicesSettings>, ConfigError> {
+    let Some(domain) = section.domain else {
+        if section.proxy_protocol || !section.trusted_proxies.is_empty() {
+            return Err(ConfigError::ServicesProxyWithoutDomain);
+        }
+        return Ok(None);
+    };
+    let agents = agents.ok_or(ConfigError::ServicesWithoutAgents)?;
+    let names = EntryNames::new(std::slice::from_ref(&agents.server_name), Some(&domain)).map_err(
+        |error| match error {
+            EntryNamesError::InvalidDomain => ConfigError::InvalidServicesDomain,
+            EntryNamesError::AgentNameCollision(_) => ConfigError::ServicesDomainCoversAgents,
+        },
+    )?;
+    let trusted_proxies = section
+        .trusted_proxies
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            text.parse::<IpNet>()
+                .map_err(|_| ConfigError::InvalidServicesTrustedProxy(index))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((index, problem)) = trusted_proxies
+        .iter()
+        .enumerate()
+        .find_map(|(index, network)| trusted_proxy_problem(network).map(|problem| (index, problem)))
+    {
+        return Err(ConfigError::UnusableServicesTrustedProxy { index, problem });
+    }
+    match (section.proxy_protocol, trusted_proxies.is_empty()) {
+        (true, true) => return Err(ConfigError::MissingServicesTrustedProxies),
+        (false, false) => return Err(ConfigError::ServicesTrustedProxiesWithoutProxyProtocol),
+        (true, false) | (false, true) => {}
+    }
+    Ok(Some(ServicesSettings {
+        domain: names.domain().unwrap_or(&domain).to_owned(),
+        proxy_protocol: section.proxy_protocol,
+        trusted_proxies,
     }))
 }
 
@@ -579,7 +665,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use crate::agents::AgentsSettings;
+    use crate::agents::{AgentsSettings, ServicesSettings};
     use crate::gate_ssh::GateSshSettings;
     use crate::recordings::StoreSettings;
     use jaunt_gate::TrustedProxyProblem;
@@ -1170,6 +1256,104 @@ cert_ttl_secs: {SECRET}
         let error = config.into_run_settings(&secret_env).err().unwrap();
         assert!(matches!(error, ConfigError::GateWithoutAgents), "{error}");
         assert!(error.to_string().contains("agents_listen"));
+    }
+
+    #[test]
+    fn the_services_domain_is_optional_and_carries_the_proxy_rules_of_the_ssh_gate() {
+        let plain = parse("").into_run_settings(&secret_env).unwrap();
+        assert_eq!(plain.services, None);
+        let empty = parse("services: {}\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(empty.services, None);
+        let domain = parse("services:\n  domain: Svc.Example.COM.\n")
+            .into_run_settings(&secret_env)
+            .unwrap();
+        assert_eq!(
+            domain.services,
+            Some(ServicesSettings {
+                domain: "svc.example.com".to_owned(),
+                proxy_protocol: false,
+                trusted_proxies: Vec::new(),
+            })
+        );
+        let proxied = parse(
+            "services:\n  domain: svc.example.com\n  proxy_protocol: true\n  \
+             trusted_proxies: [10.0.0.0/8, \"2001:db8::/32\"]\n",
+        )
+        .into_run_settings(&secret_env)
+        .unwrap()
+        .services
+        .unwrap();
+        assert!(proxied.proxy_protocol);
+        assert_eq!(proxied.trusted_proxies.len(), 2);
+    }
+
+    #[test]
+    fn invalid_services_settings_are_refused_with_the_key_name() {
+        type Expected = fn(&ConfigError) -> bool;
+        let cases: [(&str, Expected); 10] = [
+            ("services:\n  proxy_protocol: true\n", |error| {
+                matches!(error, ConfigError::ServicesProxyWithoutDomain)
+            }),
+            ("services:\n  trusted_proxies: [10.0.0.0/8]\n", |error| {
+                matches!(error, ConfigError::ServicesProxyWithoutDomain)
+            }),
+            (
+                "agents_listen: \"\"\nservices:\n  domain: svc.example.com\n",
+                |error| matches!(error, ConfigError::ServicesWithoutAgents),
+            ),
+            ("services:\n  domain: 192.0.2.7\n", |error| {
+                matches!(error, ConfigError::InvalidServicesDomain)
+            }),
+            ("services:\n  domain: \"*.example.com\"\n", |error| {
+                matches!(error, ConfigError::InvalidServicesDomain)
+            }),
+            ("services:\n  domain: agents.example.com\n", |error| {
+                matches!(error, ConfigError::ServicesDomainCoversAgents)
+            }),
+            ("services:\n  domain: Agents.Example.com.\n", |error| {
+                matches!(error, ConfigError::ServicesDomainCoversAgents)
+            }),
+            (
+                "services:\n  domain: svc.example.com\n  proxy_protocol: true\n",
+                |error| matches!(error, ConfigError::MissingServicesTrustedProxies),
+            ),
+            (
+                "services:\n  domain: svc.example.com\n  trusted_proxies: [10.0.0.0/8]\n",
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::ServicesTrustedProxiesWithoutProxyProtocol
+                    )
+                },
+            ),
+            (
+                "services:\n  domain: svc.example.com\n  proxy_protocol: true\n  \
+                 trusted_proxies: [10.0.0.0/8, 0.0.0.0/0]\n",
+                |error| {
+                    matches!(
+                        error,
+                        ConfigError::UnusableServicesTrustedProxy { index: 1, .. }
+                    )
+                },
+            ),
+        ];
+        for (extra, expected) in cases {
+            let error = parse(extra).into_run_settings(&secret_env).err().unwrap();
+            assert!(expected(&error), "{extra:?}: {error}");
+            assert!(error.to_string().contains("services."), "{error}");
+        }
+        let bad_network = parse(
+            "services:\n  domain: svc.example.com\n  proxy_protocol: true\n  \
+             trusted_proxies: [nonsense]\n",
+        );
+        assert!(matches!(
+            bad_network.into_run_settings(&secret_env).err().unwrap(),
+            ConfigError::InvalidServicesTrustedProxy(0)
+        ));
+        let text = "data_dir: /d\nservices:\n  domain: svc.example.com\n  extra: 1\n";
+        assert!(serde_saphyr::from_str::<Config>(text).is_err());
     }
 
     #[test]

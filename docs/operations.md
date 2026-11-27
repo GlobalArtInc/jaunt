@@ -408,13 +408,15 @@ Defaults are in [configuration.md](configuration.md#limits). What you see when o
 | SSH connections per address (`limits.ssh`) | the connection is dropped | audit `gate.limited` with `reason` `rate`, `concurrent` or `table_full` |
 | SSH connections that have not authenticated (`ssh_gate.max_unauthenticated`, 512) | refused | `gate.limited` |
 | open SSH streams per user and node | 8; the next `ssh` gets `jaunt: too many open sessions` | `gate.forward` with `outcome: limit` |
-| agent handshakes (`limits.agents`) | the TLS handshake is refused | audit `agent.limited` |
+| handshakes in progress on `agents_listen` per address (`limits.agents`) | the TLS handshake is refused | audit `agent.limited`; with `services.domain` set, `gate.tls.refused` with `reason: limit` instead |
+| open pass-through connections to `<cluster>.kube.<services.domain>` per address (`limits.kube`) | the connection is closed before a byte reaches the cluster agent | `gate.tls.refused` with `reason: limit` |
+| the services entry on `agents_listen` (with `services.domain`): 1024 handshakes at once, PROXY header in 5 s, ClientHello at most 16 KiB, hello and TLS handshake in 10 s | the connection is closed | `gate.tls.refused` with `reason` `limit`, `proxy_timeout`, `hello_too_large` or `hello_timeout` |
 | API connections of one node (4) and of all nodes (1024) | the extra connection is refused | server log and the agent's log |
 | web terminals | `max_per_user` 4, `max_total` 64, 8 tickets per web session | `terminal.denied` with `reason` `limit` or `tickets_full` |
 | recording memory on the node (`recording.*`) | recording data is dropped and the session is marked incomplete | agent log `agent.ssh.recording_dropped`; session `recording_incomplete: true` |
 | recording uploads and sizes on the server (`recordings.*`) | the upload is refused | audit `recording.rejected` with `reason` |
 
-Noisy events are the connection-level and flood-driven ones (the `(noisy)` rows in the [Audit](#audit) table). Eight of them carry a `suppressed` field: the first occurrence is logged and later ones are counted into it (`recording.rejected`, `login.callback_refused`, `http.rate_limited`, `http.connection_limited`, `http.client_ip_header_ignored`, `gate.limited`, `agent.limited`, `terminal.denied`). The other six have no such field and are written one by one: `login.device.code_failed`, `gate.connect`, `gate.session_refused`, `gate.disconnect`, `agent.rejected` and `join_token.refused`. Noisy events wait in their own queue, a quarter of `audit.queue` (256 with the default of 1024). Critical events have their own queue and are written first, so a flood of noisy events never displaces them. When the noisy queue is full, the newest noisy events are dropped, not the old ones. The daemon logs `the noisy audit queue is full, the newest noisy events were dropped` with the number dropped, at most once a minute, and the daemon log is the only place that says so.
+Noisy events are the connection-level and flood-driven ones (the `(noisy)` rows in the [Audit](#audit) table). Nine of them carry a `suppressed` field: the first occurrence is logged and later ones are counted into it (`recording.rejected`, `login.callback_refused`, `http.rate_limited`, `http.connection_limited`, `http.client_ip_header_ignored`, `gate.limited`, `agent.limited`, `gate.tls.refused`, `terminal.denied`). `gate.tls.refused` counts each `reason` on its own, so a flood of one reason never hides the first event of another. The other six have no such field and are written one by one: `login.device.code_failed`, `gate.connect`, `gate.session_refused`, `gate.disconnect`, `agent.rejected` and `join_token.refused`. Noisy events wait in their own queue, a quarter of `audit.queue` (256 with the default of 1024). Critical events have their own queue and are written first, so a flood of noisy events never displaces them. When the noisy queue is full, the newest noisy events are dropped, not the old ones. The daemon logs `the noisy audit queue is full, the newest noisy events were dropped` with the number dropped, at most once a minute, and the daemon log is the only place that says so.
 
 ## Audit
 
@@ -426,7 +428,7 @@ sudo journalctl -u jauntd -o cat | grep '^{"v":1' | jq -c 'select(.type | starts
 
 The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
 
-The 64 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
+The 65 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
 
 | Type | Actor | Fields |
 |---|---|---|
@@ -486,6 +488,7 @@ The 64 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `http.client_ip_header_ignored` (noisy) | anonymous | `peer_addr`, `total`, `suppressed` |
 | `gate.limited` (noisy) | anonymous | `client`, `reason`, `suppressed` |
 | `agent.limited` (noisy) | anonymous | `client`, `reason`, `suppressed` |
+| `gate.tls.refused` (noisy) | anonymous | `client` (the address from the PROXY header when there is one, IPv6 per /64), `reason` (`proxy_untrusted`, `proxy_malformed`, `proxy_timeout`, `limit`, `hello_too_large`, `hello_timeout`, `bad_hello`, `no_sni`, `unknown_sni`, `alpn_unsupported`, `unsupported_class`), `suppressed` |
 | `ca.key.added` | user | `kind`, `fp` |
 | `ca.key.promoted` | user | `kind`, `fp`, `forced`, `blocked`, `nodes_behind`, `old_unexpired` |
 | `ca.key.retired` | user | `kind`, `fp`, `forced`, `blocked`, `old_unexpired`, `nodes_old` |

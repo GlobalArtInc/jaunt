@@ -16,21 +16,24 @@ use tokio_util::sync::CancellationToken;
 use crate::options::{OptionsError, TunnelOptions};
 use crate::proto::NodeId;
 use crate::registry::AgentRegistry;
+use crate::replay::Replay;
 use crate::server::TunnelConnection;
 use crate::stats::GateStats;
-use crate::tls::{Accepted, GateAcceptor, PeerStream};
-use crate::{PeerAuthenticator, RejectReason, Rejection};
+use crate::tls::{AcceptError, Accepted, GateAcceptor, HandshakePermit, PeerStream};
+use crate::{BoxFuture, PeerAuthenticator, RejectReason, Rejection};
 
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const REJECT_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub type GateTlsStream = TlsStream<Replay<TcpStream>>;
+
 pub struct MainConnection {
-    pub stream: TlsStream<TcpStream>,
+    pub stream: GateTlsStream,
     pub peer_addr: SocketAddr,
 }
 
 pub struct AgentApiConnection {
-    pub stream: TlsStream<TcpStream>,
+    pub stream: GateTlsStream,
     pub node: NodeId,
     pub peer_cert: CertificateDer<'static>,
     pub peer_addr: SocketAddr,
@@ -45,6 +48,16 @@ pub enum GateError {
 pub trait Handover: Send + Sync {
     fn main(&self, connection: MainConnection);
     fn agent_api(&self, connection: AgentApiConnection);
+}
+
+pub trait Front: Send + Sync {
+    fn serve(
+        &self,
+        gate: Gate,
+        tcp: TcpStream,
+        peer_addr: SocketAddr,
+        shutdown: CancellationToken,
+    ) -> BoxFuture<'static, ()>;
 }
 
 pub trait GateObserver: Send + Sync {
@@ -114,6 +127,24 @@ impl Gate {
         listener: TcpListener,
         shutdown: CancellationToken,
     ) -> Result<(), GateError> {
+        self.accept_loop(listener, shutdown, None).await
+    }
+
+    pub async fn serve_behind(
+        &self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+        front: Arc<dyn Front>,
+    ) -> Result<(), GateError> {
+        self.accept_loop(listener, shutdown, Some(front)).await
+    }
+
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+        front: Option<Arc<dyn Front>>,
+    ) -> Result<(), GateError> {
         Handle::try_current().map_err(|_| GateError::NoRuntime)?;
         let mut connections = JoinSet::new();
         loop {
@@ -129,8 +160,18 @@ impl Gate {
                     Ok((tcp, peer_addr)) => {
                         let gate = self.clone();
                         let token = shutdown.child_token();
+                        let front = front.clone();
                         connections.spawn(async move {
-                            gate.handle(tcp, peer_addr, token).await;
+                            match front {
+                                None => gate.handle(tcp, peer_addr, token).await,
+                                Some(front) => {
+                                    if tcp.set_nodelay(true).is_err() {
+                                        gate.stats().record_accept_error();
+                                        return;
+                                    }
+                                    front.serve(gate, tcp, peer_addr, token).await;
+                                }
+                            }
                         });
                     }
                     Err(_) => {
@@ -163,7 +204,29 @@ impl Gate {
             },
             None => None,
         };
-        let (accepted, permit) = match self.acceptor.accept(tcp).await {
+        let accepted = self.acceptor.accept(Replay::new(Vec::new(), tcp)).await;
+        self.finish(accepted, peer_addr, token).await;
+        drop(client);
+    }
+
+    pub async fn serve_connection(
+        &self,
+        stream: Replay<TcpStream>,
+        client_addr: SocketAddr,
+        deadline: Instant,
+        token: CancellationToken,
+    ) {
+        let accepted = self.acceptor.accept_by(stream, deadline).await;
+        self.finish(accepted, client_addr, token).await;
+    }
+
+    async fn finish(
+        &self,
+        accepted: Result<(Accepted<Replay<TcpStream>>, HandshakePermit), AcceptError>,
+        peer_addr: SocketAddr,
+        token: CancellationToken,
+    ) {
+        let (accepted, permit) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
                 if error.is_missing_peer_certificate() {
@@ -211,7 +274,6 @@ impl Gate {
             }
         }
         drop(permit);
-        drop(client);
     }
 
     fn observe_rejection(&self, peer_addr: SocketAddr, rejection: &Rejection) {
@@ -242,7 +304,7 @@ impl Gate {
     async fn establish_tunnel(
         &self,
         node: NodeId,
-        stream: TlsStream<TcpStream>,
+        stream: GateTlsStream,
         peer_addr: SocketAddr,
         token: &CancellationToken,
         deadline: Instant,
@@ -268,7 +330,7 @@ impl Gate {
     }
 }
 
-async fn close_rejected(mut stream: TlsStream<TcpStream>) {
+async fn close_rejected(mut stream: GateTlsStream) {
     drop(timeout(REJECT_CLOSE_TIMEOUT, stream.shutdown()).await);
 }
 

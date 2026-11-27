@@ -386,11 +386,23 @@ impl GateAcceptor {
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
+        self.accept_by(io, Instant::now() + self.handshake_timeout)
+            .await
+    }
+
+    pub async fn accept_by<IO>(
+        &self,
+        io: IO,
+        deadline: Instant,
+    ) -> Result<(Accepted<IO>, HandshakePermit), AcceptError>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.stats.record_refused_busy();
             return Err(AcceptError::TooManyHandshakes);
         };
-        let deadline = Instant::now() + self.handshake_timeout;
+        let deadline = deadline.min(Instant::now() + self.handshake_timeout);
         match self.handshake(io, deadline).await {
             Ok(accepted) => Ok((
                 accepted,
@@ -499,6 +511,25 @@ mod tests {
         identity.replace_certificate(vec![second.clone()]).unwrap();
         assert_eq!(identity.end_entity(), Some(second));
         assert_eq!(format!("{identity:?}"), "SwappableClientCert { .. }");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_given_deadline_can_shorten_the_handshake_but_never_extend_it() {
+        let refusing = Arc::new(refusing_server_config().unwrap());
+        let mut config = AcceptorConfig::new(Vec::new(), refusing.clone(), refusing);
+        config.handshake_timeout = Duration::from_secs(2);
+        let acceptor = GateAcceptor::new(config, Arc::new(GateStats::default())).unwrap();
+        for (given, expected) in [
+            (Duration::from_secs(3600), Duration::from_secs(2)),
+            (Duration::from_millis(500), Duration::from_millis(500)),
+        ] {
+            let (near, _far) = tokio::io::duplex(64);
+            let start = Instant::now();
+            let outcome = acceptor.accept_by(near, start + given).await;
+            assert!(matches!(outcome, Err(AcceptError::Timeout)), "{given:?}");
+            assert_eq!(start.elapsed(), expected, "{given:?}");
+        }
+        assert_eq!(acceptor.stats().snapshot().handshake_timeouts, 2);
     }
 
     #[test]

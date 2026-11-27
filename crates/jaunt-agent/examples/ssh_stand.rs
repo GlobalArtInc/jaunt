@@ -27,7 +27,7 @@ use jaunt_proto::{
 use jaunt_record::{Assembler, Chunk, Limits, SessionKind, SessionManifest, Sink, SinkError};
 use jaunt_ssh::{UserCaKeys, UserCaSource};
 use jaunt_tunnel::{
-    BoxFuture, NodeId, PeerAuthenticator, RejectReason, Rejection, TunnelOptions,
+    BoxFuture, GateTlsStream, NodeId, PeerAuthenticator, RejectReason, Rejection, TunnelOptions,
     agent_server_config,
 };
 use rcgen::{
@@ -39,8 +39,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use ssh_key::certificate::{Builder, CertType};
 use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey, PublicKey};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::server::TlsStream;
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
@@ -389,7 +388,7 @@ impl AgentApiHandler for AgentApi {
     fn serve(
         &self,
         _node: NodeId,
-        stream: TlsStream<TcpStream>,
+        stream: GateTlsStream,
         shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()> {
         let stand = Arc::clone(&self.0);

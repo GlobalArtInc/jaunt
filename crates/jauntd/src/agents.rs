@@ -9,11 +9,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use ipnet::IpNet;
 use jaunt_ca::CaError;
 use jaunt_control::{Clock, Control, REVOCATION_WATCH_INTERVAL, SESSION_SWEEP_INTERVAL};
 use jaunt_gate::{
-    AgentHub, AgentHubConfig, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS, HubError,
-    HubStatsSnapshot, ShutdownReport,
+    AgentHub, AgentHubConfig, ConnectedAgents, DEFAULT_AGENT_CLIENT_LIMITS,
+    DEFAULT_KUBE_CLIENT_LIMITS, HubError, HubStatsSnapshot, ServicesEntry, ShutdownReport,
+    TlsRefusal,
 };
 use jaunt_limits::AddressLimits;
 use jaunt_store::Store;
@@ -51,6 +53,13 @@ pub struct AgentsSettings {
     pub server_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServicesSettings {
+    pub domain: String,
+    pub proxy_protocol: bool,
+    pub trusted_proxies: Vec<IpNet>,
+}
+
 pub struct AgentServerParts {
     pub settings: AgentsSettings,
     pub control: Control,
@@ -64,6 +73,8 @@ pub struct AgentServerParts {
     pub api_limits: ApiLimits,
     pub tunnel: TunnelOptions,
     pub client_limits: AddressLimits,
+    pub kube_limits: AddressLimits,
+    pub services: Option<ServicesSettings>,
 }
 
 pub fn ssh_tunnel_options() -> TunnelOptions {
@@ -89,6 +100,8 @@ impl AgentServerParts {
             api_limits: ApiLimits::default(),
             tunnel: ssh_tunnel_options(),
             client_limits: DEFAULT_AGENT_CLIENT_LIMITS,
+            kube_limits: DEFAULT_KUBE_CLIENT_LIMITS,
+            services: None,
         }
     }
 }
@@ -135,6 +148,8 @@ impl AgentServer {
             api_limits,
             tunnel,
             client_limits,
+            kube_limits,
+            services,
         } = parts;
         tracing::info!(
             target: "jaunt::daemon",
@@ -175,6 +190,12 @@ impl AgentServer {
         let mut hub_config = AgentHubConfig::new(settings.server_name, Arc::new(tls));
         hub_config.tunnel = tunnel;
         hub_config.client_limits = client_limits;
+        hub_config.services = services.map(|services| ServicesEntry {
+            proxy_protocol: services.proxy_protocol,
+            trusted_proxies: services.trusted_proxies,
+            kube_limits,
+            ..ServicesEntry::new(services.domain)
+        });
         let hub = AgentHub::start(
             listener,
             hub_config,
@@ -247,6 +268,14 @@ impl AgentServer {
 
     pub fn hub_stats(&self) -> HubStatsSnapshot {
         self.hub.hub_stats()
+    }
+
+    pub fn services_domain(&self) -> Option<&str> {
+        self.hub.services_domain()
+    }
+
+    pub fn tls_refused(&self, reason: TlsRefusal) -> u64 {
+        self.hub.tls_refused(reason)
     }
 
     pub fn certificate_not_after(&self) -> SystemTime {

@@ -157,7 +157,7 @@ impl AgentApiHandler for NoApi {
     fn serve(
         &self,
         _node: NodeId,
-        _stream: tokio_rustls::server::TlsStream<TcpStream>,
+        _stream: jaunt_tunnel::GateTlsStream,
         _shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})

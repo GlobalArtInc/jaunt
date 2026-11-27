@@ -813,6 +813,7 @@ name = "jaunt-fuzz"
 version = "0.0.0"
 dependencies = [
  "http",
+ "jaunt-gate",
  "jaunt-kube",
  "jaunt-pgwire",
  "jaunt-policy",
@@ -825,6 +826,24 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "jaunt-gate"
+version = "0.0.0"
+dependencies = [
+ "ipnet",
+ "jaunt-limits",
+ "jaunt-proto",
+ "jaunt-ssh",
+ "jaunt-tunnel",
+ "rustls",
+ "socket2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

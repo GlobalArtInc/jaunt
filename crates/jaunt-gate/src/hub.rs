@@ -5,15 +5,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use ipnet::IpNet;
 use jaunt_limits::{
     AddressLimits, AddressLimitsError, ClientKey, DEFAULT_CAPACITY, LogThrottle, Rate, Refused,
 };
 use jaunt_tunnel::{
     ALPN_AGENT_API, ALPN_TUNNEL, AcceptorConfig, AgentApiConnection, AgentRegistry, BoxFuture,
-    ConnectionId, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_HANDSHAKING, DisconnectReason, Gate,
-    GateAcceptor, GateError, GateObserver, GateStats, Handover, MainConnection, NodeId,
-    OptionsError, PeerAuthenticator, RegistryObserver, RejectReason, Rejection, TlsConfigError,
-    TunnelOptions, refusing_server_config,
+    ConnectionId, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_HANDSHAKING, DisconnectReason, Front,
+    Gate, GateAcceptor, GateError, GateObserver, GateStats, GateTlsStream, Handover,
+    MainConnection, NodeId, OptionsError, PeerAuthenticator, RegistryObserver, RejectReason,
+    Rejection, TlsConfigError, TunnelOptions, refusing_server_config,
 };
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
@@ -22,11 +23,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
-use tokio_rustls::server::TlsStream;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tokio_util::task::TaskTracker;
 
 use crate::audit;
+use crate::entry::{Admitted, ClassHandlers, TlsEntry, TlsEntryConfig, TlsEntryError, TlsRefusal};
+use crate::ssh::DEFAULT_SSH_CLIENT_LIMITS;
 
 pub const DEFAULT_MAX_API_SESSIONS_PER_NODE: usize = 4;
 pub const DEFAULT_MAX_API_SESSIONS: usize = 1024;
@@ -35,6 +37,7 @@ pub const DEFAULT_AGENT_CLIENT_LIMITS: AddressLimits = AddressLimits {
     concurrent: 64,
     tracked: DEFAULT_CAPACITY,
 };
+pub const DEFAULT_KUBE_CLIENT_LIMITS: AddressLimits = DEFAULT_SSH_CLIENT_LIMITS;
 const API_KEEPALIVE_TIME: Duration = Duration::from_secs(60);
 const API_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -43,9 +46,30 @@ pub trait AgentApiHandler: Send + Sync {
     fn serve(
         &self,
         node: NodeId,
-        stream: TlsStream<TcpStream>,
+        stream: GateTlsStream,
         shutdown: CancellationToken,
     ) -> BoxFuture<'static, ()>;
+}
+
+#[derive(Clone)]
+pub struct ServicesEntry {
+    pub domain: String,
+    pub proxy_protocol: bool,
+    pub trusted_proxies: Vec<IpNet>,
+    pub kube_limits: AddressLimits,
+    pub handlers: ClassHandlers,
+}
+
+impl ServicesEntry {
+    pub fn new(domain: impl Into<String>) -> Self {
+        Self {
+            domain: domain.into(),
+            proxy_protocol: false,
+            trusted_proxies: Vec::new(),
+            kube_limits: DEFAULT_KUBE_CLIENT_LIMITS,
+            handlers: ClassHandlers::default(),
+        }
+    }
 }
 
 pub struct AgentHubConfig {
@@ -57,6 +81,7 @@ pub struct AgentHubConfig {
     pub client_limits: AddressLimits,
     pub max_api_sessions_per_node: usize,
     pub max_api_sessions: usize,
+    pub services: Option<ServicesEntry>,
 }
 
 impl AgentHubConfig {
@@ -70,6 +95,7 @@ impl AgentHubConfig {
             client_limits: DEFAULT_AGENT_CLIENT_LIMITS,
             max_api_sessions_per_node: DEFAULT_MAX_API_SESSIONS_PER_NODE,
             max_api_sessions: DEFAULT_MAX_API_SESSIONS,
+            services: None,
         }
     }
 }
@@ -88,6 +114,8 @@ pub enum HubError {
     SessionLimits,
     #[error("the agents' per address limits are invalid: {0}")]
     ClientLimits(#[from] AddressLimitsError),
+    #[error("the services entry is invalid: {0}")]
+    Entry(#[from] TlsEntryError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +343,7 @@ impl Handover for Glue {
                 return;
             }
         };
-        enable_keepalive(stream.get_ref().0);
+        enable_keepalive(stream.get_ref().0.get_ref());
         audit::connected(&node, peer_addr, ALPN_AGENT_API, false);
         let session = self.handler.serve(node.clone(), stream, slot.token.clone());
         self.sessions.spawn(async move {
@@ -346,6 +374,65 @@ impl GateObserver for Glue {
     }
 }
 
+struct EntryFront {
+    entry: Arc<TlsEntry>,
+}
+
+impl Front for EntryFront {
+    fn serve(
+        &self,
+        gate: Gate,
+        tcp: TcpStream,
+        peer_addr: SocketAddr,
+        shutdown: CancellationToken,
+    ) -> BoxFuture<'static, ()> {
+        let entry = Arc::clone(&self.entry);
+        Box::pin(async move {
+            let admitted = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                admitted = entry.admit(tcp, peer_addr) => admitted,
+            };
+            let Ok(admitted) = admitted else {
+                return;
+            };
+            let Some(admitted) = entry.serve_class(admitted, shutdown.clone()).await else {
+                return;
+            };
+            let Admitted {
+                route,
+                stream,
+                handshake,
+                stream_slot,
+            } = admitted;
+            gate.serve_connection(
+                stream,
+                route.client_addr,
+                route.handshake_deadline,
+                shutdown,
+            )
+            .await;
+            drop(handshake);
+            drop(stream_slot);
+        })
+    }
+}
+
+fn entry_config(config: &AgentHubConfig, services: ServicesEntry) -> TlsEntryConfig {
+    let mut entry = TlsEntryConfig::new(
+        vec![config.server_name.clone()],
+        Some(services.domain),
+        config.client_limits,
+        services.kube_limits,
+    );
+    entry.proxy_protocol = services.proxy_protocol;
+    entry.trusted_proxies = services.trusted_proxies;
+    entry.handshake_timeout = config.handshake_timeout;
+    entry.max_handshaking = config.max_handshaking;
+    entry.handlers = services.handlers;
+    entry
+}
+
 fn enable_keepalive(tcp: &TcpStream) {
     let keepalive = TcpKeepalive::new()
         .with_time(API_KEEPALIVE_TIME)
@@ -364,6 +451,7 @@ pub struct AgentHub {
     stats: Arc<GateStats>,
     local_addr: SocketAddr,
     glue: Arc<Glue>,
+    entry: Option<Arc<TlsEntry>>,
     accept: JoinHandle<Result<(), GateError>>,
     stop_connections: DropGuard,
 }
@@ -384,6 +472,10 @@ impl AgentHub {
             return Err(HubError::SessionLimits);
         }
         let local_addr = listener.local_addr().map_err(HubError::LocalAddr)?;
+        let entry = match config.services.clone() {
+            Some(services) => Some(Arc::new(TlsEntry::new(entry_config(&config, services))?)),
+            None => None,
+        };
         let mut acceptor_config = AcceptorConfig::new(
             vec![config.server_name],
             config.tls,
@@ -418,15 +510,26 @@ impl AgentHub {
             glue.clone(),
             config.tunnel,
         )?
-        .with_observer(glue.clone())
-        .with_client_limits(config.client_limits)?;
+        .with_observer(glue.clone());
         let token = connections.clone();
-        let accept = tokio::spawn(async move { gate.serve(listener, token).await });
+        let accept = match &entry {
+            Some(entry) => {
+                let front: Arc<dyn Front> = Arc::new(EntryFront {
+                    entry: Arc::clone(entry),
+                });
+                tokio::spawn(async move { gate.serve_behind(listener, token, front).await })
+            }
+            None => {
+                let gate = gate.with_client_limits(config.client_limits)?;
+                tokio::spawn(async move { gate.serve(listener, token).await })
+            }
+        };
         Ok(Self {
             agents: ConnectedAgents { registry, book },
             stats,
             local_addr,
             glue,
+            entry,
             accept,
             stop_connections: connections.drop_guard(),
         })
@@ -446,6 +549,18 @@ impl AgentHub {
 
     pub fn stats(&self) -> &Arc<GateStats> {
         &self.stats
+    }
+
+    pub fn services_domain(&self) -> Option<&str> {
+        self.entry.as_ref().and_then(|entry| entry.names().domain())
+    }
+
+    pub fn entry_handshaking(&self) -> usize {
+        self.entry.as_ref().map_or(0, |entry| entry.handshaking())
+    }
+
+    pub fn tls_refused(&self, reason: TlsRefusal) -> u64 {
+        self.entry.as_ref().map_or(0, |entry| entry.refused(reason))
     }
 
     pub fn hub_stats(&self) -> HubStatsSnapshot {

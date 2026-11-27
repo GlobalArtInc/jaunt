@@ -1,5 +1,7 @@
 use jaunt_control::{MAX_CONNECTIONS_LIMIT, RequestLimits};
-use jaunt_gate::{DEFAULT_AGENT_CLIENT_LIMITS, DEFAULT_SSH_CLIENT_LIMITS};
+use jaunt_gate::{
+    DEFAULT_AGENT_CLIENT_LIMITS, DEFAULT_KUBE_CLIENT_LIMITS, DEFAULT_SSH_CLIENT_LIMITS,
+};
 use jaunt_limits::{
     AddressLimits, MAX_CONCURRENT_PER_ADDRESS, MAX_TRACKED_ADDRESSES, Rate, RateError,
 };
@@ -22,6 +24,8 @@ pub struct LimitsSection {
     pub ssh: SshLimitsSection,
     #[serde(default)]
     pub agents: AgentLimitsSection,
+    #[serde(default)]
+    pub kube: KubeLimitsSection,
 }
 
 #[derive(Deserialize, Default)]
@@ -55,11 +59,19 @@ pub struct AgentLimitsSection {
     pub handshaking_per_address: Option<usize>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct KubeLimitsSection {
+    pub handshakes: Option<RateSection>,
+    pub handshaking_per_address: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitSettings {
     pub http: RequestLimits,
     pub ssh: AddressLimits,
     pub agents: AddressLimits,
+    pub kube: AddressLimits,
 }
 
 impl Default for LimitSettings {
@@ -68,6 +80,7 @@ impl Default for LimitSettings {
             http: RequestLimits::default(),
             ssh: DEFAULT_SSH_CLIENT_LIMITS,
             agents: DEFAULT_AGENT_CLIENT_LIMITS,
+            kube: DEFAULT_KUBE_CLIENT_LIMITS,
         }
     }
 }
@@ -182,7 +195,22 @@ impl LimitsSection {
             )?,
             tracked,
         };
-        Ok(LimitSettings { http, ssh, agents })
+        let kube = AddressLimits {
+            rate: rate("kube.handshakes", self.kube.handshakes, defaults.kube.rate)?,
+            concurrent: bounded(
+                self.kube.handshaking_per_address,
+                defaults.kube.concurrent,
+                MAX_CONCURRENT_PER_ADDRESS,
+                LimitsError::PerAddress("kube.handshaking_per_address"),
+            )?,
+            tracked,
+        };
+        Ok(LimitSettings {
+            http,
+            ssh,
+            agents,
+            kube,
+        })
     }
 }
 
@@ -216,6 +244,7 @@ mod tests {
             (http.other, 600, 300),
             (defaults.ssh.rate, 600, 600),
             (defaults.agents.rate, 128, 1200),
+            (defaults.kube.rate, 600, 600),
         ] {
             assert_eq!(rate, Rate::new(burst, per_minute).unwrap());
         }
@@ -224,6 +253,8 @@ mod tests {
         assert_eq!(http.tracked_addresses, 65_536);
         assert_eq!(defaults.ssh.concurrent, 128);
         assert_eq!(defaults.agents.concurrent, 64);
+        assert_eq!(defaults.kube.concurrent, 128);
+        assert_eq!(defaults.kube.tracked, 65_536);
         assert_eq!(defaults.ssh.tracked, 65_536);
     }
 
@@ -236,7 +267,8 @@ mod tests {
              web_terminal: { burst: 4, per_minute: 5 }\n  \
              max_connections: 10\n  max_connections_per_address: 2\n  other: { burst: 3, per_minute: 4 }\n\
              ssh:\n  connections: { burst: 7, per_minute: 70 }\n  unauthenticated_per_address: 3\n\
-             agents:\n  handshakes: { burst: 9, per_minute: 90 }\n  handshaking_per_address: 4\n",
+             agents:\n  handshakes: { burst: 9, per_minute: 90 }\n  handshaking_per_address: 4\n\
+             kube:\n  handshakes: { burst: 11, per_minute: 110 }\n  handshaking_per_address: 5\n",
         )
         .unwrap();
         assert_eq!(tuned.http.login_start, Rate::new(5, 2).unwrap());
@@ -257,6 +289,9 @@ mod tests {
         assert_eq!(tuned.agents.rate, Rate::new(9, 90).unwrap());
         assert_eq!(tuned.agents.concurrent, 4);
         assert_eq!(tuned.agents.tracked, 1000);
+        assert_eq!(tuned.kube.rate, Rate::new(11, 110).unwrap());
+        assert_eq!(tuned.kube.concurrent, 5);
+        assert_eq!(tuned.kube.tracked, 1000);
     }
 
     #[test]
@@ -268,6 +303,7 @@ mod tests {
             "http:\n  login_start: { burst: 1, per_minute: 1, per_second: 1 }\n",
             "ssh:\n  connections: { burst: -1, per_minute: 1 }\n",
             "agents:\n  handshakes_per_address: 1\n",
+            "kube:\n  connections: { burst: 1, per_minute: 1 }\n",
             "ssh:\n  unauthenticated: 1\n",
             "ssh:\n  connections: { burst: 1, per_minute: 1 }\n  extra: true\n",
             "http:\n  max_connections_per_ip: 1\n",
@@ -320,6 +356,17 @@ mod tests {
             (
                 "agents:\n  handshaking_per_address: 0\n",
                 LimitsError::PerAddress("agents.handshaking_per_address"),
+            ),
+            (
+                "kube:\n  handshakes: { burst: 0, per_minute: 1 }\n",
+                LimitsError::Rate {
+                    field: "kube.handshakes",
+                    source: RateError::Burst,
+                },
+            ),
+            (
+                "kube:\n  handshaking_per_address: 1048577\n",
+                LimitsError::PerAddress("kube.handshaking_per_address"),
             ),
         ] {
             let refused = settings(text).unwrap_err();

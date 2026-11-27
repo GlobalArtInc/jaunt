@@ -26,6 +26,16 @@ pub(crate) fn agent_limited(client: ClientKey, refused: Refused, suppressed: u64
     );
 }
 
+pub(crate) fn tls_refused(client: ClientKey, reason: &'static str, suppressed: u64) {
+    tracing::info!(
+        target: "jaunt::audit",
+        event = "gate.tls.refused",
+        client = %client,
+        reason,
+        suppressed
+    );
+}
+
 pub(crate) fn ssh_connected(client_addr: SocketAddr, peer_addr: SocketAddr, proxied: bool) {
     tracing::info!(
         target: "jaunt::audit",

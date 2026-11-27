@@ -173,7 +173,7 @@ fn normalize(name: &str, max_len: usize) -> Option<String> {
     valid.then(|| bare.to_owned())
 }
 
-fn is_dns_label(label: &str) -> bool {
+pub(crate) fn is_dns_label(label: &str) -> bool {
     let bytes = label.as_bytes();
     let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
