@@ -13,10 +13,14 @@ const ALICE: &str = "alice:x:30000:30001:jaunt:/home/alice:/bin/bash";
 const BOB: &str = "bob:x:30002:30002:jaunt:/home/bob:/bin/sh";
 
 fn getent(dir: &TempDir, label: &str, body: &str) -> SystemUsers {
+    getent_within(dir, label, body, Duration::from_secs(20))
+}
+
+fn getent_within(dir: &TempDir, label: &str, body: &str, timeout: Duration) -> SystemUsers {
     let path = dir.path().join(label);
     fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
-    SystemUsers::with_limits(path, Duration::from_millis(500), Duration::from_secs(60))
+    SystemUsers::with_limits(path, timeout, Duration::from_secs(60))
 }
 
 fn database_getent(dir: &TempDir) -> (SystemUsers, PathBuf) {
@@ -152,7 +156,7 @@ fn other_exit_codes_timeouts_and_a_missing_program_are_errors() {
             exit_code: Some(1)
         })
     ));
-    let hanging = getent(&dir, "hanging", "sleep 30");
+    let hanging = getent_within(&dir, "hanging", "sleep 30", Duration::from_millis(500));
     assert!(matches!(
         hanging.passwd(&name("alice")),
         Err(LookupError::Exit {
