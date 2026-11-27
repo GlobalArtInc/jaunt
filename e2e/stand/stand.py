@@ -43,7 +43,7 @@ def write_file(path, text, mode=0o644):
     os.chmod(path, mode)
 
 
-def jauntd_config(cert_ttl_secs, recordings=True):
+def jauntd_config(cert_ttl_secs, recordings=True, web_idle_timeout_secs=None):
     return "\n".join([
         "data_dir: /var/lib/jaunt",
         "listen: 0.0.0.0:{}".format(CONTROL_PORT),
@@ -63,7 +63,8 @@ def jauntd_config(cert_ttl_secs, recordings=True):
         "  client_id: {}".format(IDP_CLIENT_ID),
         "  client_secret_file: /etc/jaunt/oidc-client-secret",
         "  extra_root_certificates_file: {}".format(CA_PEM),
-    ] + (["recordings:", "  dir: /var/lib/jaunt/recordings"] if recordings else []) + [""])
+    ] + (["recordings:", "  dir: /var/lib/jaunt/recordings"] if recordings else [])
+        + (["web_terminal:", "  idle_timeout_secs: {}".format(web_idle_timeout_secs)] if web_idle_timeout_secs else []) + [""])
 
 
 class Stand:
@@ -84,6 +85,7 @@ class Stand:
         self.secrets = [CLIENT_SECRET]
         self.cert_ttl_secs = 28800
         self.recordings_enabled = True
+        self.web_idle_timeout_secs = None
         self.publish_ports = {}
         self.codes = {}
         self.node_ids = {}
@@ -169,7 +171,7 @@ class Stand:
         if not made.ok:
             raise RuntimeError("creating the test certificates failed:\n" + made.err[-2000:])
 
-        write_file(os.path.join(etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled))
+        write_file(os.path.join(etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled, self.web_idle_timeout_secs))
         write_file(os.path.join(etc, "oidc-client-secret"), CLIENT_SECRET + "\n")
         shutil.copytree(os.path.join(FIXTURES, "policy"), os.path.join(etc, "policy"))
         write_file(os.path.join(idp, "client-secret"), CLIENT_SECRET + "\n")
@@ -433,7 +435,7 @@ class Stand:
             self.cert_ttl_secs = cert_ttl_secs
         if recordings is not None:
             self.recordings_enabled = recordings
-        write_file(os.path.join(self.etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled))
+        write_file(os.path.join(self.etc, "jauntd.yaml"), jauntd_config(self.cert_ttl_secs, self.recordings_enabled, self.web_idle_timeout_secs))
         restarted = engine.engine("restart", "-t", "30", container("jauntd"), timeout=90)
         if not restarted.ok:
             raise StepFailed("restarting jauntd failed: " + restarted.text())

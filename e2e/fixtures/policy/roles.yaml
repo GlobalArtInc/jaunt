@@ -53,3 +53,15 @@ spec:
     nodes: { env: [test, prod] }
     logins: [hu-off, hu-yes, hu-no, hu-denied, hu-group, hu-home, hu-full, hu-uid, hu-r1, hu-r2, hu-r3, hu-r4, hu-r5, hu-r6, hu-race, hu-restart, hu-allow, hu-repeat, hu-web1, hu-web2, hu-wgrp, hu-wuncreated, hu-sd1, hu-sd2, hu-sd3, postgres]
     portForwarding: false
+---
+apiVersion: jaunt/v1
+kind: Role
+metadata: { name: terminal-admins }
+spec:
+  members: { users: [operator@e2e.test] }
+  admin: [nodes.approve, sessions.read, sessions.terminate, audit.read]
+  ssh:
+    nodes: { env: [test, prod] }
+    logins: [deploy]
+    portForwarding: false
+    recordInput: false

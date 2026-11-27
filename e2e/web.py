@@ -3,7 +3,7 @@ import os
 import subprocess
 import time
 
-from scenarios import enrol, host_users_web, logins
+from scenarios import enrol, host_users_web, logins, terminal_web
 from scenarios.recording import record_shell
 from stand import engine, recordings
 from stand.layout import OUT, ROOT, container
@@ -62,6 +62,7 @@ def run_node(step, script, stand, extra):
 def run(args):
     stand = Stand("debian:13", keep=args.keep)
     stand.publish_ports = {"edge-web": "127.0.0.1:{}:443".format(WEB_PORT), "edge-idp": "127.0.0.1:{}:443".format(IDP_PORT)}
+    stand.web_idle_timeout_secs = terminal_web.IDLE_TIMEOUT_SECS
     report = Report("web")
     session = None
     try:
@@ -123,6 +124,10 @@ def run(args):
             finally:
                 host_users_web.finish(stand)
             host_users_web.verify(stand, step)
+        with report.step("the terminal workspace in the browser: quick open, tabs, pins, recent, limit, idle, Sessions origin and Terminate, at 380 and 1440 px") as step:
+            terminal_web.prepare()
+            run_node(step, "workspace.mjs", stand, terminal_web.environment())
+            terminal_web.verify(stand, step)
         with report.step("the approved enrolments reached the node list") as step:
             status, listed = stand.api("GET", "/v1/admin/nodes")
             names = [node["name"] for node in listed["nodes"]] if status == 200 else []

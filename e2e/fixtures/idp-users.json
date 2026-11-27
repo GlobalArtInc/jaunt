@@ -5,5 +5,6 @@
   {"login_hint": "admin", "subject": "e2e-admin", "email": "admin@e2e.test", "username": "admin", "name": "Admin Operator", "groups": []},
   {"login_hint": "dave", "subject": "e2e-dave", "email": "dave@e2e.test", "username": "dave", "name": "Dave Audited", "groups": []},
   {"login_hint": "viewer", "subject": "e2e-viewer", "email": "viewer@e2e.test", "username": "viewer", "name": "Viewer Sessions", "groups": []},
-  {"login_hint": "erin", "subject": "e2e-erin", "email": "erin@e2e.test", "username": "erin", "name": "Erin Onboarding", "groups": []}
+  {"login_hint": "erin", "subject": "e2e-erin", "email": "erin@e2e.test", "username": "erin", "name": "Erin Onboarding", "groups": []},
+  {"login_hint": "operator", "subject": "e2e-operator", "email": "operator@e2e.test", "username": "operator", "name": "Operator Terminal", "groups": []}
 ]
