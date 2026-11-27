@@ -304,14 +304,18 @@ fn record_view(control: &Control, principal: &AdminPrincipal, session_id: &str, 
         tracing::error!(target: "jaunt::control", "the clock is before the unix epoch");
         return;
     };
-    let actor = principal.user().id.as_str();
-    if !control.web.views.admit(actor, session_id, kind, now.secs) {
+    let actor = match principal.token_id() {
+        Some(_) => principal.actor(),
+        None => principal.user().id.clone(),
+    };
+    if !control.web.views.admit(&actor, session_id, kind, now.secs) {
         return;
     }
     tracing::info!(
         target: "jaunt::audit",
         event = "recording.viewed",
-        user_id = actor,
+        user_id = actor.as_str(),
+        jat_id = principal.token_id(),
         session_id,
         kind = kind.as_str()
     );

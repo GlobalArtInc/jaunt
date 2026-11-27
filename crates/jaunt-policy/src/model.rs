@@ -153,15 +153,17 @@ pub enum AdminPermission {
     RecordingsRead,
     RevocationsWrite,
     AuditRead,
+    TokensWrite,
 }
 
 impl AdminPermission {
-    pub const ALL: [AdminPermission; 5] = [
+    pub const ALL: [AdminPermission; 6] = [
         AdminPermission::NodesApprove,
         AdminPermission::SessionsRead,
         AdminPermission::RecordingsRead,
         AdminPermission::RevocationsWrite,
         AdminPermission::AuditRead,
+        AdminPermission::TokensWrite,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -171,6 +173,7 @@ impl AdminPermission {
             AdminPermission::RecordingsRead => "recordings.read",
             AdminPermission::RevocationsWrite => "revocations.write",
             AdminPermission::AuditRead => "audit.read",
+            AdminPermission::TokensWrite => "tokens.write",
         }
     }
 }

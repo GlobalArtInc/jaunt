@@ -1,9 +1,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, header};
+use jaunt_store::{AdminTokenCaps, AdminTokenCreated, NewAdminToken, SecretHash};
 use serde_json::{Value, json};
 
 use crate::session_support::{apply_policy, user};
-use crate::support::{Enrolled, Harness, Options, PUBLIC_ORIGIN, Reply, send};
+use crate::support::{Enrolled, Harness, Options, PUBLIC_ORIGIN, Reply, send, sha256_hex_of_bytes};
 
 pub const FOREIGN_ORIGIN: &str = "https://evil.example";
 
@@ -172,4 +173,54 @@ pub async fn reject_with(harness: &Harness, admin: &Admin, looked: &Looked) -> R
         &json!({ "intent": looked.intent }),
     )
     .await
+}
+
+pub async fn plant_token(harness: &Harness, creator: &str, id: &str, scope: &[&str]) -> String {
+    let text = format!("jat_{id}_{}", "k".repeat(43));
+    let created = harness
+        .store
+        .admin_tokens()
+        .create(
+            &NewAdminToken {
+                id: id.to_owned(),
+                name: format!("planted-{}", id.to_ascii_lowercase()),
+                creator_user_id: creator.to_owned(),
+                secret_hash: SecretHash::new(sha256_hex_of_bytes(text.as_bytes())),
+                scope: scope.iter().map(|value| (*value).to_owned()).collect(),
+                cidrs: Vec::new(),
+                ttl_secs: 86_400,
+            },
+            harness.clock.now_secs(),
+            AdminTokenCaps {
+                max_live_per_creator: 20,
+                max_dead_per_creator: 100,
+                max_created_per_window: 1_000,
+                window_secs: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(created, AdminTokenCreated::Created(_)));
+    text
+}
+
+pub async fn with_token(
+    harness: &Harness,
+    method: Method,
+    path: &str,
+    token: &str,
+    body: Option<&Value>,
+) -> Reply {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    let request = match body {
+        Some(body) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap())),
+        None => builder.body(Body::empty()),
+    }
+    .unwrap();
+    send(harness.router.clone(), request).await
 }

@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use crate::recording_support::{Gate, Rec, Session, cast_of, metadata_only, named, recorded, wire};
 use crate::session_support::{NODE_NAME, apply_policy, holder, node, raw_pool, role};
 use crate::support::{DEFAULT_PEER, Harness, Options, PUBLIC_ORIGIN, RecordingOptions, Reply};
-use crate::web_support::{ADMIN_ROLES, Admin, Csrf, admin, call, get};
+use crate::web_support::{ADMIN_ROLES, Admin, Csrf, admin, call, get, plant_token, with_token};
 
 const WATCHERS: &str = "apiVersion: jaunt/v1\nkind: Role\nmetadata: { name: watchers }\nspec:\n  \
      members: { users: [watcher@example.com, second@example.com] }\n  \
@@ -452,6 +452,50 @@ async fn a_view_is_audited_once_per_actor_session_and_kind_each_minute_and_refus
             id(&watcher, &session, "stream"),
         ]
     );
+}
+
+#[tokio::test]
+async fn a_view_through_a_token_is_its_own_critical_event_naming_the_token() {
+    let r = setup().await;
+    let (session, _) = stored(&r, 30_000, 11).await;
+    let watcher = admin(&r.harness, "watcher").await;
+    let token = plant_token(
+        &r.harness,
+        &watcher.user_id,
+        "watcherAAAA",
+        &["recordings.read"],
+    )
+    .await;
+    let path = stream_path(&session);
+    let by_token = || with_token(&r.harness, Method::GET, &path, &token, None);
+    let capture = ScopedCapture::start();
+
+    let by_person = fetch(&r, &path, &watcher).await;
+    let first_by_token = by_token().await;
+    let again_by_token = by_token().await;
+    let again_by_person = fetch(&r, &path, &watcher).await;
+    let events = capture.finish().await;
+
+    for reply in [
+        &by_person,
+        &first_by_token,
+        &again_by_token,
+        &again_by_person,
+    ] {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    }
+    let viewed = named(&events, "recording.viewed");
+    assert_eq!(viewed.len(), 2);
+    assert!(
+        viewed
+            .iter()
+            .all(|event| event.kind().class() == jaunt_audit::Class::Critical)
+    );
+    assert_eq!(viewed[0].actor().as_wire(), watcher.user_id);
+    assert_eq!(viewed[0].text("jat_id"), None);
+    assert_eq!(viewed[1].actor().as_wire(), "token:watcherAAAA");
+    assert_eq!(viewed[1].text("jat_id"), Some("watcherAAAA"));
+    assert_eq!(viewed[1].session_id(), Some(session.id.as_str()));
 }
 
 #[tokio::test]

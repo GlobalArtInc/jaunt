@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::session_support::{routed, scenario, stored};
 use crate::support::{Enrolled, Harness};
+use crate::web_support::plant_token;
 
 const RETENTION_SECS: u64 = 3600;
 const STALE_DELIVERY_SECS: u64 = 120;
@@ -195,4 +196,29 @@ async fn serving_with_a_zero_sweep_interval_is_refused() {
         matches!(served, Err(ControlError::ZeroSweepInterval)),
         "a zero sweep interval was not refused"
     );
+}
+
+#[tokio::test]
+async fn the_sweep_loop_deletes_an_admin_token_thirty_days_after_it_expired() {
+    let harness = Harness::new().await;
+    plant_token(&harness, "creator-1", "loopAAAAAAA", &["audit.read"]).await;
+    harness.clock.advance(86_400 + 30 * 86_400 + 1);
+    let running = serve_sweeping_often(&harness).await;
+
+    let started = Instant::now();
+    while harness
+        .store
+        .admin_tokens()
+        .get_for_use("loopAAAAAAA")
+        .await
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "the admin token was not purged"
+        );
+        tokio::time::sleep(POLL_EVERY).await;
+    }
+    running.shut_down().await;
 }

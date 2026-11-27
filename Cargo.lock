@@ -2338,6 +2338,7 @@ dependencies = [
  "tower",
  "tracing",
  "tungstenite",
+ "zeroize",
  "zstd",
 ]
 

@@ -20,6 +20,7 @@ mod services;
 mod session;
 mod signed;
 pub(crate) mod terminal;
+mod tokens;
 #[cfg(feature = "test-support")]
 pub use self::terminal::WebTerminalCounters;
 
@@ -54,6 +55,7 @@ pub(crate) struct WebState {
     pub(crate) terminals: terminal::TerminalState,
     pub(crate) nonces: signed::NonceCache,
     pub(crate) signed_noise: crate::limits::NoiseLog,
+    pub(crate) tokens: tokens::TokenState,
 }
 
 impl WebState {
@@ -68,6 +70,7 @@ impl WebState {
             terminals: terminal::TerminalState::default(),
             nonces: signed::NonceCache::default(),
             signed_noise: crate::limits::NoiseLog::new(),
+            tokens: tokens::TokenState::default(),
         }
     }
 }
@@ -126,6 +129,8 @@ pub(crate) fn mount(
             get(revocations::list).post(revocations::create),
         )
         .route("/v1/admin/revocations/{id}", delete(revocations::remove))
+        .route("/v1/admin/tokens", get(tokens::list).post(tokens::create))
+        .route("/v1/admin/tokens/{id}", delete(tokens::revoke))
         .route("/v1/admin/nodes", get(nodes::list))
         .route(
             "/v1/admin/nodes/{id}",

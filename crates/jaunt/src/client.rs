@@ -8,6 +8,7 @@ use jaunt_proto::{
     FinishResponse, NodeList, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER, StartRequest,
     StartResponse, WhoamiResponse,
 };
+use reqwest::Method;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
@@ -132,6 +133,44 @@ impl ApiClient {
         self.call(request)
     }
 
+    pub fn exchange_signed(
+        &self,
+        method: Method,
+        url: Url,
+        signed: &SignedHeaders,
+        body: Vec<u8>,
+    ) -> Result<(u16, Vec<u8>), ApiError> {
+        let header = |value: &str| HeaderValue::from_str(value).map_err(|_| ApiError::Transport);
+        let mut request = self
+            .http
+            .request(method, url)
+            .header(ACCEPT, JSON)
+            .header(ADMIN_CERTIFICATE_HEADER, header(&signed.certificate)?)
+            .header(CONTENT_DIGEST_HEADER, header(&signed.content_digest)?)
+            .header(SIGNATURE_INPUT_HEADER, header(&signed.signature_input)?)
+            .header(SIGNATURE_HEADER, header(&signed.signature)?);
+        if !body.is_empty() {
+            request = request.header(CONTENT_TYPE, JSON).body(body);
+        }
+        self.exchange(request)
+    }
+
+    pub fn exchange_with_token(
+        &self,
+        path: &str,
+        token: &Secret,
+    ) -> Result<(u16, Vec<u8>), ApiError> {
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
+            .map_err(|_| ApiError::Unauthorized)?;
+        bearer.set_sensitive(true);
+        let request = self
+            .http
+            .get(self.server.endpoint(path))
+            .header(ACCEPT, JSON)
+            .header(AUTHORIZATION, bearer);
+        self.exchange(request)
+    }
+
     pub fn client_config(&self) -> Result<ClientConfig, ApiError> {
         let request = self
             .http
@@ -167,7 +206,7 @@ impl ApiClient {
         self.call(request)
     }
 
-    fn call<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, ApiError> {
+    fn exchange(&self, request: RequestBuilder) -> Result<(u16, Vec<u8>), ApiError> {
         let deadline = Instant::now()
             .checked_add(self.deadline)
             .ok_or(ApiError::TimedOut)?;
@@ -177,11 +216,15 @@ impl ApiClient {
             .name("jaunt-http".to_owned())
             .spawn(move || drop(results.send(fetch(request, deadline))))
             .map_err(|_| ApiError::Transport)?;
-        let (status, body) = match inbox.recv_timeout(self.deadline) {
-            Ok(outcome) => outcome?,
-            Err(RecvTimeoutError::Timeout) => return Err(ApiError::TimedOut),
-            Err(RecvTimeoutError::Disconnected) => return Err(ApiError::Transport),
-        };
+        match inbox.recv_timeout(self.deadline) {
+            Ok(outcome) => outcome,
+            Err(RecvTimeoutError::Timeout) => Err(ApiError::TimedOut),
+            Err(RecvTimeoutError::Disconnected) => Err(ApiError::Transport),
+        }
+    }
+
+    fn call<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, ApiError> {
+        let (status, body) = self.exchange(request)?;
         if (200..300).contains(&status) {
             serde_json::from_slice(&body).map_err(|_| ApiError::BadResponse)
         } else {

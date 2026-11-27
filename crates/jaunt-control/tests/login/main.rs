@@ -1,5 +1,7 @@
 mod admin_signed;
 mod admin_signed_rows;
+mod admin_token_use;
+mod admin_tokens;
 mod audit;
 mod audit_events;
 mod ca_rotation;
@@ -23,6 +25,7 @@ mod signed_support;
 mod start;
 mod support;
 mod sweep;
+mod token_support;
 mod web_admin;
 mod web_audit;
 mod web_audit_api;

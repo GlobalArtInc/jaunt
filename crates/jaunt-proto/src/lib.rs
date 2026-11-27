@@ -1,4 +1,5 @@
 mod admin_signature;
+mod admin_token;
 mod agent_trust;
 mod client;
 mod db_principal;
@@ -20,6 +21,14 @@ pub use admin_signature::{
     ADMIN_SIGNATURE_LABEL, ADMIN_SIGNATURE_MAX_SKEW_SECS, ADMIN_SIGNATURE_NAMESPACE,
     ADMIN_WHOAMI_PATH, CONTENT_DIGEST_HEADER, SIGNATURE_HEADER, SIGNATURE_INPUT_HEADER,
     admin_signature_base, admin_signature_params, is_admin_nonce,
+};
+pub use admin_token::{
+    ADMIN_TOKEN_DEFAULT_TTL_SECS, ADMIN_TOKEN_ENV, ADMIN_TOKEN_ID_BYTES, ADMIN_TOKEN_ID_LEN,
+    ADMIN_TOKEN_LEN, ADMIN_TOKEN_MAX_CIDRS, ADMIN_TOKEN_MAX_CREATED_PER_HOUR,
+    ADMIN_TOKEN_MAX_DEAD_PER_CREATOR, ADMIN_TOKEN_MAX_LIVE_PER_CREATOR, ADMIN_TOKEN_MAX_TTL_SECS,
+    ADMIN_TOKEN_MIN_TTL_SECS, ADMIN_TOKEN_NAME_MAX_LEN, ADMIN_TOKEN_PREFIX,
+    ADMIN_TOKEN_SECRET_BYTES, ADMIN_TOKEN_SECRET_LEN, ADMIN_TOKENS_PATH, admin_token_id,
+    admin_token_path, is_admin_token_id, is_admin_token_name,
 };
 pub use agent_trust::{AgentTrust, AgentTrustV2};
 pub use client::{ClientConfig, GateEndpoint, NodeList, NodeSummary};

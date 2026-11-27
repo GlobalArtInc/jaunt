@@ -48,6 +48,7 @@ const ADDR: FieldKind = FieldKind::Text(64);
 const HOST: FieldKind = FieldKind::Text(255);
 const LIST: FieldKind = FieldKind::Text(512);
 const ACCOUNT_GROUPS: FieldKind = FieldKind::Text(1100);
+const NETWORKS: FieldKind = FieldKind::Text(720);
 const ERROR: FieldKind = FieldKind::Text(256);
 const INT: FieldKind = FieldKind::Int;
 const BOOL: FieldKind = FieldKind::Bool;
@@ -144,6 +145,15 @@ events! {
          ("client_addr", ADDR)]),
     AdminSignedRequestRefused => ("admin.signed_request_refused", "admin.signed_request_refused", ActorRule::Anonymous, None, None, None,
         [("reason", NAME), ("client_addr", ADDR), ("suppressed", INT)], Class::Noisy),
+    TokenCreated => ("token.created", "token.created", ActorRule::User("created_by"), None, None, None,
+        [("jat_id", ID), ("name", NAME), ("scope", LIST), ("cidrs", NETWORKS), ("expires_at", INT)]),
+    TokenRevoked => ("token.revoked", "token.revoked", ActorRule::User("revoked_by"), None, None, None,
+        [("jat_id", ID), ("name", NAME), ("creator", ID)]),
+    TokenUsed => ("token.used", "token.used", ActorRule::User("user_id"), None, None, None,
+        [("jat_id", ID), ("permission", NAME), ("decision", SHORT), ("reason", NAME), ("client_addr", ADDR),
+         ("suppressed", INT)], Class::Noisy),
+    TokenRefused => ("token.refused", "token.refused", ActorRule::Anonymous, None, None, None,
+        [("reason", NAME), ("client_addr", ADDR), ("suppressed", INT)], Class::Noisy),
     AuthzDeny => ("authz.deny", "authz.deny", ActorRule::User("user_id"), NODE, SESSION, HASH,
         [("phase", SHORT), ("reason", NAME), ("permission", NAME), ("serial", INT), ("node_name", NAME),
          ("login", NAME), ("client_addr", ADDR)]),
@@ -236,7 +246,7 @@ events! {
     RecordingRejected => ("recording.rejected", "recording.rejected", ActorRule::Node("node_id"), NODE, SESSION, None,
         [("reason", NAME), ("suppressed", INT)], Class::Noisy),
     RecordingViewed => ("recording.viewed", "recording.viewed", ActorRule::User("user_id"), None, SESSION, None,
-        [("kind", SHORT)]),
+        [("kind", SHORT), ("jat_id", ID)]),
     RecordingMismatch => ("recording.mismatch", "recording.mismatch", ActorRule::Node("node_id"), NODE, SESSION, None,
         [("manifest_incomplete", BOOL), ("session_incomplete", BOOL)]),
     PolicyReload => ("policy.reload", "policy.reload", ActorRule::System, None, None, Some("hash"),
@@ -414,6 +424,8 @@ mod tests {
             [
                 "login.device.code_failed",
                 "admin.signed_request_refused",
+                "token.used",
+                "token.refused",
                 "gate.connect",
                 "gate.session_refused",
                 "gate.disconnect",
@@ -481,5 +493,19 @@ mod tests {
             panic!("the groups were not stored");
         };
         assert!(stored.ends_with(names.last().unwrap().as_str()));
+    }
+
+    #[test]
+    fn the_networks_of_a_created_token_fit_whole_at_the_largest_list_a_token_may_hold() {
+        let widest = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128";
+        let joined = vec![widest; jaunt_proto::ADMIN_TOKEN_MAX_CIDRS].join(",");
+        let (event, report) = AuditEvent::from_raw(
+            EventType::TokenCreated,
+            &[("cidrs", RawValue::Text(joined.clone()))],
+            "id-1".to_owned(),
+            Timestamp::from_millis(0).unwrap(),
+        );
+        assert_eq!(report.fields_dropped, 0);
+        assert_eq!(event.fields().get("cidrs"), Some(&FieldValue::Text(joined)));
     }
 }

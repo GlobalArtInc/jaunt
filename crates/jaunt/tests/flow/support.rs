@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::body::Bytes;
+use axum::extract::{Path as UrlPath, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -45,6 +46,8 @@ pub const SUFFIX: &str = "example.test";
 pub const GATE_HOST: &str = "gate.other.test";
 pub const GATE_PORT: u16 = 2222;
 pub const HARMLESS_PROGRAM: &str = "/usr/bin/true";
+pub const ADMIN_TOKEN_ID: &str = "AbC-_09xyzQ";
+pub const ADMIN_TOKEN: &str = "jat_AbC-_09xyzQ_s3cr3t-s3cr3t_s3cr3t-s3cr3t_s3cr3t-s3cr3t_Z";
 
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -168,6 +171,24 @@ pub struct Seen {
     pub revoked: bool,
     pub requests: usize,
     pub admin_requests: Vec<Vec<(String, String)>>,
+    pub token_requests: Vec<SeenRequest>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SeenRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl SeenRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(found, _)| found == name)
+            .map(|(_, value)| value.as_str())
+    }
 }
 
 fn record_request(shared: &Shared) -> bool {
@@ -298,7 +319,105 @@ pub const ADMIN_HEADERS: [&str; 4] = [
     "signature",
 ];
 
-async fn admin_whoami_handler(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+fn record_token_request(
+    shared: &Shared,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    record_request(shared);
+    let captured = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect();
+    shared
+        .seen
+        .lock()
+        .unwrap()
+        .token_requests
+        .push(SeenRequest {
+            method: method.as_str().to_owned(),
+            path: uri.path().to_owned(),
+            headers: captured,
+            body: body.to_vec(),
+        });
+}
+
+fn token_summary() -> serde_json::Value {
+    serde_json::json!({
+        "id": ADMIN_TOKEN_ID,
+        "name": "ci-audit",
+        "creator": USER_ID,
+        "scope": ["audit.read"],
+        "cidrs": [],
+        "created_at": 1_700_000_000,
+        "expires_at": 1_702_592_000,
+        "revoked_at": null,
+        "last_used_at": null,
+    })
+}
+
+async fn tokens_create_handler(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    record_token_request(&shared, &method, &uri, &headers, &body);
+    let mut created = token_summary();
+    created["secret"] = serde_json::Value::String(ADMIN_TOKEN.to_owned());
+    (StatusCode::CREATED, Json(created)).into_response()
+}
+
+async fn tokens_list_handler(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    record_token_request(&shared, &method, &uri, &headers, b"");
+    Json(serde_json::json!({ "tokens": [token_summary()], "truncated": true })).into_response()
+}
+
+async fn tokens_revoke_handler(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    record_token_request(&shared, &method, &uri, &headers, b"");
+    if id == ADMIN_TOKEN_ID {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error_response(StatusCode::NOT_FOUND, "not_found")
+    }
+}
+
+async fn admin_whoami_handler(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(authorization) = headers.get(header::AUTHORIZATION) {
+        record_token_request(&shared, &method, &uri, &headers, b"");
+        if authorization.to_str().ok() != Some(format!("Bearer {ADMIN_TOKEN}").as_str()) {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        }
+        return Json(serde_json::json!({ "token": {
+            "id": ADMIN_TOKEN_ID,
+            "name": "ci-audit",
+            "scope": ["audit.read"],
+            "rights": ["audit.read"],
+            "expires_at": 1_702_592_000,
+        } }))
+        .into_response();
+    }
     record_request(&shared);
     let captured = ADMIN_HEADERS
         .iter()
@@ -385,6 +504,11 @@ impl FakeServer {
             .route("/v1/client-config", get(client_config_handler))
             .route("/v1/nodes", get(nodes_handler))
             .route("/v1/admin/whoami", get(admin_whoami_handler))
+            .route(
+                "/v1/admin/tokens",
+                get(tokens_list_handler).post(tokens_create_handler),
+            )
+            .route("/v1/admin/tokens/{id}", delete(tokens_revoke_handler))
             .with_state(Arc::clone(&shared));
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();

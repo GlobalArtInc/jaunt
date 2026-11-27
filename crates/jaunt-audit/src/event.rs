@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use jaunt_proto::{ADMIN_TOKEN_LEN, ADMIN_TOKEN_PREFIX, admin_token_id};
 use jaunt_store::AuditRecord;
 use serde::Serialize;
 use serde::ser::{SerializeMap, Serializer};
@@ -147,11 +148,20 @@ fn has_bearer_credential(lowered: &str) -> bool {
     })
 }
 
+fn has_admin_token(value: &str) -> bool {
+    value.match_indices(ADMIN_TOKEN_PREFIX).any(|(at, _)| {
+        value
+            .get(at..at.saturating_add(ADMIN_TOKEN_LEN))
+            .is_some_and(|candidate| admin_token_id(candidate).is_some())
+    })
+}
+
 fn looks_secret(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
     lowered.contains(PEM_MARKER)
         || lowered.contains(SSH_CERTIFICATE_MARKER)
         || has_bearer_credential(&lowered)
+        || has_admin_token(value)
 }
 
 pub fn clean_text(value: &str, max_chars: usize) -> Option<String> {
@@ -671,6 +681,8 @@ mod tests {
             "-----BEG\u{200b}IN KEY-----bearer\u{2028}x",
             "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5",
             "ecdsa-sha2-nistp256-cert-v01@OPENSSH.COM AAAA",
+            "jat_AbC-_09xyzQ_s3cr3t-s3cr3t_s3cr3t-s3cr3t_s3cr3t-s3cr3t_Z",
+            "token=jat_AbC-_09xyzQ_s3cr3t-s3cr3t_s3cr3t-s3cr3t_s3cr3t-s3cr3t_Z;",
         ] {
             assert_eq!(clean_text(secret, 512), None, "{secret:?}");
         }
@@ -678,6 +690,8 @@ mod tests {
             "bearer",
             "bearers of news",
             "carbearer x",
+            "jat_short",
+            "token:AbC-_09xyzQ",
             "ssh-ed25519 AAAA",
             "deploy",
         ] {

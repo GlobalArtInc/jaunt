@@ -1,3 +1,4 @@
+mod admin_tokens;
 mod api_tokens;
 mod audit_events;
 mod ca_counters;
@@ -21,6 +22,10 @@ use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+pub use admin_tokens::{
+    AdminToken, AdminTokenCaps, AdminTokenCreated, AdminTokenPage, AdminTokenRevoked, AdminTokens,
+    NewAdminToken, SecretHash, StoredAdminToken,
+};
 pub use api_tokens::{ApiToken, ApiTokens, NewApiToken, ValidApiToken};
 pub use audit_events::{
     AuditCursor, AuditEvents, AuditQuery, AuditRecord, MAX_AUDIT_PAGE, MAX_AUDIT_PAYLOAD_BYTES,
@@ -96,6 +101,10 @@ impl Store {
     pub async fn migrate(&self) -> Result<(), StoreError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
+    }
+
+    pub fn admin_tokens(&self) -> AdminTokens {
+        AdminTokens::new(self.pool.clone())
     }
 
     pub fn api_tokens(&self) -> ApiTokens {

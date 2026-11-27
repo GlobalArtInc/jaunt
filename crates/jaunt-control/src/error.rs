@@ -47,6 +47,8 @@ pub enum ControlError {
     PurgeEnrollments(#[source] StoreError),
     #[error("purging expired join tokens failed: {0}")]
     PurgeJoinTokens(#[source] StoreError),
+    #[error("purging dead admin tokens failed: {0}")]
+    PurgeAdminTokens(#[source] StoreError),
     #[error("purging stale sessions failed: {0}")]
     PurgeSessions(#[source] StoreError),
     #[error("purging expired web sessions failed: {0}")]

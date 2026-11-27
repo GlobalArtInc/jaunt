@@ -436,26 +436,29 @@ fn admin_permissions_are_the_union_of_applicable_roles() {
             "auditors",
             Some("{ groups: [auditors] }"),
             "",
-            "[audit.read]",
+            "[audit.read, tokens.write]",
         ),
     ]);
     let cases = [
         (
             identity(ALICE, &["readers"]),
-            [true, true, true, false, false],
+            [true, true, true, false, false, false],
         ),
-        (identity(ALICE, &[]), [true, false, false, false, false]),
+        (
+            identity(ALICE, &[]),
+            [true, false, false, false, false, false],
+        ),
         (
             identity("bob@example.com", &["readers"]),
-            [false, true, true, false, false],
+            [false, true, true, false, false, false],
         ),
         (
             identity("bob@example.com", &[]),
-            [false, false, false, false, false],
+            [false, false, false, false, false, false],
         ),
         (
             identity("bob@example.com", &["auditors"]),
-            [false, false, false, false, true],
+            [false, false, false, false, true, true],
         ),
     ];
     for (who, expected) in cases {

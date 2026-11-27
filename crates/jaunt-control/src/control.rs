@@ -46,6 +46,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STORED_REQUEST_RETENTION_SECS: i64 = 3600;
 const STORED_ENROLLMENT_RETENTION_SECS: i64 = 3600;
 const EXPIRED_JOIN_TOKEN_RETENTION_SECS: i64 = 3600;
+const DEAD_ADMIN_TOKEN_RETENTION_SECS: i64 = 30 * 86_400;
 const STALE_DELIVERY_SECS: i64 = 120;
 const STALE_SESSION_RETENTION_SECS: i64 = 3600;
 const CLOSE_POLL: Duration = Duration::from_millis(20);
@@ -315,6 +316,7 @@ impl Control {
     pub fn sweep_expired(&self) -> usize {
         let tick = self.tick();
         self.request_limits.sweep(tick);
+        self.web.tokens.sweep(tick);
         let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {
@@ -364,6 +366,15 @@ impl Control {
             .purge_expired(now.secs.saturating_sub(EXPIRED_JOIN_TOKEN_RETENTION_SECS))
             .await
             .map_err(ControlError::PurgeJoinTokens)
+    }
+
+    pub async fn purge_admin_tokens(&self) -> Result<u64, ControlError> {
+        let now = self.now().ok_or(ControlError::Clock)?;
+        self.store
+            .admin_tokens()
+            .purge_dead(now.secs.saturating_sub(DEAD_ADMIN_TOKEN_RETENTION_SECS))
+            .await
+            .map_err(ControlError::PurgeAdminTokens)
     }
 
     pub async fn purge_stale_sessions(&self) -> Result<u64, ControlError> {
@@ -509,6 +520,9 @@ async fn sweep_forever(control: Control, sweep_interval: Duration) {
         }
         if let Err(err) = control.purge_join_tokens().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired join tokens failed");
+        }
+        if let Err(err) = control.purge_admin_tokens().await {
+            tracing::warn!(target: "jaunt::control", error = %err, "purging dead admin tokens failed");
         }
         if let Err(err) = control.purge_stale_sessions().await {
             tracing::warn!(target: "jaunt::control", error = %err, "purging stale sessions failed");

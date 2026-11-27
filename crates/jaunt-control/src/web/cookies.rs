@@ -74,6 +74,19 @@ pub(crate) fn presented<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a st
     found
 }
 
+pub(crate) fn carries(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|line| line.to_str().ok())
+        .flat_map(|text| text.split(';'))
+        .any(|pair| {
+            pair.trim()
+                .split_once('=')
+                .is_some_and(|(cookie_name, _)| cookie_name == name)
+        })
+}
+
 pub(crate) fn login_binding_matches(headers: &HeaderMap, stored_hash: &str) -> bool {
     completion::matches(presented(headers, LOGIN_COOKIE), stored_hash)
 }

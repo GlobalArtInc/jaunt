@@ -20,6 +20,7 @@ use super::admin_principal::AdminPrincipal;
 use super::cookies::{self, SESSION_COOKIE};
 use super::csrf;
 use super::signed;
+use super::tokens;
 
 const LOGIN_PATH: &str = "/v1/web/login";
 const API_PREFIX: &str = "/v1/";
@@ -194,6 +195,17 @@ pub(crate) async fn guard(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
+    if is_under(path, ADMIN_PREFIX) && tokens::presents_token(request.headers()) {
+        if signed::is_signed(request.headers())
+            || cookies::carries(request.headers(), SESSION_COOKIE)
+        {
+            return tokens::refuse_ambiguous(&control, &request);
+        }
+        return match tokens::authenticate(&control, request).await {
+            Ok(request) => next.run(request).await,
+            Err(denied) => denied.into_response(),
+        };
+    }
     if is_under(path, ADMIN_PREFIX) && signed::is_signed(request.headers()) {
         return match signed::authenticate(&control, request).await {
             Ok(request) => next.run(request).await,
@@ -242,6 +254,12 @@ impl Permission for RecordingsRead {
     const REQUIRED: AdminPermission = AdminPermission::RecordingsRead;
 }
 
+pub(crate) struct TokensWrite;
+
+impl Permission for TokensWrite {
+    const REQUIRED: AdminPermission = AdminPermission::TokensWrite;
+}
+
 pub(crate) struct RequireAdmin<P: Permission> {
     pub(crate) principal: AdminPrincipal,
     permission: PhantomData<P>,
@@ -261,7 +279,11 @@ impl<P: Permission> FromRequestParts<Control> for RequireAdmin<P> {
             }
         };
         let policy = control.policy_snapshot();
-        if !policy.admin_can(&policy_identity(principal.user()), P::REQUIRED) {
+        if let AdminPrincipal::Token(token) = &principal {
+            if !tokens::permits(token, &policy, P::REQUIRED) {
+                return Err(Rejection::new(Failure::Refused, &parts.uri));
+            }
+        } else if !policy.admin_can(&policy_identity(principal.user()), P::REQUIRED) {
             audit::admin_denied(
                 &principal.user().id,
                 P::REQUIRED.as_str(),

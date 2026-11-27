@@ -6,8 +6,14 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
+use jaunt_policy::AdminPermission;
+use jaunt_proto::ADMIN_TOKEN_ENV;
 
-use crate::admin::{AGENT_TIMEOUT, AdminContext, render_identity, whoami};
+use crate::admin::{
+    AGENT_TIMEOUT, AdminContext, NewToken, TokenSource, create_token, list_tokens, parse_scope,
+    parse_token_source, parse_ttl, read_admin_token, render_created, render_identity,
+    render_token_identity, render_token_list, revoke_token, token_whoami, whoami,
+};
 use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
 use crate::client::{ApiClient, ApiError};
@@ -134,10 +140,112 @@ pub struct EnsureArgs {
     pub quiet: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct AdminArgs {
+    #[arg(
+        long,
+        value_name = "FILE|env",
+        value_parser = parse_token_source,
+        help = "Use an automation token instead of the session key, read from FILE or from the JAUNT_ADMIN_TOKEN variable when the value is `env` (only `whoami`)"
+    )]
+    pub token: Option<TokenSource>,
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "JAUNT_SERVER",
+        help = "With --token, the server to ask (by default the server of the profile)"
+    )]
+    pub server: Option<ServerUrl>,
+    #[command(subcommand)]
+    pub command: AdminCommand,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
     #[command(about = "Show the identity the server sees in a signed administrator request")]
     Whoami(AdminWhoamiArgs),
+    #[command(about = "Manage automation tokens for the administrator API")]
+    Tokens {
+        #[command(subcommand)]
+        command: TokensCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokensCommand {
+    #[command(about = "Create a token and print its secret once")]
+    Create(TokenCreateArgs),
+    #[command(about = "List the tokens")]
+    Ls(TokenListArgs),
+    #[command(about = "Revoke a token at once")]
+    Revoke(TokenRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TokenCreateArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "A name unique among your live tokens"
+    )]
+    pub name: String,
+    #[arg(
+        long,
+        required = true,
+        value_name = "RIGHT",
+        value_delimiter = ',',
+        value_parser = parse_scope,
+        help = "Administrator rights the token carries, for example audit.read"
+    )]
+    pub scope: Vec<AdminPermission>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_ttl,
+        help = "Lifetime such as 3600, 12h or 30d (at most 90d, default 30d)"
+    )]
+    pub ttl: Option<i64>,
+    #[arg(
+        long,
+        value_name = "NETWORK",
+        help = "Accept the token only from this network, for example 203.0.113.0/24 (repeatable)"
+    )]
+    pub cidr: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenListArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(value_name = "ID", allow_hyphen_values = true)]
+    pub id: String,
 }
 
 #[derive(Debug, Args)]
@@ -479,10 +587,145 @@ pub fn run_ls(args: &LsArgs, environment: &Environment) -> ExitCode {
     report_lines(&rendered, ExitCode::SUCCESS)
 }
 
-pub fn run_admin(command: &AdminCommand, environment: &Environment) -> ExitCode {
-    match command {
-        AdminCommand::Whoami(args) => run_admin_whoami(args, environment),
+pub fn run_admin(args: &AdminArgs, environment: &Environment) -> ExitCode {
+    match (&args.token, &args.command) {
+        (Some(source), AdminCommand::Whoami(whoami_args)) => {
+            run_token_whoami(source, args.server.as_ref(), whoami_args, environment)
+        }
+        (Some(_), AdminCommand::Tokens { .. }) => usage_error(
+            "--token works only with `whoami`: creating, listing and revoking tokens needs your own signed sign-in",
+        ),
+        (None, AdminCommand::Whoami(whoami_args)) => run_admin_whoami(whoami_args, environment),
+        (None, AdminCommand::Tokens { command }) => run_tokens(command, environment),
     }
+}
+
+fn run_token_whoami(
+    source: &TokenSource,
+    server: Option<&ServerUrl>,
+    args: &AdminWhoamiArgs,
+    environment: &Environment,
+) -> ExitCode {
+    let token = match read_admin_token(source, env::var_os(ADMIN_TOKEN_ENV)) {
+        Ok(token) => token,
+        Err(err) => return usage_error(err),
+    };
+    let server = match server {
+        Some(server) => server.clone(),
+        None => {
+            let home = match home_for(environment) {
+                Ok(home) => home,
+                Err(code) => return code,
+            };
+            match ProfileStore::new(&home, &args.profile).read_server() {
+                Ok(Some(server)) => server,
+                Ok(None) => {
+                    return usage_error("no server given: pass --server URL or set JAUNT_SERVER");
+                }
+                Err(err) => return failure(err),
+            }
+        }
+    };
+    let identity = match token_whoami(&server, &token) {
+        Ok(identity) => identity,
+        Err(err) => return failure(err),
+    };
+    let rendered = match args.format {
+        OutputFormat::Json => match serde_json::to_string_pretty(&identity) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => render_token_identity(&identity),
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
+}
+
+fn run_tokens(command: &TokensCommand, environment: &Environment) -> ExitCode {
+    let profile = match command {
+        TokensCommand::Create(args) => &args.profile,
+        TokensCommand::Ls(args) => &args.profile,
+        TokensCommand::Revoke(args) => &args.profile,
+    };
+    let home = match home_for(environment) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let store = ProfileStore::new(&home, profile);
+    let context = AdminContext {
+        store: &store,
+        agent_socket: environment.ssh_auth_sock.as_ref(),
+        clock: &SystemTime::now,
+        agent_timeout: AGENT_TIMEOUT,
+    };
+    match command {
+        TokensCommand::Create(args) => run_token_create(&context, args),
+        TokensCommand::Ls(args) => run_token_list(&context, args),
+        TokensCommand::Revoke(args) => match revoke_token(&context, &args.id) {
+            Ok(()) => report_lines(
+                &format!("Revoked token {}.", crate::display::printable(&args.id)),
+                ExitCode::SUCCESS,
+            ),
+            Err(err) => failure(err),
+        },
+    }
+}
+
+fn run_token_create(context: &AdminContext<'_>, args: &TokenCreateArgs) -> ExitCode {
+    let request = NewToken {
+        name: args.name.clone(),
+        scope: args
+            .scope
+            .iter()
+            .map(|permission| permission.as_str().to_owned())
+            .collect(),
+        ttl_secs: args.ttl,
+        cidrs: args.cidr.clone(),
+    };
+    let created = match create_token(context, &request) {
+        Ok(created) => created,
+        Err(err) => return failure(err),
+    };
+    match args.format {
+        OutputFormat::Json => {
+            let mut body = match serde_json::to_value(&created.token) {
+                Ok(body) => body,
+                Err(err) => return failure(format!("cannot format the answer: {err}")),
+            };
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "secret".to_owned(),
+                    serde_json::Value::String(created.secret.expose().to_owned()),
+                );
+            }
+            eprintln!("jaunt: the secret is shown only this once: store it now");
+            report_lines(&body.to_string(), ExitCode::SUCCESS)
+        }
+        OutputFormat::Text => {
+            eprintln!("{}", render_created(&created));
+            report_lines(created.secret.expose(), ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn run_token_list(context: &AdminContext<'_>, args: &TokenListArgs) -> ExitCode {
+    let list = match list_tokens(context) {
+        Ok(list) => list,
+        Err(err) => return failure(err),
+    };
+    let rendered = match args.format {
+        OutputFormat::Json => match serde_json::to_string_pretty(&list) {
+            Ok(text) => text,
+            Err(err) => return failure(format!("cannot format the answer: {err}")),
+        },
+        OutputFormat::Text => {
+            let now = match now_secs() {
+                Ok(now) => now,
+                Err(code) => return code,
+            };
+            render_token_list(&list, now)
+        }
+    };
+    report_lines(&rendered, ExitCode::SUCCESS)
 }
 
 fn run_admin_whoami(args: &AdminWhoamiArgs, environment: &Environment) -> ExitCode {

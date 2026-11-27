@@ -1,4 +1,5 @@
 mod admin;
+mod admin_tokens;
 mod agent;
 mod agent_faults;
 mod certs;

@@ -12,8 +12,9 @@ use crate::token;
 
 use super::cookies::{self, SESSION_COOKIE};
 use super::csrf;
-use super::session::{NodesApprove, RequireAdmin, WebSession};
+use super::session::WebSession;
 use super::terminal::End;
+use super::tokens::{self, WhoamiCaller};
 
 #[derive(Serialize)]
 struct SessionBody {
@@ -90,8 +91,12 @@ pub(crate) async fn logout(State(control): State<Control>, session: WebSession) 
     response
 }
 
-pub(crate) async fn whoami(admin: RequireAdmin<NodesApprove>) -> Response {
-    let user = admin.principal.user().clone();
+pub(crate) async fn whoami(State(control): State<Control>, caller: WhoamiCaller) -> Response {
+    let principal = match caller {
+        WhoamiCaller::Token(token) => return tokens::whoami(&control, token),
+        WhoamiCaller::Person(principal) => principal,
+    };
+    let user = principal.user().clone();
     json_response(
         StatusCode::OK,
         &AdminWhoamiBody {
