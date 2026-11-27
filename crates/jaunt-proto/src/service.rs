@@ -348,5 +348,19 @@ pub struct ServiceList {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeService {
+    pub id: String,
+    pub kind: ServiceKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeServices {
+    pub services: Vec<NodeService>,
+}
+
 #[cfg(test)]
 mod tests;

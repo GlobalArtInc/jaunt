@@ -324,7 +324,13 @@ events! {
         [("login", NAME), ("stage", SHORT), ("exit_status", INT), ("ref", SHORT)], Class::Noisy),
 }
 
-pub const IGNORED_PREFIXES: &[&str] = &["agent.ssh.", "agent.host_user."];
+pub const IGNORED_PREFIXES: &[&str] = &[
+    "agent.ssh.",
+    "agent.host_user.",
+    "kube.tls.refused",
+    "db.tls.refused",
+    "tcp.tls.refused",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classified {
@@ -491,6 +497,17 @@ mod tests {
         assert_eq!(
             EventType::classify("agent.host_user.created"),
             Classified::Ignored
+        );
+        for agent_side in ["kube.tls.refused", "db.tls.refused", "tcp.tls.refused"] {
+            assert_eq!(
+                EventType::classify(agent_side),
+                Classified::Ignored,
+                "{agent_side}"
+            );
+        }
+        assert_eq!(
+            EventType::classify("kube.session.start"),
+            Classified::Unknown
         );
         assert_eq!(
             EventType::classify("host_user.created"),

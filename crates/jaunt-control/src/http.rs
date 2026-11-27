@@ -67,7 +67,8 @@ pub(crate) fn agent_router(control: Control) -> Router {
         .route(
             AGENT_SERVICES_PATH,
             post(services::announce)
-                .layer(DefaultBodyLimit::max(services::ANNOUNCEMENT_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(services::ANNOUNCEMENT_BODY_BYTES))
+                .get(services::served),
         )
         .route(
             "/v1/agent/recordings/{session_id}/chunks",

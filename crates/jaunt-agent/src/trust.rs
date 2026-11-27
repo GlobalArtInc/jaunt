@@ -9,8 +9,9 @@ use ssh_key::public::KeyData;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::clock::Clock;
-use crate::run::api::{AgentApi, ApiError};
+use crate::clock::{Clock, unix_secs};
+use crate::run::api::{AgentApi, ApiError, ServedTrust};
+use crate::runtime::x509::{UserRoots, UserX509Trust};
 use crate::ssh::SshService;
 
 pub const CLOCK_SKEW_LIMIT: Duration = Duration::from_secs(60);
@@ -151,6 +152,7 @@ pub struct TrustLoader {
     pub events: Option<broadcast::Receiver<ClientEvent>>,
     pub sample: Sampler,
     pub host_ca: HostCaActive,
+    pub user_x509: Arc<UserX509Trust>,
 }
 
 impl TrustLoader {
@@ -187,6 +189,9 @@ impl TrustLoader {
                 wake = wake.as_str(),
                 "refreshing the user CA trust set"
             );
+            if wake == Wake::Reconnected {
+                self.api.retry_third_trust_version();
+            }
             let jitter = match wake {
                 Wake::Shutdown => return TrustEnd::Shutdown,
                 Wake::Periodic | Wake::Refused => Duration::ZERO,
@@ -314,6 +319,7 @@ impl TrustLoader {
     async fn load_once(&self) -> Result<Option<SystemTime>, TrustError> {
         let reply = self.api.trust().await.map_err(TrustError::Api)?;
         let host_ca = reply.value.host_ca_active().map(str::to_owned);
+        self.install_user_x509(&reply.value);
         let lines = reply.value.into_user_ca_keys();
         let keys = UserCaKeys::from_openssh_lines(&lines).map_err(TrustError::Invalid)?;
         self.ssh.install_trust(keys);
@@ -324,6 +330,36 @@ impl TrustLoader {
         );
         self.publish_host_ca(host_ca.as_deref());
         Ok(reply.server_time)
+    }
+
+    fn install_user_x509(&self, served: &ServedTrust) {
+        let Some(entries) = served.user_x509_roots() else {
+            self.user_x509.install(UserRoots::default());
+            return;
+        };
+        match UserRoots::from_trust(entries, unix_secs(self.clock.now())) {
+            Ok(roots) => {
+                let count = roots.len();
+                self.user_x509.install(roots);
+                if count == 0 {
+                    tracing::warn!(
+                        target: "jaunt::agent",
+                        "the control plane serves no usable user X.509 roots; Kubernetes, database and TCP client certificates are refused"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "jaunt::agent",
+                        roots = count,
+                        "loaded the user X.509 roots"
+                    );
+                }
+            }
+            Err(error) => tracing::error!(
+                target: "jaunt::agent",
+                error = %error,
+                "the control plane sent user X.509 roots that cannot be used; the previous roots stay in use"
+            ),
+        }
     }
 
     fn publish_host_ca(&self, line: Option<&str>) {

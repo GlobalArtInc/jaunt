@@ -107,6 +107,7 @@ pub struct Inner {
     pub(crate) presence: PresenceSlot,
     pub(crate) host_accounts: HostAccounts,
     pub(crate) service_announcements: RateLimiter<String>,
+    pub(crate) service_reads: RateLimiter<String>,
     user_x509: ArcSwapOption<ClientSlot>,
     pub(crate) services_domain: Option<ServicesDomain>,
     pub(crate) client_transport: ClientTransport,
@@ -234,6 +235,7 @@ impl Control {
                 presence: PresenceSlot::default(),
                 host_accounts: HostAccounts::default(),
                 service_announcements: services::announcement_limiter(),
+                service_reads: services::read_limiter(),
                 user_x509: ArcSwapOption::from(parts.user_x509.map(Arc::new)),
                 services_domain,
                 client_transport,
@@ -401,6 +403,7 @@ impl Control {
         self.web.tokens.sweep(tick);
         self.x509_issuance.sweep(tick);
         self.service_issuance.sweep(tick);
+        self.service_reads.sweep(tick);
         self.db_client_user_issuance.sweep(tick);
         self.service_user_authorizations.sweep(tick);
         self.service_authorizations.sweep(tick);

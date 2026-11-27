@@ -928,3 +928,147 @@ async fn a_legal_announcement_above_sixteen_kibibytes_is_accepted() {
 
     assert_eq!(listed(&harness, &approver, "limit=200").await.len(), 40);
 }
+
+async fn served(harness: &Harness, node_id: Option<&str>) -> Reply {
+    crate::issuance_support::get(&harness.agent_router, ANNOUNCE, None, node_id).await
+}
+
+async fn served_names(harness: &Harness, node_id: &str) -> Vec<String> {
+    let reply = served(harness, Some(node_id)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let parsed: jaunt_proto::NodeServices = serde_json::from_slice(&reply.body).unwrap();
+    parsed
+        .services
+        .iter()
+        .map(|service| format!("{}/{}", service.kind, service.name))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_node_reads_only_its_own_approved_and_announced_services() {
+    let harness = web_harness(&[]).await;
+    let approver = admin(&harness, "approver").await;
+    let first = node(&harness, "web-01").await;
+    let second = node(&harness, "web-02").await;
+    announced(
+        &harness,
+        &first,
+        &set(&[
+            tcp("grafana", "ops"),
+            tcp("vault", "ops"),
+            tcp("loki", "ops"),
+        ]),
+    )
+    .await;
+    announced(&harness, &second, &set(&[tcp("other", "ops")])).await;
+    let pending = listed(&harness, &approver, "state=pending").await;
+    let id_of = |name: &str| {
+        pending
+            .iter()
+            .find(|service| service["name"] == name)
+            .unwrap()["id"]
+            .clone()
+    };
+    for name in ["grafana", "vault", "other"] {
+        let reply = approve(&harness, &approver, &id_of(name), &json!({})).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    }
+
+    let reply = served(&harness, Some(&first)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply.json(),
+        json!({"services": [
+            {"id": id_of("grafana"), "kind": "tcp", "name": "grafana"},
+            {"id": id_of("vault"), "kind": "tcp", "name": "vault"},
+        ]})
+    );
+    assert_eq!(served_names(&harness, &second).await, ["tcp/other"]);
+
+    announced(
+        &harness,
+        &first,
+        &set(&[tcp("grafana", "ops"), tcp("loki", "ops")]),
+    )
+    .await;
+    assert_eq!(served_names(&harness, &first).await, ["tcp/grafana"]);
+    let grafana = id_of("grafana");
+    let removed = delete(
+        &harness,
+        &format!("/v1/admin/services/{}", grafana.as_str().unwrap()),
+        &approver,
+        &json!({}),
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::OK, "{}", removed.text());
+    assert!(served_names(&harness, &first).await.is_empty());
+    assert_eq!(served_names(&harness, &second).await, ["tcp/other"]);
+}
+
+#[tokio::test]
+async fn reading_the_services_needs_an_active_node_and_is_rate_limited_per_node() {
+    let harness = web_harness(&[]).await;
+    let first = node(&harness, "web-01").await;
+    let second = node(&harness, "web-02").await;
+    let gone = node(&harness, "web-03").await;
+    harness.admin.remove_node("web-03", APPROVER).await.unwrap();
+
+    assert_eq!(
+        served(&harness, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let removed = served(&harness, Some(&gone)).await;
+    assert_eq!(
+        (removed.status, removed.error_code().as_str()),
+        (StatusCode::FORBIDDEN, "node_removed")
+    );
+    for _ in 0..12 {
+        assert_eq!(served(&harness, Some(&first)).await.status, StatusCode::OK);
+    }
+    let limited = served(&harness, Some(&first)).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers.get("retry-after").is_some());
+    assert_eq!(served(&harness, Some(&second)).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn at_most_sixty_four_services_are_read() {
+    let harness = web_harness(&[]).await;
+    let node_id = node(&harness, "web-01").await;
+    let pool = raw_pool(&harness).await;
+    for index in 0..65 {
+        sqlx::query(
+            "INSERT INTO services (id, node_id, kind, name, labels, announced_labels, settings, \
+             address_hint, state, revision, announced, approved_by, approved_at, created_at, \
+             last_seen_at) VALUES (?, ?, 'tcp', ?, '{}', '{}', '{}', NULL, 'approved', 1, 1, \
+             'cli:root', 1, 1, 1)",
+        )
+        .bind(format!("svc-{index:03}"))
+        .bind(&node_id)
+        .bind(format!("s{index:03}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let names = served_names(&harness, &node_id).await;
+    assert_eq!(names.len(), 64);
+    assert_eq!(names[0], "tcp/s000");
+    assert_eq!(names[63], "tcp/s063");
+}
+
+#[tokio::test]
+async fn a_removed_node_is_rate_limited_before_the_store_is_read() {
+    let harness = web_harness(&[]).await;
+    let gone = node(&harness, "web-01").await;
+    harness.admin.remove_node("web-01", APPROVER).await.unwrap();
+    for _ in 0..12 {
+        let removed = served(&harness, Some(&gone)).await;
+        assert_eq!(
+            (removed.status, removed.error_code().as_str()),
+            (StatusCode::FORBIDDEN, "node_removed")
+        );
+    }
+    let limited = served(&harness, Some(&gone)).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers.get("retry-after").is_some());
+}

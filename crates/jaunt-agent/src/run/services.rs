@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use jaunt_proto::ServiceAnnouncement;
 use jaunt_tunnel::{BoxFuture, ClientEvent};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -71,6 +71,23 @@ impl ServiceSink for ControlServices {
                 Ok(answer) => delivery_of(answer),
                 Err(_) => Delivery::Retry(None),
             }
+        })
+    }
+}
+
+pub struct AnnouncedSink {
+    pub inner: Arc<dyn ServiceSink>,
+    pub announced: Arc<Notify>,
+}
+
+impl ServiceSink for AnnouncedSink {
+    fn announce<'a>(&'a self, announcement: &'a ServiceAnnouncement) -> BoxFuture<'a, Delivery> {
+        Box::pin(async move {
+            let delivery = self.inner.announce(announcement).await;
+            if delivery == Delivery::Accepted {
+                self.announced.notify_one();
+            }
+            delivery
         })
     }
 }

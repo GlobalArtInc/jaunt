@@ -172,6 +172,21 @@ impl TestPki {
         STANDARD.encode(cert.der())
     }
 
+    pub fn service_x509(
+        &self,
+        spki: &[u8],
+        dns_name: &str,
+        not_before: i64,
+        not_after: i64,
+    ) -> String {
+        let mut params = CertificateParams::new(vec![dns_name.to_owned()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.not_before = offset(not_before);
+        params.not_after = offset(not_after);
+        let subject = rcgen::SubjectPublicKeyInfo::from_der(spki).unwrap();
+        STANDARD.encode(params.signed_by(&subject, &*self.issuer).unwrap().der())
+    }
+
     pub fn host_certificate(
         &self,
         key: &KeyData,

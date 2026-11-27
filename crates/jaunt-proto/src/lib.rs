@@ -74,9 +74,9 @@ pub use recording::{
 pub use service::{
     AGENT_SERVICES_PATH, AnnouncedService, DEFAULT_MAX_QUERY_BYTES, DEFAULT_TCP_IDLE_TIMEOUT_SECS,
     KubernetesApi, KubernetesAudit, KubernetesSettings, MAX_QUERY_BYTES, MAX_SERVICE_PATH_BYTES,
-    MAX_SERVICES_PER_AGENT, MAX_TCP_IDLE_TIMEOUT_SECS, PostgresAudit, PostgresSettings,
-    PostgresTls, QueryAudit, SERVICES_PATH, ServiceAnnouncement, ServiceKind, ServiceList,
-    ServiceProblem, ServiceSettings, ServiceSummary, TcpSettings,
+    MAX_SERVICES_PER_AGENT, MAX_TCP_IDLE_TIMEOUT_SECS, NodeService, NodeServices, PostgresAudit,
+    PostgresSettings, PostgresTls, QueryAudit, SERVICES_PATH, ServiceAnnouncement, ServiceKind,
+    ServiceList, ServiceProblem, ServiceSettings, ServiceSummary, TcpSettings,
 };
 pub use service_session::{
     AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_END_PATH, DbAccess, DbAccessRequest,

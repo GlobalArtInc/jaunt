@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::{AnnounceTiming, Delivery, ServiceSink, announce_services, delivery_of};
+use super::{AnnounceTiming, AnnouncedSink, Delivery, ServiceSink, announce_services, delivery_of};
 use crate::run::api::ApiError;
 use crate::testkit::soon;
 
@@ -187,5 +187,34 @@ fn answers_are_sorted_into_retry_refusal_and_success() {
         ApiError::Shutdown,
     ] {
         assert_eq!(delivery_of(Err(retried)), Delivery::Retry(None));
+    }
+}
+
+#[tokio::test]
+async fn only_an_accepted_announcement_asks_for_the_approved_services_again() {
+    let (seen, _seen_rx) = mpsc::unbounded_channel();
+    let announced = Arc::new(tokio::sync::Notify::new());
+    let sink = AnnouncedSink {
+        inner: Arc::new(Scripted {
+            replies: Mutex::new(VecDeque::from([
+                Delivery::Refused("HTTP 422 (too_many_services)".to_owned()),
+                Delivery::Retry(None),
+                Delivery::Unsupported,
+                Delivery::Accepted,
+            ])),
+            seen,
+        }),
+        announced: announced.clone(),
+    };
+    let announcement = ServiceAnnouncement {
+        ssh_enabled: false,
+        services: Vec::new(),
+    };
+    for expected in [false, false, false, true] {
+        let delivery = sink.announce(&announcement).await;
+        let woke = tokio::time::timeout(Duration::ZERO, announced.notified())
+            .await
+            .is_ok();
+        assert_eq!(woke, expected, "{delivery:?}");
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use jaunt_proto::{AGENT_TRUST_V3_PATH, TrustRole};
 use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, NoObserver, UserCaKeys};
 use jaunt_tunnel::{BackoffPolicy, ClientEvent, StreamHandler};
 use serde_json::json;
@@ -12,10 +13,12 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Reconnections, Signal, TRUST_TIMING, TrustEnd, TrustLoader, TrustTiming, clock_skew, spread,
 };
+use crate::runtime::tests::support::{UserCa, UserSpec};
+use crate::runtime::x509::{UserX509Trust, verify_user};
 use crate::ssh::{ControlAuthority, SshService};
 use crate::testkit::{
     ApiStep, FakeGate, LogCapture, ManualClock, TRUST_PATH, TRUST_V2_PATH, eventually,
-    gate_and_api, soon, trust_reply, trust_v2_reply, user_ca_line,
+    gate_and_api, soon, trust_reply, trust_v2_reply, unix_now, user_ca_line,
 };
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -41,6 +44,7 @@ struct Loading {
     shutdown: CancellationToken,
     task: JoinHandle<TrustEnd>,
     host_ca: watch::Receiver<Option<KeyData>>,
+    user_x509: Arc<UserX509Trust>,
 }
 
 struct Options {
@@ -87,8 +91,10 @@ async fn loading_with(
         events: Some(receiver),
         sample: Arc::new(move || sample),
         host_ca: watch::Sender::new(None),
+        user_x509: Arc::new(UserX509Trust::default()),
     };
     let host_ca = loader.host_ca.subscribe();
+    let user_x509 = loader.user_x509.clone();
     let task = tokio::spawn(loader.run(shutdown.clone()));
     Loading {
         gate,
@@ -97,6 +103,7 @@ async fn loading_with(
         shutdown,
         task,
         host_ca,
+        user_x509,
     }
 }
 
@@ -621,5 +628,158 @@ async fn an_unreadable_active_host_key_still_installs_the_user_keys_and_publishe
     assert_eq!(*loading.host_ca.borrow(), Some(expected));
     assert_eq!(*loading.trust().unwrap(), keys(&second));
     assert!(loading.gate.requests(TRUST_PATH).is_empty());
+    loading.stop().await;
+}
+
+fn v3_reply(roots: &[jaunt_proto::TrustedX509Root]) -> ApiStep {
+    ApiStep::Json(
+        200,
+        json!({
+            "trust_id": "t3",
+            "user_ca_keys": [user_ca_line()],
+            "host_ca_active": user_ca_line(),
+            "user_x509_roots": roots,
+        }),
+    )
+}
+
+fn accepts(loading: &Loading, ca: &UserCa, now: i64) -> bool {
+    let user = ca.issue(&UserSpec::valid(now));
+    verify_user(&user.der, &loading.user_x509.snapshot(), now).is_ok()
+}
+
+#[tokio::test]
+async fn the_third_version_installs_the_user_roots_and_a_refresh_adds_a_rotated_next_root() {
+    let now = unix_now();
+    let (active, next) = (UserCa::new(now), UserCa::new(now));
+    let first = v3_reply(&[active.root(TrustRole::Active)]);
+    let loading = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.set_standing(AGENT_TRUST_V3_PATH, first);
+    })
+    .await;
+    eventually("the active root to load", || {
+        accepts(&loading, &active, now)
+    })
+    .await;
+    assert!(!accepts(&loading, &next, now));
+    assert!(loading.trust().is_some());
+    assert!(loading.gate.requests(TRUST_V2_PATH).is_empty());
+
+    loading.gate.set_standing(
+        AGENT_TRUST_V3_PATH,
+        v3_reply(&[active.root(TrustRole::Active), next.root(TrustRole::Next)]),
+    );
+    loading.service.trust_update();
+    eventually("the rotated next root to load", || {
+        accepts(&loading, &next, now)
+    })
+    .await;
+    assert!(accepts(&loading, &active, now));
+
+    let mut broken = next.root(TrustRole::Next);
+    broken.fingerprint = active.fingerprint();
+    loading.gate.set_standing(
+        AGENT_TRUST_V3_PATH,
+        v3_reply(&[active.root(TrustRole::Active), broken]),
+    );
+    let before = loading.gate.requests(AGENT_TRUST_V3_PATH).len();
+    loading.service.trust_update();
+    eventually("the broken set to be read", || {
+        loading.gate.requests(AGENT_TRUST_V3_PATH).len() > before
+    })
+    .await;
+    assert!(accepts(&loading, &next, now));
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn an_empty_or_missing_third_version_leaves_every_user_certificate_refused() {
+    let now = unix_now();
+    let ca = UserCa::new(now);
+    let empty = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.set_standing(AGENT_TRUST_V3_PATH, v3_reply(&[]));
+    })
+    .await;
+    eventually("the trust set to load", || empty.trust().is_some()).await;
+    assert!(empty.user_x509.snapshot().is_empty());
+    assert!(!accepts(&empty, &ca, now));
+    empty.stop().await;
+
+    let missing = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.set_standing(
+            TRUST_V2_PATH,
+            trust_v2_reply(&[user_ca_line()], &user_ca_line()),
+        );
+    })
+    .await;
+    eventually("the second version to load", || missing.trust().is_some()).await;
+    assert_eq!(missing.gate.requests(AGENT_TRUST_V3_PATH).len(), 1);
+    assert!(missing.user_x509.snapshot().is_empty());
+    assert!(!accepts(&missing, &ca, now));
+    missing.stop().await;
+}
+
+#[tokio::test]
+async fn a_reconnection_asks_for_the_third_version_again() {
+    let now = unix_now();
+    let ca = UserCa::new(now);
+    let v2 = trust_v2_reply(&[user_ca_line()], &user_ca_line());
+    let loading = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.script(
+            AGENT_TRUST_V3_PATH,
+            vec![ApiStep::Json(404, json!({"error": "not_found"}))],
+        );
+        gate.set_standing(TRUST_V2_PATH, v2);
+    })
+    .await;
+    eventually("the second version to load", || loading.trust().is_some()).await;
+    assert!(!accepts(&loading, &ca, now));
+    loading
+        .gate
+        .set_standing(AGENT_TRUST_V3_PATH, v3_reply(&[ca.root(TrustRole::Active)]));
+    loading.service.trust_update();
+    eventually("the announced reload", || {
+        loading.gate.requests(TRUST_V2_PATH).len() >= 2
+    })
+    .await;
+    assert_eq!(loading.gate.requests(AGENT_TRUST_V3_PATH).len(), 1);
+    assert!(!accepts(&loading, &ca, now));
+
+    loading.events.send(ClientEvent::Connected).unwrap();
+    loading.events.send(ClientEvent::Connected).unwrap();
+    eventually("the third version after the reconnection", || {
+        accepts(&loading, &ca, now)
+    })
+    .await;
+    assert_eq!(loading.gate.requests(AGENT_TRUST_V3_PATH).len(), 2);
+    loading.stop().await;
+}
+
+#[tokio::test]
+async fn a_control_plane_that_stops_serving_the_third_version_drops_the_user_roots() {
+    let now = unix_now();
+    let ca = UserCa::new(now);
+    let loading = loading(ManualClock::new(SystemTime::now()), |gate| {
+        gate.script(
+            AGENT_TRUST_V3_PATH,
+            vec![
+                v3_reply(&[ca.root(TrustRole::Active)]),
+                ApiStep::Json(404, json!({"error": "not_found"})),
+            ],
+        );
+        gate.set_standing(
+            TRUST_V2_PATH,
+            trust_v2_reply(&[user_ca_line()], &user_ca_line()),
+        );
+    })
+    .await;
+    eventually("the roots to load", || accepts(&loading, &ca, now)).await;
+    loading.service.trust_update();
+    eventually("the downgrade to be read", || {
+        !loading.gate.requests(TRUST_V2_PATH).is_empty()
+    })
+    .await;
+    eventually("the roots to be dropped", || !accepts(&loading, &ca, now)).await;
+    assert!(loading.user_x509.snapshot().is_empty());
     loading.stop().await;
 }

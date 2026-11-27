@@ -23,7 +23,7 @@ use jaunt_tunnel::{
 };
 use rustls::pki_types::CertificateDer;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::AGENT_VERSION;
@@ -35,6 +35,13 @@ use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
 use crate::recording::{RecordingParts, Recordings};
+use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller, ApprovalTiming};
+use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
+use crate::runtime::directory::{Approvals, ServiceDirectory};
+use crate::runtime::handler::HandlerRegistry;
+use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
+use crate::runtime::x509::UserX509Trust;
+use crate::runtime::{KindRouter, RuntimeParts, ServiceRuntime};
 use crate::ssh::{self, ControlAuthority, InnerTargetError, SshService};
 use crate::state::{DEFAULT_STATE_DIR, StateDir, StateError};
 use crate::trust::{TRUST_TIMING, TrustLoader, TrustTiming, random_sampler};
@@ -43,7 +50,9 @@ use api::{API_KEEPALIVE, AgentApi, ApiError};
 use config::{ConfigError, InnerConfig, RecordingConfig};
 use logging::LoggingError;
 use renew::{HOST_CA_RENEWAL_SPREAD, RENEWAL_BACKOFF, Renewer};
-use services::{ANNOUNCE_TIMING, AnnounceTiming, ControlServices, announce_services};
+use services::{
+    ANNOUNCE_TIMING, AnnounceTiming, AnnouncedSink, ControlServices, announce_services,
+};
 
 const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 const FILTER_VAR: &str = "RUST_LOG";
@@ -114,6 +123,9 @@ pub struct RunSettings {
     pub accounts: AccountTimings,
     pub services: ServiceAnnouncement,
     pub announce_timing: AnnounceTiming,
+    pub service_limits: ServiceLimits,
+    pub service_certificate_backoff: BackoffPolicy,
+    pub approval_timing: ApprovalTiming,
 }
 
 impl RunSettings {
@@ -137,6 +149,9 @@ impl RunSettings {
                 services: Vec::new(),
             },
             announce_timing: ANNOUNCE_TIMING,
+            service_limits: SERVICE_LIMITS,
+            service_certificate_backoff: SERVICE_CERTIFICATE_BACKOFF,
+            approval_timing: APPROVAL_TIMING,
         }
     }
 }
@@ -276,7 +291,7 @@ pub async fn run(
         AgentApi::new(&tls, &endpoint, settings.api_keepalive, api_stop.clone())
             .map_err(RunError::Api)?,
     );
-    let tunnel_config = tunnel_config(tls, &endpoint, settings.tunnel_backoff);
+    let mut tunnel_config = tunnel_config(tls, &endpoint, settings.tunnel_backoff);
     let max_uploads =
         usize::try_from(tunnel_config.options.max_concurrent_streams).unwrap_or(usize::MAX);
     let recordings = Recordings::new(RecordingParts {
@@ -320,10 +335,15 @@ pub async fn run(
     let trust_events = tunnel_config.subscribe();
     let capability_events = tunnel_config.subscribe();
     let service_events = tunnel_config.subscribe();
-    let service_sink = Arc::new(ControlServices::new(
-        api.clone(),
-        settings.announce_timing.call_timeout,
-    ));
+    let approval_events = tunnel_config.subscribe();
+    let announced = Arc::new(Notify::new());
+    let service_sink = Arc::new(AnnouncedSink {
+        inner: Arc::new(ControlServices::new(
+            api.clone(),
+            settings.announce_timing.call_timeout,
+        )),
+        announced: announced.clone(),
+    });
     let capabilities = Arc::new(ControlCapabilities::new(api.clone()));
     tracing::info!(
         target: "jaunt::agent",
@@ -340,6 +360,46 @@ pub async fn run(
             service.reload_host_identity(state, now_unix(clock.as_ref()));
         })
     };
+    let user_x509 = Arc::new(UserX509Trust::default());
+    let certificates = Arc::new(ServiceCertificates::new(
+        api.clone(),
+        env.clock.clone(),
+        random_sampler(),
+        settings.service_certificate_backoff,
+    ));
+    let handlers = Arc::new(HandlerRegistry::default());
+    let (directory, directory_changes) = watch::channel(Arc::new(ServiceDirectory::default()));
+    let (served, served_changes) = watch::channel(None);
+    tunnel_config.follow_served_kinds(served_changes);
+    let approvals = Approvals {
+        local: Arc::new(settings.services.clone()),
+        handlers: handlers.clone(),
+        directory,
+        served,
+        certificates: certificates.clone(),
+    };
+    let (approved, mut approved_changes) = watch::channel(Vec::new());
+    approvals.publish(&approved_changes.borrow_and_update());
+    let poller = ApprovalPoller {
+        source: api.clone(),
+        approved,
+        events: approval_events,
+        announced,
+        sample: random_sampler(),
+        timing: settings.approval_timing,
+    };
+    let router = Arc::new(KindRouter {
+        ssh: service.clone(),
+        services: Arc::new(ServiceRuntime::new(RuntimeParts {
+            control: api.clone(),
+            clock: env.clock.clone(),
+            user_x509: user_x509.clone(),
+            certificates: certificates.clone(),
+            handlers,
+            directory: directory_changes,
+            limits: settings.service_limits,
+        })),
+    });
     let (host_ca, host_ca_changes) = watch::channel(None);
     let loader = TrustLoader {
         api: api.clone(),
@@ -349,6 +409,7 @@ pub async fn run(
         events: Some(trust_events),
         sample: random_sampler(),
         host_ca,
+        user_x509,
     };
     let renewer = Renewer {
         api,
@@ -366,12 +427,11 @@ pub async fn run(
         host_ca: host_ca_changes,
         host_ca_spread: settings.host_ca_spread,
     };
+    let following = tokio::spawn(approvals.follow(approved_changes, stop.child_token()));
+    let polling = tokio::spawn(poller.run(stop.child_token()));
+    let renewing = tokio::spawn(certificates.run(stop.child_token()));
     let trust = tokio::spawn(loader.run(stop.child_token()));
-    let mut tunnel = tokio::spawn(TunnelClient::run(
-        tunnel_config,
-        service,
-        stop.child_token(),
-    ));
+    let mut tunnel = tokio::spawn(TunnelClient::run(tunnel_config, router, stop.child_token()));
     let event_log = tokio::spawn(log_tunnel_events(events, stop.child_token()));
     let renewal = tokio::spawn(renewer.run(stop.child_token()));
     let announcer = tokio::spawn(announce_capabilities(
@@ -425,6 +485,15 @@ pub async fn run(
     }
     if let Err(error) = event_log.await {
         tracing::error!(target: "jaunt::agent", error = %error, "the tunnel event task failed");
+    }
+    if let Err(error) = polling.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the service approval reader failed");
+    }
+    if let Err(error) = following.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the service approval task failed");
+    }
+    if let Err(error) = renewing.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the service certificate task failed");
     }
     match tunnel_result {
         Ok(Ok(())) if shutdown.is_cancelled() => Ok(()),

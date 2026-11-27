@@ -188,7 +188,7 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 | `inner.sshd_host_key` | absolute path | `/etc/ssh/ssh_host_ed25519_key.pub` | the host key the agent pins for the local `sshd` |
 | `recording.session_queue_bytes` | integer | 67108864 | recording data one session may hold in memory while the tunnel is down; 1 MiB to `memory_budget_bytes` |
 | `recording.memory_budget_bytes` | integer | 268435456 | the same, for all sessions on the node; 1 MiB to 64 GiB |
-| `ssh.enabled` | boolean | `true` | whether the node is an SSH target. With `false` the server neither routes SSH to it nor lists it as an SSH node |
+| `ssh.enabled` | boolean | `true` | whether the node is an SSH target. With `false` the server neither routes SSH to it nor lists it as an SSH node, and the agent answers 400 to any SSH stream that reaches its tunnel |
 | `services` | list | empty | at most 64 Kubernetes clusters, PostgreSQL servers and TCP services this agent offers. The agent announces them at every connection; each new service, and each change of its kind, name or labels, waits for an administrator with `nodes.approve` |
 | `services[].kind` | string | required | `kubernetes`, `postgres` or `tcp` |
 | `services[].name` | string | required | a DNS label of at most 63 characters, unique per kind on this agent |

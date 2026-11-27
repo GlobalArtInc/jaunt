@@ -9,11 +9,13 @@ use h2::{Ping, PingPong};
 use http::header::{ACCEPT, CONTENT_TYPE, DATE, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
-    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AccountReport,
-    AgentCapabilities, AgentTrust, AgentTrustV2, AuthorizeRequest, AuthorizeResponse, ErrorBody,
-    RecordingAck, RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse,
-    ServiceAnnouncement, SessionEnd, SessionEndOutcome, recording_chunks_path,
-    recording_complete_path,
+    AGENT_CAPABILITIES_PATH, AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH,
+    AGENT_SERVICE_END_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH,
+    AccountReport, AgentCapabilities, AgentTrust, AgentTrustV2, AgentTrustV3, AuthorizeRequest,
+    AuthorizeResponse, ErrorBody, NodeServices, RecordingAck, RecordingChunk, RecordingComplete,
+    RecordingReceipt, RenewRequest, RenewResponse, ServiceAnnouncement, ServiceAuthorizeRequest,
+    ServiceAuthorizeResponse, ServiceCertificateRequest, ServiceCertificateResponse, ServiceEnd,
+    SessionEnd, SessionEndOutcome, TrustedX509Root, recording_chunks_path, recording_complete_path,
 };
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
@@ -103,6 +105,7 @@ pub struct Dated<T> {
 pub enum ServedTrust {
     V1(AgentTrust),
     V2(AgentTrustV2),
+    V3(AgentTrustV3),
 }
 
 impl ServedTrust {
@@ -110,6 +113,7 @@ impl ServedTrust {
         match self {
             ServedTrust::V1(trust) => trust.user_ca_keys,
             ServedTrust::V2(trust) => trust.user_ca_keys,
+            ServedTrust::V3(trust) => trust.user_ca_keys,
         }
     }
 
@@ -117,6 +121,14 @@ impl ServedTrust {
         match self {
             ServedTrust::V1(_) => None,
             ServedTrust::V2(trust) => Some(&trust.host_ca_active),
+            ServedTrust::V3(trust) => Some(&trust.host_ca_active),
+        }
+    }
+
+    pub fn user_x509_roots(&self) -> Option<&[TrustedX509Root]> {
+        match self {
+            ServedTrust::V1(_) | ServedTrust::V2(_) => None,
+            ServedTrust::V3(trust) => Some(&trust.user_x509_roots),
         }
     }
 }
@@ -150,6 +162,7 @@ pub struct AgentApi {
     connecting: Mutex<()>,
     shutdown: CancellationToken,
     first_trust_version_only: AtomicBool,
+    third_trust_version_missing: AtomicBool,
 }
 
 impl AgentApi {
@@ -177,6 +190,7 @@ impl AgentApi {
             connecting: Mutex::new(()),
             shutdown,
             first_trust_version_only: AtomicBool::new(false),
+            third_trust_version_missing: AtomicBool::new(false),
         })
     }
 
@@ -230,7 +244,64 @@ impl AgentApi {
         .await
     }
 
+    pub fn retry_third_trust_version(&self) {
+        self.third_trust_version_missing
+            .store(false, Ordering::Release);
+    }
+
+    pub async fn node_services(&self) -> Result<NodeServices, ApiError> {
+        self.call(Method::GET, AGENT_SERVICES_PATH, None, Retry::Idempotent)
+            .await
+            .map(|dated| dated.value)
+    }
+
+    pub async fn authorize_service(
+        &self,
+        request: &ServiceAuthorizeRequest,
+    ) -> Result<ServiceAuthorizeResponse, ApiError> {
+        self.post_json(AGENT_SERVICE_AUTHORIZE_PATH, request, Retry::OnlyUnsent)
+            .await
+    }
+
+    pub async fn end_service(&self, end: &ServiceEnd) -> Result<SessionEndOutcome, ApiError> {
+        self.post_json(AGENT_SERVICE_END_PATH, end, Retry::Idempotent)
+            .await
+    }
+
+    pub async fn service_certificate(
+        &self,
+        request: &ServiceCertificateRequest,
+    ) -> Result<ServiceCertificateResponse, ApiError> {
+        self.post_json(AGENT_SERVICE_CERTIFICATE_PATH, request, Retry::OnlyUnsent)
+            .await
+    }
+
     pub async fn trust(&self) -> Result<Dated<ServedTrust>, ApiError> {
+        if !self.third_trust_version_missing.load(Ordering::Acquire)
+            && !self.first_trust_version_only.load(Ordering::Acquire)
+        {
+            match self
+                .call::<AgentTrustV3>(Method::GET, AGENT_TRUST_V3_PATH, None, Retry::Idempotent)
+                .await
+            {
+                Ok(dated) => {
+                    return Ok(Dated {
+                        value: ServedTrust::V3(dated.value),
+                        server_time: dated.server_time,
+                    });
+                }
+                Err(ApiError::Status { status: 404, .. }) => {
+                    self.third_trust_version_missing
+                        .store(true, Ordering::Release);
+                    tracing::info!(
+                        target: "jaunt::agent",
+                        "the control plane does not serve the third trust version; \
+                         Kubernetes, database and TCP client certificates are refused until the agent reconnects to a newer server"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
         if !self.first_trust_version_only.load(Ordering::Acquire) {
             match self
                 .call::<AgentTrustV2>(Method::GET, TRUST_V2_PATH, None, Retry::Idempotent)
@@ -604,9 +675,12 @@ mod tests {
 
     use http::StatusCode;
     use jaunt_proto::{
-        AGENT_SESSION_ACCOUNT_PATH, AccountEvent, AccountReference, AccountReport, AgentTrust,
-        AgentTrustV2, AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse, SessionEnd,
-        SessionEndOutcome, SessionPermissions,
+        AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH, AGENT_SERVICE_END_PATH,
+        AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH, AccountEvent,
+        AccountReference, AccountReport, AgentTrust, AgentTrustV2, AuthorizeRequest,
+        AuthorizeResponse, RenewRequest, RenewResponse, ServiceAuthorizeRequest,
+        ServiceAuthorizeResponse, ServiceCertificateRequest, ServiceEnd, ServiceIdentity,
+        ServiceKind, ServiceOutcome, SessionEnd, SessionEndOutcome, SessionPermissions,
     };
     use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
     use serde_json::json;
@@ -751,6 +825,145 @@ mod tests {
             not_before: now - 60,
             not_after: now + 3600,
         }
+    }
+
+    fn service_request() -> ServiceAuthorizeRequest {
+        ServiceAuthorizeRequest {
+            session_id: "k-0123456789abcdef0123456789abcdef".to_owned(),
+            kind: ServiceKind::Kubernetes,
+            service: "prod-eu".to_owned(),
+            identity: ServiceIdentity {
+                user_id: "4f0e7a52-6c1b-4b39-9d55-2a8f1f0c7e11".to_owned(),
+                serial: 7,
+                subject_fingerprint: "ab".repeat(32),
+                issuer_fingerprint: "cd".repeat(32),
+            },
+            client_addr: "203.0.113.5:40000".to_owned(),
+            db: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_approved_services_are_read_with_a_get_and_parsed_strictly() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        let listed = json!({"services": [{"id": "id-1", "kind": "tcp", "name": "grafana"}]});
+        gate.script(
+            AGENT_SERVICES_PATH,
+            vec![
+                ApiStep::Json(200, listed),
+                ApiStep::Json(
+                    200,
+                    json!({"services": [{"id": "id-1", "kind": "tcp", "name": "grafana",
+                                         "address": "10.0.0.5:3000"}]}),
+                ),
+                ApiStep::Json(404, json!({"error": "not_found"})),
+            ],
+        );
+        let read = api.node_services().await.unwrap();
+        assert_eq!(read.services[0].name, "grafana");
+        assert!(matches!(
+            api.node_services().await,
+            Err(ApiError::BadResponse)
+        ));
+        assert!(matches!(
+            api.node_services().await,
+            Err(ApiError::Status { status: 404, .. })
+        ));
+        let seen = gate.requests(AGENT_SERVICES_PATH);
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter()
+                .all(|request| request.method == "GET" && request.body.is_empty())
+        );
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_third_trust_version_is_preferred_and_a_404_is_not_asked_again() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        gate.script(
+            AGENT_TRUST_V3_PATH,
+            vec![ApiStep::Json(
+                200,
+                json!({"trust_id": "t3", "user_ca_keys": [user_ca_line()],
+                       "host_ca_active": user_ca_line(), "user_x509_roots": []}),
+            )],
+        );
+        let served = api.trust().await.unwrap().value;
+        assert_eq!(served.user_x509_roots(), Some(&[][..]));
+        assert!(gate.requests(TRUST_V2_PATH).is_empty());
+        let fallen_back = api.trust().await.unwrap().value;
+        assert_eq!(fallen_back.user_x509_roots(), None);
+        api.trust().await.unwrap();
+        assert_eq!(gate.requests(AGENT_TRUST_V3_PATH).len(), 2);
+        gate.stop().await;
+    }
+
+    #[tokio::test]
+    async fn service_calls_speak_their_routes_and_authorization_is_never_repeated() {
+        let (_pki, gate, api) = gate_with(&[]).await;
+        gate.script(
+            AGENT_SERVICE_AUTHORIZE_PATH,
+            vec![
+                ApiStep::Json(200, json!({"decision": "deny"})),
+                ApiStep::RefuseStream,
+            ],
+        );
+        gate.script(
+            AGENT_SERVICE_END_PATH,
+            vec![ApiStep::Json(200, json!({"outcome": "recorded"}))],
+        );
+        let end = ServiceEnd {
+            session_id: "s".to_owned(),
+            outcome: ServiceOutcome::UpstreamError,
+            bytes_in: 1,
+            bytes_out: 2,
+        };
+        let certificate = ServiceCertificateRequest {
+            service_id: "svc-1".to_owned(),
+            public_key: "MCowBQYDK2VwAyEA".to_owned(),
+        };
+        gate.script(
+            AGENT_SERVICE_CERTIFICATE_PATH,
+            vec![ApiStep::Json(
+                200,
+                json!({"certificate_der": "MIIB", "serial": 9, "dns_name": "prod-eu.kube.svc.test",
+                       "valid_after": 1, "valid_before": 2}),
+            )],
+        );
+
+        assert_eq!(
+            api.authorize_service(&service_request()).await.unwrap(),
+            ServiceAuthorizeResponse::Deny
+        );
+        assert_eq!(
+            api.end_service(&end).await.unwrap(),
+            SessionEndOutcome::Recorded
+        );
+        assert_eq!(
+            api.service_certificate(&certificate)
+                .await
+                .unwrap()
+                .dns_name,
+            "prod-eu.kube.svc.test"
+        );
+        let unanswered = api.authorize_service(&service_request()).await;
+        assert!(
+            matches!(unanswered, Err(ApiError::Http2(_))),
+            "{unanswered:?}"
+        );
+
+        let asked = gate.requests(AGENT_SERVICE_AUTHORIZE_PATH);
+        assert_eq!(asked.len(), 2);
+        let sent: ServiceAuthorizeRequest = serde_json::from_slice(&asked[0].body).unwrap();
+        assert_eq!(sent, service_request());
+        let ended: ServiceEnd =
+            serde_json::from_slice(&gate.requests(AGENT_SERVICE_END_PATH)[0].body).unwrap();
+        assert_eq!(ended, end);
+        let issued: ServiceCertificateRequest =
+            serde_json::from_slice(&gate.requests(AGENT_SERVICE_CERTIFICATE_PATH)[0].body).unwrap();
+        assert_eq!(issued, certificate);
+        gate.stop().await;
     }
 
     #[tokio::test]
@@ -1020,10 +1233,10 @@ mod tests {
         let (api, node) = client(&pki, &endpoint, API_KEEPALIVE);
         gate.set_identity(node);
         gate.set_standing(
-            TRUST_V2_PATH,
+            AGENT_TRUST_V3_PATH,
             ApiStep::Json(
                 200,
-                json!({"trust_id": "t", "user_ca_keys": [user_ca_line()], "host_ca_active": user_ca_line()}),
+                json!({"trust_id": "t", "user_ca_keys": [user_ca_line()], "host_ca_active": user_ca_line(), "user_x509_roots": []}),
             ),
         );
         let api = Arc::new(api);

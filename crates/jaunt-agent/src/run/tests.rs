@@ -13,7 +13,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_host_users::{HostUsersSection, Name};
 use jaunt_proto::{
-    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, RenewRequest, ServiceAnnouncement,
+    AGENT_CAPABILITIES_PATH, AGENT_SERVICES_PATH, AGENT_TRUST_V3_PATH, RenewRequest,
+    ServiceAnnouncement,
 };
 use jaunt_ssh::SshError;
 use jaunt_tunnel::{
@@ -208,6 +209,13 @@ async fn gate_and_node(
     let node = enrolled(&pki, &gate.endpoint(), not_before, not_after);
     gate.set_identity(node.identity());
     (pki, gate, node)
+}
+
+fn service_reads(gate: &FakeGate) -> usize {
+    gate.requests(AGENT_SERVICES_PATH)
+        .iter()
+        .filter(|seen| seen.method == "GET")
+        .count()
 }
 
 fn paths_besides_announcements(gate: &FakeGate) -> Vec<String> {
@@ -426,6 +434,16 @@ async fn renewal_at_half_life_swaps_the_certificate_for_new_connections_only() {
     let clock = ManualClock::new(at_unix_secs(t0 - 600));
     let agent = Agent::start(&node.path(), clock.clone());
     gate.wait_connected().await;
+    eventually("the startup calls of the agent API", || {
+        !gate.requests(TRUST_PATH).is_empty()
+            && !gate.requests(AGENT_CAPABILITIES_PATH).is_empty()
+            && gate
+                .requests(AGENT_SERVICES_PATH)
+                .iter()
+                .any(|seen| seen.method == "POST")
+            && service_reads(&gate) > 0
+    })
+    .await;
     clock.wait_for_sleeper(at_unix_secs(t0)).await;
     assert!(gate.renewals().is_empty());
 
@@ -464,16 +482,38 @@ async fn renewal_at_half_life_swaps_the_certificate_for_new_connections_only() {
         }
     }
 
+    let presented_at_disconnect = gate.auth.presented().len();
+    let reads_before = service_reads(&gate);
     assert!(gate.registry.disconnect(&node_id()));
     gate.wait_connected().await;
-    assert_eq!(gate.auth.presented().last(), Some(&new_x509));
+    eventually(
+        "the approved services to be read after the reconnection",
+        || service_reads(&gate) > reads_before,
+    )
+    .await;
+    let reconnected = gate.auth.presented();
+    assert!(
+        reconnected.len() >= presented_at_disconnect + 2,
+        "the tunnel and the API connection reconnect"
+    );
+    assert!(
+        reconnected[presented_at_disconnect..]
+            .iter()
+            .all(|der| *der == new_x509)
+    );
     clock.wait_for_sleeper(at_unix_secs(t0 + 3570)).await;
-    let presented_before = gate.auth.presented().len();
     clock.set(at_unix_secs(t0 + 3570));
-    eventually("the second renewal", || gate.renewals().len() == 2).await;
+    eventually("the second renewal to be stored", || {
+        gate.renewals().len() == 2 && node.record().x509_not_after == t0 + 4 * HOUR
+    })
+    .await;
+    let newest_x509 = node.file("x509.der");
     let presented = gate.auth.presented();
-    assert_eq!(presented.len(), presented_before + 1);
-    assert_eq!(presented.last(), Some(&new_x509));
+    assert!(
+        presented[presented_at_disconnect..]
+            .iter()
+            .all(|der| *der == new_x509 || *der == newest_x509)
+    );
 
     agent.stop().await;
     gate.stop().await;
@@ -597,9 +637,18 @@ async fn a_removed_node_stops_renewing_after_one_attempt() {
     })
     .await;
     assert_eq!(gate.renewals().len(), 1);
+    eventually("the trust set to be fetched", || {
+        !gate.requests(TRUST_PATH).is_empty()
+    })
+    .await;
     assert_eq!(
         paths_besides_announcements(&gate),
-        ["/v1/agent/renew", TRUST_PATH, TRUST_V2_PATH]
+        [
+            "/v1/agent/renew",
+            TRUST_PATH,
+            TRUST_V2_PATH,
+            AGENT_TRUST_V3_PATH
+        ]
     );
 
     agent.stop().await;
@@ -628,7 +677,7 @@ async fn an_expired_certificate_asks_for_reenrollment_without_renewal() {
         assert!(gate.renewals().is_empty());
         assert_eq!(
             paths_besides_announcements(&gate),
-            [TRUST_PATH, TRUST_V2_PATH]
+            [TRUST_PATH, TRUST_V2_PATH, AGENT_TRUST_V3_PATH]
         );
 
         agent.stop().await;
@@ -839,9 +888,18 @@ async fn the_agent_announces_its_services_once_the_tunnel_is_up() {
         !gate.requests(AGENT_SERVICES_PATH).is_empty()
     })
     .await;
-    let seen = gate.requests(AGENT_SERVICES_PATH);
+    eventually("the service announcement", || {
+        gate.requests(AGENT_SERVICES_PATH)
+            .iter()
+            .any(|seen| seen.method == "POST")
+    })
+    .await;
+    let seen: Vec<_> = gate
+        .requests(AGENT_SERVICES_PATH)
+        .into_iter()
+        .filter(|seen| seen.method == "POST")
+        .collect();
     assert_eq!(seen[0].node, node_id());
-    assert_eq!(seen[0].method, "POST");
     assert_eq!(seen[0].content_type.as_deref(), Some("application/json"));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap(),

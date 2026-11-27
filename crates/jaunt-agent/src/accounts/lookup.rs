@@ -185,7 +185,7 @@ mod tests {
                 dir.path(),
                 &format!("echo $$ > '{}'\nexec /bin/sleep 30", pid_file.display()),
             ),
-            Duration::from_millis(500),
+            Duration::from_secs(3),
         );
         let started = Instant::now();
         assert!(matches!(

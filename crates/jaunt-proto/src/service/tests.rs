@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    AnnouncedService, KubernetesAudit, MAX_SERVICES_PER_AGENT, QueryAudit, ServiceAnnouncement,
-    ServiceKind, ServiceList, ServiceProblem, ServiceSettings,
+    AnnouncedService, KubernetesAudit, MAX_SERVICES_PER_AGENT, NodeServices, QueryAudit,
+    ServiceAnnouncement, ServiceKind, ServiceList, ServiceProblem, ServiceSettings,
 };
 
 fn service(value: Value) -> AnnouncedService {
@@ -231,4 +231,32 @@ fn wire_types_reject_unknown_fields_and_kinds() {
     let mut extra = list;
     extra["services"][0]["address"] = json!("10.0.0.5:3000");
     assert!(serde_json::from_value::<ServiceList>(extra).is_err());
+}
+
+#[test]
+fn the_node_service_list_carries_only_id_kind_and_name() {
+    let wire = json!({"services": [
+        {"id": "4f0e7a52-6c1b-4b39-9d55-2a8f1f0c7e11", "kind": "postgres", "name": "billing"}
+    ]});
+    let parsed: NodeServices = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(parsed.services[0].kind, ServiceKind::Postgres);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+    for (path, value) in [
+        ("/services/0/labels", json!({"env": "prod"})),
+        ("/services/0/address", json!("10.0.0.5:5432")),
+        ("/truncated", json!(false)),
+    ] {
+        let mut extra = wire.clone();
+        let (parent, key) = path.rsplit_once('/').unwrap();
+        extra
+            .pointer_mut(if parent.is_empty() { "" } else { parent })
+            .unwrap()[key] = value;
+        assert!(
+            serde_json::from_value::<NodeServices>(extra).is_err(),
+            "{path}"
+        );
+    }
+    let mut unknown_kind = wire;
+    unknown_kind["services"][0]["kind"] = json!("ssh");
+    assert!(serde_json::from_value::<NodeServices>(unknown_kind).is_err());
 }

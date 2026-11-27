@@ -19,6 +19,7 @@ hostname = "0.4.2"
 http = "1.5.0"
 httpdate = "1.0.3"
 jaunt-host-users = { workspace = true }
+jaunt-limits = { workspace = true }
 jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }
@@ -47,6 +48,7 @@ zeroize = "1.9.2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 jaunt-gate = { workspace = true }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
 tempfile = "3.27.0"
 time = { version = "0.3.55", default-features = false }

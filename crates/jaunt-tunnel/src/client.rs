@@ -13,7 +13,7 @@ use rustls::{AlertDescription, ClientConfig};
 use thiserror::Error;
 use tokio::net::{TcpStream, lookup_host};
 use tokio::runtime::Handle;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_rustls::TlsConnector;
@@ -170,6 +170,23 @@ impl Default for ServedKinds {
     }
 }
 
+enum Served {
+    Fixed(ServedKinds),
+    Following(watch::Receiver<Option<ServedKinds>>),
+}
+
+impl Served {
+    fn contains(&self, kind: StreamKind) -> bool {
+        match self {
+            Self::Fixed(kinds) => kinds.contains(kind),
+            Self::Following(updates) => updates
+                .borrow()
+                .as_ref()
+                .is_some_and(|kinds| kinds.contains(kind)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientEvent {
     ConnectFailed(ConnectFailure),
@@ -186,6 +203,7 @@ pub struct TunnelClientConfig {
     pub backoff: BackoffPolicy,
     pub sessions: SessionRegistry,
     pub served_kinds: ServedKinds,
+    served_updates: Option<watch::Receiver<Option<ServedKinds>>>,
     events: broadcast::Sender<ClientEvent>,
 }
 
@@ -206,12 +224,17 @@ impl TunnelClientConfig {
             backoff: BackoffPolicy::default(),
             sessions: SessionRegistry::new(),
             served_kinds: ServedKinds::default(),
+            served_updates: None,
             events,
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ClientEvent> {
         self.events.subscribe()
+    }
+
+    pub fn follow_served_kinds(&mut self, updates: watch::Receiver<Option<ServedKinds>>) {
+        self.served_updates = Some(updates);
     }
 }
 
@@ -222,7 +245,7 @@ struct Context {
     agent_version: String,
     options: TunnelOptions,
     sessions: SessionRegistry,
-    served_kinds: ServedKinds,
+    served: Served,
     handler: Arc<dyn StreamHandler>,
     events: broadcast::Sender<ClientEvent>,
 }
@@ -257,7 +280,10 @@ impl TunnelClient {
             agent_version: config.agent_version,
             options: config.options,
             sessions: config.sessions,
-            served_kinds: config.served_kinds,
+            served: match config.served_updates {
+                Some(updates) => Served::Following(updates),
+                None => Served::Fixed(config.served_kinds),
+            },
             handler,
             events: config.events,
         };
@@ -402,7 +428,7 @@ impl Context {
         }
         let Some(meta) = StreamMeta::from_headers(&parts.headers)
             .ok()
-            .filter(|meta| self.served_kinds.contains(meta.kind()))
+            .filter(|meta| self.served.contains(meta.kind()))
         else {
             refuse(respond, StatusCode::BAD_REQUEST);
             return;
@@ -574,6 +600,26 @@ mod tests {
         assert!(served.contains(StreamKind::Kube));
         assert!(!served.contains(StreamKind::Db));
         assert_eq!(ServedKinds::new([]), Err(NoServedKinds));
+    }
+
+    #[test]
+    fn a_followed_set_decides_at_each_stream_and_none_serves_nothing() {
+        let (updates, receiver) = watch::channel(None);
+        let served = Served::Following(receiver);
+        for kind in [StreamKind::Ssh, StreamKind::Kube, StreamKind::Db] {
+            assert!(!served.contains(kind), "{kind:?}");
+        }
+        updates.send_replace(Some(ServedKinds::new([StreamKind::Db]).unwrap()));
+        assert!(served.contains(StreamKind::Db));
+        assert!(!served.contains(StreamKind::Ssh));
+        updates.send_replace(Some(ServedKinds::default()));
+        assert!(served.contains(StreamKind::Ssh));
+        assert!(!served.contains(StreamKind::Db));
+        drop(updates);
+        assert!(served.contains(StreamKind::Ssh));
+        let fixed = Served::Fixed(ServedKinds::new([StreamKind::Tcp]).unwrap());
+        assert!(fixed.contains(StreamKind::Tcp));
+        assert!(!fixed.contains(StreamKind::Ssh));
     }
 
     #[test]

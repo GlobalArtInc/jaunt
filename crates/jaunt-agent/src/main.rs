@@ -9,6 +9,7 @@ mod paths;
 mod pin;
 mod recording;
 mod run;
+mod runtime;
 mod ssh;
 mod state;
 #[cfg(test)]

@@ -650,3 +650,60 @@ async fn the_live_cap_refuses_a_whole_announcement_above_one_hundred_twenty_eigh
             .ssh_enabled
     );
 }
+
+#[tokio::test]
+async fn a_node_reads_only_its_own_approved_and_announced_services() {
+    let f = fixture().await;
+    let first = f
+        .announce_as(
+            "n1",
+            &[
+                item("a", "prod", "{}"),
+                item("b", "prod", "{}"),
+                item("c", "prod", "{}"),
+            ],
+            10,
+        )
+        .await;
+    let ids: Vec<String> = requested(&first)
+        .iter()
+        .map(|service| service.id.clone())
+        .collect();
+    for id in &ids[..2] {
+        assert!(matches!(
+            f.approve(id, None).await,
+            ServiceApproveOutcome::Approved(_)
+        ));
+    }
+    let other = f.announce_as("n2", &[item("z", "prod", "{}")], 10).await;
+    let other_id = requested(&other)[0].id.clone();
+    assert!(matches!(
+        f.approve(&other_id, None).await,
+        ServiceApproveOutcome::Approved(_)
+    ));
+    let names = |rows: Vec<Service>| -> Vec<String> {
+        rows.into_iter().map(|service| service.name).collect()
+    };
+    let services = f.store.services();
+    assert_eq!(
+        names(services.served_by("n1", 64).await.unwrap()),
+        ["a", "b"]
+    );
+    assert_eq!(names(services.served_by("n1", 1).await.unwrap()), ["a"]);
+    assert_eq!(names(services.served_by("n2", 64).await.unwrap()), ["z"]);
+
+    f.announce_as(
+        "n1",
+        &[item("a", "prod", "{}"), item("c", "prod", "{}")],
+        20,
+    )
+    .await;
+    assert_eq!(names(services.served_by("n1", 64).await.unwrap()), ["a"]);
+
+    sqlx::query("UPDATE nodes SET state = 'removed' WHERE id = 'n1'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert!(services.served_by("n1", 64).await.unwrap().is_empty());
+    assert!(services.served_by("unknown", 64).await.unwrap().is_empty());
+}

@@ -292,3 +292,46 @@ async fn the_agent_reports_a_gate_that_negotiates_no_application_protocol() {
     );
     agent.stop().await;
 }
+
+async fn status_of(gate: &mut FakeGate, session: &[u8], kind: &[u8]) -> StatusCode {
+    let request = if kind == b"ssh" {
+        headers(session, kind, b"203.0.113.9:1")
+    } else {
+        with_service(kind, session, &[b"main-cluster"])
+    };
+    let borrowed: Vec<(&str, &[u8])> = request
+        .iter()
+        .map(|(key, value)| (*key, value.as_slice()))
+        .collect();
+    gate.request(Method::POST, "/v1/stream", &borrowed, true)
+        .await
+        .0
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followed_set_of_kinds_is_read_at_every_stream() {
+    let pki = Pki::new("ca");
+    let leaf = pki.client_leaf("node-a");
+    let (addr, gate_rx) = start_fake_gate(&pki).await;
+    let waiting = handler(|stream: IncomingStream| async move {
+        let mut io = stream.io;
+        let mut byte = [0_u8; 1];
+        drop(io.read(&mut byte).await);
+    });
+    let (updates, receiver) = tokio::sync::watch::channel(None);
+    let options = AgentOptions {
+        served_updates: Some(receiver),
+        ..AgentOptions::default()
+    };
+    let agent = spawn_agent(addr, &pki, &leaf, waiting, options);
+    let mut gate = gate_rx.await.unwrap();
+    let bad = StatusCode::BAD_REQUEST;
+    assert_eq!(status_of(&mut gate, b"s1", b"ssh").await, bad);
+    assert_eq!(status_of(&mut gate, b"s2", b"kube").await, bad);
+    updates.send_replace(Some(ServedKinds::new([StreamKind::Kube]).unwrap()));
+    assert_eq!(status_of(&mut gate, b"s3", b"kube").await, StatusCode::OK);
+    assert_eq!(status_of(&mut gate, b"s4", b"ssh").await, bad);
+    updates.send_replace(None);
+    assert_eq!(status_of(&mut gate, b"s5", b"kube").await, bad);
+    agent.stop().await;
+}

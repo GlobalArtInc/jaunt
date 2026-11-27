@@ -7,12 +7,13 @@ use axum::response::Response;
 use jaunt_limits::{Decision, Rate, RateLimiter};
 use jaunt_policy::{Identity, PolicySet, ResourceInfo};
 use jaunt_proto::{
-    ServiceAnnouncement, ServiceKind as WireKind, ServiceList, ServiceProblem, ServiceSummary,
+    MAX_SERVICES_PER_AGENT, NodeService, NodeServices, ServiceAnnouncement,
+    ServiceKind as WireKind, ServiceList, ServiceProblem, ServiceSummary,
 };
 use jaunt_store::{AnnounceOutcome, AnnouncedService, Announcement, Service, ServiceKind};
 use jaunt_tunnel::ServiceName;
 
-use crate::agent::{AuthenticatedNode, node_removed};
+use crate::agent::{AuthenticatedNode, node_removed, refuse_unless_active};
 use crate::control::Control;
 use crate::http::{empty_response, error_response, json_body, json_response, server_error};
 use crate::identity::policy_identity;
@@ -26,8 +27,14 @@ pub(crate) const ANNOUNCEMENTS_PER_NODE: Rate = Rate::clamped(6, 6);
 pub(crate) const MAX_LISTED_SERVICES: usize = 1000;
 const NODES_TRACKED: usize = 10_000;
 
+pub(crate) const SERVICE_READS_PER_NODE: Rate = Rate::clamped(12, 12);
+
 pub(crate) fn announcement_limiter() -> RateLimiter<String> {
     RateLimiter::new(ANNOUNCEMENTS_PER_NODE, NODES_TRACKED)
+}
+
+pub(crate) fn read_limiter() -> RateLimiter<String> {
+    RateLimiter::new(SERVICE_READS_PER_NODE, NODES_TRACKED)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +170,42 @@ pub(crate) async fn announce(
         tracing::error!(target: "jaunt::control", "the service announcement task did not finish");
         server_error()
     })
+}
+
+pub(crate) async fn served(
+    State(control): State<Control>,
+    authenticated: Option<Extension<AuthenticatedNode>>,
+) -> Response {
+    let Some(Extension(AuthenticatedNode(node_id))) = authenticated else {
+        return empty_response(StatusCode::UNAUTHORIZED);
+    };
+    if let Decision::Limited { retry_after } = control.service_reads.check(&node_id, control.tick())
+    {
+        return too_many_requests(retry_after);
+    }
+    if let Some(refused) = refuse_unless_active(&control, &node_id).await {
+        return refused;
+    }
+    let limit = u32::try_from(MAX_SERVICES_PER_AGENT).unwrap_or(u32::MAX);
+    match control.store.services().served_by(&node_id, limit).await {
+        Ok(services) => json_response(
+            StatusCode::OK,
+            &NodeServices {
+                services: services
+                    .into_iter()
+                    .map(|service| NodeService {
+                        id: service.id,
+                        kind: wire_kind(service.kind),
+                        name: service.name,
+                    })
+                    .collect(),
+            },
+        ),
+        Err(err) => {
+            tracing::error!(target: "jaunt::control", error = %err, "reading the services of a node failed");
+            server_error()
+        }
+    }
 }
 
 pub(crate) fn reachable(policy: &PolicySet, identity: &Identity, service: &Service) -> bool {

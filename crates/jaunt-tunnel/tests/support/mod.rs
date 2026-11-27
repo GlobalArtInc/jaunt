@@ -38,7 +38,7 @@ use tokio::io::{
     WriteHalf,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -287,6 +287,7 @@ pub struct AgentOptions {
     pub tunnel: TunnelOptions,
     pub backoff: BackoffPolicy,
     pub served_kinds: Option<ServedKinds>,
+    pub served_updates: Option<watch::Receiver<Option<ServedKinds>>>,
 }
 
 impl Default for AgentOptions {
@@ -299,6 +300,7 @@ impl Default for AgentOptions {
                 reset_after: Duration::from_secs(30),
             },
             served_kinds: None,
+            served_updates: None,
         }
     }
 }
@@ -331,6 +333,9 @@ pub fn spawn_agent(
     config.backoff = options.backoff;
     if let Some(served_kinds) = options.served_kinds {
         config.served_kinds = served_kinds;
+    }
+    if let Some(updates) = options.served_updates {
+        config.follow_served_kinds(updates);
     }
     let events = config.subscribe();
     let sessions = config.sessions.clone();

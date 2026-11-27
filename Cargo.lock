@@ -2226,6 +2226,7 @@ dependencies = [
  "httpdate",
  "jaunt-gate",
  "jaunt-host-users",
+ "jaunt-limits",
  "jaunt-proto",
  "jaunt-record",
  "jaunt-ssh",

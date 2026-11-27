@@ -294,6 +294,14 @@ const SERVING_ON: &str = concat!(
      AND announced = 1 AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active')"
 );
 
+const SERVED_BY: &str = concat!(
+    "SELECT ",
+    service_columns!(),
+    " FROM services WHERE node_id = ? AND state = 'approved' AND announced = 1 \
+     AND EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') \
+     ORDER BY kind, name, id LIMIT ?"
+);
+
 const HOLDERS: &str = "SELECT s.id AS service_id, s.node_id AS node_id, n.name AS node_name, \
     s.kind AS kind, s.name AS name, s.revision AS revision, s.labels AS labels \
     FROM services s \
@@ -552,6 +560,16 @@ impl Services {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(service_from_row).transpose()
+    }
+
+    pub async fn served_by(&self, node_id: &str, limit: u32) -> Result<Vec<Service>, StoreError> {
+        let rows = sqlx::query(SERVED_BY)
+            .bind(node_id)
+            .bind(node_id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(service_from_row).collect()
     }
 
     pub async fn approved_holders(&self) -> Result<Vec<ApprovedHolder>, StoreError> {
