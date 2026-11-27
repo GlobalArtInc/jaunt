@@ -3,7 +3,7 @@ import os
 import subprocess
 import time
 
-from scenarios import enrol, logins
+from scenarios import enrol, host_users_web, logins
 from scenarios.recording import record_shell
 from stand import engine, recordings
 from stand.layout import OUT, ROOT, container
@@ -116,6 +116,13 @@ def run(args):
                 step.expect(len(closed) == 1, "terminal.closed of {}: {}".format(session_id, closed))
                 step.note("{} px: session {} recorded, closed with reason {}".format(
                     entry["width"], session_id[:8], closed[0].get("fields", {}).get("reason")))
+        with report.step("account creation in the browser: marker, creating and created banners, three refusals with references, at 380 and 1440 px") as step:
+            host_users_web.prepare(stand, step)
+            try:
+                run_node(step, "accounts.mjs", stand, host_users_web.environment())
+            finally:
+                host_users_web.finish(stand)
+            host_users_web.verify(stand, step)
         with report.step("the approved enrolments reached the node list") as step:
             status, listed = stand.api("GET", "/v1/admin/nodes")
             names = [node["name"] for node in listed["nodes"]] if status == 200 else []

@@ -178,7 +178,7 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `inner`, `recording` | maps | see below | the two sections that hold the keys that follow |
+| `inner`, `recording`, `host_users` | maps | see below | the sections that hold the keys that follow. `host_users` is described in its own section after this table |
 | `state_dir` | absolute path | `/var/lib/jaunt` | the enrolled identity: keys, certificates, `state.json`, `inner-ca.pub`. Mode 0700 |
 | `log_level` | string | `info` | a log filter; `RUST_LOG` overrides it |
 | `inner.sshd_addr` | address:port | `127.0.0.1:22` | where the local `sshd` listens. Must be a loopback address |
@@ -191,9 +191,45 @@ Command-line flags:
 | Command | Flags |
 |---|---|
 | `jaunt-agent enroll` | `--server <URL>` and `--name <NAME>` (required), `--labels k=v,...`, `--replace`, `--ca-pin sha256:<hex>`, `--state-dir <DIR>` (default `/var/lib/jaunt`), `--hostname <NAME>`, `--timeout-secs <N>` (default 900), `--token-file <PATH>` (enrol with a join token from this file, without an approval code; see [operations.md](operations.md#enrol-many-nodes-with-join-tokens)) |
-| `jaunt-agent install` | `--user` (default `jaunt`), `--binary` (default `/usr/local/bin/jaunt-agent`), `--config`, `--state-dir`, `--root` (default `/`), `--no-service`, `--dry-run` |
+| `jaunt-agent install` | `--user` (default `jaunt`), `--binary` (default `/usr/local/bin/jaunt-agent`), `--config`, `--state-dir`, `--root` (default `/`), `--no-service`, `--dry-run`, `--create-accounts` (set up account creation at first login, see [operations.md](operations.md#account-creation-at-first-login)) |
 | `jaunt-agent uninstall` | `--purge`, `--config`, `--state-dir`, `--root`, `--no-service`, `--dry-run` |
 | `jaunt-agent run` | `--config <PATH>`, `--state-dir <DIR>` |
+
+### host_users
+
+Account creation at first login is off unless the operator of the node turns it on. The section lives in `/etc/jaunt/agent.yaml`, which must be owned by root and writable only by root: the helper that creates the accounts (`jaunt-host-users`, running as root) reads the same file on every request and refuses to act on a file, or on `/etc/jaunt` or `/etc`, that group or others can write. The control plane cannot change it. How to turn it on and what the feature does is in [operations.md](operations.md#account-creation-at-first-login); the threat model is in [security.md](security.md#account-creation-and-the-root-helper).
+
+```yaml
+host_users:
+  enabled: true
+  groups: [developers]
+  home_mode: "0750"
+  uid_min: 30000
+  uid_max: 30999
+  max_users: 100
+  names:
+    deny_prefixes: [svc-]
+```
+
+Every key is optional. The agent reads the file strictly, like every other agent key. An unknown key, or a value of the wrong type (`uid_min: abc`, `max_users: -1`, `groups: ops` instead of a list, `home_mode: 750` without quotes), stops the agent when it loads the file: `jaunt-agent run` exits with status 1 and prints `is not a valid agent configuration` with the key and its line, and under systemd `systemctl status jaunt-agent` shows that text. A value of the right type that is out of range or makes no sense (a range smaller than `max_users`, `uid_min` below 1000, `home_mode` of another string, a group that does not exist) does not stop the agent: account creation stays off, the agent logs the warning `agent.host_user.config_invalid` and the helper answers `disabled`.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `host_users.enabled` | boolean | `false` | the switch. `jaunt-agent install --create-accounts` sets it to `true` |
+| `host_users.groups` | list of names | empty | supplementary groups of every created account. Each group must exist on the node; at most 32 groups together with `privileged_groups`; a group may be listed once. A name from the privileged list (`root`, `sudo`, `wheel`, `adm`, `admin`, `docker`, `lxd`, `libvirt`, `disk`, `shadow`) is an error here |
+| `host_users.privileged_groups` | list of names | empty | the only place where a privileged group may be listed. The account joins it too, and a login with the name of one of these groups is refused as a reserved name |
+| `host_users.shell` | absolute path | `/bin/bash` | the login shell. It must be listed in `/etc/shells` and be an executable file of root that others cannot write. At most 128 bytes |
+| `host_users.home_base` | absolute path | `/home` | the directory that holds the homes: `<home_base>/<login>`. It must exist, belong to root, not be writable by group or others and not be a link. A system directory such as `/`, `/etc`, `/usr`, `/var` or `/root` is an error. At most 95 bytes. After a change run `jaunt-agent install --create-accounts` again, because the helper unit lists the directory as writable |
+| `host_users.home_mode` | string | `"0750"` | the mode of the new home: `"0700"`, `"0750"` or `"0755"`. Quote it, so that YAML does not read an octal number |
+| `host_users.uid_min` | integer | `30000` | the lowest uid of a created account, 1000 or more |
+| `host_users.uid_max` | integer | `30999` | the highest uid, 59999 or less. The range must hold at least `max_users` ids. `useradd` picks the id itself; the group id is taken from the same range |
+| `host_users.max_users` | integer | `100` | how many created accounts that still exist may be there at once, 1 to 1000. Accounts deleted by hand stop counting |
+| `host_users.names.deny` | list of names | empty | logins that are never created |
+| `host_users.names.deny_prefixes` | list of names | empty | logins that start with one of these are never created |
+| `host_users.names.allow_prefixes` | list of names | empty | if not empty, only logins that start with one of these are created |
+| `host_users.allow_with_directory` | boolean | `false` | create accounts although `/etc/nsswitch.conf` takes users from a directory (`ldap`, `nis`, `winbind`, or `sss` while `/etc/sssd/sssd.conf` exists). Off by default, because when the directory is down `getent` answers "no such user" and a local shadow of a directory user would be created |
+
+Every name in these lists is written like a login: `[a-z_][a-z0-9_.-]{0,31}`. A login must pass `names` and must not be reserved: the built-in list holds the static users and groups of Debian's `base-passwd`, `administrator`, `operator`, `jaunt`, `sshd`, common service names (`postgres`, `mysql`, `redis`, `nginx`, `git`, `gitlab-runner`, `www-data`, `ubuntu`, `debian`, `rocky`, `ec2-user`), every name that starts with `systemd-` or `_`, and the privileged groups. The limits of the helper that no key changes: at most 5 creation attempts in a minute and 50 in a day per node.
 
 ## The command-line client
 

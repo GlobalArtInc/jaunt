@@ -428,7 +428,7 @@ sudo journalctl -u jauntd -o cat | grep '^{"v":1' | jq -c 'select(.type | starts
 
 The console's Audit log page and `GET /v1/admin/audit` (permission `audit.read`, browser session) read the database. Query parameters, each at most once: `type` (a type or a prefix such as `session.`), `actor`, `node` (node id), `session`, `from` and `to` (RFC 3339 UTC, `from` before `to`), `limit` (default 50, at most 200) and `cursor` (from `next_cursor`). An unknown parameter is an error `unknown_parameter`. The answer is `{"events": [...], "next_cursor": "..."}`.
 
-The 65 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
+The 70 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; text fields are truncated to a fixed length; `email` is never stored):
 
 | Type | Actor | Fields |
 |---|---|---|
@@ -447,6 +447,8 @@ The 65 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `cert.rotated` | system | `not_after` |
 | `admin.csrf_denied` | user | `reason` |
 | `admin.enrolment.looked_up` | user | `outcome`, `enrollment_id` |
+| `admin.signed_request` | user | `decision`, `reason`, `serial`, `method`, `path`, `client_addr` |
+| `admin.signed_request_refused` (noisy) | anonymous | `reason`, `client_addr`, `suppressed` |
 | `authz.deny` | user | `phase`, `reason`, `permission`, `serial`, `node_name`, `login`, `client_addr`; envelope: node, session_id, policy_hash |
 | `session.routed` | user | `serial`, `node_name`, `client_addr`; envelope: node, session_id, policy_hash |
 | `session.start` | user | `serial`, `login`, `pty`, `port_forwarding`, `record_input`, `max_duration_secs`, `roles`, `client_addr`; envelope: node, session_id, policy_hash |
@@ -496,7 +498,10 @@ The 65 types and their fields (generated from `crates/jaunt-audit/src/spec.rs`; 
 | `ca.reload.failed` | system | `reason` |
 | `terminal.opened` | user | `node`, `login`, `serial`, `client_addr`; envelope: node, session_id |
 | `terminal.closed` | user | `reason`, `bytes_in`, `bytes_out`, `duration_ms`, `serial`; envelope: node, session_id |
-| `terminal.denied` (noisy) | user | `reason`, `node`, `login`, `client_addr`, `suppressed` |
+| `terminal.denied` (noisy) | user | `reason`, `node`, `login`, `client_addr`, `suppressed`, `ref` |
+| `host_user.created` | user | `login`, `uid`, `home`, `groups`, `ref`; envelope: node, session_id |
+| `host_user.refused` (noisy) | user | `login`, `reason`, `ref`, `suppressed`; envelope: node, session_id |
+| `host_user.helper_failed` (noisy) | user | `login`, `stage`, `exit_status`, `ref`; envelope: node, session_id |
 
 What is **not** audited: terminal output and keystrokes (that is the recording); individual SFTP file operations; the contents of commands run with `ssh host command` beyond what the metadata recording holds; reads of the console pages other than recordings; and the agent-side events listed under `agent.ssh.*` (they are in the agent's log, not in the server's trail). The `jauntd` subcommands that change state (`revoke`, `node approve`, `node rm`, `join-token create`, `join-token rm`, `ca ...`) are audited; `node list`, `join-token list`, `ca status` and `recordings verify` are not. With `audit.database: false` the console and the API see nothing; with `audit.jsonl: off` the trail exists only in the database, which an administrator with access to the host can alter.
 
@@ -510,7 +515,7 @@ The gate and the agent answer a refusal with a generic text on purpose, so that 
 | `jaunt: your certificate has expired, run jaunt login` | the user certificate ended | `jaunt login`; `jaunt status` shows the time left |
 | `jaunt: too many open sessions` | 8 streams for the same user and node | `gate.forward` `outcome: limit` |
 | `Permission denied (publickey).` straight from the gate (no `jaunt:` text) | the certificate is not signed by a trusted user CA, expired, or the key is not the one in the certificate | audit `gate.auth` with `outcome` and `reason` (`untrusted_ca`, `expired`, `plain_key`, ...) |
-| `Permission denied (publickey).` after the gate accepted | the **agent** refused. Agent log `agent.ssh.auth` with `reason`: `login` (the login does not match `[a-z_][a-z0-9_.-]{0,31}`), `untrusted_ca` (the agent has an old trust set), `policy_denied`, `revoked`, `session_used`, `inner_login` failures `host_key_mismatch`, `refused`, `connect`, or `not_loopback` | `journalctl -u jaunt-agent`; the server's `authz.deny` when the agent asked the server |
+| `Permission denied (publickey).` after the gate accepted | the **agent** refused. Agent log `agent.ssh.auth` with `reason`: `no_account`, `account_refused` or `account_failed` (account creation, see [Account creation at first login](#account-creation-at-first-login)), `login` (the login does not match `[a-z_][a-z0-9_.-]{0,31}`), `untrusted_ca` (the agent has an old trust set), `policy_denied`, `revoked`, `session_used`, `inner_login` failures `host_key_mismatch`, `refused`, `connect`, or `not_loopback` | `journalctl -u jaunt-agent`; the server's `authz.deny` when the agent asked the server |
 | the web terminal shows "Access denied" | same causes as the line above; with `reason=login` in the node log the login has an upper-case letter or a character the agent does not accept | node log `agent.ssh.auth outcome=denied reason=login`; audit `terminal.denied`, `terminal.closed` |
 | Console login fails after waiting a long time on the identity provider page | the login state lives 5 minutes; start again | audit `login.callback_refused`, `login.denied` with `reason: request_expired` or `unknown_state` |
 | Sign-in is denied right after the provider's page, for a user who can sign in elsewhere | the provider's `email_verified` is not true and `oidc.require_verified_email` is on (the default); or the provider sends no `email`, `sub` or username claim under the configured names | audit `login.denied` with `reason: email_not_verified` or `identity_rejected`; set `oidc.require_verified_email`, `oidc.username_claim` or `oidc.scopes` ([configuration.md](configuration.md#oidc)) |
@@ -571,3 +576,105 @@ The terminal logs in to the node with a web certificate that the server signs fo
 A terminal ends when: the shell exits; the user closes the tab (the server notices a dead browser after 60 seconds without an answer to its pings); there is no input and no output for `web_terminal.idle_timeout_secs` (30 minutes); the session reaches its time limit of 12 hours; the user is revoked (4001, within about a second); the web session ends because the user signed out or the 8 hour cookie expired (1008); `jauntd` restarts. A browser that signs out on one `jauntd` instance and keeps a terminal on another is noticed within 60 seconds. Open terminals per user and in all are limited (see Limits).
 
 Behind a reverse proxy the WebSocket upgrade and a read timeout of more than a minute must be allowed (the server sends a ping every 20 seconds), and the proxy must pass the `Origin` header and the `Sec-WebSocket-Protocol` header as one line.
+
+## Account creation at first login
+
+By default a user can log in only as an account that already exists on the node. A node can create the account at the first login instead: the policy still decides who may use which login, and the node decides, with its own rules, whether it will create that account. The operator of the node turns this on; the control plane cannot.
+
+Two programs take part. The agent (`jaunt-agent`, the unprivileged user `jaunt`) notices that the account is missing and asks. The helper (`jaunt-host-users`, root) is started by systemd for each request on the socket `/run/jaunt/host-users.sock` (owner `root`, group `jaunt`, mode 0660), checks the rules in `/etc/jaunt/agent.yaml` itself and runs `useradd`. The helper can create accounts. It cannot change or delete one, and it never creates a login that the rules refuse. [security.md](security.md#account-creation-and-the-root-helper) states what a compromised agent can still do. Supported nodes: Debian 12 and 13, Ubuntu 22.04 and 24.04 and Rocky Linux 9, all with systemd. Alpine is not supported: the installer needs systemd, and BusyBox `adduser` differs from `useradd`.
+
+### Enable it
+
+Put `jaunt-agent` and `jaunt-host-users` together in a directory that only root can change, and install with the flag. The helper must be named `jaunt-host-users` and sit in the directory of the `--binary` path:
+
+```sh
+sudo install -d -m 0755 -o root -g root /opt/jaunt/bin
+sudo install -m 0755 -o root -g root jaunt-agent jaunt-host-users /opt/jaunt/bin/
+sudo /opt/jaunt/bin/jaunt-agent install --dry-run --create-accounts --binary /opt/jaunt/bin/jaunt-agent
+sudo /opt/jaunt/bin/jaunt-agent install --create-accounts --binary /opt/jaunt/bin/jaunt-agent
+```
+
+With the `.deb` package both binaries are in `/usr/bin` and the second command is `sudo jaunt-agent install --create-accounts --binary /usr/bin/jaunt-agent`. The default `--binary /usr/local/bin/jaunt-agent` is refused on Debian and Ubuntu: `/usr/local` and `/usr/local/bin` are `root:staff` with mode 2775 there, so members of `staff` could replace a binary that root runs. Use the package, use `/opt/jaunt/bin`, or tighten the two directories with `chmod g-w,o-w` when that is safe on your system. The installer refuses, and changes nothing, when the helper is missing, is a link, belongs to another user, is writable by group or others, carries a setuid or setgid bit, or sits below a directory that is not owned by root or is writable by group or others. The error names the path. These checks happen at install time only: after you change the permissions of the helper or of a directory above it, and after every upgrade of the binaries, run `jaunt-agent install --create-accounts` again.
+
+The installer writes the `host_users` section with `enabled: true` and the defaults of [configuration.md](configuration.md#host_users), the units `/etc/systemd/system/jaunt-host-users.socket` and `jaunt-host-users@.service` (the helper runs under `ProtectSystem=strict`, a private `/tmp` and network namespace, `NoNewPrivileges`, a seccomp filter of `@system-service` and only the capabilities `CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_FOWNER` and `CAP_FSETID`), enables the socket and restarts a running agent once. With `--no-service` it writes the files and prints the two `systemctl` commands to run. On a node that is already enrolled run it the same way; the enrolment is not touched.
+
+It also warns about things that would stop the feature from working. Read the warnings:
+
+| Warning | Meaning |
+|---|---|
+| `sshd -T` shows that AllowUsers is set | the accounts that the agent creates are not in `AllowUsers`, so `sshd` refuses them after the account exists. Add each one, or switch to `AllowGroups` and put a group from `groups` in it |
+| `sshd -T` shows that AllowGroups is set | add to it a group listed in `groups` of the section |
+| `/etc/nsswitch.conf` takes users from a directory service | creation stays off unless `allow_with_directory: true` is set; see below |
+| `useradd`, `userdel` or `getent` not found | the helper refuses to create accounts until they are installed |
+| `home_base` does not exist | create it (owned by root, not writable by group or others), or the helper service cannot start |
+| SELinux is Enforcing | see the note below |
+
+The section belongs to the operator. `install --create-accounts` keeps every value you wrote in it (it only sets `enabled: true`), and an install without the flag keeps it as it is. The installer does rewrite the rest of the managed `agent.yaml`: another top-level key that you added by hand, for example `recording:`, is lost when you run `install` again, so keep such keys in mind or put them back afterwards. Edit the section in a text editor, keep the file owned by root with mode 0644, and restart the agent. The helper reads the file again for every request; the agent reads it only when it starts, so a change of the uid range, `names`, `groups` or `enabled` needs `sudo systemctl restart jaunt-agent` to take effect on the agent side. If the section is wrong the agent and the helper do not create accounts at all (see "A broken section" below).
+
+### Turn it off
+
+Set `enabled: false` in the section and restart the agent. `install` without the flag never turns creation off. `jaunt-agent uninstall` removes the two helper units and, together with the managed `agent.yaml`, the section; it keeps every created account, their home directories, `/var/lib/jaunt-host-users` and the `jaunt-host-users` binary, and prints how many accounts it kept.
+
+### What a user sees
+
+The agent looks the login up with `getent passwd`. An existing account (including one made by an earlier request or by hand) is used as before and the helper is not asked. Only a missing account starts the creation, and only if the section is on, valid and the helper listens. The first login then takes a little longer: the account is created, then the login goes on.
+
+| Case | Command line (`ssh`) | Web terminal |
+|---|---|---|
+| account created | the shell opens | a banner "Creating your account ..." while it runs, then "Account created." with the home directory (dismissable) above the terminal; the console never writes into the terminal area |
+| creation off or not available | `Permission denied (publickey).` | "There is no account <login> on <node>." with the reference |
+| the node refuses the login (name rule, reserved name, existing group of that name, existing home directory, `max_users`, no free uid) | `Permission denied (publickey).` | "Your account could not be created." with the reference |
+| the helper failed, or the rate limit of 5 creations a minute was reached | `Permission denied (publickey).` | "The node could not create your account. Try again later." with the reference |
+| the account exists but `sshd` refuses it (`AllowUsers`, `AllowGroups`, `DenyUsers`, PAM) | `Permission denied (publickey).` | the generic denial of the console |
+
+On the command line the user never learns why: the text is the same generic refusal as for every other denial. A refusal by the helper is remembered by the agent for 60 seconds: the same login again in that time is refused at once, with the same reference, and the helper is not asked again. The name rules (`names`, reserved names) are checked by the agent first, so such a refusal never reaches the helper, leaves no line in the helper journal and gets a new reference for every attempt.
+
+The reference `H-` plus eight hexadecimal digits identifies one attempt and is the key to the records of one attempt. The agent makes it for each attempt and gives it to the helper and to the control plane. Every attempt that reaches the helper has the reference in all three places below. Two cases have fewer: a refusal by the node rules that the agent checks first (name rule, reserved name) never reaches the helper, so the helper journal has no line; and a login that finds no account while creation is off or unavailable (`agent.host_user.missing`) has no `host_user.*` event in the control audit:
+
+| Where | How to find it |
+|---|---|
+| agent log | `journalctl -u jaunt-agent -o cat \| grep H-1A2B3C4D`: the lines `agent.host_user.created`, `agent.host_user.refused`, `agent.host_user.helper_failed` and `agent.host_user.missing`, with `session_id` and `login`. The line `agent.ssh.auth` with `outcome=denied` and `reason` `no_account`, `account_refused` or `account_failed` has the same `session_id` |
+| helper journal | `journalctl -t jaunt-host-users -o cat \| grep H-1A2B3C4D`: one line per request with `ref`, `session`, `login`, `outcome` (`created`, `exists`, `refused`, `failed`, `disabled`), `reason` or `stage`, `uid`, the exit status of `useradd` and up to 256 bytes of its error output. Only the helper journal has the details of a failure |
+| control audit | `host_user.created`, `host_user.refused` and `host_user.helper_failed` carry `ref`. Query `GET /v1/admin/audit?type=host_user.` ([Audit](#audit)) and look at the field. Refusals are limited to a burst of 5 and then 1 every 10 seconds per node, and then counted in `suppressed`; `terminal.denied` for the web terminal has the reasons `no_account`, `account_refused` and `account_failed` |
+
+When several first logins for the same new name arrive together, the agent makes the account once and logs one `agent.host_user.created`. The control audit can hold several `host_user.created` events for that one account with the same `ref`: one for each session that waited for the shared attempt (one to three in the test with eight parallel logins).
+
+### Accounts the helper made
+
+```sh
+sudo jaunt-host-users list
+sudo jaunt-host-users list --json
+```
+
+Columns: `LOGIN`, `STATE`, `UID`, `ACCOUNT`, `CREATED (UTC)`, `REF`, `SESSION`, `HOME`. `STATE` is `active` for a normal account, `pending` for a creation in progress and `unconfirmed` for one that ended in a state the helper could not verify; unconfirmed accounts count against `max_users` and the helper logs them at ERROR level. `ACCOUNT` compares the record with the system: `present`, `missing` (deleted since), `other_uid` (the name now belongs to another uid: the helper no longer treats it as its own), `unbound` (the record has no uid yet and the name exists) or `unknown` (the lookup was not possible). An account that carries a record and the same uid is the helper's; `jaunt` is written in its comment field for people only.
+
+Accounts are never deleted automatically: not at logout, not on a timer, not at `uninstall`. To remove one, with its home directory and mail:
+
+```sh
+sudo jaunt-host-users list
+sudo userdel --remove <login>
+```
+
+Check first that nobody uses the account and that the home directory holds nothing you need. The next request makes the helper forget the record (it logs `forgotten=<login>`) and the account stops counting against `max_users`. A login that was removed can be created again.
+
+### A broken section
+
+The agent reads `agent.yaml` strictly. An unknown key in `host_users`, or a value of the wrong type (`uid_min: abc`, `max_users: -1`, `groups: ops` instead of a list, `home_mode: 750` without quotes), makes it stop when it loads the file: `jaunt-agent run` prints `... is not a valid agent configuration: unknown field ... at line N` (or the type error) and exits with status 1, so the service does not start and `systemctl status jaunt-agent` shows that text. A value of the right type that is out of range or inconsistent (a range smaller than `max_users`, `uid_min` below 1000, `home_mode` of another string, a group that does not exist, a shell that is not in `/etc/shells`) does not stop the agent: it logs the warning `agent.host_user.config_invalid` with the reason, does not announce account creation, and every missing account is refused as `no_account`; the helper answers `disabled` for the same section. Fix the file and restart the agent.
+
+### What the agent announces, and the probe
+
+When its tunnel connects, the agent tells the control plane whether the node creates accounts, and repeats it every minute. The announcement is `true` only if the section is enabled and valid, the helper socket exists and accepts a connection, and the node takes no users from a directory. The console shows the marker "Creates accounts" on such a node only while that agent connection lasts. To check the socket the agent connects to it once for each tunnel connection and closes it without a request. That is one start of the helper unit that ends with exit status 1: `systemctl status` of the instance would show `failed`, the journal holds one warning `outcome=failed stage=request` per tunnel connection, and `CollectMode=inactive-or-failed` removes the instance at once, so no failed units pile up. The socket is probed only then, not every minute: if it appears after the agent connected, the node stays "does not create" until the agent reconnects, so restart the agent after you install the helper (the installer does it for a running agent). After a restart of the agent the marker can appear up to a minute late.
+
+### Time budget of the first login
+
+The agent waits up to 2 seconds for `getent`, 2 seconds for each report to the control plane and 11 seconds for the helper. The helper reads the request for at most 5 seconds, waits at most 2 seconds for its state lock (answers `failed` with the stage `busy` otherwise), gives `useradd` 5 seconds and the rollback with `userdel` 2 seconds more, and ends after at most 30 seconds (`RuntimeMaxSec`). The 45 seconds are the agent's own limit for authenticating a login (`AGENT_AUTH_DEADLINE`); when it runs out, the login ends as the generic refusal. The console's web terminal has a separate, outer bound of 50 seconds (`SETUP_TIMEOUT`) for the whole setup, so the agent's limit is the one that normally ends a slow first login. A first login that takes longer than that ends as the generic refusal; the account may still appear, and the next login finds it.
+
+### Details that matter on a real node
+
+- **UsePAM.** The account gets the password field `*`: password login is impossible, but `sshd` does not treat the account as locked. A locked hash (`!`) would be refused with `UsePAM no`; with `UsePAM yes` the PAM `account` modules decide. Both settings were tested on Debian 13 and Rocky Linux 9. Rocky's `sshd` prints a warning that `UsePAM no` is not supported there.
+- **sshd rules still apply.** `AllowUsers`, `AllowGroups`, `DenyUsers`, `DenyGroups`, `/etc/security/access.conf` and PAM can refuse an account that was just created. The user sees the generic refusal, the account stays (within `max_users`), and `sshd` says why in its log (`not allowed because not listed in AllowUsers`).
+- **Network directories.** With `passwd: ... sss`, `ldap`, `nis` or `winbind` in `/etc/nsswitch.conf` (for `sss` only while `/etc/sssd/sssd.conf` exists), creation is off and the helper answers `disabled`. With `allow_with_directory: true` the account is created. What the test showed about `sss_cache`: on Debian 13 (systemd 257, `sssd-common` and `sssd-tools` installed, `sssd` itself failed to start in the test container) the helper journal held `sss_cache` errors, `Unable to open config database [/var/lib/sss/db/config.ldb]`, while `useradd` exited 0 and the account was created; the same `sss_cache` command run by root outside the unit exited 0. The message says the SSSD database could not be opened from inside the unit; it does not tell whether `ProtectSystem=strict` or the missing database caused it, and a node with a running SSSD was not tested. On Rocky Linux 9 the same test showed no error. Making `/var/lib/sss` writable for the helper unit with a drop-in was not tested.
+- **SELinux.** In containers SELinux is off and the label of the home directory could not be checked. On a node where it is Enforcing, create the first account and run `ls -Zd /home/<login>`: `useradd` sets the label, and the helper does not touch contexts. The installer prints this reminder.
+- **Home directories on NFS or autofs.** `useradd --create-home` fails there; set another `home_base`.
+- **Account and group numbers.** `useradd` chooses the uid itself within `uid_min` to `uid_max`, and the private group gets a number from the same range. A range without a free id ends as `refused` with the reason `uid_range`.
+- **Failures in the middle.** If `useradd` fails after it made the account, the helper rolls back only what it made itself (account, group, home) and logs it (`rollback=removed`). Anything else becomes `unconfirmed`.

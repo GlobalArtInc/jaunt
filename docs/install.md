@@ -5,6 +5,7 @@ Every release at https://github.com/GlobalArtInc/jaunt/releases carries these fi
 | File | Contents | Platforms |
 |---|---|---|
 | `jaunt-agent-<version>-<target>.tar.gz` | the node agent | Linux x86_64 and aarch64 |
+| `jaunt-host-users-<version>-<target>.tar.gz` | the helper that creates accounts at first login; only for nodes that use `jaunt-agent install --create-accounts` | Linux x86_64 and aarch64 |
 | `jaunt-<version>-<target>.tar.gz` | the command-line client | Linux x86_64 and aarch64, macOS Apple silicon and Intel |
 | `jauntd-<version>-<target>.tar.gz` | the control daemon, for hosts that do not use the container image | Linux x86_64 and aarch64 |
 | `SHA256SUMS` | checksums of all archives | |
@@ -80,6 +81,24 @@ Approval can replace the proposed labels (`--labels`). When the node is approved
 sudo systemctl start jaunt-agent
 ```
 
+### Create accounts at first login (optional)
+
+A node can create the operating-system account of a user the first time that user logs in. This needs the second binary, `jaunt-host-users` (a small program that runs as root, see [security.md](security.md#account-creation-and-the-root-helper)), and the flag `--create-accounts` on `install`. What the feature does, how to run it and how to turn it off is in [operations.md](operations.md#account-creation-at-first-login); the keys are in [configuration.md](configuration.md#host_users). This page covers only the installation.
+
+The helper must be named `jaunt-host-users` and lie in the same directory as the agent binary that you pass with `--binary`. Because root runs it, the installer refuses to continue unless the helper is a regular file of root, not writable by group or others, without setuid or setgid bits, and every directory above it belongs to root and is not writable by group or others. Nothing is changed when it refuses, and the error names the path and the fix.
+
+On Debian and Ubuntu `/usr/local` and `/usr/local/bin` are `root:staff` with mode 2775, so the default `--binary /usr/local/bin/jaunt-agent` is refused with `--create-accounts`. Use the `.deb` package (both binaries are installed in `/usr/bin`), or put both binaries in a directory that you create for them, or run `chmod g-w,o-w` on the two directories if that is safe on your system:
+
+```sh
+sudo install -d -m 0755 -o root -g root /opt/jaunt/bin
+sudo install -m 0755 -o root -g root jaunt-agent jaunt-host-users /opt/jaunt/bin/
+sudo /opt/jaunt/bin/jaunt-agent install --create-accounts --binary /opt/jaunt/bin/jaunt-agent
+```
+
+The check is made when `install` runs. After you change the permissions of the helper or of a directory above it, and after you replace the binaries in an upgrade, run the same `install --create-accounts` command again: the installer checks again and refuses an unsafe state. Running it again is safe: the `host_users` section that you edited is kept. The installer rewrites the rest of the managed `/etc/jaunt/agent.yaml` as before, so other top-level keys that you added by hand (for example `recording:`) are lost; the `host_users` section is the exception.
+
+`install --create-accounts` writes the section with `enabled: true`, the units `jaunt-host-users.socket` and `jaunt-host-users@.service` in `/etc/systemd/system`, enables the socket and restarts a running agent once. With `--no-service` it writes the files only and tells you which `systemctl` commands to run. It prints a warning when `sshd -T` shows `AllowUsers` or `AllowGroups`, when `/etc/nsswitch.conf` takes users from a directory, when `useradd`, `userdel` or `getent` is missing and when SELinux is enforcing. Alpine is not supported.
+
 ## Install the command-line client
 
 ```sh
@@ -126,7 +145,7 @@ sudo apt-get install jaunt-agent
 sudo apt-get install jaunt
 ```
 
-The packages install files only: `/usr/bin/jaunt-agent` (or `/usr/bin/jaunt`) and, for the agent, the unit file `/usr/lib/systemd/system/jaunt-agent.service`. They do not enrol the node, create the `jaunt` account, change the sshd configuration or start anything. Set the node up yourself, in this order: run the installer first, enrol second, start the service last. The installer needs to know where the packaged binary is, and `jaunt-agent install` refuses to run on a node that is already enrolled. The `enroll` options are described in [Install the node agent](#install-the-node-agent).
+The packages install files only: `/usr/bin/jaunt-agent` (or `/usr/bin/jaunt`) and, for the agent, the unit file `/usr/lib/systemd/system/jaunt-agent.service` and the account helper `/usr/bin/jaunt-host-users`, which does nothing until you install with `--create-accounts`. They do not enrol the node, create the `jaunt` account, change the sshd configuration or start anything. Set the node up yourself, in this order: run the installer first, enrol second, start the service last. The installer needs to know where the packaged binary is. The `enroll` options are described in [Install the node agent](#install-the-node-agent).
 
 ```sh
 sudo jaunt-agent install --dry-run --binary /usr/bin/jaunt-agent
@@ -150,7 +169,7 @@ sudo install -m 0755 "jaunt-agent-$version-$target/jaunt-agent" /usr/local/bin/j
 sudo systemctl restart jaunt-agent
 ```
 
-Enrolment is not repeated: the identity under `/var/lib/jaunt` is kept.
+Enrolment is not repeated: the identity under `/var/lib/jaunt` is kept. On a node that creates accounts, replace `jaunt-host-users` next to the agent and run `sudo jaunt-agent install --create-accounts --binary <path>` again before the restart.
 
 ## Uninstall
 
@@ -161,6 +180,8 @@ sudo jaunt-agent uninstall --purge
 ```
 
 The first form shows the plan, the second removes the service and the sshd drop-in and keeps the state, the third also removes the state directory with the stored identity and the `jaunt` account. Then delete `/usr/local/bin/jaunt-agent`.
+
+On a node that creates accounts, `uninstall` also removes the two helper units and, together with the managed `agent.yaml`, the `host_users` section. It keeps every account that was created, their home directories, `/var/lib/jaunt-host-users` and the `jaunt-host-users` binary, and prints how many accounts it kept and the command that lists them (`jaunt-host-users list`). Remove accounts by hand if you want them gone ([operations.md](operations.md#account-creation-at-first-login)).
 
 ## Caveats of the static Linux binaries
 

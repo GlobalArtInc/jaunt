@@ -7,6 +7,7 @@ Every scenario asserts what a user can see and what the audit trail records.
     just e2e                 # debian:13 and rockylinux:9 as the node images
     just e2e debian:13       # one image
     just e2e-rotation        # the CA rotation scenarios on debian:13, about 15 minutes
+    just e2e-systemd         # account creation on a node with systemd as PID 1, debian:13 and rockylinux:9
     just e2e-down            # remove the containers, the network and the volume of an aborted run
 
 `CONTAINER_ENGINE` selects the engine (`podman` by default, `docker` on CI). `E2E_PROJECT` (default `jaunt-e2e`) is the
@@ -14,7 +15,7 @@ prefix of every container, network, volume and image tag of a run and of the run
 or a local run next to CI) do not touch each other; `just e2e-down` takes the same variable. The published ports of
 `just e2e-web` (18443, 18444) are fixed, so run only one browser run at a time. `E2E_TRANSFER_MIB` sets the size of the
 files moved by scp and rsync (256 by default). `python3 e2e/run.py --help` lists `--keep`, `--only`, `--list`,
-`--skip-build` and `--web`.
+`--skip-build`, `--web`, `--rotation` and `--systemd`.
 
 ## How it works
 
@@ -82,6 +83,24 @@ After every outage `require_tunnel_break` reads the audit trail from a marker ta
 `the tunnel did not break on this engine` unless `agent.disconnected` with the tunnel ALPN appears for the node, then
 waits for the matching `agent.connected`. A client session that outlives a verified break is a note, not a failure: the
 property under test is that the recording completes whole and matches what the client saw.
+
+## Account creation scenarios
+
+`scenarios/host_users.py` (with the helpers in `host_users_kit.py`) proves account creation at first login on both nodes of the stand with the real stack: real `sshd`, the real agent, the real `jaunt-host-users` binary, real `useradd`. The node containers have no systemd as PID 1, so the helper is started by `systemd-socket-activate --accept --inetd` from the systemd package: that gives the helper what the unit gives it, a fresh process for each connection with the connected socket as standard input, so `SO_PEERCRED` shows the real client (a `socat` pair would not). The socket is `root:jaunt 0660` in `/run/jaunt`, the helper log is `/var/log/jaunt-host-users.log` (standard error of the helper, `<6>INFO ...` lines, plus the launcher's `Communication attempt` line for each connection, which the scenarios count as contacts). The node is set up with the real `jaunt-agent install --create-accounts --no-service` from `/opt/jaunt/bin`, where both binaries belong to root, and the section is then edited the way an operator would. Run it with the scenarios it builds on:
+
+    python3 e2e/run.py debian:13 --only enrol --only logins --only host_users
+
+What it checks, in order: the installer output and the written units; the socket owner and mode; creation off (the default) refuses with the generic denial and never contacts the helper; creation on, with the agent probing the helper once per tunnel connection; the first login and the second login with `UsePAM yes` on `node-a` and `UsePAM no` on `node-b`, with the uid in range, the home mode, `jaunt-host-users list`, the helper journal, the agent audit and the control audit; refusals by the node rules (reserved name, name rule) that never reach the helper; refusals by the helper (group collision, existing home, full quota, no free uid, the sixth creation within a minute), each with its reference found in the agent log and the helper journal, and the repeat within 60 seconds that does not call the helper again; eight parallel first logins of one name; an agent restarted while `useradd` is held by a wrapper; `AllowUsers` blocking a created account with the installer's warning and the section surviving a reinstall; a semantic error in the section (creation off with a warning) and an unknown key (the agent stops at load). The wrapper scripts replace `/usr/sbin/useradd` for the time of one step and are put back in a `finally`.
+
+The reference is checked in the three places: the agent audit lines `agent.host_user.*` (JSON in `/tmp/agent*.log`), the helper journal line with the same `ref=`, and the control audit events `host_user.*` (found by `type=host_user.` and the `ref` field; the audit API has no `ref` filter). The agent announces `creates_accounts` to the control plane; after a restart the flag can appear only on the next announcement a minute later, so the steps that need it wait up to 90 seconds and note a wait longer than 15 seconds.
+
+`just e2e-web` adds one step after the console run: `web-tests/e2e/accounts.mjs` (Chromium, 380 and 1440 px, user `erin` of the role `onboarding`, the admin for the node cards) checks the marker "Creates accounts" on the node card and the picker of `node-a` and not on `node-b`, the creating banner (a wrapper delays `useradd` by 3 seconds so that it can be seen), the created banner with the home directory, that nothing of the console is written into the terminal area, and the refusal banners with their reference for a reserved name, a group collision and a node that does not create accounts. `e2e/scenarios/host_users_web.py` then checks each reference and session against the agent log, the helper journal and the control audit (`host_user.*`, `terminal.denied`).
+
+### The systemd stand
+
+`python3 e2e/run.py --systemd debian:13 rockylinux:9` (`just e2e-systemd`) starts one node whose PID 1 is systemd (`--systemd=always`, as in `scripts/test-quickstart.sh`) and runs `scenarios/host_users_systemd.py`: the installer enables the units for real; the socket is activated by the agent's probe; one probe and one `failed` helper instance per tunnel connection, collected at once (`CollectMode=inactive-or-failed`), so `systemctl --failed` stays empty; failed requests leave nothing behind; a user outside the group `jaunt` cannot open the socket; the first login creates the account under the helper unit (a wrapper around `useradd` dumps what the sandbox looks like: `NoNewPrivs`, the seccomp filter, the capability bounding set `0x1b`, a read-only `/usr`, an empty private `/tmp`, and the network namespace where the container allows it) and fills the home from `/etc/skel`; `systemd-analyze security` scores of the helper and the agent unit are printed as notes; with `passwd: files sss` and an `sssd.conf` the agent does not announce the capability and the helper answers `disabled`; and with `allow_with_directory: true` the `sss_cache` result under `ProtectSystem=strict` is printed. Podman only: the `--systemd=always` flag does not exist in docker, so CI does not run this stand.
+
+Known limit: systemd inside a podman container cannot create a network namespace, so `PrivateNetwork=yes` is ignored on Debian 13 in this stand (the journal says so and the step notes it); it is enforced on Rocky Linux 9, where the step proves it. SELinux is off in containers, so the labels of the home directories are not checked.
 
 ## The browser run
 

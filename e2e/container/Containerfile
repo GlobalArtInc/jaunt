@@ -4,10 +4,10 @@ RUN set -eu; \
     if command -v apt-get >/dev/null 2>&1; then \
       export DEBIAN_FRONTEND=noninteractive; \
       apt-get update -qq; \
-      apt-get install -y -qq --no-install-recommends openssh-server openssh-client procps iproute2 rsync python3 socat curl openssl ca-certificates util-linux iptables >/dev/null; \
+      apt-get install -y -qq --no-install-recommends openssh-server openssh-client procps iproute2 rsync python3 socat curl openssl ca-certificates util-linux iptables systemd systemd-sysv dbus >/dev/null; \
       rm -rf /var/lib/apt/lists/*; \
     elif command -v dnf >/dev/null 2>&1; then \
-      dnf install -y -q openssh-server openssh-clients procps-ng iproute rsync python3 socat openssl util-linux findutils iptables-nft >/dev/null; \
+      dnf install -y -q openssh-server openssh-clients procps-ng iproute rsync python3 socat openssl util-linux findutils iptables-nft systemd dbus-daemon >/dev/null; \
       dnf clean all >/dev/null; \
     else \
       echo "unsupported base image: neither apt-get nor dnf is available" >&2; \

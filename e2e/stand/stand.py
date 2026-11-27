@@ -17,6 +17,9 @@ from .report import StepFailed
 CLIENT_SECRET = "e2e-test-only-oidc-client-secret"
 LOGIN_DEADLINE = 120
 JAUNTD_BIN = "/usr/local/bin/jauntd"
+HELPER_DIST = "/opt/jaunt-dist/jaunt-host-users"
+HELPER_LOG = "/var/log/jaunt-host-users.log"
+SYSTEMD_INIT = "/usr/lib/systemd/systemd"
 SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}"),
@@ -121,9 +124,11 @@ class Stand:
             argv += ["-v", "{}:{}".format(source, target)]
         return argv
 
-    def create(self, role, image, aliases, mounts, command, user=None, env=None, publish=None, caps=()):
+    def create(self, role, image, aliases, mounts, command, user=None, env=None, publish=None, caps=(), systemd=False):
         argv = ["run", "-d", "--security-opt", "label=disable", "--name", container(role), "--network", NETWORK,
                 "--hostname", role]
+        if systemd:
+            argv += ["--systemd=always", "--cap-add", "SYS_ADMIN"]
         for cap in caps:
             argv += ["--cap-add", cap]
         for alias in aliases:
@@ -154,7 +159,7 @@ class Stand:
         etc = os.path.join(self.run_dir, "jauntd-etc")
         idp = os.path.join(self.run_dir, "idp")
         container_dir = CONTAINER_DIR
-        for check in ("jauntd", "jaunt", "jaunt-agent", "jaunt-fake-idp"):
+        for check in ("jauntd", "jaunt", "jaunt-agent", "jaunt-host-users", "jaunt-fake-idp"):
             self.binary(check)
 
         made = engine.engine(
@@ -227,9 +232,11 @@ class Stand:
             agent = os.path.join(OLD_AGENT_DIR, "jaunt-agent") if spec.get("old_agent") else self.binary("jaunt-agent")
             if not os.path.exists(agent):
                 raise RuntimeError("{} is missing: run e2e/build-old-agent.sh".format(agent))
+            booted = spec.get("systemd", False)
             self.create(node, self.node_image, [node], [
-                (agent, "/usr/local/bin/jaunt-agent:ro"), e2e,
-            ], ["/e2e/node.sh"], caps=["NET_ADMIN"] if spec.get("net_admin") else ())
+                (agent, "/usr/local/bin/jaunt-agent:ro"), (self.binary("jaunt-host-users"), "{}:ro".format(HELPER_DIST)), e2e,
+            ], [SYSTEMD_INIT] if booted else ["/e2e/node.sh"], caps=["NET_ADMIN"] if spec.get("net_admin") else (),
+                systemd=booted)
         self.prepare_client()
         self.wait_until("jauntd answers health checks", self.control_healthy, 60)
         for node in self.nodes:
@@ -255,6 +262,9 @@ class Stand:
         return exec_in(container("client"), ["curl", "-sf", "http://127.0.0.1:{}/healthz".format(CLIENT_FORWARD_PORT)]).ok
 
     def node_ready(self, node):
+        if self.nodes[node].get("systemd"):
+            state = exec_in(container(node), ["systemctl", "is-system-running"]).out.strip()
+            return state in ("running", "degraded")
         return exec_in(container(node), ["test", "-f", "/run/e2e/ready"]).ok
 
     def wait_until(self, what, check, timeout, interval=0.5):
@@ -327,12 +337,12 @@ class Stand:
             argv.append(command)
         return argv
 
-    def ssh(self, user, node, command=None, timeout=60, tty=False, options=(), extra=()):
-        return self.on_client(self.ssh_argv(node, command, options=options, extra=extra), user=user, tty=tty, timeout=timeout)
+    def ssh(self, user, node, command=None, timeout=60, tty=False, options=(), extra=(), login="deploy"):
+        return self.on_client(self.ssh_argv(node, command, login=login, options=options, extra=extra), user=user, tty=tty, timeout=timeout)
 
-    def ssh_stream(self, user, node, command=None, options=(), extra=()):
+    def ssh_stream(self, user, node, command=None, options=(), extra=(), login="deploy"):
         return Streaming(engine.exec_argv(
-            container("client"), self.ssh_argv(node, command, options=options, extra=extra),
+            container("client"), self.ssh_argv(node, command, login=login, options=options, extra=extra),
             user=user, env=self.user_env(user),
         ))
 
@@ -447,13 +457,17 @@ class Stand:
             gathered[role] = text
         for node in self.nodes if include_files else ():
             for name, path in (("sshd", "/var/log/sshd.log"), ("agent", "/tmp/agent.log"), ("enroll", "/tmp/enroll.log"),
-                               ("install", "/run/e2e/install.log")):
+                               ("install", "/run/e2e/install.log"), ("helper", HELPER_LOG)):
                 fetched = self.on_node(node, ["cat", path])
                 write_file(os.path.join(self.log_dir, "{}-{}.log".format(node, name)), fetched.out)
                 gathered["{}-{}".format(node, name)] = fetched.out
             for index, (path, text) in enumerate(self.saved_agent_logs(node).items(), start=1):
                 write_file(os.path.join(self.log_dir, "{}-agent-saved-{}.log".format(node, index)), text)
                 gathered["{}-agent-saved-{}".format(node, index)] = text
+            if self.nodes[node].get("systemd"):
+                journal = self.on_node(node, ["journalctl", "--no-pager", "-o", "short-precise"], timeout=60)
+                write_file(os.path.join(self.log_dir, "{}-journal.log".format(node)), journal.out)
+                gathered["{}-journal".format(node)] = journal.out
         return gathered
 
     def enrol_start(self, node, replace=False):

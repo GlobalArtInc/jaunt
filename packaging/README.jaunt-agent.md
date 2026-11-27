@@ -15,6 +15,16 @@ node that is already enrolled):
 The `--binary` option is needed because the installer defaults to
 `/usr/local/bin/jaunt-agent`.
 
+The package also installs `/usr/bin/jaunt-host-users`, the root helper that
+creates the account of a user at the first login. It does nothing until you
+add `--create-accounts` to the install command above:
+
+    jaunt-agent install --create-accounts --binary /usr/bin/jaunt-agent
+
+Run that command again after every upgrade of the package, so that the
+installer checks the helper and its directories again. `jaunt-agent uninstall`
+keeps the accounts that were created; `jaunt-host-users list` shows them.
+
 After an upgrade of the package, restart the service yourself:
 
     systemctl restart jaunt-agent

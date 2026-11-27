@@ -469,6 +469,10 @@ cleanup() {
 
 native_reference() {
   local image=$1 arch image_arch digest reference
+  if [ "$(basename "$engine")" = docker ]; then
+    printf '%s' "$image"
+    return
+  fi
   arch=$("$engine" info --format '{{.Host.Arch}}')
   if ! image_arch=$("$engine" image inspect --format '{{.Architecture}}' "$image" 2>/dev/null); then
     "$engine" pull -q "$image" >/dev/null
@@ -504,7 +508,11 @@ run_image() {
   container=jaunt-host-users-test-$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-')-$$
   started=$(now)
   echo "testing the host users helper on $image"
-  "$engine" run --rm --init --name "$container" --timeout "$CONTAINER_DEADLINE" \
+  local -a deadline=()
+  if [ "$(basename "$engine")" = podman ]; then
+    deadline=(--timeout "$CONTAINER_DEADLINE")
+  fi
+  "$engine" run --rm --init --name "$container" ${deadline[@]+"${deadline[@]}"} \
     --security-opt label=disable \
     -e HOST_USERS_IMAGE="$1" \
     -v "$binary:$BINARY:ro" \

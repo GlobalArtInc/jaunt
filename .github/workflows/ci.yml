@@ -66,6 +66,25 @@ jobs:
         timeout-minutes: 35
         env:
           CONTAINER_ENGINE: docker
+  host-users-containers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CONTAINER_ENGINE: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/cargo-home
+            target/installer-linux
+          key: host-users-linux-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: host-users-linux-
+      - run: just host-users-containers
+        timeout-minutes: 45
   e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 60

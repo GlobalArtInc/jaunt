@@ -48,6 +48,11 @@ ROTATION_NODES = {
 }
 
 
+SYSTEMD_NODES = {
+    "node-a": {"labels": "env=test", "systemd": True},
+}
+
+
 def container(role):
     return PREFIX + role
 

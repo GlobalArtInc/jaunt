@@ -8,9 +8,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from scenarios import ROTATION_SCENARIOS, SCENARIOS
+from scenarios import ROTATION_SCENARIOS, SCENARIOS, SYSTEMD_SCENARIOS
 from stand.cleanup import remove_everything
-from stand.layout import OUT, ROTATION_NODES
+from stand.layout import OUT, ROTATION_NODES, SYSTEMD_NODES
 from stand.report import Report
 from stand.stand import Stand, slug
 
@@ -26,6 +26,7 @@ def parse(argv):
     parser.add_argument("--only", action="append", default=[], help="run only the named scenarios (repeatable)")
     parser.add_argument("--web", action="store_true", help="drive the real console in Chromium (needs web-tests/node_modules)")
     parser.add_argument("--rotation", action="store_true", help="run the CA rotation scenarios on three nodes (one old agent)")
+    parser.add_argument("--systemd", action="store_true", help="run the account creation checks on a node with systemd as PID 1")
     parser.add_argument("--list", action="store_true", help="list the scenarios and exit")
     parser.add_argument(
         "--transfer-mib", type=int, default=int(os.environ.get("E2E_TRANSFER_MIB", "256")),
@@ -65,6 +66,10 @@ def run_image(image, args):
         stand.cert_ttl_secs = ROTATION_CERT_TTL_SECS
         stand.log_dir = os.path.join(OUT, "logs", slug(image) + "-rotation")
         scenarios = ROTATION_SCENARIOS
+    elif args.systemd:
+        stand = Stand(image, transfer_mib=args.transfer_mib, keep=args.keep, nodes=SYSTEMD_NODES)
+        stand.log_dir = os.path.join(OUT, "logs", slug(image) + "-systemd")
+        scenarios = SYSTEMD_SCENARIOS
     else:
         stand = Stand(image, transfer_mib=args.transfer_mib, keep=args.keep)
         scenarios = SCENARIOS
@@ -88,7 +93,7 @@ def run_image(image, args):
                     step.expect(False, "{}: {}".format(type(error).__name__, error))
     finally:
         try:
-            if not args.only:
+            if not args.only and not args.systemd:
                 from scenarios.hygiene import finish
                 finish(stand, report)
             else:
@@ -105,10 +110,13 @@ def run_image(image, args):
 
 def main(argv):
     args = parse(argv)
+    if args.systemd and args.rotation:
+        print("--systemd and --rotation cannot be combined", file=sys.stderr)
+        return 2
     if args.rotation and args.only:
         args.only = rotation_selection(args.only)
     if args.list:
-        for name, _ in ROTATION_SCENARIOS if args.rotation else SCENARIOS:
+        for name, _ in ROTATION_SCENARIOS if args.rotation else SYSTEMD_SCENARIOS if args.systemd else SCENARIOS:
             print(name)
         return 0
     if args.down:
@@ -122,8 +130,8 @@ def main(argv):
         if not build_binaries(args.rotation):
             print("building the Linux binaries failed", file=sys.stderr)
             return 2
-    if args.web and args.rotation:
-        print("--web and --rotation cannot be combined", file=sys.stderr)
+    if args.web and (args.rotation or args.systemd):
+        print("--web cannot be combined with --rotation or --systemd", file=sys.stderr)
         return 2
     if args.web:
         import web

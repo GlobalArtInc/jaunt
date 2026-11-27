@@ -35,11 +35,17 @@ installer-containers:
 ssh-containers *images="debian:13 rockylinux:9":
     scripts/test-ssh-bridge.sh {{images}}
 
+host-users-containers *images:
+    scripts/test-host-users.sh {{images}}
+
 e2e *images:
     python3 e2e/run.py {{images}}
 
 e2e-rotation:
     python3 e2e/run.py --rotation debian:13
+
+e2e-systemd *images:
+    python3 e2e/run.py --systemd {{images}}
 
 e2e-web:
     python3 e2e/run.py --web

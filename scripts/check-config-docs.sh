@@ -11,6 +11,7 @@ sources=(
   crates/jauntd/src/recordings.rs
   crates/jauntd/src/web_terminal.rs
   crates/jaunt-agent/src/run/config.rs
+  crates/jaunt-host-users/src/config.rs
   crates/jaunt-policy/src/raw.rs
 )
 

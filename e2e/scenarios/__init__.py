@@ -1,5 +1,5 @@
 from . import (
-    enrol, expiry, forwarding, logins, nodes, policy, recording, recording_faults, revocation, rotation_audit,
+    enrol, expiry, forwarding, host_users, host_users_systemd, logins, nodes, policy, recording, recording_faults, revocation, rotation_audit,
     rotation_force, rotation_host, rotation_setup, rotation_user, ssh, transfers,
 )
 
@@ -10,6 +10,7 @@ SCENARIOS = [
     ("transfers", transfers.run),
     ("forwarding", forwarding.run),
     ("policy", policy.run),
+    ("host_users", host_users.run),
     ("recording", recording.run),
     ("recording_faults", recording_faults.run),
     ("revocation", revocation.run),
@@ -23,4 +24,8 @@ ROTATION_SCENARIOS = [
     ("rotation_host", rotation_host.run),
     ("rotation_force", rotation_force.run),
     ("rotation_audit", rotation_audit.run),
+]
+
+SYSTEMD_SCENARIOS = [
+    ("host_users_systemd", host_users_systemd.run),
 ]
