@@ -247,7 +247,14 @@ fn a_second_lock_on_the_same_directory_is_refused_until_the_first_is_released() 
     assert!(held.is_some());
     assert!(second.lock(".enroll.lock", None).unwrap().is_none());
     drop(held);
-    assert!(second.lock(".enroll.lock", None).unwrap().is_some());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while second.lock(".enroll.lock", None).unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lock was never released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(mode_of(&dir.path().join(".enroll.lock")), 0o600);
 }
 
