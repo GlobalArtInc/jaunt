@@ -36,9 +36,23 @@ pub fn enable(env: &mut Env<'_>) -> Result<(), InstallError> {
         .map(|_| ())
 }
 
+pub fn enable_now(env: &mut Env<'_>, unit: &str) -> Result<(), InstallError> {
+    env.act_checked("systemctl", &["enable", "--now", unit])
+        .map(|_| ())
+}
+
+pub fn try_restart(env: &mut Env<'_>) -> Result<(), InstallError> {
+    env.act_checked("systemctl", &["try-restart", SERVICE_NAME])
+        .map(|_| ())
+}
+
 pub fn stop_and_disable(env: &mut Env<'_>) {
+    stop_and_disable_unit(env, SERVICE_NAME);
+}
+
+pub fn stop_and_disable_unit(env: &mut Env<'_>, unit: &str) {
     for action in ["stop", "disable"] {
-        let args = [action, SERVICE_NAME];
+        let args = [action, unit];
         match env.act("systemctl", &args) {
             Ok(output) if output.success() => {}
             Ok(output) => env.report.warn(format!(

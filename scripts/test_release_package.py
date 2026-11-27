@@ -21,6 +21,7 @@ class Workspace:
         self.license = self.write("LICENSE", b"license text\n")
         self.agent = self.write("bin/jaunt-agent", b"\x7fELF agent")
         self.cli = self.write("bin/jaunt", b"\x7fELF cli")
+        self.helper = self.write("bin/jaunt-host-users", b"\x7fELF helper")
 
     def write(self, name, data):
         path = os.path.join(self.root, name)
@@ -80,6 +81,29 @@ class Package(unittest.TestCase):
         self.assertEqual(first, space.read("second", name))
         sums = space.read("first", f"SHA256SUMS.{TARGET}").decode().splitlines()
         self.assertIn(f"{hashlib.sha256(first).hexdigest()}  {name}", sums)
+        self.assertEqual(len(sums), 2)
+
+    def test_the_account_helper_gets_its_own_archive_named_like_the_others(self):
+        space = Workspace(self)
+        space.run("out", space.agent, space.helper)
+        name = f"jaunt-host-users-1.2.3-{TARGET}.tar.gz"
+        with tarfile.open(os.path.join(space.root, "out", name)) as handle:
+            members = {member.name: member for member in handle.getmembers()}
+            self.assertEqual(
+                sorted(members),
+                sorted(
+                    [
+                        f"jaunt-host-users-1.2.3-{TARGET}",
+                        f"jaunt-host-users-1.2.3-{TARGET}/jaunt-host-users",
+                        f"jaunt-host-users-1.2.3-{TARGET}/LICENSE",
+                        f"jaunt-host-users-1.2.3-{TARGET}/README.txt",
+                    ]
+                ),
+            )
+            self.assertEqual(members[f"jaunt-host-users-1.2.3-{TARGET}/jaunt-host-users"].mode, 0o755)
+        sums = space.read("out", f"SHA256SUMS.{TARGET}").decode().splitlines()
+        digest = hashlib.sha256(space.read("out", name)).hexdigest()
+        self.assertIn(f"{digest}  {name}", sums)
         self.assertEqual(len(sums), 2)
 
     def test_macos_archive_does_not_claim_static_linking(self):

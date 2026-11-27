@@ -5,6 +5,7 @@ use super::args::UninstallOptions;
 use super::env::{Env, require_root};
 use super::error::InstallError;
 use super::files::{self, Existing};
+use super::host_users;
 use super::layout::{DROPIN_PATH, INNER_CA_FILE, SYSTEM_USER, UNIT_PATH};
 use super::render::{MANAGED_HEADER, carries_header, is_foreign};
 use super::runner::excerpt;
@@ -15,6 +16,7 @@ use crate::paths::check_state_dir;
 pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), InstallError> {
     require_root(env)?;
     let unit_present = files::exists(&env.layout.path(UNIT_PATH))?;
+    let helper_units_present = host_users::units_present(env)?;
     let dropin = files::read_optional(&env.layout.path(DROPIN_PATH))?;
     let foreign = dropin.as_deref().is_some_and(is_foreign);
     let ours = dropin.as_deref().filter(|bytes| !is_foreign(bytes));
@@ -24,7 +26,12 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
         ));
     }
     let config = config_state(env, &opts.config)?;
-    if !unit_present && ours.is_none() && config != ConfigState::Managed && !opts.purge {
+    if !unit_present
+        && !helper_units_present
+        && ours.is_none()
+        && config != ConfigState::Managed
+        && !opts.purge
+    {
         if !foreign && config == ConfigState::Absent {
             env.report.info("nothing to uninstall");
         }
@@ -54,8 +61,18 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
         }
         env.remove_file(UNIT_PATH)?;
     }
+    if helper_units_present {
+        host_users::remove_units(env, manage_service)?;
+    }
     if config == ConfigState::Managed && config_state(env, &opts.config)? == ConfigState::Managed {
+        let content = match files::read_regular_no_follow(&env.layout.path(&opts.config))? {
+            Existing::Regular(file) => Some(file.content),
+            Existing::Absent | Existing::NotRegular | Existing::Oversized => None,
+        };
         env.remove_file(&opts.config)?;
+        if let Some(content) = content {
+            host_users::removed_section_note(env, &opts.config, &content);
+        }
     }
     if ours.is_some() {
         env.remove_file(DROPIN_PATH)?;
@@ -66,7 +83,7 @@ pub fn uninstall(env: &mut Env<'_>, opts: &UninstallOptions) -> Result<(), Insta
             }
         }
     }
-    if unit_present && manage_service {
+    if (unit_present || helper_units_present) && manage_service {
         service::daemon_reload_or_warn(env)?;
     }
 

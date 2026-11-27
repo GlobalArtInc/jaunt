@@ -9,6 +9,7 @@ pub(crate) use clock::{SystemClock, unix_seconds};
 pub(crate) use files::{SystemFiles, SystemNode};
 pub(crate) use process::SystemRunner;
 pub(crate) use socket::{ByteReader, limit_waits, peer_uid, send};
+pub use tools::TOOL_PATHS;
 pub(crate) use tools::{GETENT, Tool, ToolError, USERADD, USERDEL, locate};
 pub(crate) use users::SystemUsers;
 #[cfg(test)]

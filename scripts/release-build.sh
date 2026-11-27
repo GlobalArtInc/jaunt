@@ -18,11 +18,11 @@ target=$1
 case "$target" in
   x86_64-unknown-linux-musl)
     platform=linux/amd64
-    packages=(jaunt-agent jaunt jauntd)
+    packages=(jaunt-agent jaunt-host-users jaunt jauntd)
     ;;
   aarch64-unknown-linux-musl)
     platform=linux/arm64
-    packages=(jaunt-agent jaunt jauntd)
+    packages=(jaunt-agent jaunt-host-users jaunt jauntd)
     ;;
   x86_64-apple-darwin | aarch64-apple-darwin)
     platform=
@@ -103,7 +103,7 @@ build_linux() {
       shift
       cargo build --locked --profile dist --target "$triple" "$@"
       mkdir -p /work/stage
-      for name in jaunt-agent jaunt jauntd; do
+      for name in jaunt-agent jaunt-host-users jaunt jauntd; do
         if [ -f "/work/target/$triple/dist/$name" ]; then
           install -m 0755 "/work/target/$triple/dist/$name" "/work/stage/$name"
         fi

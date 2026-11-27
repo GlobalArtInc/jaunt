@@ -9,7 +9,8 @@ die() {
 }
 
 usage() {
-  printf 'usage: %s --package jaunt-agent|jaunt --version <tag without v> --arch amd64|arm64 --binary <path> --output <dir>\n' "$0" >&2
+  printf 'usage: %s --package jaunt-agent|jaunt --version <tag without v> --arch amd64|arm64 --binary <path> [--helper-binary <path>] --output <dir>\n' "$0" >&2
+  printf '       --helper-binary is the jaunt-host-users binary; jaunt-agent requires it, jaunt refuses it\n' >&2
   exit 2
 }
 
@@ -17,6 +18,7 @@ package=
 version=
 arch=
 binary=
+helper_binary=
 output=
 while [ $# -gt 0 ]; do
   [ $# -ge 2 ] || usage
@@ -25,6 +27,7 @@ while [ $# -gt 0 ]; do
     --version) version=$2 ;;
     --arch) arch=$2 ;;
     --binary) binary=$2 ;;
+    --helper-binary) helper_binary=$2 ;;
     --output) output=$2 ;;
     *) usage ;;
   esac
@@ -44,6 +47,9 @@ case $package in
     description=' Node agent of the Jaunt SSH access gateway. It keeps an outbound tunnel
  to the Jaunt server and logs in to the local sshd with short-lived
  certificates.
+ .
+ It also ships jaunt-host-users, the helper that creates local accounts
+ at first login once `jaunt-agent install --create-accounts` enables it.
  .
  This package installs files only. It does not enrol the node, change the
  sshd configuration or start the service. The commands to run after
@@ -77,9 +83,20 @@ if [ -n "${BASH_REMATCH[5]}" ]; then
   deb_version+="+${build_metadata//-/.}"
 fi
 
-[ -f "$binary" ] && [ -x "$binary" ] || die "binary $binary is not an executable file"
-[ "$(od -An -tx1 -N4 "$binary" | tr -d ' \n')" = 7f454c46 ] || die "binary $binary is not an ELF file"
-[ "$(od -An -tx1 -j18 -N2 "$binary" | tr -d ' \n')" = "$machine" ] || die "binary $binary is not built for $arch"
+case $package in
+  jaunt-agent) [ -n "$helper_binary" ] || die "--helper-binary is required for jaunt-agent: give the jaunt-host-users binary" ;;
+  *) [ -z "$helper_binary" ] || die "--helper-binary is only for jaunt-agent" ;;
+esac
+
+check_binary() {
+  [ -f "$1" ] && [ -x "$1" ] || die "binary $1 is not an executable file"
+  [ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" = 7f454c46 ] || die "binary $1 is not an ELF file"
+  [ "$(od -An -tx1 -j18 -N2 "$1" | tr -d ' \n')" = "$machine" ] || die "binary $1 is not built for $arch"
+}
+check_binary "$binary"
+if [ -n "$helper_binary" ]; then
+  check_binary "$helper_binary"
+fi
 
 epoch=${SOURCE_DATE_EPOCH:-}
 if [ -z "$epoch" ]; then
@@ -99,6 +116,10 @@ install -m 0644 "$repo/packaging/copyright" "$root/usr/share/doc/$package/copyri
 install -m 0644 "$repo/packaging/README.$package.md" "$root/usr/share/doc/$package/README.md"
 install -d -m 0755 "$root/usr/share/lintian/overrides"
 sed "s|{{package}}|$package|g" "$repo/packaging/lintian-overrides" >"$stage/overrides"
+if [ -n "$helper_binary" ]; then
+  install -m 0755 "$helper_binary" "$root/usr/bin/jaunt-host-users"
+  printf '%s: statically-linked-binary [usr/bin/jaunt-host-users]\n' "$package" >>"$stage/overrides"
+fi
 install -m 0644 "$stage/overrides" "$root/usr/share/lintian/overrides/$package"
 
 if [ "$package" = jaunt-agent ]; then

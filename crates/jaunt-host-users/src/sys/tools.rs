@@ -24,6 +24,11 @@ pub(crate) const GETENT: Tool = Tool {
     name: "getent",
     candidates: &["/usr/bin/getent", "/bin/getent"],
 };
+pub const TOOL_PATHS: [(&str, &[&str]); 3] = [
+    (USERADD.name, USERADD.candidates),
+    (USERDEL.name, USERDEL.candidates),
+    (GETENT.name, GETENT.candidates),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ToolError {

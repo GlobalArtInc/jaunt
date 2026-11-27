@@ -25,6 +25,8 @@ pub struct InstallArgs {
     pub no_service: bool,
     #[arg(long)]
     pub dry_run: bool,
+    #[arg(long)]
+    pub create_accounts: bool,
 }
 
 #[derive(Debug, Args)]
@@ -50,6 +52,7 @@ pub struct InstallOptions {
     pub config: String,
     pub state_dir: String,
     pub no_service: bool,
+    pub create_accounts: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +76,7 @@ impl InstallOptions {
             config: args.config.clone(),
             state_dir: args.state_dir.clone(),
             no_service: args.no_service,
+            create_accounts: args.create_accounts,
         })
     }
 }
@@ -222,6 +226,7 @@ mod tests {
             root: PathBuf::from("/"),
             no_service: true,
             dry_run: false,
+            create_accounts: false,
         };
         assert!(matches!(
             InstallOptions::from_args(&args),

@@ -118,11 +118,11 @@ arm_verify='{"arch":"aarch64","runner":"ubuntu-24.04-arm"}'
 if [ "$include_arm" = true ]; then
   build_matrix="[$x86_linux,$arm_linux,$arm_mac,$x86_mac]"
   verify_matrix="[$x86_verify,$arm_verify]"
-  archives=8
+  archives=10
 else
   build_matrix="[$x86_linux,$arm_mac,$x86_mac]"
   verify_matrix="[$x86_verify]"
-  archives=5
+  archives=6
 fi
 
 printf 'version=%s\n' "$version"

@@ -1,9 +1,12 @@
+import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-plan.sh")
+BUILD_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-build.sh")
 SHA = "0123456789abcdef0123456789abcdef01234567"
 KEYS = [
     "version",
@@ -53,6 +56,28 @@ class Plan(unittest.TestCase):
         self.assertEqual([line.split("=", 1)[0] for line in lines], KEYS)
         return dict(line.split("=", 1) for line in lines)
 
+    def built_archives(self, plan):
+        with open(BUILD_SCRIPT) as handle:
+            build = handle.read()
+        total = 0
+        for entry in json.loads(plan["build_matrix"]):
+            target = re.escape(entry["target"])
+            case = re.search(
+                rf"^\s*(?:[\w-]+ \| )*{target}(?: \| [\w-]+)*\)\n\s*platform=[^\n]*\n\s*packages=\(([^)]*)\)",
+                build,
+                re.MULTILINE,
+            )
+            self.assertIsNotNone(case, entry)
+            total += len(case.group(1).split())
+        return total
+
+    def test_the_archive_count_matches_what_the_build_matrix_produces(self):
+        for overrides, expected in [({}, 10), ({"INPUT_INCLUDE_ARM": "false"}, 6)]:
+            with self.subTest(overrides=overrides):
+                plan = self.plan(**overrides)
+                self.assertEqual(int(plan["archives"]), self.built_archives(plan))
+                self.assertEqual(int(plan["archives"]), expected)
+
     def refuses(self, **overrides):
         result = self.run_plan(**overrides)
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -66,7 +91,7 @@ class Plan(unittest.TestCase):
         self.assertEqual(plan["draft"], "true")
         self.assertEqual(plan["release"], "true")
         self.assertEqual(plan["prerelease"], "true")
-        self.assertEqual(plan["archives"], "8")
+        self.assertEqual(plan["archives"], "10")
 
     def test_dispatch_publish_true_is_not_a_draft_and_a_plain_version_is_not_a_prerelease(self):
         plan = self.plan(INPUT_VERSION="2.0.0", INPUT_PUBLISH="true")
@@ -96,14 +121,14 @@ class Plan(unittest.TestCase):
 
     def test_include_arm_false_drops_the_arm_linux_entries(self):
         plan = self.plan(INPUT_INCLUDE_ARM="false")
-        self.assertEqual(plan["archives"], "5")
+        self.assertEqual(plan["archives"], "6")
         self.assertNotIn("aarch64-unknown-linux-musl", plan["build_matrix"])
         self.assertNotIn("aarch64", plan["verify_matrix"])
         self.assertIn("aarch64-apple-darwin", plan["build_matrix"])
 
     def test_tag_push_ignores_include_arm(self):
         plan = self.plan(EVENT="push", REF="refs/tags/v3.1.4", REF_NAME="v3.1.4", INPUT_INCLUDE_ARM="false")
-        self.assertEqual(plan["archives"], "8")
+        self.assertEqual(plan["archives"], "10")
 
     def test_hostile_versions_are_refused_and_print_nothing(self):
         hostile = [

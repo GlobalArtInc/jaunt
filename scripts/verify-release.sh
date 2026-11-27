@@ -76,10 +76,15 @@ find_binary() {
   printf '%s' "$1"
 }
 agent=$(find_binary jaunt-agent)
+helper=$(find_binary jaunt-host-users)
 cli=$(find_binary jaunt)
 daemon=$(find_binary jauntd)
-for binary in "$agent" "$cli" "$daemon"; do
-  "$binary" --version
+for binary in "$agent" "$helper" "$cli" "$daemon"; do
+  if [ "$binary" = "$helper" ]; then
+    "$binary" --help
+  else
+    "$binary" --version
+  fi
   if command -v ldd >/dev/null 2>&1; then
     listing=$(ldd "$binary" 2>&1 || true)
     case "$listing" in
@@ -182,7 +187,7 @@ check_file_kind() {
     return
   fi
   local binary kind
-  for binary in "$extract"/*/jaunt-agent "$extract"/*/jaunt "$extract"/*/jauntd; do
+  for binary in "$extract"/*/jaunt-agent "$extract"/*/jaunt-host-users "$extract"/*/jaunt "$extract"/*/jauntd; do
     kind=$(file -b "$binary")
     case "$kind" in
       *"statically linked"* | *"static-pie linked"*) pass "$target $(basename "$binary") is $(printf '%s' "$kind" | grep -o 'static[a-z-]* linked')" ;;

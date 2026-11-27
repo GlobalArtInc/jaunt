@@ -155,7 +155,7 @@ fn read_capped(path: &Path) -> io::Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixDatagram, UnixListener};
     use std::path::Path;
 
     use jaunt_host_users::HostUsersSection;
@@ -278,10 +278,15 @@ mod tests {
     #[tokio::test]
     async fn a_socket_without_a_listener_is_not_announced_but_logins_still_try_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, listener) = paths(dir.path(), Some("passwd: files\n"), false, true);
+        let (mut paths, _listener) = paths(dir.path(), Some("passwd: files\n"), false, true);
+        assert!(
+            Availability::new(&enabled(), paths.clone())
+                .helper_listens()
+                .await
+        );
+        paths.socket = dir.path().join("silent.sock");
+        let _silent = UnixDatagram::bind(&paths.socket).unwrap();
         let availability = Availability::new(&enabled(), paths);
-        assert!(availability.helper_listens().await);
-        drop(listener);
         assert!(availability.creation().is_ok());
         assert!(!availability.helper_listens().await);
     }

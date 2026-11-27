@@ -7,6 +7,9 @@ pub const DROPIN_DIR: &str = "/etc/ssh/sshd_config.d";
 pub const DROPIN_PATH: &str = "/etc/ssh/sshd_config.d/50-jaunt.conf";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const UNIT_PATH: &str = "/etc/systemd/system/jaunt-agent.service";
+pub const HELPER_SOCKET_UNIT: &str = "jaunt-host-users.socket";
+pub const HELPER_SOCKET_PATH: &str = "/etc/systemd/system/jaunt-host-users.socket";
+pub const HELPER_SERVICE_PATH: &str = "/etc/systemd/system/jaunt-host-users@.service";
 pub const CONFIG_DIR: &str = "/etc/jaunt";
 pub const DEFAULT_CONFIG: &str = "/etc/jaunt/agent.yaml";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/jaunt";
@@ -15,6 +18,7 @@ pub const DEFAULT_SSHD: &str = "/usr/sbin/sshd";
 pub const NOLOGIN_SHELL: &str = "/usr/sbin/nologin";
 pub const SERVICE_NAME: &str = "jaunt-agent";
 pub const SYSTEM_USER: &str = "jaunt";
+pub const ROOT_UID: u32 = 0;
 
 #[derive(Debug, Clone)]
 pub struct Layout {

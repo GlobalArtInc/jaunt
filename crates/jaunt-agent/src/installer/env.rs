@@ -13,6 +13,7 @@ pub struct Env<'a> {
     pub dry_run: bool,
     pub live: bool,
     pub path_env: String,
+    pub root_uid: u32,
 }
 
 pub struct DirSpec<'a> {

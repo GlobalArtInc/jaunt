@@ -3,6 +3,12 @@ set -euo pipefail
 
 SSHD=/usr/sbin/sshd
 AGENT=/usr/local/bin/jaunt-agent
+HELPER=/usr/local/bin/jaunt-host-users
+HELPER_STAGED=/staged/jaunt-host-users
+HELPER_SOCKET=/etc/systemd/system/jaunt-host-users.socket
+HELPER_SERVICE=/etc/systemd/system/jaunt-host-users@.service
+HELPER_STATE_DIR=/var/lib/jaunt-host-users
+HELPER_STATE=$HELPER_STATE_DIR/accounts.json
 STATE_DIR=/var/lib/jaunt
 CA_FILE=$STATE_DIR/inner-ca.pub
 DROPIN=/etc/ssh/sshd_config.d/50-jaunt.conf
@@ -46,6 +52,7 @@ run_agent_as_jaunt() {
 }
 
 output_has() { grep -qF -- "$1" <<<"$last_output"; }
+output_lacks() { ! grep -qF -- "$1" <<<"$last_output"; }
 first_line_is() { [ "$(head -n 1 "$2")" = "$1" ]; }
 managed_checksums() { sha256sum "$DROPIN" "$UNIT" "$CONFIG"; }
 status_is_zero() { [ "$last_status" -eq 0 ]; }
@@ -141,9 +148,9 @@ prepare_image() {
   export DEBIAN_FRONTEND=noninteractive
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq >/dev/null
-    apt-get install -y -qq openssh-server openssh-client >/dev/null
+    apt-get install -y -qq openssh-server openssh-client systemd >/dev/null
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q openssh-server openssh-clients >/dev/null
+    dnf install -y -q openssh-server openssh-clients systemd >/dev/null
   else
     echo "unsupported image: neither apt-get nor dnf is available" >&2
     exit 2
@@ -538,6 +545,128 @@ test_custom_config_is_removed_only_with_the_same_flag() {
   rmdir /opt/jaunt-conf
 }
 
+helper_units_verify() {
+  local out
+  out=$(systemd-analyze verify "$HELPER_SOCKET" "$HELPER_SERVICE" 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+  [ -z "$out" ] || { printf '%s\n' "$out" >&2; return 1; }
+}
+
+helper_checksums() { sha256sum "$HELPER_SOCKET" "$HELPER_SERVICE" "$CONFIG" "$UNIT" "$DROPIN"; }
+
+write_helper_state() {
+  install -d -o root -g root -m 0700 "$HELPER_STATE_DIR"
+  printf '%s\n' '{"v":1,"accounts":[{"login":"alice","uid":30001,"gid":30001,"home":"/home/alice","created_at":1700000000,"ref":"H-0000ABCD","session":"s-9","state":"active"}],"attempts":[]}' >"$HELPER_STATE"
+  chmod 0600 "$HELPER_STATE"
+}
+
+test_create_accounts() {
+  install -o root -g root -m 0755 "$HELPER_STAGED" "$HELPER"
+  local before
+  chmod 0775 "$HELPER"
+  before=$(manifest)
+  run_agent install --no-service --create-accounts
+  check "create accounts, group-writable helper: install fails" status_is_nonzero
+  check "create accounts, group-writable helper: message names the helper and the fix" output_has "$HELPER is writable by group or others"
+  check "create accounts, group-writable helper: nothing was changed" same_text "$(manifest)" "$before"
+  check "create accounts, group-writable helper: no user was created" user_absent
+  chmod 0755 "$HELPER"
+
+  chmod 4755 "$HELPER"
+  before=$(manifest)
+  run_agent install --no-service --create-accounts
+  check "create accounts, setuid helper: install fails" status_is_nonzero
+  check "create accounts, setuid helper: message names the setuid bit" output_has "$HELPER has the setuid or setgid bit"
+  check "create accounts, setuid helper: nothing was changed" same_text "$(manifest)" "$before"
+  chmod 0755 "$HELPER"
+
+  local usr_local_mode
+  usr_local_mode=$(stat -c '%a' /usr/local)
+  chmod 2775 /usr/local
+  before=$(manifest)
+  run_agent install --no-service --create-accounts
+  check "create accounts, /usr/local 2775: install fails" status_is_nonzero
+  check "create accounts, /usr/local 2775: message names the directory and its mode" output_has "/usr/local is writable by group or others (mode 2775)"
+  check "create accounts, /usr/local 2775: message points to root-only places" output_has "for example /usr/bin"
+  check "create accounts, /usr/local 2775: nothing was changed" same_text "$(manifest)" "$before"
+  chmod "$usr_local_mode" /usr/local
+
+  before=$(manifest)
+  run_agent install --no-service --create-accounts --dry-run
+  check "create accounts, dry-run: exits zero" status_is_zero
+  check "create accounts, dry-run: plans the socket unit" output_has "plan: write $HELPER_SOCKET"
+  check "create accounts, dry-run: changes no file" same_text "$(manifest)" "$before"
+
+  run_agent install --no-service --create-accounts
+  if ! status_is_zero; then printf '%s\n' "$last_output"; fi
+  check "create accounts: install exits zero" status_is_zero
+  check "create accounts: the helper was verified" output_has "verified: $HELPER is a regular file owned by root"
+  check "create accounts: socket unit is 0644 root:root" mode_is 644 "$HELPER_SOCKET"
+  check "create accounts: socket unit owner is root" owner_is root:root "$HELPER_SOCKET"
+  check "create accounts: service unit is 0644 root:root" mode_is 644 "$HELPER_SERVICE"
+  check "create accounts: service unit owner is root" owner_is root:root "$HELPER_SERVICE"
+  check "create accounts: socket group is the agent account" has_line "SocketGroup=jaunt" "$HELPER_SOCKET"
+  check "create accounts: service runs the helper next to the agent" has_line "ExecStart=$HELPER serve --config $CONFIG --agent-user jaunt" "$HELPER_SERVICE"
+  check "create accounts: units have no unfilled placeholder" bash -c "! grep -q '{{' '$HELPER_SOCKET' '$HELPER_SERVICE'"
+  check "create accounts: systemd-analyze verify accepts both units" helper_units_verify
+  check "create accounts: agent config enables the section" has_line "  enabled: true" "$CONFIG"
+  check "create accounts: agent config keeps the header" first_line_is "$HEADER" "$CONFIG"
+  check "create accounts: the output says how to enable the socket" output_has "systemctl enable --now jaunt-host-users.socket"
+  run_agent_as_jaunt run --config "$CONFIG"
+  check "create accounts: run --config as user jaunt accepts the section and reports no enrollment" output_has "$STATE_DIR holds no enrollment"
+
+  local after_first checksums
+  after_first=$(manifest)
+  checksums=$(helper_checksums)
+  run_agent install --no-service --create-accounts
+  check "create accounts, second install: exits zero" status_is_zero
+  check "create accounts, second install: checksums, modes and owners are unchanged" same_text "$(manifest)" "$after_first"
+  check "create accounts, second install: units, config, agent unit and drop-in checksums are unchanged" same_text "$(helper_checksums)" "$checksums"
+  check "create accounts, second install: reports the socket unit unchanged" output_has "unchanged: $HELPER_SOCKET"
+
+  sed -i 's/^  groups: \[\]$/  groups: [staff]/' "$CONFIG"
+  after_first=$(manifest)
+  checksums=$(helper_checksums)
+  run_agent install --no-service
+  check "create accounts, install without the flag: exits zero" status_is_zero
+  check "create accounts, install without the flag: says the section is kept" output_has "kept: the host_users section of $CONFIG as it was (enabled: true)"
+  check "create accounts, install without the flag: the edited section, the units and every file are unchanged" same_text "$(manifest)" "$after_first"
+  check "create accounts, install without the flag: checksums are unchanged" same_text "$(helper_checksums)" "$checksums"
+  check "create accounts, install without the flag: the edited groups survive" has_line "  groups: [staff]" "$CONFIG"
+
+  install -d -o root -g root -m 0755 /srv/home
+  sed -i 's|^  home_base: "/home"$|  home_base: /srv/home|' "$CONFIG"
+  run_agent install --no-service --create-accounts
+  check "create accounts, custom home_base: install exits zero" status_is_zero
+  check "create accounts, custom home_base: the service unit writes there" has_line "ReadWritePaths=/etc /srv/home -/var/spool/mail /var/log" "$HELPER_SERVICE"
+  check "create accounts, custom home_base: systemd-analyze verify accepts both units" helper_units_verify
+  check "create accounts, custom home_base: no warning about a missing home_base" output_lacks "does not exist"
+
+  useradd -m -s /bin/bash alice
+  write_helper_state
+  local state_sum
+  state_sum=$(sha256sum "$HELPER_STATE")
+  run_agent uninstall --no-service
+  check "create accounts, uninstall: exits zero" status_is_zero
+  check "create accounts, uninstall: socket unit removed" absent "$HELPER_SOCKET"
+  check "create accounts, uninstall: service unit removed" absent "$HELPER_SERVICE"
+  check "create accounts, uninstall: prints the number of kept accounts" output_has "kept: 1 account(s) listed in $HELPER_STATE"
+  check "create accounts, uninstall: prints the list command" output_has "jaunt-host-users list"
+  check "create accounts, uninstall: the helper state is kept" same_text "$(sha256sum "$HELPER_STATE")" "$state_sum"
+  check "create accounts, uninstall: the created account is kept" user_present alice
+  check "create accounts, uninstall: the helper binary is kept" present "$HELPER"
+  run_agent uninstall --purge --no-service
+  check "create accounts, uninstall --purge: exits zero" status_is_zero
+  check "create accounts, uninstall --purge: the helper state is kept" same_text "$(sha256sum "$HELPER_STATE")" "$state_sum"
+  check "create accounts, uninstall --purge: the created account is kept" user_present alice
+  check "create accounts, uninstall --purge: its home is kept" present /home/alice
+  check "create accounts, uninstall --purge: the service account is removed" user_absent
+  check "create accounts: effective sshd configuration equals the original" same_text "$(effective_dump)" "$baseline"
+  userdel -r alice >/dev/null 2>&1 || true
+  rm -rf -- "${HELPER_STATE_DIR:?}"
+  rm -f -- "$HELPER"
+  rmdir /srv/home
+}
+
 inside() {
   prepare_image
   baseline=$(effective_dump)
@@ -559,6 +688,7 @@ inside() {
   test_purge_keeps_a_human_account
   test_custom_state_dir_reaches_run
   test_custom_config_is_removed_only_with_the_same_flag
+  test_create_accounts
   if [ "$failures" -ne 0 ]; then
     printf 'RESULT [%s]: %d assertion(s) failed\n' "$label" "$failures"
     exit 1
@@ -603,7 +733,7 @@ build_binary() {
     -v "$repo:/src" -w /src \
     -v jaunt-installer-cargo-registry:/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/src/target/installer-linux \
-    "$rust_image" cargo build -p jaunt-agent --locked --release
+    "$rust_image" cargo build -p jaunt-agent -p jaunt-host-users --locked --release
 }
 
 run_image() {
@@ -613,6 +743,7 @@ run_image() {
   "$engine" run --rm --security-opt label=disable \
     -e INSTALLER_IMAGE="$1" \
     -v "$binary:$AGENT:ro" \
+    -v "$helper_binary:$HELPER_STAGED:ro" \
     -v "$script_path:/installer-test.sh:ro" \
     "$image" bash /installer-test.sh --inside
 }
@@ -626,6 +757,7 @@ main() {
   script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
   repo=$(cd "$(dirname "$script_path")/.." && pwd)
   binary=$repo/target/installer-linux/release/jaunt-agent
+  helper_binary=$repo/target/installer-linux/release/jaunt-host-users
   build_binary
   local image status=0
   for image in "$@"; do

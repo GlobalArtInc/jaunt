@@ -8,7 +8,7 @@ import re
 import sys
 import tarfile
 
-NAMES = {"jaunt-agent", "jaunt", "jauntd"}
+NAMES = {"jaunt-agent", "jaunt-host-users", "jaunt", "jauntd"}
 VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]*")
 TARGET = re.compile(r"[a-z0-9_]+(-[a-z0-9_]+){2,3}")
 DOCS_URL = "https://github.com/GlobalArtInc/jaunt/blob/main/docs/install.md"

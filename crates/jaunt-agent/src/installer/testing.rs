@@ -72,6 +72,8 @@ fn collect(base: &Path, dir: &Path, entries: &mut BTreeMap<String, String>) {
         if meta.is_dir() {
             entries.insert(relative, format!("dir {mode:o}"));
             collect(base, &path, entries);
+        } else if !meta.is_file() {
+            entries.insert(relative, format!("other {mode:o}"));
         } else {
             entries.insert(
                 relative,
@@ -113,6 +115,9 @@ pub struct FakeConfig {
     pub pubkeyauthentication: String,
     pub authenticationmethods: String,
     pub selinux: Option<String>,
+    pub sshd_allow_groups: Option<String>,
+    pub sshd_allow_users: Option<String>,
+    pub sshd_loopback_allow_groups: Option<String>,
 }
 
 impl Default for FakeConfig {
@@ -142,6 +147,9 @@ impl Default for FakeConfig {
             pubkeyauthentication: "yes".to_string(),
             authenticationmethods: "any".to_string(),
             selinux: None,
+            sshd_allow_groups: None,
+            sshd_allow_users: None,
+            sshd_loopback_allow_groups: None,
         }
     }
 }
@@ -218,6 +226,17 @@ impl FakeRunner {
             "pubkeyauthentication {}\nauthenticationmethods {}\n",
             self.config.pubkeyauthentication, self.config.authenticationmethods
         ));
+        if let Some(groups) = &self.config.sshd_allow_groups {
+            out.push_str(&format!("allowgroups {groups}\n"));
+        }
+        if let Some(users) = &self.config.sshd_allow_users {
+            out.push_str(&format!("allowusers {users}\n"));
+        }
+        if let Some(groups) = &self.config.sshd_loopback_allow_groups
+            && spec.is_some_and(|spec| spec.contains("addr=127.0.0.1,"))
+        {
+            out.push_str(&format!("allowgroups {groups}\n"));
+        }
         let Some(spec) = spec else {
             let global = self.config.foreign_global_ca.as_deref().unwrap_or("none");
             out.push_str(&format!("trustedusercakeys {global}\n"));
@@ -361,6 +380,7 @@ pub struct Harness {
     pub report: Report,
     pub live: bool,
     pub dry_run: bool,
+    pub root_uid: u32,
 }
 
 impl Harness {
@@ -386,6 +406,7 @@ impl Harness {
             report: Report::new(),
             live: false,
             dry_run: false,
+            root_uid: rustix::process::getuid().as_raw(),
         }
     }
 
@@ -397,6 +418,7 @@ impl Harness {
             dry_run: self.dry_run,
             live: self.live,
             path_env: String::new(),
+            root_uid: self.root_uid,
         }
     }
 
@@ -426,5 +448,6 @@ pub fn options() -> InstallOptions {
         config: "/etc/jaunt/agent.yaml".to_string(),
         state_dir: "/var/lib/jaunt".to_string(),
         no_service: true,
+        create_accounts: false,
     }
 }

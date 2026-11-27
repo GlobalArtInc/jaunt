@@ -298,6 +298,10 @@ struct AgentFileView {
 }
 
 pub fn parse_agent_file(text: &str) -> Result<HostUsersSection, ConfigError> {
+    parse_agent_section(text).map(Option::unwrap_or_default)
+}
+
+pub fn parse_agent_section(text: &str) -> Result<Option<HostUsersSection>, ConfigError> {
     if text.len() > MAX_CONFIG_BYTES {
         return Err(ConfigError::TooLarge);
     }
@@ -306,7 +310,7 @@ pub fn parse_agent_file(text: &str) -> Result<HostUsersSection, ConfigError> {
         .map(str::trim)
         .any(|line| !line.is_empty() && !line.starts_with('#') && line != "---");
     if !meaningful {
-        return Ok(HostUsersSection::default());
+        return Ok(None);
     }
     let options = serde_saphyr::options! { with_snippet: false };
     let view: AgentFileView =
@@ -319,7 +323,7 @@ pub fn parse_agent_file(text: &str) -> Result<HostUsersSection, ConfigError> {
                 },
             }
         })?;
-    Ok(view.host_users.unwrap_or_default())
+    Ok(view.host_users)
 }
 
 impl HostUsersSection {

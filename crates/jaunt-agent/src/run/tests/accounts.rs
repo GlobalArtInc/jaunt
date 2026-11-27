@@ -13,7 +13,7 @@ use jaunt_tunnel::{BoxFuture, H2Io, IncomingStream, StreamHandler};
 use russh::client::{self, AuthResult};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpSocket, UnixListener};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +92,7 @@ impl Helper {
 struct Node {
     service: SshService,
     helper: Helper,
+    _closed: TcpSocket,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -103,12 +104,12 @@ async fn node(api: &Arc<AgentApi>, user: &User, reply: Option<Response>) -> Node
         sssd_conf: helper_dir.path().join("sssd.conf"),
     };
     let helper = Helper::start(&paths.socket, reply);
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed = TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let target = InnerTarget {
         sshd_addr: closed.local_addr().unwrap(),
         sshd_host_key: sshd_host_key_file(helper_dir.path()),
     };
-    drop(closed);
     let section = HostUsersSection {
         enabled: true,
         ..HostUsersSection::default()
@@ -135,6 +136,7 @@ async fn node(api: &Arc<AgentApi>, user: &User, reply: Option<Response>) -> Node
     Node {
         service,
         helper,
+        _closed: closed,
         _dirs: (helper_dir, node.dir),
     }
 }

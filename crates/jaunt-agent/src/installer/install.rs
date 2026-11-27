@@ -1,16 +1,20 @@
 use std::fs;
 use std::path::PathBuf;
 
+use jaunt_host_users::HostUsersSection;
+
 use super::account::{self, Inspection};
 use super::args::InstallOptions;
 use super::env::{DirSpec, Env, Ledger, Replaced, Written, require_root};
 use super::error::{
-    ConfigTestOutcome, DROPIN_AND_UNIT_REMAIN, DROPIN_REMAINS, InstallError, RollbackOutcome,
+    ConfigTestOutcome, DROPIN_AND_HELPER_UNITS_REMAIN, DROPIN_AND_UNIT_REMAIN,
+    DROPIN_AND_UNITS_REMAIN, DROPIN_REMAINS, InstallError, RollbackOutcome,
 };
 use super::files::{self, Existing, RegularFile};
+use super::host_users;
 use super::layout::{
-    CONFIG_DIR, DROPIN_DIR, DROPIN_PATH, INNER_CA_FILE, SERVICE_NAME, SSHD_CONFIG, UNIT_DIR,
-    UNIT_PATH, inner_ca_path,
+    CONFIG_DIR, DROPIN_DIR, DROPIN_PATH, HELPER_SOCKET_UNIT, INNER_CA_FILE, SERVICE_NAME,
+    SSHD_CONFIG, UNIT_DIR, UNIT_PATH, inner_ca_path,
 };
 use super::render::{self, is_foreign};
 use super::runner::{Output, RunnerError, excerpt};
@@ -24,31 +28,90 @@ use super::sshd::{
 pub fn install(env: &mut Env<'_>, opts: &InstallOptions) -> Result<(), InstallError> {
     require_root(env)?;
     let sshd = Sshd::locate(env.layout, &env.path_env)?;
-    let inspection = preflight(env, &sshd, opts)?;
+    let helper = if opts.create_accounts {
+        host_users::check_state_dir(&opts.state_dir)?;
+        let helper = host_users::verify_helper(env, &opts.binary)?;
+        host_users::check_unit_paths(env)?;
+        Some(helper)
+    } else {
+        None
+    };
+    let (inspection, existing_section) = preflight(env, &sshd, opts)?;
+    let section = host_users::desired_section(existing_section, opts.create_accounts);
+    let units = match (helper.as_deref(), section.as_ref()) {
+        (Some(helper), Some(section)) => {
+            Some(host_users::prepare_units(env, opts, helper, section)?)
+        }
+        _ => None,
+    };
     let mut ledger = Ledger::default();
-    if let Err(error) = stage_changes(env, &sshd, opts, &inspection, &mut ledger) {
-        return Err(handle_stage_failure(env, opts, &ledger, error));
-    }
-    install_unit(env, opts)?;
-    service_actions(env, opts)?;
+    let outcome = match stage_changes(
+        env,
+        &sshd,
+        opts,
+        Staged {
+            units: units.as_ref(),
+            section: section.as_ref(),
+        },
+        &inspection,
+        &mut ledger,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(handle_stage_failure(env, opts, &ledger, error)),
+    };
+    install_unit(env, opts, outcome.helper_units_written)?;
+    service_actions(env, opts, &outcome)?;
     env.report.info(
         "next: run `jaunt-agent enroll --server <URL> --name <NAME>` to enroll this node, then `systemctl start jaunt-agent`",
     );
     Ok(())
 }
 
+struct Staged<'a> {
+    units: Option<&'a host_users::UnitFiles>,
+    section: Option<&'a HostUsersSection>,
+}
+
+struct StageOutcome {
+    restart_agent: bool,
+    helper_units_written: bool,
+}
+
+fn with_helper_units(remains: &'static str, helper_units: bool) -> &'static str {
+    match (helper_units, remains == DROPIN_REMAINS) {
+        (false, _) => remains,
+        (true, true) => DROPIN_AND_HELPER_UNITS_REMAIN,
+        (true, false) => DROPIN_AND_UNITS_REMAIN,
+    }
+}
+
 fn stage_changes(
     env: &mut Env<'_>,
     sshd: &Sshd,
     opts: &InstallOptions,
+    staged: Staged<'_>,
     inspection: &Inspection,
     ledger: &mut Ledger,
-) -> Result<(), InstallError> {
+) -> Result<StageOutcome, InstallError> {
+    let Staged { units, section } = staged;
     ledger.preexisting_group_gid = inspection.group_gid.clone();
     account::ensure(env, &opts.user, &opts.state_dir, inspection, ledger)?;
     prepare_directories(env, opts, ledger)?;
-    write_agent_config(env, opts, ledger)?;
-    install_dropin(env, sshd, opts, ledger)
+    let config_changed = write_agent_config(env, opts, section, ledger)?;
+    if !opts.create_accounts
+        && let Some(section) = section
+    {
+        host_users::kept_section_note(env, &opts.config, section);
+    }
+    let units_changed = match units {
+        Some(units) => host_users::write_units(env, units, ledger)?,
+        None => false,
+    };
+    install_dropin(env, sshd, opts, ledger)?;
+    Ok(StageOutcome {
+        restart_agent: units.is_some() && (config_changed || units_changed),
+        helper_units_written: units_changed,
+    })
 }
 
 fn should_undo(error: &InstallError) -> bool {
@@ -71,9 +134,15 @@ fn handle_stage_failure(
     if should_undo(&error) {
         undo(env, opts, ledger);
     } else if !matches!(error, InstallError::AfterCommit { .. }) {
-        env.report.warn(
-            "not cleaning up: the drop-in could not be rolled back, so the account, the state directory, inner-ca.pub and the agent configuration stay in place for it",
-        );
+        if host_users::holds_helper_units(env, ledger) {
+            env.report.warn(
+                "not cleaning up: the drop-in could not be rolled back, so the account, the state directory, inner-ca.pub, the agent configuration and the jaunt-host-users units stay in place for it",
+            );
+        } else {
+            env.report.warn(
+                "not cleaning up: the drop-in could not be rolled back, so the account, the state directory, inner-ca.pub and the agent configuration stay in place for it",
+            );
+        }
     }
     error
 }
@@ -117,7 +186,7 @@ fn preflight(
     env: &mut Env<'_>,
     sshd: &Sshd,
     opts: &InstallOptions,
-) -> Result<Inspection, InstallError> {
+) -> Result<(Inspection, Option<HostUsersSection>), InstallError> {
     let config_path = env.layout.path(SSHD_CONFIG);
     let config_text =
         fs::read_to_string(&config_path).map_err(InstallError::io("read", &config_path))?;
@@ -134,7 +203,7 @@ fn preflight(
             path: DROPIN_PATH.to_string(),
         });
     }
-    check_config_replaceable(env, &opts.config)?;
+    let existing_section = existing_host_users(env, &opts.config)?;
     if let Some(finding) = find_user_ca_directives(env.layout)?.into_iter().next() {
         return Err(InstallError::UserCaDirective {
             file: finding.file,
@@ -175,14 +244,20 @@ fn preflight(
     }
     warn_about_per_user_trust(env, sshd, &loopback)?;
     warn_about_loopback_settings(env, &loopback);
+    if opts.create_accounts {
+        host_users::warn_about_sshd_rules(env, &opts.config, &[&global, &loopback]);
+    }
 
     check_state_dir_adoptable(env, &opts.state_dir)?;
     let inspection = account::inspect(env, &opts.user, &opts.state_dir)?;
-    warn_about_selinux(env);
+    let selinux_enforcing = warn_about_selinux(env);
+    if opts.create_accounts {
+        host_users::warn_about_host(env, &opts.config, selinux_enforcing)?;
+    }
     env.report.info(
         "preflight passed: sshd includes the drop-in directory and serves loopback; no TrustedUserCAKeys was found in the configuration files or in the `sshd -T` probes",
     );
-    Ok(inspection)
+    Ok((inspection, existing_section))
 }
 
 fn warn_about_per_user_trust(
@@ -220,27 +295,36 @@ fn warn_about_loopback_settings(env: &mut Env<'_>, loopback: &Effective) {
     }
 }
 
-fn warn_about_selinux(env: &mut Env<'_>) {
+fn warn_about_selinux(env: &mut Env<'_>) -> bool {
     if !env.live {
-        return;
+        return false;
     }
     match env.query("getenforce", &[]) {
         Ok(output) if output.stdout.trim().eq_ignore_ascii_case("enforcing") => {
             env.report.warn(
                 "SELinux is Enforcing; the label of the state directory may need review so that sshd can read inner-ca.pub",
             );
+            true
         }
-        Ok(_) | Err(RunnerError::NotFound { .. }) => {}
-        Err(error) => env
-            .report
-            .warn(format!("could not determine the SELinux mode: {error}")),
+        Ok(_) | Err(RunnerError::NotFound { .. }) => false,
+        Err(error) => {
+            env.report
+                .warn(format!("could not determine the SELinux mode: {error}"));
+            false
+        }
     }
 }
 
 const CONFIG_MODE: u32 = 0o644;
 
-fn check_config_replaceable(env: &Env<'_>, config: &str) -> Result<(), InstallError> {
-    existing_config(env, config).map(|_| ())
+fn existing_host_users(
+    env: &Env<'_>,
+    config: &str,
+) -> Result<Option<HostUsersSection>, InstallError> {
+    match existing_config(env, config)? {
+        Some(file) => host_users::existing_section(env, config, &file.content),
+        None => Ok(None),
+    }
 }
 
 fn existing_config(env: &Env<'_>, config: &str) -> Result<Option<RegularFile>, InstallError> {
@@ -271,8 +355,9 @@ fn config_parent(config: &str) -> &str {
 fn write_agent_config(
     env: &mut Env<'_>,
     opts: &InstallOptions,
+    section: Option<&HostUsersSection>,
     ledger: &mut Ledger,
-) -> Result<(), InstallError> {
+) -> Result<bool, InstallError> {
     let config = opts.config.as_str();
     let parent = config_parent(config);
     if parent != CONFIG_DIR {
@@ -286,17 +371,23 @@ fn write_agent_config(
             ledger,
         )?;
     }
-    let content = render::agent_config(&opts.state_dir);
+    let content = match section {
+        Some(section) => render::agent_config_with_host_users(&opts.state_dir, section),
+        None => render::agent_config(&opts.state_dir),
+    };
     let previous = existing_config(env, config)?;
-    let same_content = previous
-        .as_ref()
-        .is_some_and(|file| file.content == content.as_bytes());
+    let same_content = previous.as_ref().is_some_and(|file| {
+        file.content == content.as_bytes()
+            || section.is_some_and(|section| {
+                host_users::same_config(&file.content, &opts.state_dir, section)
+            })
+    });
     let settled = previous.as_ref().is_some_and(|file| {
         file.mode == CONFIG_MODE && (!env.live || (file.uid == 0 && file.gid == 0))
     });
     if same_content && settled {
         env.report.info(format!("unchanged: {config}"));
-        return Ok(());
+        return Ok(false);
     }
     if env.dry_run {
         if same_content {
@@ -308,10 +399,14 @@ fn write_agent_config(
                 .plan(format!("write {config} (mode {CONFIG_MODE:04o})"));
             env.report.plan_block(&content);
         }
-        return Ok(());
+        return Ok(!same_content);
     }
     let path = env.layout.path(config);
-    let sync_error = files::write_atomic(&path, content.as_bytes(), CONFIG_MODE)?;
+    let bytes = match &previous {
+        Some(file) if same_content => file.content.clone(),
+        _ => content.into_bytes(),
+    };
+    let sync_error = files::write_atomic(&path, &bytes, CONFIG_MODE)?;
     match previous {
         None => ledger.files.push(path),
         Some(file) => ledger.replaced.push(Replaced {
@@ -330,7 +425,7 @@ fn write_agent_config(
     }
     match sync_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(!same_content),
     }
 }
 
@@ -398,7 +493,14 @@ fn install_dropin(
         ledger,
     )?;
     let written = env.write_file(DROPIN_PATH, &render::dropin(&opts.state_dir), 0o644)?;
-    finish_dropin(env, sshd, &inner_ca_path(&opts.state_dir), written)
+    let helper_units = host_users::holds_helper_units(env, ledger);
+    finish_dropin(
+        env,
+        sshd,
+        &inner_ca_path(&opts.state_dir),
+        written,
+        helper_units,
+    )
 }
 
 fn finish_dropin(
@@ -406,6 +508,7 @@ fn finish_dropin(
     sshd: &Sshd,
     ca_path: &str,
     written: Written,
+    helper_units: bool,
 ) -> Result<(), InstallError> {
     if env.dry_run {
         for command in sshd.validation_plan() {
@@ -419,7 +522,7 @@ fn finish_dropin(
                 return Err(after_commit(
                     "syncing the sshd drop-in directory",
                     error,
-                    DROPIN_REMAINS,
+                    with_helper_units(DROPIN_REMAINS, helper_units),
                 ));
             }
             env.report.info(
@@ -527,8 +630,14 @@ fn undo(env: &mut Env<'_>, opts: &InstallOptions, ledger: &Ledger) {
         .info("cleaned up everything this failed run created");
 }
 
-fn install_unit(env: &mut Env<'_>, opts: &InstallOptions) -> Result<(), InstallError> {
+fn install_unit(
+    env: &mut Env<'_>,
+    opts: &InstallOptions,
+    helper_units: bool,
+) -> Result<(), InstallError> {
     let step = "writing the unit file";
+    let dropin_remains = with_helper_units(DROPIN_REMAINS, helper_units);
+    let unit_remains = with_helper_units(DROPIN_AND_UNIT_REMAIN, helper_units);
     let mut ledger = Ledger::default();
     env.ensure_dir(
         UNIT_DIR,
@@ -539,34 +648,65 @@ fn install_unit(env: &mut Env<'_>, opts: &InstallOptions) -> Result<(), InstallE
         },
         &mut ledger,
     )
-    .map_err(|error| after_commit(step, &error, DROPIN_REMAINS))?;
+    .map_err(|error| after_commit(step, &error, dropin_remains))?;
     let unit = render::unit(&opts.user, &opts.binary, &opts.config, &opts.state_dir);
     let written = env
         .write_file(UNIT_PATH, &unit, 0o644)
-        .map_err(|error| after_commit(step, &error, DROPIN_REMAINS))?;
+        .map_err(|error| after_commit(step, &error, dropin_remains))?;
     match written.sync_error {
-        Some(error) => Err(after_commit(step, &error, DROPIN_AND_UNIT_REMAIN)),
+        Some(error) => Err(after_commit(step, &error, unit_remains)),
         None => Ok(()),
     }
 }
 
-fn service_actions(env: &mut Env<'_>, opts: &InstallOptions) -> Result<(), InstallError> {
+fn service_actions(
+    env: &mut Env<'_>,
+    opts: &InstallOptions,
+    outcome: &StageOutcome,
+) -> Result<(), InstallError> {
+    let remains = with_helper_units(DROPIN_AND_UNIT_REMAIN, outcome.helper_units_written);
     if !service::manage(env, opts.no_service) {
         service::skipped_note(env, opts.no_service);
+        if opts.create_accounts {
+            host_users::manual_steps_note(env);
+        }
         return Ok(());
     }
-    service::daemon_reload(env).map_err(|error| {
-        after_commit("`systemctl daemon-reload`", &error, DROPIN_AND_UNIT_REMAIN)
-    })?;
-    service::reload_sshd(env)
-        .map_err(|error| after_commit("the sshd reload", &error, DROPIN_AND_UNIT_REMAIN))?;
+    service::daemon_reload(env)
+        .map_err(|error| after_commit("`systemctl daemon-reload`", &error, remains))?;
+    service::reload_sshd(env).map_err(|error| after_commit("the sshd reload", &error, remains))?;
     service::enable(env).map_err(|error| {
         after_commit(
             &format!("`systemctl enable {SERVICE_NAME}`"),
             &error,
-            DROPIN_AND_UNIT_REMAIN,
+            remains,
         )
-    })
+    })?;
+    if !opts.create_accounts {
+        return Ok(());
+    }
+    service::enable_now(env, HELPER_SOCKET_UNIT).map_err(|error| {
+        after_commit(
+            &format!("`systemctl enable --now {HELPER_SOCKET_UNIT}`"),
+            &error,
+            DROPIN_AND_UNITS_REMAIN,
+        )
+    })?;
+    if outcome.restart_agent {
+        service::try_restart(env).map_err(|error| {
+            after_commit(
+                &format!("`systemctl try-restart {SERVICE_NAME}`"),
+                &error,
+                DROPIN_AND_UNITS_REMAIN,
+            )
+        })?;
+        if !env.dry_run {
+            env.report.info(format!(
+                "restarted {SERVICE_NAME} if it was running, so that it reads the host_users section"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -580,7 +720,7 @@ mod tests {
     use super::super::error::{
         ConfigTestOutcome, DROPIN_REMAINS, InstallError, RollbackOutcome, ValidationProblem,
     };
-    use super::super::layout::{DROPIN_PATH, UNIT_PATH};
+    use super::super::layout::{DROPIN_PATH, HELPER_SOCKET_PATH, UNIT_PATH};
     use super::super::render;
     use super::super::report::Level;
     use super::super::sshd::{LOOPBACK_DEPLOY_SPEC, PROBES, Sshd};
@@ -1156,7 +1296,8 @@ mod tests {
             .write(DROPIN_PATH, &render::dropin("/var/lib/jaunt"));
         let sshd = Sshd::locate(&harness.layout, "").unwrap();
         let mut env = harness.env();
-        let error = finish_dropin(&mut env, &sshd, CA, written(Some(sync_error()))).unwrap_err();
+        let error =
+            finish_dropin(&mut env, &sshd, CA, written(Some(sync_error())), false).unwrap_err();
         assert!(matches!(error, InstallError::AfterCommit { .. }), "{error}");
         assert!(
             error
@@ -1175,7 +1316,8 @@ mod tests {
             .write(DROPIN_PATH, &render::dropin("/var/lib/jaunt"));
         let sshd = Sshd::locate(&harness.layout, "").unwrap();
         let mut env = harness.env();
-        let error = finish_dropin(&mut env, &sshd, CA, written(Some(sync_error()))).unwrap_err();
+        let error =
+            finish_dropin(&mut env, &sshd, CA, written(Some(sync_error())), false).unwrap_err();
         assert!(matches!(error, InstallError::Validation { .. }), "{error}");
         assert_eq!(harness.root.read(DROPIN_PATH), None);
     }
@@ -1634,6 +1776,27 @@ mod tests {
                 warned
             );
         }
+    }
+
+    #[test]
+    fn a_failed_rollback_names_the_helper_units_it_leaves_behind() {
+        let mut harness = Harness::new(FakeConfig::default());
+        let mut ledger = ledger_with_artifacts(&harness);
+        let unit = harness.root.path_of(HELPER_SOCKET_PATH);
+        ledger.files.push(unit);
+        let mut env = harness.env();
+        handle_stage_failure(
+            &mut env,
+            &options(),
+            &ledger,
+            validation_error(RollbackOutcome::Failed {
+                reason: "stuck".to_string(),
+            }),
+        );
+        assert!(harness.report.contains(
+            Level::Warn,
+            "the agent configuration and the jaunt-host-users units stay in place"
+        ));
     }
 
     #[test]

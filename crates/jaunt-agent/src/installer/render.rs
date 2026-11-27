@@ -1,3 +1,5 @@
+use jaunt_host_users::{HostUsersSection, NamesSection};
+
 use super::layout::inner_ca_path;
 
 const UNIT_TEMPLATE: &str = include_str!("jaunt-agent.service.tpl");
@@ -13,6 +15,62 @@ pub fn dropin(state_dir: &str) -> String {
 
 pub fn agent_config(state_dir: &str) -> String {
     format!("{MANAGED_HEADER}\nstate_dir: {state_dir}\nlog_level: info\n")
+}
+
+pub fn agent_config_with_host_users(state_dir: &str, section: &HostUsersSection) -> String {
+    let HostUsersSection {
+        enabled,
+        groups,
+        privileged_groups,
+        shell,
+        home_base,
+        home_mode,
+        uid_min,
+        uid_max,
+        max_users,
+        names,
+        allow_with_directory,
+    } = section;
+    let NamesSection {
+        deny,
+        deny_prefixes,
+        allow_prefixes,
+    } = names;
+    format!(
+        "{}host_users:\n  enabled: {enabled}\n  groups: {}\n  privileged_groups: {}\n  shell: {}\n  home_base: {}\n  home_mode: {}\n  uid_min: {uid_min}\n  uid_max: {uid_max}\n  max_users: {max_users}\n  names:\n    deny: {}\n    deny_prefixes: {}\n    allow_prefixes: {}\n  allow_with_directory: {allow_with_directory}\n",
+        agent_config(state_dir),
+        yaml_list(groups),
+        yaml_list(privileged_groups),
+        yaml_string(shell),
+        yaml_string(home_base),
+        yaml_string(home_mode),
+        yaml_list(deny),
+        yaml_list(deny_prefixes),
+        yaml_list(allow_prefixes),
+    )
+}
+
+fn yaml_string(value: &str) -> String {
+    serde_json::Value::from(value).to_string()
+}
+
+fn yaml_list(values: &[String]) -> String {
+    let items: Vec<String> = values.iter().map(|value| yaml_string(value)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+pub fn helper_unit(
+    template: &str,
+    helper: &str,
+    config: &str,
+    user: &str,
+    home_base: &str,
+) -> String {
+    template
+        .replace("{{binary}}", helper)
+        .replace("{{config}}", config)
+        .replace("{{user}}", user)
+        .replace("{{home_base}}", home_base)
 }
 
 pub fn carries_header(content: &[u8]) -> bool {
@@ -36,7 +94,11 @@ pub fn unit(user: &str, binary: &str, config: &str, state_dir: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{agent_config, carries_header, dropin, is_foreign, unit};
+    use jaunt_host_users::{HostUsersSection, NamesSection, parse_agent_file};
+
+    use super::{
+        agent_config, agent_config_with_host_users, carries_header, dropin, is_foreign, unit,
+    };
     use crate::paths::check_state_dir;
     use crate::run::config::{AgentConfig, InnerConfig, RecordingConfig, load};
 
@@ -94,6 +156,73 @@ mod tests {
                 "{state_dir}"
             );
         }
+    }
+
+    #[test]
+    fn the_host_users_section_is_rendered_with_every_library_key() {
+        let enabled = HostUsersSection {
+            enabled: true,
+            ..HostUsersSection::default()
+        };
+        let text = agent_config_with_host_users("/var/lib/jaunt", &enabled);
+        assert_eq!(
+            text,
+            concat!(
+                "# Managed by jaunt-agent. Do not edit.\n",
+                "state_dir: /var/lib/jaunt\n",
+                "log_level: info\n",
+                "host_users:\n",
+                "  enabled: true\n",
+                "  groups: []\n",
+                "  privileged_groups: []\n",
+                "  shell: \"/bin/bash\"\n",
+                "  home_base: \"/home\"\n",
+                "  home_mode: \"0750\"\n",
+                "  uid_min: 30000\n",
+                "  uid_max: 30999\n",
+                "  max_users: 100\n",
+                "  names:\n",
+                "    deny: []\n",
+                "    deny_prefixes: []\n",
+                "    allow_prefixes: []\n",
+                "  allow_with_directory: false\n",
+            )
+        );
+        let expected = HostUsersSection {
+            enabled: true,
+            ..HostUsersSection::default()
+        };
+        assert_eq!(parse_agent_file(&text).unwrap(), expected);
+        assert!(expected.settings().is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::write(&path, &text).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.host_users, expected);
+        assert_eq!(loaded.state_dir, Some(PathBuf::from("/var/lib/jaunt")));
+    }
+
+    #[test]
+    fn an_edited_host_users_section_survives_rendering_with_every_value() {
+        let section = HostUsersSection {
+            enabled: false,
+            groups: vec!["staff".to_owned(), "ssh-users".to_owned()],
+            privileged_groups: vec!["sudo".to_owned()],
+            shell: "/usr/bin/zsh".to_owned(),
+            home_base: "/srv/home".to_owned(),
+            home_mode: "0700".to_owned(),
+            uid_min: 40_000,
+            uid_max: 40_099,
+            max_users: 10,
+            names: NamesSection {
+                deny: vec!["guest".to_owned()],
+                deny_prefixes: vec!["svc-".to_owned()],
+                allow_prefixes: vec!["ext-".to_owned(), "\"q\\".to_owned()],
+            },
+            allow_with_directory: true,
+        };
+        let text = agent_config_with_host_users("/var/lib/jaunt", &section);
+        assert_eq!(parse_agent_file(&text).unwrap(), section);
     }
 
     #[test]

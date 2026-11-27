@@ -75,13 +75,15 @@ run_builder() {
   local debs=/work/debs bin=/work/bin
   mkdir -p "$debs" "$bin"
 
-  local version name
+  local version name arch
   for version in 0.0.1 0.0.2; do
-    for name in jaunt-agent jaunt; do
+    for name in jaunt-agent jaunt-host-users jaunt; do
       compile_dummy "$name" "$version" "$bin/$name-$version-$native"
       as_foreign_arch "$bin/$name-$version-$native" "$bin/$name-$version-$foreign" "$foreign_machine"
-      "$build" --package "$name" --version "$version" --arch "$native" --binary "$bin/$name-$version-$native" --output "$debs" >/dev/null
-      "$build" --package "$name" --version "$version" --arch "$foreign" --binary "$bin/$name-$version-$foreign" --output "$debs" >/dev/null
+    done
+    for arch in "$native" "$foreign"; do
+      "$build" --package jaunt-agent --version "$version" --arch "$arch" --binary "$bin/jaunt-agent-$version-$arch" --helper-binary "$bin/jaunt-host-users-$version-$arch" --output "$debs" >/dev/null
+      "$build" --package jaunt --version "$version" --arch "$arch" --binary "$bin/jaunt-$version-$arch" --output "$debs" >/dev/null
     done
   done
 
@@ -92,6 +94,9 @@ run_builder() {
   check_fails "a binary for the other architecture is refused" "is not built for" "$build" --package jaunt --version 0.0.1 --arch "$foreign" --binary "$bin/jaunt-0.0.1-$native" --output /work/refused
   check_fails "a version with a leading v is refused" "version must look like" "$build" --package jaunt --version v0.0.1 --arch "$native" --binary "$bin/jaunt-0.0.1-$native" --output /work/refused
   check_fails "a file that is not an ELF binary is refused" "is not an ELF file" "$build" --package jaunt --version 0.0.1 --arch "$native" --binary /repo/scripts/build-deb.sh --output /work/refused
+  check_fails "jaunt-agent without the account helper is refused" "--helper-binary is required" "$build" --package jaunt-agent --version 0.0.1 --arch "$native" --binary "$bin/jaunt-agent-0.0.1-$native" --output /work/refused
+  check_fails "an account helper for the other architecture is refused" "is not built for" "$build" --package jaunt-agent --version 0.0.1 --arch "$native" --binary "$bin/jaunt-agent-0.0.1-$native" --helper-binary "$bin/jaunt-host-users-0.0.1-$foreign" --output /work/refused
+  check_fails "the client package refuses an account helper" "--helper-binary is only for jaunt-agent" "$build" --package jaunt --version 0.0.1 --arch "$native" --binary "$bin/jaunt-0.0.1-$native" --helper-binary "$bin/jaunt-host-users-0.0.1-$native" --output /work/refused
 
   local pair given expected built
   for pair in 0.0.3-rc.1:0.0.3~rc.1 1.2.3-rc-1:1.2.3~rc~1 1.2.3+b1:1.2.3+b1 1.2.3-rc.1+b1:1.2.3~rc.1+b1 1.2.3+b-1:1.2.3+b.1; do
@@ -158,8 +163,10 @@ run_clean() {
   check "apt installs both packages" apt-get install -y -qq jaunt-agent jaunt
   check "jaunt-agent reports its version" version_is jaunt-agent 0.0.1
   check "jaunt reports its version" version_is jaunt 0.0.1
+  check "jaunt-host-users reports its version" version_is jaunt-host-users 0.0.1
 
   check "jaunt-agent is root-owned and 0755" mode_is '755 root:root' /usr/bin/jaunt-agent
+  check "jaunt-host-users is root-owned and 0755" mode_is '755 root:root' /usr/bin/jaunt-host-users
   check "jaunt is root-owned and 0755" mode_is '755 root:root' /usr/bin/jaunt
   check "the unit file is root-owned and 0644" mode_is '644 root:root' /usr/lib/systemd/system/jaunt-agent.service
   check "the agent unit runs the packaged binary with the default config" file_has_line 'ExecStart=/usr/bin/jaunt-agent run --config /etc/jaunt/agent.yaml' /usr/lib/systemd/system/jaunt-agent.service
@@ -169,7 +176,7 @@ run_clean() {
 
   local listed
   listed=$(dpkg -L jaunt-agent jaunt | while read -r path; do if [ -f "$path" ]; then echo "$path"; fi; done | sort | tr '\n' ' ')
-  local expected='/usr/bin/jaunt /usr/bin/jaunt-agent /usr/lib/systemd/system/jaunt-agent.service /usr/share/doc/jaunt-agent/README.md /usr/share/doc/jaunt-agent/changelog.gz /usr/share/doc/jaunt-agent/copyright /usr/share/doc/jaunt/README.md /usr/share/doc/jaunt/changelog.gz /usr/share/doc/jaunt/copyright /usr/share/lintian/overrides/jaunt /usr/share/lintian/overrides/jaunt-agent '
+  local expected='/usr/bin/jaunt /usr/bin/jaunt-agent /usr/bin/jaunt-host-users /usr/lib/systemd/system/jaunt-agent.service /usr/share/doc/jaunt-agent/README.md /usr/share/doc/jaunt-agent/changelog.gz /usr/share/doc/jaunt-agent/copyright /usr/share/doc/jaunt/README.md /usr/share/doc/jaunt/changelog.gz /usr/share/doc/jaunt/copyright /usr/share/lintian/overrides/jaunt /usr/share/lintian/overrides/jaunt-agent '
   check "the packages contain exactly the expected files" test "$listed" = "$expected"
   dpkg -L jaunt-agent jaunt >/work/installed-paths
   check "no packaged path is setuid or setgid" bash -c "! find \$(cat /work/installed-paths) -maxdepth 0 -perm /6000 | grep -q ."
@@ -181,12 +188,15 @@ run_clean() {
   check "the package left sshd alone" absent /etc/ssh/sshd_config.d/50-jaunt.conf
   check "the package enabled nothing" absent /etc/systemd/system/jaunt-agent.service
   check "the package enabled no unit link" bash -c "! find /etc/systemd -name 'jaunt-agent*' | grep -q ."
+  check "the package ships no unit of the account helper" bash -c "! find /usr/lib/systemd /lib/systemd /etc/systemd -name 'jaunt-host-users*' 2>/dev/null | grep -q ."
+  check "the package created no account helper state" absent /var/lib/jaunt-host-users
 
   use_repo repo-b
   check "apt update accepts the repository with version 0.0.2" refresh_jaunt_source
   check "apt upgrades both packages" apt-get install -y -qq --only-upgrade jaunt-agent jaunt
   check "jaunt-agent is upgraded" version_is jaunt-agent 0.0.2
   check "jaunt is upgraded" version_is jaunt 0.0.2
+  check "jaunt-host-users is upgraded" version_is jaunt-host-users 0.0.2
   check "the upgrade keeps the file modes" mode_is '755 root:root' /usr/bin/jaunt-agent
   check "the installed version is 0.0.2" bash -c "[ \"\$(dpkg-query -W -f='\${Version}' jaunt-agent)\" = 0.0.2 ]"
 
@@ -201,7 +211,7 @@ run_clean() {
   check_fails "apt update refuses a repository without a signature" "$SIGNATURE_REASON" refresh_jaunt_source
 
   check "apt purges both packages" apt-get purge -y -qq jaunt-agent jaunt
-  check "the binaries are gone" bash -c '! test -e /usr/bin/jaunt-agent && ! test -e /usr/bin/jaunt'
+  check "the binaries are gone" bash -c '! test -e /usr/bin/jaunt-agent && ! test -e /usr/bin/jaunt && ! test -e /usr/bin/jaunt-host-users'
   check "no packaged file remains" bash -c "! while read -r path; do if [ -e \"\$path\" ] && [ ! -d \"\$path\" ]; then echo \"\$path\"; fi; done </work/installed-paths | grep -q ."
   check "the documentation directories are gone" bash -c '! test -e /usr/share/doc/jaunt-agent && ! test -e /usr/share/doc/jaunt'
   check "dpkg no longer knows the packages" bash -c '! dpkg -s jaunt-agent >/dev/null 2>&1 && ! dpkg -s jaunt >/dev/null 2>&1'

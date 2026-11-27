@@ -48,6 +48,12 @@ pub enum InstallError {
     )]
     ForeignConfig { path: String, reason: &'static str },
     #[error(
+        "refusing to rewrite {path}: {reason}; fix it or remove the host_users section and run install again (nothing was changed)"
+    )]
+    InvalidHostUsersSection { path: String, reason: String },
+    #[error("refusing to set up account creation: {path} {reason} (nothing was changed)")]
+    CreateAccountsRefused { path: String, reason: String },
+    #[error(
         "{file}:{line}: `TrustedUserCAKeys {value}` makes sshd trust a user CA; Jaunt requires that sshd trusts no user CA for outside connections. Remove or comment out that directive and run install again (nothing was changed)"
     )]
     UserCaDirective {
@@ -101,6 +107,8 @@ impl InstallError {
 pub const DROPIN_REMAINS: &str = "the validated sshd drop-in stays in place";
 pub const DROPIN_AND_UNIT_REMAIN: &str =
     "the validated sshd drop-in and the unit file stay in place";
+pub const DROPIN_AND_HELPER_UNITS_REMAIN: &str = "the validated sshd drop-in, the agent configuration and the jaunt-host-users units stay in place";
+pub const DROPIN_AND_UNITS_REMAIN: &str = "the validated sshd drop-in, the agent configuration, the agent unit file and the jaunt-host-users units stay in place";
 
 #[derive(Debug, Error)]
 pub enum ValidationProblem {
