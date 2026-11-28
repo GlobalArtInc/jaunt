@@ -277,6 +277,7 @@ pub struct FakeServiceControl {
     lifetime: i64,
     calls: Mutex<Vec<&'static str>>,
     batches: Mutex<Vec<AgentEventBatch>>,
+    refused_events: Mutex<Vec<String>>,
 }
 
 impl FakeServiceControl {
@@ -304,7 +305,15 @@ impl FakeServiceControl {
             lifetime: 7 * DAY,
             calls: Mutex::new(Vec::new()),
             batches: Mutex::new(Vec::new()),
+            refused_events: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn refuse_events_of(&self, session_id: &str) {
+        self.refused_events
+            .lock()
+            .unwrap()
+            .push(session_id.to_owned());
     }
 
     pub fn calls(&self) -> Vec<&'static str> {
@@ -454,7 +463,18 @@ impl EventTransport for FakeServiceControl {
         self.calls.lock().unwrap().push("events");
         self.batches.lock().unwrap().push(batch.clone());
         let accepted = u64::try_from(batch.events.len()).unwrap();
+        let refused: Vec<String> = self
+            .refused_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| batch.events.iter().any(|event| &event.session_id == *id))
+            .cloned()
+            .collect();
         Box::pin(async move {
+            if !refused.is_empty() {
+                return Ok(EventsAnswer::SessionsRefused(refused));
+            }
             Ok(EventsAnswer::Accepted(AgentEventsAccepted {
                 accepted,
                 ..AgentEventsAccepted::default()

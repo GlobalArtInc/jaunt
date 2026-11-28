@@ -1,7 +1,10 @@
 mod audit;
+mod buckets;
 mod catalog;
 mod ledger;
 pub(crate) mod notices;
+
+pub use buckets::AgentEventLimits;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,80 +32,67 @@ use crate::http::{
 use crate::limits::too_many_requests;
 
 use audit::{Accepted, DropReason};
+use buckets::{Buckets, Lane};
 use catalog::Fitting;
 use ledger::{Budget, Charge, ENDED_GRACE_SECS, Edge, Gate, Ledger, Verdict, WINDOW_SECS};
 use notices::Notices;
 
 pub(crate) const REQUESTS_PER_NODE: Rate = Rate::clamped(50, 50 * 60);
-pub(crate) const EDGES_PER_NODE: Rate = Rate::clamped(200, 50 * 60);
-pub(crate) const LIFECYCLE_PER_NODE: Rate = Rate::clamped(500, 100 * 60);
-pub(crate) const MARKS_PER_NODE: Rate = Rate::clamped(100, 20 * 60);
-pub(crate) const CRITICAL_FROM_AGENTS: Rate = Rate::clamped(2000, 400 * 60);
 pub(crate) const MAX_FITTED_PER_REQUEST: usize = 16;
+pub(crate) const MAX_FLAGS_PER_REQUEST: usize = 64;
+pub(crate) const DEFERRED_MARKS_PER_SWEEP: usize = 256;
+pub(crate) const DEFERRED_FLAGS_PER_SWEEP: usize = 256;
 const NODES_TRACKED: usize = 10_000;
 const INVALID_BATCH: &str = "invalid_batch";
 
 pub(crate) struct AgentEvents {
     requests: RateLimiter<String>,
-    edges: RateLimiter<String>,
-    lifecycle: RateLimiter<String>,
-    marks: RateLimiter<String>,
-    agents: RateLimiter<()>,
+    buckets: Buckets,
     ledger: Ledger,
     notices: Notices,
     mark_attempts: AtomicU64,
     fittings: AtomicU64,
+    #[cfg(feature = "test-support")]
+    recording_gate: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 impl AgentEvents {
-    pub(crate) fn new() -> AgentEvents {
+    pub(crate) fn new(limits: AgentEventLimits) -> AgentEvents {
         AgentEvents {
             requests: RateLimiter::new(REQUESTS_PER_NODE, NODES_TRACKED),
-            edges: RateLimiter::new(EDGES_PER_NODE, NODES_TRACKED),
-            lifecycle: RateLimiter::new(LIFECYCLE_PER_NODE, NODES_TRACKED),
-            marks: RateLimiter::new(MARKS_PER_NODE, NODES_TRACKED),
-            agents: RateLimiter::new(CRITICAL_FROM_AGENTS, 1),
+            buckets: Buckets::new(limits, NODES_TRACKED),
             ledger: Ledger::new(),
             notices: Notices::new(),
             mark_attempts: AtomicU64::new(0),
             fittings: AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            recording_gate: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
     pub(crate) fn sweep_limits(&self, tick: std::time::Duration) {
         self.requests.sweep(tick);
-        self.edges.sweep(tick);
-        self.lifecycle.sweep(tick);
-        self.marks.sweep(tick);
-        self.agents.sweep(tick);
+        self.buckets.sweep(tick);
         self.notices.sweep(tick);
     }
 
-    fn admit(&self, node: &String, charge: Charge, tick: std::time::Duration) -> Gate {
-        let bucket = match charge {
-            Charge::Once(_) => &self.edges,
-            Charge::Budgeted(_) | Charge::Invalid => &self.lifecycle,
+    fn admit(&self, node: &str, charge: Charge, tick: std::time::Duration) -> Gate {
+        let lane = match charge {
+            Charge::Once(_) => Lane::Edges,
+            Charge::Budgeted(_) | Charge::Invalid => Lane::Lifecycle,
         };
-        self.admit_in(bucket, node, tick)
+        self.buckets.admit(node, lane, tick)
     }
 
-    fn admit_mark(&self, node: &String, tick: std::time::Duration) -> Gate {
-        self.admit_in(&self.marks, node, tick)
+    fn admit_mark(&self, node: &str, tick: std::time::Duration) -> Gate {
+        self.buckets.admit(node, Lane::Marks, tick)
     }
 
-    fn admit_in(
-        &self,
-        bucket: &RateLimiter<String>,
-        node: &String,
-        tick: std::time::Duration,
-    ) -> Gate {
-        if !bucket.check(node, tick).is_allowed() {
-            return Gate::Node;
-        }
-        if !self.agents.check(&(), tick).is_allowed() {
-            return Gate::Agents;
-        }
-        Gate::Open
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn hold_recording(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        std::sync::Arc::clone(&self.recording_gate)
+            .write_owned()
+            .await
     }
 
     #[cfg(feature = "test-support")]
@@ -319,7 +309,13 @@ pub(crate) async fn handle(
         let sessions = session_ids(&batch).len();
         return refuse(&control, &node_id, refusal, batch.events.len(), sessions);
     }
-    let task = tokio::spawn(async move { record(&control, &node_id, batch).await });
+    let task = tokio::spawn(async move {
+        #[cfg(feature = "test-support")]
+        let _pass = std::sync::Arc::clone(&control.agent_events.recording_gate)
+            .read_owned()
+            .await;
+        record(&control, &node_id, batch).await
+    });
     task.await.unwrap_or_else(|_| {
         tracing::error!(target: "jaunt::control", "recording agent events did not finish");
         server_error()
@@ -395,7 +391,6 @@ async fn record(control: &Control, node_id: &str, batch: AgentEventBatch) -> Res
     }
     let state = &control.agent_events;
     let tick = control.tick();
-    let node_key = node_id.to_owned();
     let now_ms = now.secs.saturating_mul(1000);
     let mut tally = Tally::default();
     let mut fitting = Fitting::new(MAX_FITTED_PER_REQUEST);
@@ -422,7 +417,7 @@ async fn record(control: &Control, node_id: &str, batch: AgentEventBatch) -> Res
             charge,
             session.ended_at,
             now.secs,
-            |charge| state.admit(&node_key, charge, tick),
+            |charge| state.admit(node_id, charge, tick),
         );
         if let Some(reason) = verdict_drop(verdict) {
             tally.drop_event(&event.session_id, reason);
@@ -468,13 +463,19 @@ async fn record(control: &Control, node_id: &str, batch: AgentEventBatch) -> Res
         );
     }
     let mut failed = false;
+    let mut flags_left = MAX_FLAGS_PER_REQUEST;
     for id in &ids {
         let Some(session) = sessions.get(id).copied() else {
             continue;
         };
-        if let Err(err) = settle_mark(control, session).await {
-            tracing::error!(target: "jaunt::control", error = %err, session_id = *id, "marking the audit of a session incomplete failed");
-            failed = true;
+        match settle_mark(control, session, flags_left > 0).await {
+            Ok(Mark::Written) => flags_left = flags_left.saturating_sub(1),
+            Ok(Mark::Unneeded | Mark::Postponed) => {}
+            Err(err) => {
+                flags_left = flags_left.saturating_sub(1);
+                tracing::error!(target: "jaunt::control", error = %err, session_id = *id, "marking the audit of a session incomplete failed");
+                failed = true;
+            }
         }
         announce(control, session, now.secs, tick);
     }
@@ -491,14 +492,28 @@ async fn record(control: &Control, node_id: &str, batch: AgentEventBatch) -> Res
     )
 }
 
-async fn settle_mark(control: &Control, session: &Session) -> Result<(), jaunt_store::StoreError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Unneeded,
+    Postponed,
+    Written,
+}
+
+async fn settle_mark(
+    control: &Control,
+    session: &Session,
+    may_write: bool,
+) -> Result<Mark, jaunt_store::StoreError> {
     let state = &control.agent_events;
     let pending = state.ledger.pending_mark(&session.id);
     if !needs_update(session.audit_incomplete, pending) {
         if pending.is_some() {
             state.ledger.marked(&session.id);
         }
-        return Ok(());
+        return Ok(Mark::Unneeded);
+    }
+    if !may_write {
+        return Ok(Mark::Postponed);
     }
     state.mark_attempts.fetch_add(1, Ordering::Relaxed);
     let newly = control
@@ -510,24 +525,24 @@ async fn settle_mark(control: &Control, session: &Session) -> Result<(), jaunt_s
     if newly {
         state.ledger.defer_event(&session.id);
     }
-    Ok(())
+    Ok(Mark::Written)
 }
 
 fn announce(control: &Control, session: &Session, now: i64, tick: std::time::Duration) {
     let state = &control.agent_events;
-    let Some(dropped_total) = state.ledger.pending_event(&session.id) else {
+    let Some(dropped_total) = state.ledger.claim_event(&session.id) else {
         return;
     };
     let long_ended = session
         .ended_at
         .is_some_and(|ended| now.saturating_sub(ended) > WINDOW_SECS);
     if long_ended {
-        state.ledger.event_settled(&session.id);
         return;
     }
     if state.admit_mark(&session.node_id, tick) == Gate::Open {
         audit::audit_incomplete(session, dropped_total);
-        state.ledger.event_settled(&session.id);
+    } else {
+        state.ledger.defer_event(&session.id);
     }
 }
 
@@ -540,9 +555,52 @@ pub(crate) async fn settle_stale(control: &Control, session_id: &str) -> Option<
         .agent_events
         .ledger
         .note_dropped(session_id, 1, true, stale.ended_at, now.secs);
-    settle_mark(control, &stale).await.ok()?;
+    settle_mark(control, &stale, true).await.ok()?;
     announce(control, &stale, now.secs, control.tick());
     Some(())
+}
+
+pub(crate) async fn sweep_marks(control: &Control) {
+    let Some(now) = control.now() else {
+        return;
+    };
+    let state = &control.agent_events;
+    let flags = state
+        .ledger
+        .deferred_marks(now.secs, DEFERRED_FLAGS_PER_SWEEP);
+    let events = state
+        .ledger
+        .deferred_events(now.secs, DEFERRED_MARKS_PER_SWEEP);
+    let flagging: BTreeSet<&str> = flags.iter().map(String::as_str).collect();
+    let mut ids: Vec<&str> = flags.iter().map(String::as_str).collect();
+    ids.extend(
+        events
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !flagging.contains(id)),
+    );
+    if ids.is_empty() {
+        return;
+    }
+    match control.store.service_sessions().for_audit(&ids).await {
+        Ok(rows) => {
+            for id in &ids {
+                let Some(session) = rows.iter().find(|row| row.id == *id) else {
+                    state.ledger.forget(id);
+                    continue;
+                };
+                if flagging.contains(id)
+                    && let Err(err) = settle_mark(control, session, true).await
+                {
+                    tracing::warn!(target: "jaunt::control", error = %err, session_id = *id, "marking the audit of a session incomplete failed; it is retried at the next sweep");
+                }
+                announce(control, session, now.secs, control.tick());
+            }
+        }
+        Err(err) => {
+            tracing::warn!(target: "jaunt::control", error = %err, "reading the sessions of deferred audit marks failed");
+        }
+    }
 }
 
 pub(crate) async fn sweep(control: &Control) {
@@ -560,7 +618,7 @@ pub(crate) async fn sweep(control: &Control) {
                         None => state.ledger.forget(id),
                         Some(session) => {
                             state.ledger.resolve(id, session.ended_at);
-                            if let Err(err) = settle_mark(control, session).await {
+                            if let Err(err) = settle_mark(control, session, true).await {
                                 tracing::warn!(target: "jaunt::control", error = %err, session_id = *id, "marking the audit of a session incomplete failed; it is retried at the next sweep");
                             }
                             announce(control, session, now.secs, control.tick());

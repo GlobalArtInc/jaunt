@@ -18,8 +18,8 @@ use jaunt_ca::{
     SubjectPublicKey, Uuid,
 };
 use jaunt_control::{
-    AgentEndpoint, Clock, Control, ControlParts, DeviceSettings, NodeAdmin, RequestLimits,
-    SshSuffix, Ticker,
+    AgentEndpoint, AgentEventLimits, Clock, Control, ControlParts, DeviceSettings, NodeAdmin,
+    RequestLimits, SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -194,6 +194,7 @@ impl Harness {
             services_domain: None,
             client_transport: None,
             db_client: None,
+            agent_events: AgentEventLimits::default(),
         };
         let control = match options.control_ticker.clone() {
             Some(ticker) => {

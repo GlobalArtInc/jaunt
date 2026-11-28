@@ -125,6 +125,8 @@ struct Entry {
     ended_at: Option<i64>,
     seen_at: i64,
     checked_at: i64,
+    offered_at: i64,
+    mark_offered_at: i64,
 }
 
 impl Entry {
@@ -140,6 +142,8 @@ impl Entry {
             ended_at: None,
             seen_at: now,
             checked_at: now,
+            offered_at: i64::MIN,
+            mark_offered_at: i64::MIN,
         }
     }
 
@@ -335,17 +339,44 @@ impl Ledger {
         }
     }
 
-    pub(crate) fn pending_event(&self, id: &str) -> Option<u64> {
-        self.lock()
-            .get(id)
-            .filter(|entry| entry.needs_event)
-            .map(|entry| entry.dropped_total)
+    pub(crate) fn claim_event(&self, id: &str) -> Option<u64> {
+        let mut entries = self.lock();
+        let entry = entries.get_mut(id).filter(|entry| entry.needs_event)?;
+        entry.needs_event = false;
+        Some(entry.dropped_total)
     }
 
-    pub(crate) fn event_settled(&self, id: &str) {
-        if let Some(entry) = self.lock().get_mut(id) {
-            entry.needs_event = false;
+    pub(crate) fn deferred_events(&self, now: i64, limit: usize) -> Vec<String> {
+        self.offer(now, limit, |entry| {
+            entry.needs_event.then_some(&mut entry.offered_at)
+        })
+    }
+
+    pub(crate) fn deferred_marks(&self, now: i64, limit: usize) -> Vec<String> {
+        self.offer(now, limit, |entry| {
+            entry.needs_mark.then_some(&mut entry.mark_offered_at)
+        })
+    }
+
+    fn offer(
+        &self,
+        now: i64,
+        limit: usize,
+        stamp: impl Fn(&mut Entry) -> Option<&mut i64>,
+    ) -> Vec<String> {
+        let mut entries = self.lock();
+        let mut waiting: Vec<(i64, String)> = entries
+            .iter_mut()
+            .filter_map(|(id, entry)| stamp(entry).map(|at| (*at, id.clone())))
+            .collect();
+        waiting.sort_unstable();
+        waiting.truncate(limit);
+        for (_, id) in &waiting {
+            if let Some(at) = entries.get_mut(id).and_then(&stamp) {
+                *at = now;
+            }
         }
+        waiting.into_iter().map(|(_, id)| id).collect()
     }
 
     pub(crate) fn unresolved(&self, now: i64, limit: usize) -> Vec<String> {
@@ -607,11 +638,11 @@ mod tests {
         assert_eq!(ledger.pending_mark("s"), Some(7));
         ledger.marked("s");
         assert_eq!(ledger.pending_mark("s"), None);
-        assert_eq!(ledger.pending_event("s"), None);
+        assert_eq!(ledger.claim_event("s"), None);
         ledger.defer_event("s");
-        assert_eq!(ledger.pending_event("s"), Some(7));
-        ledger.event_settled("s");
-        assert_eq!(ledger.pending_event("s"), None);
+        assert_eq!(ledger.claim_event("s"), Some(7));
+        assert_eq!(ledger.claim_event("s"), None);
+        assert_eq!(ledger.claim_event("unknown"), None);
         ledger.note_dropped("s", u64::MAX, true, None, NOW);
         assert_eq!(ledger.pending_mark("s"), Some(u64::MAX));
     }
@@ -641,7 +672,7 @@ mod tests {
         assert_eq!(decide(&ledger, "ended", 1, START, NOW), Verdict::Accept);
         assert_eq!(ledger.len(), 4);
         ledger.marked("pending");
-        ledger.event_settled("deferred");
+        ledger.claim_event("deferred");
         assert_eq!(ledger.sweep(ended + FORGET_AFTER_END_SECS + 1), 2);
         assert_eq!(ledger.sweep(NOW + IDLE_LIMIT_SECS), 0);
         assert_eq!(ledger.sweep(NOW + IDLE_LIMIT_SECS + 1), 2);
@@ -669,8 +700,48 @@ mod tests {
         );
         ledger.resolve("live", Some(NOW + 2));
         ledger.forget("pending");
-        ledger.event_settled("deferred");
+        ledger.claim_event("deferred");
         assert!(ledger.unresolved(NOW + 4 * ENDED_GRACE_SECS, 10).is_empty());
+    }
+
+    #[test]
+    fn deferred_events_are_offered_least_recently_offered_first_and_a_claimed_one_is_not_offered() {
+        let ledger = Ledger::new();
+        for id in ["a", "b", "c", "quiet"] {
+            decide(&ledger, id, 1, START, NOW);
+        }
+        for id in ["a", "b", "c"] {
+            ledger.defer_event(id);
+        }
+        let mut first = ledger.deferred_events(NOW, 2);
+        first.sort();
+        assert_eq!(first.len(), 2);
+        let second = ledger.deferred_events(NOW + 5, 2);
+        assert_eq!(second.len(), 2);
+        let mut offered: Vec<String> = first.iter().chain(&second).cloned().collect();
+        offered.sort();
+        offered.dedup();
+        assert_eq!(offered, ["a", "b", "c"]);
+        assert!(!first.contains(&second[0]));
+        assert_eq!(ledger.claim_event("c"), Some(0));
+        let mut rest = ledger.deferred_events(NOW + 10, 10);
+        rest.sort();
+        assert_eq!(rest, ["a", "b"]);
+        assert!(ledger.deferred_events(NOW + 15, 0).is_empty());
+    }
+
+    #[test]
+    fn marks_waiting_for_their_flag_are_offered_in_bounded_portions_oldest_offer_first() {
+        let ledger = Ledger::new();
+        for id in ["a", "b", "c"] {
+            ledger.note_dropped(id, 1, true, None, NOW);
+        }
+        ledger.note_dropped("unflagged", 1, false, None, NOW);
+        assert_eq!(ledger.deferred_marks(NOW, 2), ["a", "b"]);
+        assert_eq!(ledger.deferred_marks(NOW + 5, 2), ["c", "a"]);
+        ledger.marked("b");
+        assert_eq!(ledger.deferred_marks(NOW + 10, 10), ["a", "c"]);
+        assert!(ledger.deferred_events(NOW + 10, 10).is_empty());
     }
 
     #[test]

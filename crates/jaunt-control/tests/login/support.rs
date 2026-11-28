@@ -15,8 +15,8 @@ use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, PrivateKey};
 use jaunt_ca::{AgeIdentity, CaKind, FileBackend, InternalCa, Signer};
 use jaunt_control::{
-    AgentEndpoint, Clock, Control, ControlError, ControlParts, DeviceSettings, RequestLimits,
-    SshSuffix, Ticker,
+    AgentEndpoint, AgentEventLimits, Clock, Control, ControlError, ControlParts, DeviceSettings,
+    RequestLimits, SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_store::Store;
@@ -346,6 +346,7 @@ impl Harness {
                 services_domain: None,
                 client_transport: None,
                 db_client: None,
+                agent_events: AgentEventLimits::default(),
             },
             options.request_limits,
             options.ticker.unwrap_or_else(|| clock.ticker()),

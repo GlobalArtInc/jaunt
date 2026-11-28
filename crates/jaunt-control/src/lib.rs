@@ -81,6 +81,7 @@ pub use admin::{
     RejectedEnrollment, RemoveError,
 };
 pub use agent::AuthenticatedNode;
+pub use agent_events::AgentEventLimits;
 pub use ca_snapshot::CaSnapshot;
 #[cfg(feature = "test-support")]
 pub use clock::Ticker;

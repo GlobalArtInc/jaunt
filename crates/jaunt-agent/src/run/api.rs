@@ -1472,12 +1472,23 @@ mod tests {
             }
         }
         assert!(matches!(
-            events_answer(StatusCode::OK, b"{}", None),
+            events_answer(StatusCode::OK, br#"{"accepted":0,"dropped":0}"#, None),
             Ok(EventsAnswer::Accepted(body)) if body == AgentEventsAccepted::default()
         ));
-        assert!(matches!(
-            events_answer(StatusCode::OK, b"7", None),
-            Err(ApiError::BadResponse)
-        ));
+        for body in [
+            &b"{}"[..],
+            br#"{"error":"x"}"#,
+            br#"{"dropped":1,"withheld":0}"#,
+            b"7",
+        ] {
+            assert!(
+                matches!(
+                    events_answer(StatusCode::OK, body, None),
+                    Err(ApiError::BadResponse)
+                ),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 }

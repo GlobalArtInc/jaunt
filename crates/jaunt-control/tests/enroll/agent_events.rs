@@ -772,6 +772,23 @@ fn reports_for(sessions: &[String]) -> Value {
     json!({"events": [], "dropped": dropped})
 }
 
+async fn flagged(stand: &Stand) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE audit_incomplete = 1")
+        .fetch_one(&raw_pool(&stand.harness).await)
+        .await
+        .unwrap()
+}
+
+async fn swept_marks(stand: &Stand) -> Vec<Captured> {
+    start_recording();
+    stand
+        .harness
+        .control
+        .sweep_deferred_agent_event_marks()
+        .await;
+    take_recording()
+}
+
 #[tokio::test]
 async fn lifecycle_events_of_one_user_do_not_spend_the_starts_of_another_or_of_another_node() {
     let stand = stand().await;
@@ -785,7 +802,7 @@ async fn lifecycle_events_of_one_user_do_not_spend_the_starts_of_another_or_of_a
         accepted += counts(&reply).0;
     }
     let recorded = take_recording();
-    assert_eq!(accepted, 500);
+    assert_eq!(accepted, 32);
     let dropped = named(&recorded, "agent.events.dropped");
     assert_eq!(values(&dropped, "reason"), ["node_ceiling"]);
     assert_eq!(named(&recorded, "session.audit_incomplete").len(), 1);
@@ -794,23 +811,27 @@ async fn lifecycle_events_of_one_user_do_not_spend_the_starts_of_another_or_of_a
     let tcp = open(&stand, &bob, ServiceKind::Tcp, TCP).await;
     let start = batch(vec![event(&tcp, 1, "tcp.session.start", json!({}))]);
     assert_eq!(counts(&post(&stand, &stand.node_id, &start).await), (1, 0));
-    let elsewhere = raw_sessions(&stand, &bob, &stand.other_node_id, "kube", 1, 1, None).await;
+    let other = &stand.other_node_id;
+    let elsewhere = raw_sessions(&stand, &bob, other, "tcp", 1, 1, None).await;
+    let start = batch(vec![event(
+        &elsewhere[0],
+        1,
+        "tcp.session.start",
+        json!({}),
+    )]);
+    assert_eq!(counts(&post(&stand, other, &start).await), (1, 0));
+    let busy = raw_sessions(&stand, &bob, other, "kube", 2, 1, None).await;
     let mut other_seq = 0;
-    let reply = post(
-        &stand,
-        &stand.other_node_id,
-        &exec_flood(&elsewhere[0], &mut other_seq, 256),
-    )
-    .await;
-    assert_eq!(counts(&reply), (256, 0));
+    let reply = post(&stand, other, &exec_flood(&busy[0], &mut other_seq, 256)).await;
+    assert_eq!(counts(&reply), (32, 224));
 
     stand.harness.clock.advance(1);
     let reply = post(&stand, &stand.node_id, &exec_flood(&kube, &mut seq, 256)).await;
-    assert_eq!(counts(&reply), (100, 156));
+    assert_eq!(counts(&reply), (32, 224));
 }
 
 #[tokio::test]
-async fn repeated_starts_spend_nothing_and_a_full_node_leaves_the_next_node_alone() {
+async fn repeated_starts_spend_nothing_and_a_full_node_leaves_room_for_the_next_node() {
     let stand = stand().await;
     let alice = person(&stand.harness, "alice", &["ops"]).await;
     let first = open(&stand, &alice, ServiceKind::Tcp, TCP).await;
@@ -828,26 +849,57 @@ async fn repeated_starts_spend_nothing_and_a_full_node_leaves_the_next_node_alon
             expected
         );
     }
+    let starts = |ids: &[String]| {
+        batch(
+            ids.iter()
+                .map(|id| event(id, 1, "tcp.session.start", json!({})))
+                .collect(),
+        )
+    };
     let many = raw_sessions(&stand, &alice, &stand.node_id, "tcp", 2, 200, None).await;
-    let starts: Vec<Value> = many
-        .iter()
-        .map(|id| event(id, 1, "tcp.session.start", json!({})))
-        .collect();
+    start_recording();
     assert_eq!(
-        counts(&post(&stand, &stand.node_id, &batch(starts)).await),
-        (199, 1)
+        counts(&post(&stand, &stand.node_id, &starts(&many)).await),
+        (31, 169)
     );
-    let elsewhere = raw_sessions(&stand, &alice, &stand.other_node_id, "tcp", 3, 1, None).await;
-    let start = batch(vec![event(
-        &elsewhere[0],
-        1,
-        "tcp.session.start",
-        json!({}),
-    )]);
+    let reasons = values(&named(&take_recording(), "agent.events.dropped"), "reason").join(",");
+    assert_eq!(reasons, "node_ceiling");
+    let other = &stand.other_node_id;
+    let elsewhere = raw_sessions(&stand, &alice, other, "tcp", 3, 2, None).await;
     assert_eq!(
-        counts(&post(&stand, &stand.other_node_id, &start).await),
+        counts(&post(&stand, other, &starts(&elsewhere[..1])).await),
         (1, 0)
     );
+
+    stand.harness.clock.advance(1);
+    let more = raw_sessions(&stand, &alice, &stand.node_id, "tcp", 4, 200, None).await;
+    assert_eq!(
+        counts(&post(&stand, &stand.node_id, &starts(&more)).await),
+        (32, 168)
+    );
+    assert_eq!(
+        counts(&post(&stand, other, &starts(&elsewhere[1..])).await),
+        (1, 0)
+    );
+}
+
+async fn flooding_nodes(stand: &Stand, names: &[&str]) -> Vec<String> {
+    let mut nodes = Vec::new();
+    for name in names {
+        nodes.push(crate::session_support::node(&stand.harness, name).await);
+    }
+    nodes
+}
+
+async fn flood_exec(stand: &Stand, holder: &X509, node_id: &str, tag: u32) -> (String, u64) {
+    let session = raw_sessions(stand, holder, node_id, "kube", tag, 1, None).await;
+    let mut seq = 0;
+    let mut taken = 0;
+    for _ in 0..2 {
+        let reply = post(stand, node_id, &exec_flood(&session[0], &mut seq, 256)).await;
+        taken += counts(&reply).0;
+    }
+    (session[0].clone(), taken)
 }
 
 #[tokio::test]
@@ -855,45 +907,69 @@ async fn agents_together_stop_at_one_ceiling_for_the_whole_control() {
     let stand = stand().await;
     let alice = person(&stand.harness, "alice", &["ops"]).await;
     let mut nodes = vec![stand.node_id.clone(), stand.other_node_id.clone()];
-    for name in ["svc-03", "svc-04", "svc-05"] {
-        nodes.push(crate::session_support::node(&stand.harness, name).await);
-    }
+    nodes.extend(flooding_nodes(&stand, &["svc-03", "svc-04", "svc-05"]).await);
     let mut accepted = Vec::new();
+    let mut flooded = Vec::new();
     start_recording();
     for (index, node_id) in nodes.iter().enumerate() {
         let tag = 10 + u32::try_from(index).unwrap();
-        let session = raw_sessions(&stand, &alice, node_id, "kube", tag, 1, None).await;
-        let mut seq = 0;
-        let mut taken = 0;
-        for _ in 0..2 {
-            let reply = post(&stand, node_id, &exec_flood(&session[0], &mut seq, 256)).await;
-            taken += counts(&reply).0;
-        }
+        let (session, taken) = flood_exec(&stand, &alice, node_id, tag).await;
         accepted.push(taken);
+        flooded.push(session);
     }
     let recorded = take_recording();
-    let marks = named(&recorded, "session.audit_incomplete").len() as u64;
-    assert_eq!(accepted[..3], [500, 500, 500]);
+    let written = named(&recorded, "session.audit_incomplete");
+    assert_eq!(accepted[..3], [32, 32, 32]);
     assert_eq!(accepted[4], 0);
-    assert_eq!(accepted.iter().sum::<u64>() + marks, 2000);
+    assert_eq!(accepted.iter().sum::<u64>() + written.len() as u64, 128);
     let reasons = values(&named(&recorded, "agent.events.dropped"), "reason");
     assert!(reasons.contains(&"agents_ceiling"), "{reasons:?}");
-    let bob = person(&stand.harness, "bob", &["ops"]).await;
-    let tcp = open(&stand, &bob, ServiceKind::Tcp, TCP).await;
-    let start = batch(vec![event(&tcp, 1, "tcp.session.start", json!({}))]);
-    assert_eq!(counts(&post(&stand, &stand.node_id, &start).await), (0, 1));
-    assert!(row(&stand.harness, &tcp).await.audit_incomplete);
+    assert_eq!(flagged(&stand).await, 5);
+
+    stand.harness.clock.advance(5);
+    let caught_up = swept_marks(&stand).await;
+    let mut marked = values(&written, "session_id");
+    marked.extend(values(
+        &named(&caught_up, "session.audit_incomplete"),
+        "session_id",
+    ));
+    marked.sort_unstable();
+    flooded.sort_unstable();
+    assert_eq!(marked, flooded);
 }
 
 #[tokio::test]
-async fn marks_of_ended_sessions_set_every_flag_at_once_and_write_their_events_within_the_bucket() {
+async fn two_nodes_flooding_exec_leave_the_starts_and_exec_of_a_third_passing_at_once() {
     let stand = stand().await;
     let alice = person(&stand.harness, "alice", &["ops"]).await;
-    let kube = open(&stand, &alice, ServiceKind::Kubernetes, KUBE).await;
-    let mut seq = 0;
-    for _ in 0..3 {
-        post(&stand, &stand.node_id, &exec_flood(&kube, &mut seq, 256)).await;
+    let nodes = flooding_nodes(&stand, &["svc-03", "svc-04"]).await;
+    for (index, node_id) in nodes.iter().enumerate() {
+        let tag = 40 + u32::try_from(index).unwrap();
+        let (_, taken) = flood_exec(&stand, &alice, node_id, tag).await;
+        assert_eq!(taken, 32);
     }
+    let bob = person(&stand.harness, "bob", &["ops"]).await;
+    let tcp = open(&stand, &bob, ServiceKind::Tcp, TCP).await;
+    let kube = open(&stand, &bob, ServiceKind::Kubernetes, KUBE).await;
+    start_recording();
+    let start = batch(vec![event(&tcp, 1, "tcp.session.start", json!({}))]);
+    assert_eq!(counts(&post(&stand, &stand.node_id, &start).await), (1, 0));
+    let mut seq = 0;
+    let reply = post(&stand, &stand.node_id, &exec_flood(&kube, &mut seq, 10)).await;
+    assert_eq!(counts(&reply), (10, 0));
+    let recorded = take_recording();
+    assert_eq!(agent_written(&recorded).len(), 11);
+    assert!(named(&recorded, "agent.events.dropped").is_empty());
+    assert!(!row(&stand.harness, &tcp).await.audit_incomplete);
+    assert!(!row(&stand.harness, &kube).await.audit_incomplete);
+}
+
+#[tokio::test]
+async fn a_request_sets_at_most_sixty_four_flags_and_the_five_second_sweep_sets_the_rest_and_writes_the_marks()
+ {
+    let stand = stand().await;
+    let alice = person(&stand.harness, "alice", &["ops"]).await;
+    let control = &stand.harness.control;
     let now = stand.harness.clock.now_secs();
     let recent = raw_sessions(
         &stand,
@@ -901,38 +977,48 @@ async fn marks_of_ended_sessions_set_every_flag_at_once_and_write_their_events_w
         &stand.node_id,
         "tcp",
         20,
-        150,
+        400,
         Some(now - 600),
     )
     .await;
     start_recording();
-    let reply = post(&stand, &stand.node_id, &reports_for(&recent[..12])).await;
+    let reply = post(&stand, &stand.node_id, &reports_for(&recent[..256])).await;
     assert_eq!(counts(&reply), (0, 0));
-    let reply = post(&stand, &stand.node_id, &reports_for(&recent[12..])).await;
+    assert_eq!(flagged(&stand).await, 64);
+    let reply = post(&stand, &stand.node_id, &reports_for(&recent[256..])).await;
     assert_eq!(counts(&reply), (0, 0));
+    assert_eq!(flagged(&stand).await, 128);
+    assert_eq!(control.agent_event_mark_attempts(), 128);
     let first = take_recording();
-    for id in &recent {
-        assert!(row(&stand.harness, id).await.audit_incomplete, "{id}");
-    }
-    let written = named(&first, "session.audit_incomplete");
-    assert_eq!(written.len(), 99);
+    let mut all: Vec<String> = values(&named(&first, "session.audit_incomplete"), "session_id")
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(all.len(), 32);
 
-    stand.harness.clock.advance(5);
-    start_recording();
-    stand.harness.control.sweep_agent_events().await;
-    let caught_up = take_recording();
-    let mut all: Vec<&str> = values(&written, "session_id");
-    all.extend(values(
-        &named(&caught_up, "session.audit_incomplete"),
-        "session_id",
-    ));
+    let mut expected_marks = vec![32; 11];
+    expected_marks.push(16);
+    for (pass, expected) in expected_marks.into_iter().enumerate() {
+        stand.harness.clock.advance(5);
+        let caught_up = swept_marks(&stand).await;
+        let marks = named(&caught_up, "session.audit_incomplete");
+        assert_eq!(marks.len(), expected, "{pass}");
+        all.extend(values(&marks, "session_id").into_iter().map(str::to_owned));
+        let flags = match pass {
+            0 => 384,
+            _ => 400,
+        };
+        assert_eq!(flagged(&stand).await, flags, "{pass}");
+    }
+    assert_eq!(control.agent_event_mark_attempts(), 400);
     all.sort_unstable();
-    let mut expected: Vec<&str> = recent.iter().map(String::as_str).collect();
+    let mut expected = recent.clone();
     expected.sort_unstable();
     assert_eq!(all, expected);
-    start_recording();
     stand.harness.clock.advance(60);
-    stand.harness.control.sweep_agent_events().await;
+    start_recording();
+    control.sweep_agent_events().await;
+    control.sweep_deferred_agent_event_marks().await;
     assert!(named(&take_recording(), "session.audit_incomplete").is_empty());
 }
 
@@ -940,33 +1026,67 @@ async fn marks_of_ended_sessions_set_every_flag_at_once_and_write_their_events_w
 async fn sessions_ended_more_than_the_budget_window_ago_get_the_flag_and_no_event() {
     let stand = stand().await;
     let alice = person(&stand.harness, "alice", &["ops"]).await;
+    let control = &stand.harness.control;
     let now = stand.harness.clock.now_secs();
-    let old = raw_sessions(
-        &stand,
-        &alice,
-        &stand.node_id,
-        "tcp",
-        30,
-        5,
-        Some(now - 3661),
-    )
-    .await;
+    let node = &stand.node_id;
+    let old = raw_sessions(&stand, &alice, node, "tcp", 30, 5, Some(now - 3661)).await;
+    let edge = raw_sessions(&stand, &alice, node, "tcp", 31, 1, Some(now - 3660)).await;
+    let mut reported = old.clone();
+    reported.extend(edge.iter().cloned());
     start_recording();
     assert_eq!(
-        counts(&post(&stand, &stand.node_id, &reports_for(&old)).await),
+        counts(&post(&stand, node, &reports_for(&reported)).await),
         (0, 0)
     );
     stand.harness.clock.advance(60);
-    stand.harness.control.sweep_agent_events().await;
+    control.sweep_agent_events().await;
+    control.sweep_deferred_agent_event_marks().await;
     let recorded = take_recording();
-    for id in &old {
+    for id in &reported {
         assert!(row(&stand.harness, id).await.audit_incomplete, "{id}");
     }
-    assert!(named(&recorded, "session.audit_incomplete").is_empty());
+    assert_eq!(
+        values(&named(&recorded, "session.audit_incomplete"), "session_id"),
+        [edge[0].as_str()]
+    );
     assert_eq!(
         values(&named(&recorded, "agent.events.dropped"), "reason"),
         ["expired"]
     );
+    assert_eq!(control.tracked_agent_event_sessions(), 0);
+}
+
+#[tokio::test]
+async fn a_deferred_mark_of_a_session_that_ended_more_than_the_budget_window_ago_is_not_written() {
+    let stand = stand().await;
+    let alice = person(&stand.harness, "alice", &["ops"]).await;
+    let now = stand.harness.clock.now_secs();
+    let node = &stand.node_id;
+    let filler = raw_sessions(&stand, &alice, node, "tcp", 49, 32, Some(now - 600)).await;
+    assert_eq!(
+        counts(&post(&stand, node, &reports_for(&filler)).await),
+        (0, 0)
+    );
+    let young = raw_sessions(&stand, &alice, node, "tcp", 50, 1, Some(now - 3654)).await;
+    let old = raw_sessions(&stand, &alice, node, "tcp", 51, 1, Some(now - 3655)).await;
+    let mut reported = young.clone();
+    reported.extend(old.iter().cloned());
+    start_recording();
+    assert_eq!(
+        counts(&post(&stand, node, &reports_for(&reported)).await),
+        (0, 0)
+    );
+    assert!(named(&take_recording(), "session.audit_incomplete").is_empty());
+    assert_eq!(flagged(&stand).await, 34);
+
+    stand.harness.clock.advance(6);
+    let caught_up = swept_marks(&stand).await;
+    assert_eq!(
+        values(&named(&caught_up, "session.audit_incomplete"), "session_id"),
+        [young[0].as_str()]
+    );
+    stand.harness.clock.advance(5);
+    assert!(named(&swept_marks(&stand).await, "session.audit_incomplete").is_empty());
 }
 
 #[tokio::test]
@@ -1160,18 +1280,34 @@ async fn a_failed_mark_answers_500_and_a_retry_or_the_sweep_marks_the_session_on
     );
 }
 
-#[tokio::test]
-async fn a_request_dropped_after_its_first_poll_still_writes_its_events_and_mark_once() {
-    let stand = stand().await;
-    let alice = person(&stand.harness, "alice", &["ops"]).await;
-    let db = open(&stand, &alice, ServiceKind::Postgres, DB).await;
+fn start_and_drop(db: &str) -> Value {
     let mut body = batch(vec![event(
-        &db,
+        db,
         1,
         "db.session.start",
         json!({"db_user": "app"}),
     )]);
     body["dropped"] = json!([{"session_id": db, "count": 2}]);
+    body
+}
+
+async fn written_once_after_a_resend(stand: &Stand, db: &str, body: &Value) {
+    until_marked(stand, db).await;
+    let again = post(stand, &stand.node_id, body).await;
+    assert_eq!(counts(&again), (1, 0));
+    let recorded = take_recording();
+
+    assert_eq!(agent_written(&recorded), ["db.session.start"]);
+    assert_eq!(named(&recorded, "session.audit_incomplete").len(), 1);
+    assert_eq!(stand.harness.control.agent_event_mark_attempts(), 1);
+}
+
+#[tokio::test]
+async fn a_request_dropped_after_its_first_poll_still_writes_its_events_and_mark_once() {
+    let stand = stand().await;
+    let alice = person(&stand.harness, "alice", &["ops"]).await;
+    let db = open(&stand, &alice, ServiceKind::Postgres, DB).await;
+    let body = start_and_drop(&db);
     start_recording();
     let mut call = Box::pin(stand.harness.agent_router.clone().oneshot(request(
         AGENT_EVENTS_PATH,
@@ -1179,20 +1315,37 @@ async fn a_request_dropped_after_its_first_poll_still_writes_its_events_and_mark
         None,
         Some(&stand.node_id),
     )));
-    assert!(
-        tokio::time::timeout(Duration::ZERO, &mut call)
-            .await
-            .is_err()
-    );
+    let first = tokio::time::timeout(Duration::ZERO, &mut call).await;
+    drop(first);
     drop(call);
-    until_marked(&stand, &db).await;
-    let again = post(&stand, &stand.node_id, &body).await;
-    assert_eq!(counts(&again), (1, 0));
-    let recorded = take_recording();
+    written_once_after_a_resend(&stand, &db, &body).await;
+}
 
-    assert_eq!(agent_written(&recorded), ["db.session.start"]);
-    assert_eq!(named(&recorded, "session.audit_incomplete").len(), 1);
-    assert_eq!(stand.harness.control.agent_event_mark_attempts(), 1);
+#[tokio::test]
+async fn the_work_of_a_request_whose_caller_is_gone_runs_to_its_end_once() {
+    let stand = stand().await;
+    let alice = person(&stand.harness, "alice", &["ops"]).await;
+    let db = open(&stand, &alice, ServiceKind::Postgres, DB).await;
+    let body = start_and_drop(&db);
+    start_recording();
+    let held = stand.harness.control.hold_agent_event_recording().await;
+    let mut call = Box::pin(stand.harness.agent_router.clone().oneshot(request(
+        AGENT_EVENTS_PATH,
+        &body,
+        None,
+        Some(&stand.node_id),
+    )));
+    if let Ok(answered) = tokio::time::timeout(Duration::ZERO, &mut call).await {
+        panic!(
+            "the request was answered while its work was held: {:?}",
+            answered.map(|reply| reply.status())
+        );
+    }
+    drop(call);
+    assert!(!row(&stand.harness, &db).await.audit_incomplete);
+    assert_eq!(stand.harness.control.agent_event_mark_attempts(), 0);
+    drop(held);
+    written_once_after_a_resend(&stand, &db, &body).await;
 }
 
 #[tokio::test]

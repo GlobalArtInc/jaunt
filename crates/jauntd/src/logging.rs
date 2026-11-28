@@ -17,6 +17,11 @@ pub enum LoggingError {
     FilterNotUnicode,
     #[error("{FILTER_VAR} is not a valid log filter: {0}")]
     InvalidFilter(#[source] ParseError),
+    #[error(
+        "{FILTER_VAR} has a span or field directive for {AUDIT_PRIVATE_TARGET} with a comma inside \
+         its brackets; span and field directives for the private audit target are refused"
+    )]
+    PrivateFieldDirective,
     #[error("a log subscriber is already installed")]
     AlreadyInstalled,
 }
@@ -26,18 +31,44 @@ pub fn build_filter(spec: Option<&str>) -> Result<EnvFilter, LoggingError> {
         .parse()
         .map_err(LoggingError::InvalidFilter)?;
     let spec = spec.unwrap_or_default();
-    EnvFilter::builder()
-        .parse(spec)
-        .map_err(LoggingError::InvalidFilter)?;
+    let refused = |err| {
+        if private_directive_with_comma(spec) {
+            LoggingError::PrivateFieldDirective
+        } else {
+            LoggingError::InvalidFilter(err)
+        }
+    };
     let kept: Vec<&str> = spec
         .split(',')
         .filter(|directive| !reaches_private(directive))
         .collect();
+    EnvFilter::builder().parse(spec).map_err(refused)?;
     EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .parse(kept.join(","))
         .map(|filter| filter.add_directive(private))
-        .map_err(LoggingError::InvalidFilter)
+        .map_err(refused)
+}
+
+fn private_directive_with_comma(spec: &str) -> bool {
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut directives = Vec::new();
+    for (index, letter) in spec.char_indices() {
+        match letter {
+            '[' => depth = depth.saturating_add(1),
+            ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                directives.push(&spec[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    directives.push(&spec[start..]);
+    directives
+        .into_iter()
+        .any(|directive| directive.contains(',') && reaches_private(directive))
 }
 
 fn reaches_private(directive: &str) -> bool {
@@ -92,7 +123,7 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    use jaunt_audit::{AuditTap, MemorySink, Pipeline, system_clock};
+    use jaunt_audit::{AUDIT_PRIVATE_TARGET, AuditTap, MemorySink, Pipeline, system_clock};
     use tracing_subscriber::Layer;
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::layer::SubscriberExt;
@@ -310,6 +341,46 @@ mod tests {
     fn an_empty_filter_means_info_and_a_malformed_one_is_an_error() {
         assert!(build_filter(Some("")).is_ok());
         assert!(build_filter(Some("warn,jaunt::audit=info")).is_ok());
-        assert!(build_filter(Some("jaunt[=debug")).is_err());
+        assert!(matches!(
+            build_filter(Some("jaunt[=debug")),
+            Err(super::LoggingError::InvalidFilter(_))
+        ));
+    }
+
+    #[test]
+    fn a_field_directive_for_the_private_target_with_a_comma_is_refused_by_name() {
+        for spec in [
+            "jaunt::audit::private[{text,x}]=trace",
+            "info,jaunt::audit[{text,session_id}]=debug",
+        ] {
+            let refused = build_filter(Some(spec)).unwrap_err();
+            assert!(
+                matches!(refused, super::LoggingError::PrivateFieldDirective),
+                "{spec}: {refused}"
+            );
+            let message = refused.to_string();
+            assert!(message.contains(AUDIT_PRIVATE_TARGET), "{message}");
+            assert!(message.contains("refused"), "{message}");
+        }
+        for spec in ["jaunt[=debug", "jaunt::control[{a,b}]=trace"] {
+            assert!(
+                matches!(
+                    build_filter(Some(spec)),
+                    Err(super::LoggingError::InvalidFilter(_))
+                ),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_of_the_private_target_never_reaches_the_human_log_even_when_asked_for_by_name() {
+        let output = Captured::default();
+        let filter = build_filter(Some("jaunt::audit::private::child=trace")).unwrap();
+        tracing::subscriber::with_default(subscriber(filter, output.clone(), None), || {
+            tracing::info!(target: "jaunt::audit::private::child", event = "db.query", text = "secret row");
+            tracing::error!(target: "jaunt::audit::private::child", detail = "secret child line");
+        });
+        assert_eq!(output.text(), "");
     }
 }

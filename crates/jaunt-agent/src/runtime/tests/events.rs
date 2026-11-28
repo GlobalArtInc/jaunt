@@ -872,3 +872,48 @@ async fn a_rejected_session_is_forgotten_when_it_ends_or_after_an_hour() {
     stand.sink.emit(B, critical("b3"));
     assert_eq!(stand.sink.queue_len(), 2);
 }
+
+#[tokio::test]
+async fn a_session_named_for_its_drop_count_alone_is_remembered_and_its_later_events_dropped() {
+    let stand = stand();
+    stand.transport.script(&[Step::Refuse(vec![B.to_owned()])]);
+    stand.sink.emit(A, critical("a1"));
+    stand.sink.emit(B, event("session.start", "x", "y"));
+    stand.clock.advance(Duration::from_secs(1));
+    let batches = sent(&stand, 2).await;
+    assert!(batches[0].events.iter().all(|event| event.session_id == A));
+    assert_eq!(batches[0].dropped[0].session_id, B);
+    assert_eq!(labels(&batches[1]), ["a1"]);
+    assert!(batches[1].dropped.is_empty());
+    eventually("the rest to be delivered", || {
+        stand.sink.counters().sent == 1
+    })
+    .await;
+    assert_eq!(stand.sink.rejected_sessions(), 1);
+    stand.sink.emit(B, critical("b1"));
+    assert_eq!(stand.sink.queue_len(), 0);
+    assert_eq!(stand.sink.counters().refused, 1);
+}
+
+#[tokio::test]
+async fn refusals_older_than_an_hour_are_cleaned_by_the_events_of_any_session() {
+    let stand = stand();
+    stand
+        .transport
+        .script(&[Step::Refuse(vec![A.to_owned(), B.to_owned()])]);
+    stand.sink.emit(A, critical("a1"));
+    stand.sink.emit(B, critical("b1"));
+    stand.clock.advance(Duration::from_secs(1));
+    sent(&stand, 1).await;
+    eventually("both sessions to be refused", || {
+        stand.sink.rejected_sessions() == 2
+    })
+    .await;
+    let other = "00000000-0000-4000-8000-000000000001";
+    stand.clock.advance(Duration::from_secs(1800));
+    stand.sink.emit(other, critical("c1"));
+    assert_eq!(stand.sink.rejected_sessions(), 2);
+    stand.clock.advance(Duration::from_secs(1800));
+    stand.sink.emit(other, critical("c2"));
+    assert_eq!(stand.sink.rejected_sessions(), 0);
+}

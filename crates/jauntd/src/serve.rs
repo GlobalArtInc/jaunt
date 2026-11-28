@@ -8,7 +8,8 @@ use std::time::Duration;
 use jaunt_audit::{AuditTap, system_clock as audit_clock};
 use jaunt_ca::{Signer, TrustSet};
 use jaunt_control::{
-    Control, ControlError, ControlParts, PENDING_CAPACITY, WebTerminalSettings, system_clock,
+    AgentEventLimits, Control, ControlError, ControlParts, PENDING_CAPACITY, WebTerminalSettings,
+    system_clock,
 };
 use jaunt_gate::ServiceGateError;
 use jaunt_limits::AddressLimits;
@@ -461,6 +462,7 @@ async fn start(
         })?;
     store.migrate().await.map_err(ServeError::Migrate)?;
     let audit = audit::start(&settings.audit, Surface::Daemon, &store, tap, audit_clock())?;
+    let agent_events = AgentEventLimits::for_audit_queue(settings.audit.queue);
 
     let started: Result<Started, ServeError> = async {
         let oidc = OidcClient::discover(settings.oidc)
@@ -522,6 +524,7 @@ async fn start(
                     .map(|services| services.domain.clone()),
                 client_transport: settings.client_transport,
                 db_client: authorities.db_client,
+                agent_events,
             },
             settings.limits.http,
         )?;

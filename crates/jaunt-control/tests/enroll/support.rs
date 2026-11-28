@@ -15,9 +15,9 @@ use jaunt_ca::ssh_key::rand_core::OsRng;
 use jaunt_ca::ssh_key::{Algorithm, Certificate, HashAlg, PrivateKey, PublicKey};
 use jaunt_ca::{AgeIdentity, CaKind, ClientCa, FileBackend, InternalCa, Signer, TrustSet};
 use jaunt_control::{
-    AgentEndpoint, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError, ControlParts,
-    DeviceSettings, GateEndpoint, NodeAdmin, RecordingLimits, RecordingSettings, RequestLimits,
-    SshSuffix, Ticker,
+    AgentEndpoint, AgentEventLimits, ApprovedNode, AuthenticatedNode, Clock, Control, ControlError,
+    ControlParts, DeviceSettings, GateEndpoint, NodeAdmin, RecordingLimits, RecordingSettings,
+    RequestLimits, SshSuffix, Ticker,
 };
 use jaunt_policy::PolicyHandle;
 use jaunt_proto::ClientTransport;
@@ -486,6 +486,7 @@ impl Harness {
                 services_domain: options.services_domain.map(str::to_owned),
                 client_transport: options.client_transport,
                 db_client,
+                agent_events: AgentEventLimits::default(),
             },
             RequestLimits::default(),
             clock.ticker(),

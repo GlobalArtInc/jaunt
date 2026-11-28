@@ -166,9 +166,7 @@ pub struct AgentEventBatch {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventsAccepted {
-    #[serde(default)]
     pub accepted: u64,
-    #[serde(default)]
     pub dropped: u64,
     #[serde(default)]
     pub withheld: u64,
@@ -254,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_read_missing_fields_as_zero_and_ignore_fields_added_later() {
+    fn answers_need_their_first_fields_read_later_additions_as_zero_and_ignore_unknown_ones() {
         let refusal: super::AgentEventsRefusal =
             serde_json::from_value(json!({"error": "invalid_session", "sessions": ["a", "b"]}))
                 .unwrap();
@@ -267,9 +265,23 @@ mod tests {
         let older: super::AgentEventsAccepted =
             serde_json::from_value(json!({"accepted": 1, "dropped": 2})).unwrap();
         assert_eq!(older.withheld, 0);
-        let sparse: super::AgentEventsAccepted =
-            serde_json::from_value(json!({"later": true})).unwrap();
-        assert_eq!(sparse, super::AgentEventsAccepted::default());
+        let newer: super::AgentEventsAccepted = serde_json::from_value(
+            json!({"accepted": 1, "dropped": 0, "withheld": 3, "later": true}),
+        )
+        .unwrap();
+        assert_eq!((newer.accepted, newer.withheld), (1, 3));
+        for partial in [
+            json!({}),
+            json!({"later": true}),
+            json!({"error": "x"}),
+            json!({"accepted": 1}),
+            json!({"dropped": 1, "withheld": 1}),
+        ] {
+            assert!(
+                serde_json::from_value::<super::AgentEventsAccepted>(partial.clone()).is_err(),
+                "{partial}"
+            );
+        }
     }
 
     #[test]

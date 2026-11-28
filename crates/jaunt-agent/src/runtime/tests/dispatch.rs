@@ -899,3 +899,31 @@ async fn the_events_of_a_session_reach_control_before_its_end_is_reported() {
     assert_eq!(u128::from(batches[0].events[0].seq), started * 1000 + 1);
     assert_eq!(harness.events.queue_len(), 0);
 }
+
+#[tokio::test]
+async fn a_session_whose_events_control_refused_is_forgotten_by_the_sink_when_it_ends() {
+    let harness = Harness::new();
+    harness.control.refuse_events_of("s-refused");
+    harness.handler.emit_on_serve(vec![SessionEvent {
+        name: "tcp.session.start",
+        fields: [(
+            "client_addr".to_owned(),
+            jaunt_proto::AgentEventValue::Text(CLIENT.to_owned()),
+        )]
+        .into_iter()
+        .collect(),
+    }]);
+    let mut opened = harness.open(TCP, "grafana", "s-refused");
+    let config = harness.client_config(Some(&harness.user()), &[]);
+    let mut stream = handshake(opened.take(), &dns_name(TCP, "grafana"), config)
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    drop(stream.read_to_end(&mut rest).await);
+    opened.finished().await;
+
+    assert_eq!(harness.control.calls(), ["events", "end"]);
+    assert_eq!(harness.events.counters().refused, 1);
+    assert_eq!(harness.events.rejected_sessions(), 0);
+}

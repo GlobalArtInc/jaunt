@@ -281,6 +281,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_record_of_exactly_the_payload_limit_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = jaunt_store::Store::open(&dir.path().join("jaunt.db"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let sink = super::StoreSink::new(store.clone());
+        let text = format!("{}{}", "\"".repeat(8181), "a".repeat(11));
+        let (exact, _) = AuditEvent::from_raw(
+            EventType::DbQuery,
+            &[("text", RawValue::Text(text))],
+            "exact".to_owned(),
+            Timestamp::from_millis(1_700_000_000_000).unwrap(),
+        );
+        assert_eq!(
+            exact.to_record().payload.len(),
+            jaunt_store::MAX_AUDIT_PAYLOAD_BYTES
+        );
+
+        sink.write(&[Arc::new(exact)]).await.unwrap();
+
+        assert_eq!(sink.oversized(), 0);
+        let stored = store
+            .audit_events()
+            .query(&jaunt_store::AuditQuery::newest(10))
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "exact");
+        assert_eq!(
+            stored[0].payload.len(),
+            jaunt_store::MAX_AUDIT_PAYLOAD_BYTES
+        );
+    }
+
+    #[tokio::test]
     async fn the_jsonl_file_gets_one_parseable_line_per_event_with_mode_0640() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");

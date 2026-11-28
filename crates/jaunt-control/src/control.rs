@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
 
 use crate::admin::NodeAdmin;
-use crate::agent_events;
+use crate::agent_events::{self, AgentEventLimits};
 use crate::audit::{self, SessionEnd};
 use crate::ca_snapshot::CaSnapshot;
 use crate::child_sessions::ChildSessions;
@@ -48,6 +48,7 @@ use crate::{db_client, service_authorize, service_cert, x509_cert};
 pub const PENDING_CAPACITY: usize = 10_000;
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const DEFERRED_MARKS_INTERVAL: Duration = Duration::from_secs(5);
 const STORED_REQUEST_RETENTION_SECS: i64 = 3600;
 const STORED_ENROLLMENT_RETENTION_SECS: i64 = 3600;
 const EXPIRED_JOIN_TOKEN_RETENTION_SECS: i64 = 3600;
@@ -80,6 +81,7 @@ pub struct ControlParts {
     pub services_domain: Option<String>,
     pub client_transport: Option<ClientTransport>,
     pub db_client: Option<ClientSlot>,
+    pub agent_events: AgentEventLimits,
 }
 
 pub struct Inner {
@@ -249,7 +251,7 @@ impl Control {
                 db_client_user_issuance: db_client::user_issuance_limiter(),
                 service_user_authorizations: service_authorize::user_authorization_limiter(),
                 service_authorizations: service_authorize::authorization_limiter(),
-                agent_events: agent_events::AgentEvents::new(),
+                agent_events: agent_events::AgentEvents::new(parts.agent_events),
                 child_sessions: ChildSessions::new(),
             }),
         })
@@ -530,6 +532,16 @@ impl Control {
         agent_events::sweep(self).await;
     }
 
+    pub async fn sweep_deferred_agent_event_marks(&self) {
+        agent_events::sweep_marks(self).await;
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn hold_agent_event_recording(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.agent_events.hold_recording().await
+    }
+
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn tracked_agent_event_sessions(&self) -> usize {
@@ -606,6 +618,7 @@ impl Control {
             return Err(ControlError::ZeroSweepInterval);
         }
         let sweeper = tokio::spawn(sweep_forever(self.clone(), sweep_interval));
+        let marks = tokio::spawn(sweep_marks_forever(self.clone(), DEFERRED_MARKS_INTERVAL));
         serve::serve(
             self.router(),
             listener,
@@ -618,6 +631,7 @@ impl Control {
         )
         .await;
         sweeper.abort();
+        marks.abort();
         Ok(())
     }
 
@@ -647,6 +661,15 @@ fn client_transport(
         (Some(chosen), _) => Ok(chosen),
         (None, true) => Ok(ClientTransport::Tls),
         (None, false) => Ok(ClientTransport::Tcp),
+    }
+}
+
+async fn sweep_marks_forever(control: Control, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        control.sweep_deferred_agent_event_marks().await;
     }
 }
 
@@ -699,6 +722,7 @@ mod tests {
     use jaunt_store::Store;
 
     use super::{Control, ControlParts, client_transport};
+    use crate::agent_events::AgentEventLimits;
     use crate::clock::system_clock;
     use crate::device::DeviceSettings;
     use crate::error::ControlError;
@@ -823,6 +847,7 @@ mod tests {
             services_domain: None,
             client_transport: None,
             db_client: None,
+            agent_events: AgentEventLimits::default(),
         })
         .unwrap();
 

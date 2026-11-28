@@ -24,6 +24,7 @@ const MAX_REJECTED_SESSIONS: usize = 4096;
 const SEQ_PER_MILLISECOND: u64 = 1000;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 const FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
+const REJECTED_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkLimits {
@@ -139,6 +140,7 @@ struct State {
     probe_wait: Duration,
     probe_now: bool,
     rejected: HashMap<String, (u64, SystemTime)>,
+    rejected_swept_at: Option<SystemTime>,
     counters: SinkCounters,
 }
 
@@ -289,6 +291,18 @@ impl State {
         } else if self.rejected.len() < MAX_REJECTED_SESSIONS {
             self.rejected.insert(session_id.to_owned(), (count, now));
         }
+    }
+
+    fn forget_old_rejections(&mut self, now: SystemTime, rejected_for: Duration) {
+        let due = self
+            .rejected_swept_at
+            .is_none_or(|at| now.duration_since(at).unwrap_or_default() >= REJECTED_SWEEP_EVERY);
+        if !due {
+            return;
+        }
+        self.rejected_swept_at = Some(now);
+        self.rejected
+            .retain(|_, (_, since)| now.duration_since(*since).unwrap_or_default() < rejected_for);
     }
 
     fn still_rejected(
@@ -463,6 +477,7 @@ impl EventSink {
         wire.seq = 0;
         let mut state = self.state();
         state.counters.emitted = state.counters.emitted.saturating_add(1);
+        state.forget_old_rejections(now, self.inner.limits.rejected_for);
         if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_LEN {
             state.counters.unreported = state.counters.unreported.saturating_add(1);
             return;
@@ -549,6 +564,11 @@ impl EventSink {
 
     pub fn session_ended(&self, session_id: &str) {
         self.state().rejected.remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub fn rejected_sessions(&self) -> usize {
+        self.state().rejected.len()
     }
 
     pub fn reconnected(&self) {
