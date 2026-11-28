@@ -5,6 +5,7 @@ pub mod directory;
 pub mod events;
 pub mod handler;
 pub mod limits;
+pub mod tcp;
 #[cfg(test)]
 pub(crate) mod tests;
 pub mod x509;

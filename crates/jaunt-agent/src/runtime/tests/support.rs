@@ -645,6 +645,8 @@ pub struct HarnessOptions {
     pub behaviour: Behaviour,
     pub limits: ServiceLimits,
     pub trusted: bool,
+    pub clock: Option<Arc<ManualClock>>,
+    pub tcp: Option<Arc<dyn ServiceHandler>>,
 }
 
 impl Default for HarnessOptions {
@@ -659,6 +661,8 @@ impl Default for HarnessOptions {
             behaviour: Behaviour::Echo,
             limits: SERVICE_LIMITS,
             trusted: true,
+            clock: None,
+            tcp: None,
         }
     }
 }
@@ -669,9 +673,10 @@ impl Harness {
     }
 
     pub fn with(options: HarnessOptions) -> Self {
-        let start = SystemTime::now();
-        let now = unix_secs(start);
-        let clock = ManualClock::new(start);
+        let clock = options
+            .clock
+            .unwrap_or_else(|| ManualClock::new(SystemTime::now()));
+        let now = unix_secs(clock.now());
         let pki = Arc::new(TestPki::new());
         let ca = UserCa::new(now);
         let control = Arc::new(FakeServiceControl::new(
@@ -687,6 +692,9 @@ impl Harness {
         let mut handlers = HandlerRegistry::default();
         for kind in &options.handled {
             handlers.register(*kind, handler.clone()).unwrap();
+        }
+        if let Some(tcp) = options.tcp {
+            handlers.register(StreamKind::Tcp, tcp).unwrap();
         }
         let local = local_services(&options.services);
         let (directory, directory_changes) =
@@ -727,11 +735,21 @@ impl Harness {
     }
 
     pub fn open(&self, kind: StreamKind, service: &str, session: &str) -> Opened {
+        self.open_from(kind, service, session, CLIENT)
+    }
+
+    pub fn open_from(
+        &self,
+        kind: StreamKind,
+        service: &str,
+        session: &str,
+        client: &str,
+    ) -> Opened {
         let meta = StreamMeta::with_service(
             SessionId::new(session).unwrap(),
             kind,
             ServiceName::new(service).unwrap(),
-            CLIENT,
+            client,
         )
         .unwrap();
         let (client, agent) = tokio::io::duplex(64 * 1024);

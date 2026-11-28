@@ -78,7 +78,6 @@ impl EventTransport for AgentApi {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub struct SessionEvent {
     pub name: &'static str,
     pub fields: BTreeMap<String, AgentEventValue>,
@@ -450,7 +449,6 @@ impl EventSink {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn emit(&self, session_id: &str, event: SessionEvent) {
         let now = self.inner.clock.now();
         let known = agent_event_name(event.name);
@@ -808,7 +806,6 @@ impl fmt::Debug for SessionEvents {
 }
 
 impl SessionEvents {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn emit(&self, event: SessionEvent) {
         self.sink.emit(&self.session_id, event);
     }

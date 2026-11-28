@@ -18,8 +18,8 @@ use jaunt_host_users::HostUsersSection;
 use jaunt_proto::ServiceAnnouncement;
 use jaunt_ssh::{AgentLimits, InnerCa, InnerTarget, ObserverFactory, SshError};
 use jaunt_tunnel::{
-    BackoffPolicy, ClientError, ClientEvent, Keepalive, SwappableClientCert, TlsConfigError,
-    TunnelClient, TunnelClientConfig, agent_client_config_swappable,
+    BackoffPolicy, ClientError, ClientEvent, Keepalive, StreamKind, SwappableClientCert,
+    TlsConfigError, TunnelClient, TunnelClientConfig, agent_client_config_swappable,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::signal::unix::{SignalKind, signal};
@@ -39,8 +39,9 @@ use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller, ApprovalTiming}
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
 use crate::runtime::directory::{Approvals, ServiceDirectory};
 use crate::runtime::events::{EventSink, SINK_LIMITS, follow_connections};
-use crate::runtime::handler::HandlerRegistry;
+use crate::runtime::handler::{HandlerRegistry, NotAServiceKind};
 use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
+use crate::runtime::tcp::{TCP_LIMITS, TcpHandler};
 use crate::runtime::x509::UserX509Trust;
 use crate::runtime::{KindRouter, RuntimeParts, ServiceRuntime};
 use crate::ssh::{self, ControlAuthority, InnerTargetError, SshService};
@@ -106,6 +107,8 @@ pub enum RunError {
     Tunnel(#[source] ClientError),
     #[error("the tunnel client task failed")]
     TunnelTask,
+    #[error("cannot register a service handler: {0}")]
+    Handlers(#[source] NotAServiceKind),
 }
 
 pub struct RunSettings {
@@ -246,6 +249,20 @@ fn ssh_service(
     .with_account_keeper(Arc::new(AccountService::new(accounts)))
 }
 
+pub(crate) fn service_handlers(
+    local: &ServiceAnnouncement,
+    clock: Arc<dyn Clock>,
+) -> Result<HandlerRegistry, RunError> {
+    let mut handlers = HandlerRegistry::default();
+    handlers
+        .register(
+            StreamKind::Tcp,
+            Arc::new(TcpHandler::new(local, clock, TCP_LIMITS)),
+        )
+        .map_err(RunError::Handlers)?;
+    Ok(handlers)
+}
+
 pub async fn run(
     settings: RunSettings,
     env: RunEnv,
@@ -369,7 +386,8 @@ pub async fn run(
         random_sampler(),
         settings.service_certificate_backoff,
     ));
-    let handlers = Arc::new(HandlerRegistry::default());
+    let local_services = Arc::new(settings.services.clone());
+    let handlers = Arc::new(service_handlers(&local_services, env.clock.clone())?);
     let audit_events = EventSink::new(
         api.clone(),
         env.clock.clone(),
@@ -380,7 +398,7 @@ pub async fn run(
     let (served, served_changes) = watch::channel(None);
     tunnel_config.follow_served_kinds(served_changes);
     let approvals = Approvals {
-        local: Arc::new(settings.services.clone()),
+        local: local_services,
         handlers: handlers.clone(),
         directory,
         served,

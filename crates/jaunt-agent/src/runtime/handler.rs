@@ -91,7 +91,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
 }
 
 pub struct ServiceConnection {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub stream: ServiceStream,
     pub alpn: Option<Vec<u8>>,
     pub user: VerifiedUser,
@@ -116,7 +115,6 @@ pub struct ServiceGrant {
 }
 
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub struct ServiceSession {
     pub session_id: String,
     pub service: ServiceName,
@@ -151,7 +149,6 @@ pub trait ServiceHandler: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("SSH streams are served by the SSH terminator, not by a service handler")]
-#[cfg_attr(not(test), expect(dead_code))]
 pub struct NotAServiceKind;
 
 #[derive(Clone, Default)]
@@ -172,7 +169,6 @@ impl fmt::Debug for HandlerRegistry {
 }
 
 impl HandlerRegistry {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn register(
         &mut self,
         kind: StreamKind,
