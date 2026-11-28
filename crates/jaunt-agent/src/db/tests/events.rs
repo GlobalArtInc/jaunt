@@ -149,7 +149,7 @@ async fn digest_mode_writes_the_command_and_digest_but_no_text() {
     let queries = harness.named("s-digest", "db.query");
     let mut keys: Vec<&str> = queries[0].keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["command", "protocol", "sha256"]);
+    assert_eq!(keys, ["command", "length", "protocol", "sha256"]);
 }
 
 async fn fields_and_errors(harness: &DbHarness, session: &str) -> (Vec<Vec<String>>, Vec<bool>) {
@@ -195,8 +195,15 @@ async fn statements_that_name_a_password_carry_no_text_and_no_digest() {
     client.until_ready().await;
     finish(&harness, &mut client, "s-secret").await;
     let (queries, errors) = fields_and_errors(&harness, "s-secret").await;
-    let secret = keys(&["command", "protocol"]);
-    let plain = keys(&["command", "protocol", "sha256", "text", "truncated"]);
+    let secret = keys(&["command", "length", "protocol"]);
+    let plain = keys(&[
+        "command",
+        "length",
+        "protocol",
+        "sha256",
+        "text",
+        "truncated",
+    ]);
     assert_eq!(
         queries,
         [
@@ -227,7 +234,7 @@ async fn a_password_after_more_than_eight_kib_of_padding_is_still_found() {
     client.until_ready().await;
     finish(&harness, &mut client, "s-padded").await;
     let (queries, _) = fields_and_errors(&harness, "s-padded").await;
-    let secret = keys(&["command", "protocol"]);
+    let secret = keys(&["command", "length", "protocol"]);
     assert_eq!(queries, [secret.clone(), secret]);
 }
 

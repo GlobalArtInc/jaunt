@@ -195,6 +195,10 @@ impl CapturedQuery {
             "command".to_owned(),
             text(self.command.as_str(), SHORT_LIMIT),
         );
+        fields.insert(
+            "length".to_owned(),
+            AgentEventValue::Int(i64::try_from(self.length).unwrap_or(i64::MAX)),
+        );
         if self.sensitive {
             return fields;
         }
@@ -433,10 +437,11 @@ mod tests {
         let fields = captured.fields(QueryAudit::Text, 4096, Protocol::Simple);
         let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["command", "protocol"]);
+        assert_eq!(keys, ["command", "length", "protocol"]);
         let plain = QueryCapture::of(b"SELECT 1").finish();
         assert!(!plain.is_sensitive());
         let fields = plain.fields(QueryAudit::Text, 4096, Protocol::Simple);
+        assert_eq!(fields["length"], AgentEventValue::Int(8));
         assert_eq!(
             fields["sha256"],
             AgentEventValue::Text(crate::keys::sha256_hex(b"SELECT 1"))
