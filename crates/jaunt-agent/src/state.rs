@@ -3,6 +3,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::clock::compact_utc;
@@ -22,7 +23,7 @@ const PROBE_NAME: &str = "write-check";
 pub const INNER_CA_FILE: &str = "inner-ca.pub";
 const INSTALLER_FILES: [&str; 1] = [INNER_CA_FILE];
 const PREVIOUS_PREFIX: &str = "previous-";
-const MANAGED_FILES: [&str; 6] = [
+pub const MANAGED_FILES: [&str; 6] = [
     STATE_FILE,
     TLS_KEY_FILE,
     SSH_HOST_KEY_FILE,
@@ -32,6 +33,26 @@ const MANAGED_FILES: [&str; 6] = [
 ];
 const MAX_PREVIOUS_ATTEMPTS: usize = 100;
 pub const MAX_SSH_HOST_FILE_BYTES: u64 = 64 * 1024;
+pub const MAX_MIRRORED_FILE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct StateChanges(watch::Sender<u64>);
+
+impl StateChanges {
+    pub fn channel() -> (Self, watch::Receiver<u64>) {
+        let (sender, receiver) = watch::channel(0);
+        (Self(sender), receiver)
+    }
+
+    pub fn notify(&self) {
+        self.0.send_modify(|count| *count = count.wrapping_add(1));
+    }
+}
+
+pub struct MirroredFile {
+    pub name: &'static str,
+    pub content: Zeroizing<Vec<u8>>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,6 +213,7 @@ fn is_previous_name(name: &str) -> bool {
 pub struct StateDir {
     dir: DirHandle,
     owner: Option<Owner>,
+    changes: Option<StateChanges>,
 }
 
 impl StateDir {
@@ -206,7 +228,26 @@ impl StateDir {
             Err(error) => return Err(error.into()),
         };
         let owner = if privileged { Some(dir.owner()?) } else { None };
-        Ok(Self { dir, owner })
+        Ok(Self {
+            dir,
+            owner,
+            changes: None,
+        })
+    }
+
+    pub fn with_changes(mut self, changes: Option<StateChanges>) -> Self {
+        self.changes = changes;
+        self
+    }
+
+    fn changed(&self) {
+        if let Some(changes) = &self.changes {
+            changes.notify();
+        }
+    }
+
+    pub fn owner_uid(&self) -> Result<u32, StateError> {
+        Ok(self.dir.owner()?.uid)
     }
 
     pub fn prepare_enrollment(
@@ -257,7 +298,14 @@ impl StateDir {
         let lock = dir
             .lock(LOCK_FILE, owner)?
             .ok_or(StateError::Busy { dir: shown })?;
-        Ok((Self { dir, owner }, EnrollLock { _file: lock }))
+        Ok((
+            Self {
+                dir,
+                owner,
+                changes: None,
+            },
+            EnrollLock { _file: lock },
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -312,6 +360,7 @@ impl StateDir {
         .map_err(fail)?;
         write(CA_ROOT_FILE, files.ca_root_der).map_err(fail)?;
         write(STATE_FILE, &record).map_err(fail)?;
+        self.changed();
         Ok(previous)
     }
 
@@ -329,6 +378,7 @@ impl StateDir {
             self.owner,
         )?;
         self.dir.write_private(STATE_FILE, &encoded, self.owner)?;
+        self.changed();
         Ok(())
     }
 
@@ -359,6 +409,38 @@ impl StateDir {
         Ok(())
     }
 
+    pub fn read_mirrored(&self) -> Result<Vec<MirroredFile>, StateError> {
+        let mut files = Vec::new();
+        for name in MANAGED_FILES {
+            if self.dir.exists(name)? {
+                files.push(MirroredFile {
+                    name,
+                    content: self.dir.read_at_most(name, MAX_MIRRORED_FILE_BYTES)?,
+                });
+            }
+        }
+        Ok(files)
+    }
+
+    pub fn restore_mirrored(&self, files: &[MirroredFile]) -> Result<(), StateError> {
+        self.dir.remove_if_present(STATE_FILE)?;
+        let content = |name: &str| {
+            files
+                .iter()
+                .find(|file| file.name == name)
+                .map(|file| file.content.as_slice())
+        };
+        for name in MANAGED_FILES.into_iter().filter(|name| *name != STATE_FILE) {
+            if let Some(bytes) = content(name) {
+                self.dir.write_private(name, bytes, self.owner)?;
+            }
+        }
+        if let Some(bytes) = content(STATE_FILE) {
+            self.dir.write_private(STATE_FILE, bytes, self.owner)?;
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<Loaded, StateError> {
         let state = match self.dir.read(STATE_FILE) {
             Ok(bytes) => bytes,
@@ -367,23 +449,10 @@ impl StateDir {
             }
             Err(error) => return Err(error.into()),
         };
-        let record: EnrollmentRecord =
-            serde_json::from_slice(&state).map_err(|error| StateError::Record {
-                path: self.display(STATE_FILE),
-                reason: error.to_string(),
-            })?;
-        let tls_bytes = self.dir.read(TLS_KEY_FILE)?;
-        let tls_key = TlsKey::from_pkcs8(&tls_bytes).map_err(|source| StateError::Key {
-            path: self.display(TLS_KEY_FILE),
-            source,
-        })?;
-        let host_bytes = self.dir.read(SSH_HOST_KEY_FILE)?;
-        let host_text = std::str::from_utf8(&host_bytes).map_err(|_| StateError::Utf8 {
-            path: self.display(SSH_HOST_KEY_FILE),
-        })?;
-        let host_key = HostKey::from_openssh(host_text).map_err(|source| StateError::Key {
-            path: self.display(SSH_HOST_KEY_FILE),
-            source,
+        let record = decode_record(&state, || self.display(STATE_FILE))?;
+        let tls_key = decode_tls_key(&self.dir.read(TLS_KEY_FILE)?, || self.display(TLS_KEY_FILE))?;
+        let host_key = decode_host_key(&self.dir.read(SSH_HOST_KEY_FILE)?, || {
+            self.display(SSH_HOST_KEY_FILE)
         })?;
         let x509_der = self.dir.read(X509_FILE)?.to_vec();
         let ca_root_der = self.dir.read(CA_ROOT_FILE)?.to_vec();
@@ -446,6 +515,31 @@ pub fn previous_dirs(root: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+pub fn decode_record(
+    bytes: &[u8],
+    path: impl FnOnce() -> String,
+) -> Result<EnrollmentRecord, StateError> {
+    serde_json::from_slice(bytes).map_err(|error| StateError::Record {
+        path: path(),
+        reason: error.to_string(),
+    })
+}
+
+pub fn decode_tls_key(bytes: &[u8], path: impl FnOnce() -> String) -> Result<TlsKey, StateError> {
+    TlsKey::from_pkcs8(bytes).map_err(|source| StateError::Key {
+        path: path(),
+        source,
+    })
+}
+
+pub fn decode_host_key(bytes: &[u8], path: impl Fn() -> String) -> Result<HostKey, StateError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| StateError::Utf8 { path: path() })?;
+    HostKey::from_openssh(text).map_err(|source| StateError::Key {
+        path: path(),
+        source,
+    })
 }
 
 fn encode_record(record: &EnrollmentRecord) -> Result<Vec<u8>, StateError> {

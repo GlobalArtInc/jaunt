@@ -2,9 +2,12 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use zeroize::Zeroizing;
+
 use super::{
-    EnrollmentFiles, EnrollmentRecord, LOCK_FILE, MANAGED_FILES, STATE_FILE, StateDir, StateError,
-    TLS_KEY_FILE, is_state_entry, previous_dirs, trusted_existing_dir,
+    EnrollmentFiles, EnrollmentRecord, INNER_CA_FILE, LOCK_FILE, MANAGED_FILES, MirroredFile,
+    STATE_FILE, StateChanges, StateDir, StateError, TLS_KEY_FILE, X509_FILE, is_state_entry,
+    previous_dirs, trusted_existing_dir,
 };
 use crate::fsio::{DirHandle, Owner, effective_uid, running_as_root, temp_name};
 use crate::keys::{HostKey, TlsKey};
@@ -440,6 +443,7 @@ fn a_refused_chown_stops_moving_aside_and_renewal_before_files_change() {
     let hostile = StateDir {
         dir: handle,
         owner: Some(foreign),
+        changes: None,
     };
 
     let failure = hostile
@@ -463,4 +467,82 @@ fn a_refused_chown_stops_moving_aside_and_renewal_before_files_change() {
         "{error}"
     );
     assert_eq!(contents(dir.path()), before);
+}
+
+#[test]
+fn a_restore_that_fails_halfway_leaves_no_state_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        dir.path().join(STATE_FILE),
+        b"{\"from\": \"an earlier start\"}",
+    )
+    .unwrap();
+    fs::create_dir(dir.path().join(X509_FILE)).unwrap();
+    fs::write(dir.path().join(X509_FILE).join("blocker"), b"x").unwrap();
+    let files: Vec<MirroredFile> = MANAGED_FILES
+        .into_iter()
+        .map(|name| MirroredFile {
+            name,
+            content: Zeroizing::new(name.as_bytes().to_vec()),
+        })
+        .collect();
+    let state = StateDir::open(dir.path(), false).unwrap();
+    assert!(state.restore_mirrored(&files).is_err());
+    assert!(!dir.path().join(STATE_FILE).exists());
+    assert_eq!(
+        fs::read(dir.path().join(TLS_KEY_FILE)).unwrap(),
+        TLS_KEY_FILE.as_bytes()
+    );
+
+    fs::remove_dir_all(dir.path().join(X509_FILE)).unwrap();
+    state.restore_mirrored(&files).unwrap();
+    for name in MANAGED_FILES {
+        assert_eq!(
+            fs::read(dir.path().join(name)).unwrap(),
+            name.as_bytes(),
+            "{name}"
+        );
+        let mode = fs::metadata(dir.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o600, "{name}");
+    }
+}
+
+#[test]
+fn renewals_signal_a_change_and_the_published_inner_ca_neither_signals_nor_is_mirrored() {
+    let dir = tempfile::tempdir().unwrap();
+    let keys = Keys::new();
+    let (state, _lock) = StateDir::prepare_enrollment(dir.path(), false).unwrap();
+    state.store_enrollment(&keys.files(), NOW, false).unwrap();
+    let (changes, mut receiver) = StateChanges::channel();
+    let state = StateDir::open(dir.path(), false)
+        .unwrap()
+        .with_changes(Some(changes));
+
+    state.store_inner_ca("ssh-ed25519 AAAA inner").unwrap();
+    assert!(!receiver.has_changed().unwrap());
+    let names: Vec<&str> = state
+        .read_mirrored()
+        .unwrap()
+        .iter()
+        .map(|file| file.name)
+        .collect();
+    assert_eq!(names, MANAGED_FILES);
+    assert!(dir.path().join(INNER_CA_FILE).exists());
+
+    state
+        .store_renewal(
+            &keys.record,
+            b"renewed",
+            "ssh-ed25519-cert-v01@openssh.com AAAA",
+        )
+        .unwrap();
+    assert!(receiver.has_changed().unwrap());
+    receiver.borrow_and_update();
+    state.store_enrollment(&keys.files(), NOW, true).unwrap();
+    assert!(receiver.has_changed().unwrap());
 }

@@ -2,7 +2,7 @@ pub(crate) mod args;
 mod client;
 #[cfg(test)]
 mod tests;
-mod token;
+pub(crate) mod token;
 
 use std::collections::BTreeMap;
 use std::fmt;

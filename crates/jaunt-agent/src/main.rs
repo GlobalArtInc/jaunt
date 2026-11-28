@@ -7,6 +7,7 @@ mod fsio;
 mod installer;
 mod keys;
 mod kube;
+mod kube_state;
 mod paths;
 mod pin;
 mod recording;

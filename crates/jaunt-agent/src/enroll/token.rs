@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 const PREFIX: &str = "jt1.";
 const ENCODED_LEN: usize = 43;
-const MAX_FILE_BYTES: usize = 4096;
+pub const MAX_FILE_BYTES: usize = 4096;
 const ALLOWED_MODE_BITS: u32 = 0o600;
 const REDACTED: &str = "[redacted]";
 
@@ -92,16 +92,16 @@ pub fn read_token_file(path: &Path, caller_uid: u32) -> Result<JoinToken, TokenF
             path: owned(),
             source,
         })?;
-    let not_a_token = || TokenFileError::NotAToken { path: owned() };
+    parse_token(&content).ok_or_else(|| TokenFileError::NotAToken { path: owned() })
+}
+
+pub fn parse_token(content: &[u8]) -> Option<JoinToken> {
     if content.len() > MAX_FILE_BYTES {
-        return Err(not_a_token());
+        return None;
     }
-    let text = std::str::from_utf8(&content).map_err(|_| not_a_token())?;
+    let text = std::str::from_utf8(content).ok()?;
     let token = text.trim_matches(|ch: char| ch.is_ascii_whitespace());
-    if !is_join_token(token) {
-        return Err(not_a_token());
-    }
-    Ok(JoinToken(Zeroizing::new(token.to_owned())))
+    is_join_token(token).then(|| JoinToken(Zeroizing::new(token.to_owned())))
 }
 
 fn is_join_token(text: &str) -> bool {

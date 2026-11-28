@@ -272,7 +272,7 @@ impl DirHandle {
         Ok(File::from(fd))
     }
 
-    fn remove_if_present(&self, name: &str) -> Result<(), FsError> {
+    pub fn remove_if_present(&self, name: &str) -> Result<(), FsError> {
         let path = self.checked(name)?;
         match rustix::fs::unlinkat(&self.dir, name, AtFlags::empty()) {
             Ok(()) | Err(Errno::NOENT) => Ok(()),

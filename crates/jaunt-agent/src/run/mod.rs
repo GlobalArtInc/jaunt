@@ -36,6 +36,8 @@ use crate::db::DbHandler;
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
 use crate::kube::{KUBE_LIMITS, KubeHandler, KubeParts, KubernetesUpstream, declares_kubernetes};
+use crate::kube_state::args::ClusterArgs;
+use crate::kube_state::{self, ClusterError};
 use crate::recording::{RecordingParts, Recordings};
 use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller, ApprovalTiming};
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
@@ -47,7 +49,7 @@ use crate::runtime::tcp::{TCP_LIMITS, TcpHandler};
 use crate::runtime::x509::UserX509Trust;
 use crate::runtime::{KindRouter, RuntimeParts, ServiceRuntime};
 use crate::ssh::{self, ControlAuthority, InnerTargetError, SshService};
-use crate::state::{DEFAULT_STATE_DIR, StateDir, StateError};
+use crate::state::{DEFAULT_STATE_DIR, StateChanges, StateDir, StateError};
 use crate::trust::{TRUST_TIMING, TrustLoader, TrustTiming, random_sampler};
 use crate::verify::{self, VerifyError};
 use api::{API_KEEPALIVE, AgentApi, ApiError};
@@ -69,6 +71,8 @@ pub struct RunArgs {
     pub config: PathBuf,
     #[arg(long, value_name = "DIR")]
     pub state_dir: Option<PathBuf>,
+    #[command(flatten)]
+    pub cluster: ClusterArgs,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +115,8 @@ pub enum RunError {
     TunnelTask,
     #[error("cannot register a service handler: {0}")]
     Handlers(#[source] NotAServiceKind),
+    #[error(transparent)]
+    Cluster(#[from] ClusterError),
 }
 
 pub struct RunSettings {
@@ -133,6 +139,7 @@ pub struct RunSettings {
     pub service_certificate_backoff: BackoffPolicy,
     pub approval_timing: ApprovalTiming,
     pub kube_upstream: KubernetesUpstream,
+    pub state_changes: Option<StateChanges>,
 }
 
 impl RunSettings {
@@ -160,6 +167,7 @@ impl RunSettings {
             service_certificate_backoff: SERVICE_CERTIFICATE_BACKOFF,
             approval_timing: APPROVAL_TIMING,
             kube_upstream: KubernetesUpstream::default(),
+            state_changes: None,
         }
     }
 }
@@ -177,6 +185,7 @@ pub fn command(args: &RunArgs) -> ExitCode {
 fn run_command(args: &RunArgs) -> Result<(), RunError> {
     let loaded = config::load_reporting(&args.config)?;
     let config = loaded.config;
+    let backend = kube_state::args::select(&args.cluster, &config).map_err(ClusterError::from)?;
     let announcement = config.announcement();
     let state_dir = args
         .state_dir
@@ -231,7 +240,7 @@ fn run_command(args: &RunArgs) -> Result<(), RunError> {
             services: announcement,
             ..RunSettings::new(state_dir)
         };
-        run(settings, env, shutdown).await
+        kube_state::serve(settings, env, shutdown, backend).await
     })
 }
 
@@ -275,7 +284,8 @@ pub async fn run(
     env: RunEnv,
     shutdown: CancellationToken,
 ) -> Result<(), RunError> {
-    let state = StateDir::open(&settings.state_dir, settings.privileged)?;
+    let state = StateDir::open(&settings.state_dir, settings.privileged)?
+        .with_changes(settings.state_changes.clone());
     let loaded = state.load()?;
     let record = loaded.record;
     if !verify::is_node_id(&record.node_id) {
@@ -301,7 +311,9 @@ pub async fn run(
         sshd_addr: settings.inner.sshd_addr,
         sshd_host_key: settings.inner.sshd_host_key.clone(),
     };
-    ssh::check_inner_target(&target).map_err(RunError::InnerTarget)?;
+    if settings.services.ssh_enabled {
+        ssh::check_inner_target(&target).map_err(RunError::InnerTarget)?;
+    }
     let inner_ca = InnerCa::generate().map_err(RunError::InnerCa)?;
     let inner_ca_line = inner_ca.public_openssh().map_err(RunError::InnerCa)?;
     state

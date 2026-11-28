@@ -184,6 +184,8 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 | `inner`, `recording`, `host_users` | maps | see below | the sections that hold the keys that follow. `host_users` is described in its own section after this table |
 | `state_dir` | absolute path | `/var/lib/jaunt` | the enrolled identity: keys, certificates, `state.json`, `inner-ca.pub`. Mode 0700 |
 | `log_level` | string | `info` | a log filter; `RUST_LOG` overrides it |
+| `state.backend` | string | `file` | where the durable copy of the node identity lives: `file` (the state directory) or `kubernetes` (a Secret, for an agent that runs as a pod; see [operations.md](operations.md#agent-in-a-cluster)). Any other value is refused |
+| `state.secret_name` | string | `jaunt-agent-state` | the Secret in the pod's namespace; a DNS subdomain name. Only with `state.backend: kubernetes` |
 | `inner.sshd_addr` | address:port | `127.0.0.1:22` | where the local `sshd` listens. Must be a loopback address |
 | `inner.sshd_host_key` | absolute path | `/etc/ssh/ssh_host_ed25519_key.pub` | the host key the agent pins for the local `sshd` |
 | `recording.session_queue_bytes` | integer | 67108864 | recording data one session may hold in memory while the tunnel is down; 1 MiB to `memory_budget_bytes` |
@@ -209,7 +211,7 @@ Command-line flags:
 | `jaunt-agent enroll` | `--server <URL>` and `--name <NAME>` (required), `--labels k=v,...`, `--replace`, `--ca-pin sha256:<hex>`, `--state-dir <DIR>` (default `/var/lib/jaunt`), `--hostname <NAME>`, `--timeout-secs <N>` (default 900), `--token-file <PATH>` (enrol with a join token from this file, without an approval code; see [operations.md](operations.md#enrol-many-nodes-with-join-tokens)) |
 | `jaunt-agent install` | `--user` (default `jaunt`), `--binary` (default `/usr/local/bin/jaunt-agent`), `--config`, `--state-dir`, `--root` (default `/`), `--no-service`, `--dry-run`, `--create-accounts` (set up account creation at first login, see [operations.md](operations.md#account-creation-at-first-login)) |
 | `jaunt-agent uninstall` | `--purge`, `--config`, `--state-dir`, `--root`, `--no-service`, `--dry-run` |
-| `jaunt-agent run` | `--config <PATH>`, `--state-dir <DIR>` |
+| `jaunt-agent run` | `--config <PATH>`, `--state-dir <DIR>`, `--state-backend file\|kubernetes`. With the Kubernetes backend only: `--server <URL>`, `--name <NAME>` and `--ca-pin sha256:<hex>` (required), `--labels k=v,...`, `--join-token-file <PATH>` (default `/var/run/secrets/jaunt/join-token`); see [operations.md](operations.md#agent-in-a-cluster) |
 
 ### host_users
 

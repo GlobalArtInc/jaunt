@@ -32,6 +32,46 @@ pub struct AgentConfig {
     pub ssh: SshConfig,
     #[serde(default)]
     pub services: Vec<AnnouncedService>,
+    #[serde(default)]
+    pub state: StateConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    #[default]
+    File,
+    Kubernetes,
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text {
+            "file" => Ok(Self::File),
+            "kubernetes" => Ok(Self::Kubernetes),
+            _ => Err("the state backend is file or kubernetes".to_owned()),
+        }
+    }
+}
+
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Kubernetes => "kubernetes",
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    #[serde(default)]
+    pub backend: Option<BackendKind>,
+    #[serde(default)]
+    pub secret_name: Option<String>,
 }
 
 impl AgentConfig {
@@ -286,8 +326,8 @@ mod tests {
     use jaunt_proto::ServiceProblem;
 
     use super::{
-        AgentConfig, ConfigError, InnerConfig, RecordingConfig, ServiceConfigError, SshConfig,
-        load, load_reporting,
+        AgentConfig, BackendKind, ConfigError, InnerConfig, RecordingConfig, ServiceConfigError,
+        SshConfig, StateConfig, load, load_reporting,
     };
 
     type Expected = fn(&ConfigError) -> bool;
@@ -312,6 +352,7 @@ mod tests {
                     host_users: HostUsersSection::default(),
                     ssh: SshConfig::default(),
                     services: Vec::new(),
+                    state: StateConfig::default(),
                 },
             ),
         ] {
@@ -508,6 +549,38 @@ mod tests {
             std::fs::write(&path, &text).unwrap();
             let error = load(&path).unwrap_err();
             assert!(expected(&error), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_state_section_names_a_backend_and_a_secret_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        assert_eq!(load(&path).unwrap().state, StateConfig::default());
+        for (text, backend, secret) in [
+            ("state: {}\n", None, None),
+            ("state: { backend: file }\n", Some(BackendKind::File), None),
+            (
+                "state: { backend: kubernetes, secret_name: agent-state }\n",
+                Some(BackendKind::Kubernetes),
+                Some("agent-state"),
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let state = load(&path).unwrap().state;
+            assert_eq!(state.backend, backend, "{text:?}");
+            assert_eq!(state.secret_name.as_deref(), secret, "{text:?}");
+        }
+        for text in [
+            "state: { backend: s3 }\n",
+            "state: { backend: Kubernetes }\n",
+            "state: { secret: x }\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                matches!(load(&path), Err(ConfigError::Parse { .. })),
+                "{text:?}"
+            );
         }
     }
 }

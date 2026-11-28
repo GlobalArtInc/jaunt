@@ -8,7 +8,7 @@ alias jd='sudo -u jauntd jauntd --config /etc/jaunt/jauntd.yaml'
 
 The outputs below were captured from a real run of [quickstart.md](quickstart.md). Values such as fingerprints and ids differ in your installation.
 
-Contents: [Revocation](#revocation), [CA rotation](#ca-rotation), [Internal CA pin](#internal-ca-pin), [Enrol many nodes with join tokens](#enrol-many-nodes-with-join-tokens), [Recordings](#recordings), [Backup and restore](#backup-and-restore), [Upgrade and rollback](#upgrade-and-rollback), [Limits](#limits), [Audit](#audit), [Troubleshooting](#troubleshooting), [Web terminal](#web-terminal).
+Contents: [Revocation](#revocation), [CA rotation](#ca-rotation), [Internal CA pin](#internal-ca-pin), [Enrol many nodes with join tokens](#enrol-many-nodes-with-join-tokens), [Agent in a cluster](#agent-in-a-cluster), [Recordings](#recordings), [Backup and restore](#backup-and-restore), [Upgrade and rollback](#upgrade-and-rollback), [Limits](#limits), [Audit](#audit), [Troubleshooting](#troubleshooting), [Web terminal](#web-terminal).
 
 ## Revocation
 
@@ -296,6 +296,108 @@ When several of `revoked`, `expired` and `used_up` hold, the first of them in th
 - Do not reuse one token across environments. Make one token per environment and role, with its labels pinned, so that a leak in staging does not enrol a production host.
 - Do not leave the token file on the node after enrolment, and do not copy it into an image or a backup.
 - Do not give a prefix token more uses than the number of hosts you are bringing in.
+
+## Agent in a cluster
+
+**Trigger:** you give people access to a Kubernetes cluster. One agent runs inside the cluster as a pod: a Deployment with one replica and the strategy `Recreate`, under its own ServiceAccount.
+
+A pod loses its disk at every reschedule, but the node identity (keys and certificates) must survive it: an agent that loses its keys can come back only with a new join token. So the agent keeps the durable copy of its state in a Secret of its own namespace, `jaunt-agent-state` by default, and works from a copy in memory. There is no PersistentVolume.
+
+### What the agent stores and when
+
+The Secret holds the six enrollment files of the state directory under their own names: `state.json`, `tls.key`, `ssh_host_ed25519`, `x509.der`, `ssh_host_ed25519-cert.pub` and `ca-root.der`. `inner-ca.pub` is not stored: the agent makes a new inner CA at every start. A Secret written by an earlier version that still holds `inner-ca.pub` is accepted and that key ignored; the next write leaves it out.
+
+These are the node's private keys. Whoever can `get` the Secret can act as the node. Whoever can `update` it could otherwise decide which control plane the agent trusts and connects to, which equals control of the agent: that is why `--ca-pin` is required with this backend, and the agent refuses a Secret, a planted state directory or an enrollment whose internal CA root does not match the pin. Even with the pin, `update` lets someone swap in another enrollment of the same server or break the agent. Keep `get` and `update` on the Secret to the agent and to cluster administrators, and encrypt Secrets at rest in etcd (an `EncryptionConfiguration` for `secrets` on the API server), so that a copy of etcd or of its backups does not hold the keys in the clear.
+
+At every start the agent:
+
+1. reads the Secret (it must exist; the agent may not create it);
+2. if the Secret holds an enrollment, checks it and writes the files into the state directory with mode 0600, the directory 0700. A key that is not one of the names above, a value that is not base64, a file over 64 KiB, a Secret over 1 MiB, a missing file, a file that the agent cannot load, or a CA root that does not match `--ca-pin` stops the agent with exit status 1 and a message that names the problem. The Secret is not changed;
+3. if the Secret is empty, reads the join token once from `--join-token-file`. While the file is missing (kubelet may be replacing it) it looks again every second, up to 10 times. It then writes the Secret back unchanged, to learn that it may update it before it spends the token: without `update` it stops and the token stays unused. It enrols with `--server`, `--name`, `--labels` and `--ca-pin`, and writes the new state into the Secret before it connects to the server. If the write fails it retries (from 1 second up to 60 seconds), logs `agent.state.persist_failed` and does not serve meanwhile. The token is never logged and not kept after the enrollment. A stop signal during the enrollment ends the agent at once; the token may then count as used;
+4. if the Secret is empty and there is no token file after these attempts, stops with exit status 1 and says which token to create.
+
+If the Secret is empty but the state directory still holds an enrollment from an earlier start of the same pod (the container restarted after enrolling and before the Secret was written), the agent checks it like a Secret (including `--ca-pin`) and stores it instead of enrolling again.
+
+After the start, every certificate renewal is written to the Secret. A failed write does not stop the agent: it retries from 1 second up to 60 seconds and logs `agent.state.persist_failed` at error level at most once a minute; the certificates already in the Secret stay valid until their own end, and a renewal at the next start replaces them. At shutdown the agent makes one last attempt.
+
+Writes use the `resourceVersion` of the Secret. When the Secret changed meanwhile, the agent reads it again and writes its files over the new version, keeping labels and annotations that others set. When the Secret now holds a different enrollment (another replica, or an old pod that is still running), the agent logs `agent.state.foreign_enrollment`, does not overwrite it and stops with exit status 1. Run exactly one replica with `strategy: Recreate`.
+
+### What the pod needs
+
+| Item | Value |
+|---|---|
+| ServiceAccount token | mounted (the default `automountServiceAccountToken`). The agent reads `token`, `ca.crt` and `namespace` from `/var/run/secrets/kubernetes.io/serviceaccount` and rereads the token when kubelet rotates it and at least every minute. It talks to the API server at `https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT` when kubelet sets both, else at `https://kubernetes.default.svc`, with TLS 1.2 or 1.3, a 10 second timeout, no proxy and no redirects. Outside a pod (no token file) `--state-backend kubernetes` is refused |
+| state Secret | created empty before the agent starts, for example `kubectl -n jaunt create secret generic jaunt-agent-state`. Another name goes into `state.secret_name` |
+| RBAC | a Role in the agent's namespace with exactly `get` and `update` on `secrets` with `resourceNames: [jaunt-agent-state]`, bound to the ServiceAccount. The agent sends only `GET` and `PUT` to `/api/v1/namespaces/<namespace>/secrets/<name>` and nothing else on this path |
+| join token | a Secret mounted as a file at `/var/run/secrets/jaunt/join-token` (or `--join-token-file`), for example with `defaultMode: 0400`. The file may be a kubelet link inside its directory; it must be a regular file of root or the agent's user that group and others cannot write, at most 4 KiB, holding only the token. After the first start it is no longer read; remove it |
+| state directory | an `emptyDir` with `medium: Memory`. Point `state_dir` (or `--state-dir`) at a directory below the mount, such as `/var/lib/jaunt/state` with the volume on `/var/lib/jaunt`: the agent creates it with mode 0700 and refuses a directory that belongs to another user |
+| configuration | `ssh.enabled: false` and no `host_users.enabled: true`: the pod has no sshd and no host accounts. The agent never reads `/etc/ssh` then |
+
+The agent configuration in the pod:
+
+```yaml
+ssh: { enabled: false }
+state: { backend: kubernetes }
+state_dir: /var/lib/jaunt/state
+services:
+  - kind: kubernetes
+    name: prod-eu
+    kubernetes: { api: in-cluster, audit: mutating }
+```
+
+and the command:
+
+```sh
+jaunt-agent run --config /etc/jaunt/agent.yaml --server https://<host> --name kube-prod-eu --ca-pin sha256:<hash>
+```
+
+`--state-backend kubernetes` does the same as `state.backend: kubernetes`; when both are given they must agree. `--server`, `--name`, `--labels`, `--ca-pin`, `--join-token-file` and `state.secret_name` are refused with the file backend, and `--server`, `--name` and `--ca-pin` are required with the Kubernetes one. The pin is the `internal-ca` line that `jauntd ca init` printed; see [Internal CA pin](#internal-ca-pin) to compute it again. It is checked at the enrollment and against the CA root in the Secret at every start.
+
+The agent announces the Kubernetes service at every connection, like any other service; an administrator or the join token approves it. This release ships no image of the agent; the chart and the image come later.
+
+### Enrol the cluster
+
+Create a token that allows exactly this name, then put it into the token Secret:
+
+```sh
+(umask 077 && jd join-token create --name kube-prod-eu --uses 1 --ttl 1h > join-token.txt)
+kubectl -n jaunt create secret generic jaunt-join-token --from-file=join-token=join-token.txt
+shred -u join-token.txt
+```
+
+Start the Deployment. The pod log shows the fingerprints, `the join token was accepted` and then `starting the agent`. `jd node list` shows `kube-prod-eu` approved by the token. Delete the token Secret afterwards:
+
+```sh
+kubectl -n jaunt delete secret jaunt-join-token
+```
+
+### After losing the Secret
+
+When the state Secret was deleted or emptied, or holds an enrollment the agent refuses, the node keeps its name on the server and the agent cannot prove that it is that node any more. It enrols again only with a new join token that allows replacing that name. The agent always asks to replace when it enrols from a token, so the token decides.
+
+Make the Secret empty: create it again when it was deleted, or remove its data when the agent refuses it:
+
+```sh
+kubectl -n jaunt create secret generic jaunt-agent-state
+kubectl -n jaunt patch secret jaunt-agent-state --type=json -p='[{"op": "remove", "path": "/data"}]'
+```
+
+Then give the agent a replace token and restart it:
+
+```sh
+(umask 077 && jd join-token create --name kube-prod-eu --allow-replace --uses 1 --ttl 30m > join-token.txt)
+kubectl -n jaunt create secret generic jaunt-join-token --from-file=join-token=join-token.txt
+shred -u join-token.txt
+kubectl -n jaunt rollout restart deployment/jaunt-agent
+```
+
+The old node is removed in the same step (`node.removed` with `reason: replaced`), its sessions end, and the new keys take the name. Without `--allow-replace` the server refuses the token and the pod restarts with `the server refused the join token`, which asks for a token created with `--allow-replace`; the audit event `join_token.refused` on the control host names the reason, `replace_not_allowed`. Read the Note in [Replacing an existing node](#replacing-an-existing-node) before you create such a token.
+
+### Do not
+
+- Do not run two replicas or the `RollingUpdate` strategy: the second pod stops with `agent.state.foreign_enrollment`, and with a replace token it would take the name over.
+- Do not grant `list`, `watch` or `create` on Secrets to the agent: it needs only `get` and `update` on its own Secret.
+- Do not edit the state Secret by hand. A key the agent does not know, or a changed file, stops the next start.
 
 ## Recordings
 
