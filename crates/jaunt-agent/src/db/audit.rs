@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use jaunt_pgwire::{Excerpt, Notice, StatementKind};
@@ -84,22 +84,12 @@ impl ProtocolProblem {
     }
 }
 
-const READINGS: [Reading; 4] = [
+const READINGS: [Reading; 2] = [
     Reading {
         backslash_escapes: false,
-        multibyte_trail: false,
     },
     Reading {
         backslash_escapes: true,
-        multibyte_trail: false,
-    },
-    Reading {
-        backslash_escapes: false,
-        multibyte_trail: true,
-    },
-    Reading {
-        backslash_escapes: true,
-        multibyte_trail: true,
     },
 ];
 
@@ -108,7 +98,8 @@ pub struct QueryCapture {
     hasher: Sha256,
     length: usize,
     lexers: Vec<Lexer>,
-    primary: usize,
+    pipelined: bool,
+    high: bool,
 }
 
 impl Default for QueryCapture {
@@ -118,7 +109,7 @@ impl Default for QueryCapture {
 }
 
 impl QueryCapture {
-    pub fn new(backslash_escapes: bool) -> Self {
+    pub fn new(pipelined: bool) -> Self {
         Self {
             prefix: Vec::new(),
             hasher: Sha256::new(),
@@ -127,7 +118,8 @@ impl QueryCapture {
                 .iter()
                 .map(|reading| Lexer::new(CAPTURE_BYTES, *reading))
                 .collect(),
-            primary: usize::from(backslash_escapes),
+            pipelined,
+            high: false,
         }
     }
 
@@ -137,6 +129,7 @@ impl QueryCapture {
             .extend_from_slice(&bytes[..room.min(bytes.len())]);
         self.hasher.update(bytes);
         self.length = self.length.saturating_add(bytes.len());
+        self.high |= bytes.iter().any(|byte| *byte >= 0x80);
         for lexer in &mut self.lexers {
             lexer.feed(bytes);
         }
@@ -146,8 +139,8 @@ impl QueryCapture {
         self.lexers.iter().any(Lexer::is_malformed)
     }
 
-    pub fn of(bytes: &[u8], backslash_escapes: bool) -> Self {
-        let mut capture = Self::new(backslash_escapes);
+    pub fn of(bytes: &[u8], pipelined: bool) -> Self {
+        let mut capture = Self::new(pipelined);
         capture.feed(bytes);
         capture
     }
@@ -160,13 +153,13 @@ impl QueryCapture {
             pair[0].masked.bytes != pair[1].masked.bytes
                 || pair[0].masked.total != pair[1].masked.total
         });
-        let primary = scans.swap_remove(self.primary.min(scans.len().saturating_sub(1)));
+        let primary = scans.swap_remove(0);
         let digest = self.hasher.finalize();
         let mut sha256 = String::with_capacity(64);
         for byte in digest.as_slice() {
             sha256.push_str(&format!("{byte:02x}"));
         }
-        let shown = if ambiguous {
+        let shown = if (self.pipelined && self.high) || (sensitive && ambiguous) {
             Shown::Command
         } else if sensitive {
             Shown::Masked(primary.masked.bytes, primary.masked.total)
@@ -266,7 +259,6 @@ struct Counts {
     cycles_sent: AtomicU64,
     sensitive_through: AtomicU64,
     ready_seen: AtomicU64,
-    backslash_escapes: AtomicBool,
 }
 
 pub struct SessionAudit {
@@ -330,12 +322,9 @@ impl SessionAudit {
         self.query(query, Protocol::Extended);
     }
 
-    pub fn set_backslash_escapes(&self, on: bool) {
-        self.counts.backslash_escapes.store(on, Ordering::SeqCst);
-    }
-
-    pub fn backslash_escapes(&self) -> bool {
-        self.counts.backslash_escapes.load(Ordering::SeqCst)
+    pub fn unconfirmed(&self) -> bool {
+        self.counts.cycles_sent.load(Ordering::SeqCst)
+            > self.counts.ready_seen.load(Ordering::SeqCst)
     }
 
     pub fn sensitive_cycle(&self) {
@@ -493,29 +482,72 @@ mod tests {
     }
 
     #[test]
-    fn a_statement_the_readings_disagree_on_is_written_with_its_command_only() {
-        let mut trail = b"SELECT E'".to_vec();
-        trail.extend_from_slice(&[0x83, 0x5c]);
-        trail.extend_from_slice(b"';DROP TABLE users; -- password '");
-        for backslash_escapes in [false, true] {
-            for text in [
-                b"SELECT 'a\\' x' FROM t".to_vec(),
-                b"SELECT '\\' ;DROP TABLE users; --' /* password */".to_vec(),
-                trail.clone(),
-            ] {
-                let captured = QueryCapture::of(&text, backslash_escapes).finish();
-                assert!(captured.is_sensitive(), "{text:?}");
-                let fields = captured.fields(QueryAudit::Text, 4096, Protocol::Simple);
-                assert_eq!(keys(&fields), ["command", "protocol"], "{text:?}");
-            }
-            let plain = QueryCapture::of(b"SELECT 'C:\\path' FROM t", backslash_escapes).finish();
-            assert!(!plain.is_sensitive());
-            let fields = plain.fields(QueryAudit::Text, 4096, Protocol::Simple);
-            assert_eq!(
-                fields["text"],
-                AgentEventValue::Text("SELECT 'C:\\path' FROM t".to_owned())
-            );
+    fn a_statement_the_readings_disagree_on_loses_its_text_only_when_it_names_a_password() {
+        for text in [
+            b"SELECT 'a\\' x' FROM t -- password".to_vec(),
+            b"SELECT '\\' ;DROP TABLE users; --' /* password */".to_vec(),
+        ] {
+            let captured = QueryCapture::of(&text, false).finish();
+            assert!(captured.is_sensitive(), "{text:?}");
+            let fields = captured.fields(QueryAudit::Text, 4096, Protocol::Simple);
+            assert_eq!(keys(&fields), ["command", "protocol"], "{text:?}");
         }
+        let doubtful = b"SELECT replace(p, '\\', '/') FROM t";
+        let captured = QueryCapture::of(doubtful, false).finish();
+        assert!(!captured.is_sensitive());
+        let fields = captured.fields(QueryAudit::Text, 4096, Protocol::Simple);
+        assert_eq!(
+            keys(&fields),
+            [
+                "command",
+                "length",
+                "protocol",
+                "sha256",
+                "text",
+                "truncated"
+            ]
+        );
+        assert_eq!(
+            fields["text"],
+            AgentEventValue::Text("SELECT replace(p, '\\', '/') FROM t".to_owned())
+        );
+        let escaped =
+            QueryCapture::of(b"SELECT dblink_connect('host=h \\x70assword=x')", false).finish();
+        assert!(escaped.is_sensitive());
+        let fields = escaped.fields(QueryAudit::Text, 4096, Protocol::Simple);
+        assert_eq!(
+            fields["text"],
+            AgentEventValue::Text("SELECT dblink_connect('?')".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_statement_with_high_bytes_sent_behind_unconfirmed_ones_keeps_only_its_command() {
+        let mut big5 = b"SELECT '$a$".to_vec();
+        big5.extend_from_slice(&[0xa4, 0xee, 0xa7, 0xc0]);
+        big5.extend_from_slice(b";SELECT 1/0 AS zqx9;");
+        big5.push(0xea);
+        big5.extend_from_slice(b"\\''/*");
+        big5.extend_from_slice(&[0xc5, 0xa3]);
+        big5.push(b'\'');
+        let pipelined = QueryCapture::of(&big5, true).finish();
+        assert!(pipelined.is_sensitive());
+        let fields = pipelined.fields(QueryAudit::Text, 4096, Protocol::Simple);
+        assert_eq!(keys(&fields), ["command", "protocol"]);
+        let alone = QueryCapture::of(&big5, false).finish();
+        assert!(!alone.is_sensitive());
+        assert!(
+            alone
+                .fields(QueryAudit::Text, 4096, Protocol::Simple)
+                .contains_key("text")
+        );
+        let ascii = QueryCapture::of(b"SELECT 'a\\' FROM t", true).finish();
+        assert!(!ascii.is_sensitive());
+        assert!(
+            ascii
+                .fields(QueryAudit::Text, 4096, Protocol::Simple)
+                .contains_key("text")
+        );
     }
 
     #[test]

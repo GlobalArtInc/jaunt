@@ -527,7 +527,6 @@ impl Inner {
             }
             registered
         });
-        audit.set_backslash_escapes(login.backslash_escapes);
         if client.write_all(&login.client_bytes).await.is_err() || client.flush().await.is_err() {
             return Ok(ServiceOutcome::Closed);
         }

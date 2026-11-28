@@ -161,8 +161,12 @@ async fn an_oversized_dollar_tag_or_statement_name_ends_the_session_before_it_ru
     let mut long_name = vec![b'n'; 64 * 1024 + 1];
     long_name.push(0);
     long_name.extend_from_slice(b"SELECT 1\0\0\0");
-    let cases: [(Vec<u8>, &[u8]); 2] = [
+    let mut tagged_parse = vec![0];
+    tagged_parse.extend_from_slice(format!("SELECT ${tag}$x${tag}$").as_bytes());
+    tagged_parse.extend_from_slice(&[0, 0, 0]);
+    let cases: [(Vec<u8>, &[u8]); 3] = [
         (query(&format!("SELECT ${tag}$x${tag}$")), b""),
+        (message(b'P', &tagged_parse), b"X"),
         (message(b'P', &long_name), b"X"),
     ];
     for (bytes, database_saw) in cases {

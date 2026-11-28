@@ -51,7 +51,6 @@ pub const SAFE_PARAMETERS: &[&str] = &[
     "TimeZone",
 ];
 
-pub const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
 pub const CLIENT_ENCODING: &str = "client_encoding";
 
 pub fn is_utf8(encoding: &str) -> bool {
@@ -109,7 +108,6 @@ pub struct Login {
     pub client_bytes: Vec<u8>,
     pub key_data: Option<BackendKeyData>,
     pub decoder: BackendDecoder,
-    pub backslash_escapes: bool,
 }
 
 pub struct Trust {
@@ -314,7 +312,6 @@ pub async fn login(
         let mut client_bytes = Vec::new();
         let mut key_data = None;
         let mut authenticated = false;
-        let mut backslash_escapes = false;
         let mut buffer = vec![0_u8; READ_CHUNK];
         loop {
             loop {
@@ -348,9 +345,6 @@ pub async fn login(
                         if status.name == CLIENT_ENCODING && !is_utf8(&status.value) {
                             return Err(LoginError::Protocol(ProtocolProblem::ClientEncoding));
                         }
-                        if status.name == STANDARD_CONFORMING_STRINGS {
-                            backslash_escapes = status.value.eq_ignore_ascii_case("off");
-                        }
                         if is_safe_parameter(&status.name) {
                             greet(&mut client_bytes, frame.raw())?;
                         }
@@ -365,7 +359,6 @@ pub async fn login(
                             client_bytes,
                             key_data,
                             decoder,
-                            backslash_escapes,
                         });
                     }
                     _ => return Err(LoginError::Protocol(ProtocolProblem::ServerUnexpected)),

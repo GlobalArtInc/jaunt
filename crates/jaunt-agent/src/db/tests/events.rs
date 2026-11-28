@@ -475,7 +475,7 @@ async fn each_use_of_a_password_statement_hides_the_message_of_its_error() {
 }
 
 #[tokio::test]
-async fn the_reading_of_backslashes_follows_neither_the_setting_nor_a_guess() {
+async fn both_readings_of_backslashes_are_compared_whatever_the_database_reports() {
     let harness = DbHarness::new().await;
     harness.pg.set_mode(super::fake_pg::Mode::ScsOff);
     let (_opened, mut client, _) = harness.login("s-scs").await;
@@ -518,4 +518,71 @@ async fn the_reading_of_backslashes_follows_neither_the_setting_nor_a_guess() {
             assert!(!matches!(value, AgentEventValue::Text(text) if text.contains("hunter2")));
         }
     }
+}
+
+fn high_bytes() -> Vec<Vec<u8>> {
+    let mut big5 = b"SELECT '$a$".to_vec();
+    big5.extend_from_slice(&[0xa4, 0xee, 0xa7, 0xc0]);
+    big5.extend_from_slice(b";SELECT 1/0 AS zqx9;");
+    big5.push(0xea);
+    big5.extend_from_slice(b"\\''/*");
+    big5.extend_from_slice(&[0xc5, 0xa3]);
+    big5.push(b'\'');
+    let mut gbk = b"SELECT '".to_vec();
+    gbk.push(0xe3);
+    gbk.extend_from_slice(b"\\'");
+    gbk.push(0xc3);
+    gbk.extend_from_slice(b"~;SELECT 1/0 AS zqx9; --'");
+    let mut sjis = b"SELECT E'".to_vec();
+    sjis.extend_from_slice(&[0x83, 0x5c]);
+    sjis.extend_from_slice(b"';SELECT 1/0 AS zqx9; --'");
+    let mut katakana = b"SELECT E'".to_vec();
+    katakana.extend_from_slice(&[0xb1, 0x5c]);
+    katakana.extend_from_slice(b"';SELECT 1/0 AS zqx9; --'");
+    vec![big5, gbk, sjis, katakana]
+}
+
+fn raw_query(text: &[u8]) -> Vec<u8> {
+    let mut body = text.to_vec();
+    body.push(0);
+    message(b'Q', &body)
+}
+
+#[tokio::test]
+async fn statements_with_high_bytes_behind_unconfirmed_ones_keep_only_their_command() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-pipelined-bytes").await;
+    for statement in high_bytes() {
+        let mut batch = query("SELECT 1");
+        batch.extend(raw_query(&statement));
+        client.send(&batch).await;
+        client.until_ready().await;
+        client.until_ready().await;
+        client.send(&raw_query(&statement)).await;
+        client.until_ready().await;
+    }
+    let mut batch = query("SELECT 1");
+    batch.extend(query("SELECT 'a\\' FROM t"));
+    client.send(&batch).await;
+    client.until_ready().await;
+    client.until_ready().await;
+    let mut extended_batch = parse("", "SELECT 1");
+    extended_batch.extend(bind("", ""));
+    extended_batch.extend(execute(""));
+    extended_batch.extend(parse("", "SELECT 'caf\u{e9}'"));
+    extended_batch.extend(sync());
+    client.send(&extended_batch).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-pipelined-bytes").await;
+    let texts: Vec<bool> = harness
+        .named("s-pipelined-bytes", "db.query")
+        .iter()
+        .map(|fields| fields.contains_key("text"))
+        .collect();
+    let mut expected = Vec::new();
+    for _ in 0..4 {
+        expected.extend([true, false, true]);
+    }
+    expected.extend([true, true, true, false]);
+    assert_eq!(texts, expected);
 }

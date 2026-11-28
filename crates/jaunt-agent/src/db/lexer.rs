@@ -29,14 +29,9 @@ fn is_tag(byte: u8) -> bool {
     is_tag_start(byte) || byte.is_ascii_digit()
 }
 
-fn is_lead_byte(byte: u8) -> bool {
-    (0x81..=0xfe).contains(&byte)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reading {
     pub backslash_escapes: bool,
-    pub multibyte_trail: bool,
 }
 
 #[derive(Default)]
@@ -192,7 +187,6 @@ enum Kind {
 enum Escape {
     None,
     Backslash,
-    Trail,
     Digits {
         radix: u32,
         value: u32,
@@ -734,8 +728,7 @@ impl Lexer {
             Escape::Digits {
                 got: 0, letter: 0, ..
             }
-            | Escape::None
-            | Escape::Trail => {}
+            | Escape::None => {}
             Escape::Backslash => self.trigger.char(b'\\'),
             Escape::Digits { got: 0, letter, .. } => self.trigger.char(letter),
             Escape::Digits { value, .. } => self.trigger.decoded(value),
@@ -745,14 +738,6 @@ impl Lexer {
     fn escape_byte(&mut self, kind: Kind, escape: Escape, byte: u8) -> Step {
         match escape {
             Escape::None => Step::Done,
-            Escape::Trail => {
-                self.set_escape(Escape::None);
-                if byte >= 0x40 {
-                    Step::Done
-                } else {
-                    Step::Again
-                }
-            }
             Escape::Backslash => {
                 let next = match (kind, byte) {
                     (Kind::Escape, b'x') => Some((16, 0, 0, 2, b'x')),
@@ -834,10 +819,6 @@ impl Lexer {
                 }
             }
             b'\\' if kind != Kind::Standard => self.set_escape(Escape::Backslash),
-            _ if kind == Kind::Escape && self.reading.multibyte_trail && is_lead_byte(byte) => {
-                self.trigger.char(NON_ASCII);
-                self.set_escape(Escape::Trail);
-            }
             _ => self.trigger.char(byte),
         }
         Step::Done
@@ -882,21 +863,11 @@ mod tests {
     const SECRET: &[u8] = b"qz#~^%";
     const DEFAULT: Reading = Reading {
         backslash_escapes: false,
-        multibyte_trail: false,
     };
-    const READINGS: [Reading; 4] = [
+    const READINGS: [Reading; 2] = [
         DEFAULT,
         Reading {
             backslash_escapes: true,
-            multibyte_trail: false,
-        },
-        Reading {
-            backslash_escapes: false,
-            multibyte_trail: true,
-        },
-        Reading {
-            backslash_escapes: true,
-            multibyte_trail: true,
         },
     ];
 
@@ -1090,6 +1061,14 @@ mod tests {
                 "OPTIONS (sslpassword '?', passwd '?')",
             ),
             ("SELECT \"x\" FROM t", "SELECT \"x\" FROM t"),
+            (
+                "ALTER ROLE app PASSWORD \"a\"\"secret\"",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "OPTIONS (\"password\" hunter2)",
+                "OPTIONS (\"password\" '?')",
+            ),
         ] {
             assert_eq!(masked(statement), expected, "{statement:?}");
         }
@@ -1122,24 +1101,24 @@ mod tests {
     }
 
     #[test]
-    fn the_readings_disagree_exactly_on_the_hostile_forms() {
+    fn the_two_readings_differ_only_where_a_backslash_meets_a_quote() {
         let shown = |reading: Reading, text: &[u8]| scan_with(reading, &[text]).masked.bytes;
         let backslash = b"SELECT '\\' ;DROP TABLE users; --' /* password */";
         assert_ne!(shown(READINGS[0], backslash), shown(READINGS[1], backslash));
-        let mut trail = b"SELECT E'".to_vec();
-        trail.extend_from_slice(&[0x83, 0x5c]);
-        trail.extend_from_slice(b"';DROP TABLE users; -- password '");
-        assert_ne!(shown(READINGS[0], &trail), shown(READINGS[2], &trail));
         for plain in [
             "SELECT 'C:\\path' FROM t".as_bytes(),
-            "SELECT E'\u{e9}' FROM t".as_bytes(),
+            "SELECT E'\u{e9}\\'' FROM t".as_bytes(),
             "SELECT E'\u{20ac}' FROM t".as_bytes(),
         ] {
-            let first = shown(READINGS[0], plain);
-            for reading in &READINGS[1..] {
-                assert_eq!(shown(*reading, plain), first, "{plain:?}");
-            }
+            assert_eq!(
+                shown(READINGS[0], plain),
+                shown(READINGS[1], plain),
+                "{plain:?}"
+            );
         }
+        let escaped = b"SELECT dblink_connect('host=h \\x70assword=secret')";
+        assert!(!scan_with(READINGS[0], &[escaped]).sensitive);
+        assert!(scan_with(READINGS[1], &[escaped]).sensitive);
     }
 
     struct Random(u64);

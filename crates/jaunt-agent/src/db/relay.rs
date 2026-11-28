@@ -12,10 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use super::audit::{ProtocolProblem, QueryCapture, SessionAudit, cut};
-use super::upstream::{
-    CLIENT_ENCODING, STANDARD_CONFORMING_STRINGS, deadline, is_safe_parameter, is_utf8,
-    server_problem,
-};
+use super::upstream::{CLIENT_ENCODING, deadline, is_safe_parameter, is_utf8, server_problem};
 use super::wire::{ENCODING_REFUSED, FUNCTION_CALLS, TERMINATE, error_response};
 use crate::clock::Clock;
 
@@ -92,31 +89,42 @@ fn oversized(names: &[&str]) -> bool {
 struct SecretNames {
     statements: HashSet<String>,
     portals: HashSet<String>,
-    saturated: bool,
+    lost_statements: usize,
+    lost_portals: usize,
 }
 
 impl SecretNames {
-    fn remember(names: &mut HashSet<String>, saturated: &mut bool, name: &str) {
+    fn remember(names: &mut HashSet<String>, lost: &mut usize, name: &str) {
         let key = key(name);
         if names.len() >= MAX_SECRET_NAMES && !names.contains(key) {
-            *saturated = true;
+            *lost = lost.saturating_add(1);
         } else {
             names.insert(key.to_owned());
         }
     }
 
+    fn forget(names: &mut HashSet<String>, lost: &mut usize, name: &str) {
+        if !names.remove(key(name)) {
+            *lost = lost.saturating_sub(1);
+        }
+    }
+
+    fn saturated(&self) -> bool {
+        self.lost_statements > 0 || self.lost_portals > 0
+    }
+
     fn parsed(&mut self, statement: &str, sensitive: bool) {
         if sensitive {
-            Self::remember(&mut self.statements, &mut self.saturated, statement);
+            Self::remember(&mut self.statements, &mut self.lost_statements, statement);
         } else {
             self.statements.remove(key(statement));
         }
     }
 
     fn bound(&mut self, portal: &str, statement: &str) -> bool {
-        let sensitive = self.saturated || self.statements.contains(key(statement));
+        let sensitive = self.saturated() || self.statements.contains(key(statement));
         if sensitive {
-            Self::remember(&mut self.portals, &mut self.saturated, portal);
+            Self::remember(&mut self.portals, &mut self.lost_portals, portal);
         } else {
             self.portals.remove(key(portal));
         }
@@ -124,11 +132,11 @@ impl SecretNames {
     }
 
     fn executes(&self, portal: &str) -> bool {
-        self.saturated || self.portals.contains(key(portal))
+        self.saturated() || self.portals.contains(key(portal))
     }
 
     fn describes(&self, target: &Target) -> bool {
-        self.saturated
+        self.saturated()
             || match target.kind {
                 TargetKind::Statement => self.statements.contains(key(&target.name)),
                 TargetKind::Portal => self.portals.contains(key(&target.name)),
@@ -137,11 +145,16 @@ impl SecretNames {
 
     fn closed(&mut self, target: &Target) {
         match target.kind {
-            TargetKind::Statement => self.statements.remove(key(&target.name)),
-            TargetKind::Portal => self.portals.remove(key(&target.name)),
-        };
-        if self.statements.is_empty() && self.portals.is_empty() {
-            self.saturated = false;
+            TargetKind::Statement => {
+                Self::forget(
+                    &mut self.statements,
+                    &mut self.lost_statements,
+                    &target.name,
+                );
+            }
+            TargetKind::Portal => {
+                Self::forget(&mut self.portals, &mut self.lost_portals, &target.name);
+            }
         }
     }
 }
@@ -179,6 +192,7 @@ where
     let mut buffer = vec![0_u8; READ_CHUNK];
     let mut query: Option<StreamedQuery> = None;
     let mut secrets = SecretNames::default();
+    let mut executed = false;
     loop {
         loop {
             let event = match decoder.next_event() {
@@ -193,13 +207,15 @@ where
                         FrontendMessage::QueryText { length } => {
                             query = Some(StreamedQuery {
                                 remaining: *length,
-                                capture: QueryCapture::new(audit.backslash_escapes()),
+                                capture: QueryCapture::new(audit.unconfirmed() || executed),
                             });
                         }
                         FrontendMessage::Query(statement) => {
-                            let captured =
-                                QueryCapture::of(statement.as_bytes(), audit.backslash_escapes())
-                                    .finish();
+                            let captured = QueryCapture::of(
+                                statement.as_bytes(),
+                                audit.unconfirmed() || executed,
+                            )
+                            .finish();
                             if captured.is_malformed() {
                                 return Ending::Client(ProtocolProblem::ClientMalformed);
                             }
@@ -211,7 +227,7 @@ where
                             }
                             let captured = QueryCapture::of(
                                 parse.statement.as_bytes(),
-                                audit.backslash_escapes(),
+                                audit.unconfirmed() || executed,
                             )
                             .finish();
                             if captured.is_malformed() {
@@ -232,6 +248,7 @@ where
                             if oversized(&[&execute.portal]) {
                                 return Ending::Client(ProtocolProblem::ClientMalformed);
                             }
+                            executed = true;
                             if secrets.executes(&execute.portal) {
                                 audit.sensitive_cycle();
                             }
@@ -250,7 +267,10 @@ where
                             }
                             secrets.closed(target);
                         }
-                        FrontendMessage::Sync => audit.sync_sent(),
+                        FrontendMessage::Sync => {
+                            executed = false;
+                            audit.sync_sent();
+                        }
                         FrontendMessage::Terminate => terminate = true,
                         FrontendMessage::SslRequest
                         | FrontendMessage::GssEncRequest
@@ -341,11 +361,6 @@ where
                     match frame.message() {
                         BackendMessage::ErrorResponse(notice) => audit.error(notice),
                         BackendMessage::ReadyForQuery(_) => audit.ready(),
-                        BackendMessage::ParameterStatus(status)
-                            if status.name == STANDARD_CONFORMING_STRINGS =>
-                        {
-                            audit.set_backslash_escapes(status.value.eq_ignore_ascii_case("off"));
-                        }
                         BackendMessage::ParameterStatus(status)
                             if status.name == CLIENT_ENCODING && !is_utf8(&status.value) =>
                         {
@@ -511,27 +526,36 @@ mod tests {
     }
 
     #[test]
-    fn at_most_1024_names_are_remembered_and_then_every_use_counts_until_all_are_closed() {
+    fn names_past_1024_keep_every_use_counted_until_each_of_them_is_closed() {
         let mut names = SecretNames::default();
         for index in 0..1024 {
             names.parsed(&format!("s{index}"), true);
         }
-        assert!(!names.saturated);
+        assert!(!names.saturated());
         assert!(names.bound("p", "s1023"));
         assert!(!names.bound("q", "plain"));
-        names.parsed("s1024", true);
-        assert!(names.saturated);
+        for index in 1024..1100 {
+            names.parsed(&format!("s{index}"), true);
+        }
+        assert!(names.saturated());
         assert!(names.bound("q", "plain"));
         assert!(names.executes("anything"));
         for index in 0..1024 {
             names.closed(&statement(&format!("s{index}")));
         }
         names.closed(&portal("p"));
-        assert!(names.saturated);
         names.closed(&portal("q"));
-        assert!(!names.saturated);
+        assert!(names.saturated());
+        assert!(names.describes(&statement("s1099")));
+        for index in 1024..1099 {
+            names.closed(&statement(&format!("s{index}")));
+        }
+        assert!(names.saturated());
+        names.closed(&statement("s1099"));
+        assert!(!names.saturated());
         assert!(!names.executes("anything"));
         assert!(!names.describes(&statement("s1")));
+        assert!(!names.bound("r", "s1"));
     }
 
     #[test]
