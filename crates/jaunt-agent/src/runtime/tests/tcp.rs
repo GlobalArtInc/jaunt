@@ -22,7 +22,7 @@ use super::support::{
 };
 use crate::clock::Clock;
 use crate::runtime::directory::ApprovedService;
-use crate::runtime::handler::ServiceSession;
+use crate::runtime::handler::{EndReason as SessionEnd, ServiceSession};
 use crate::runtime::tcp::{
     CLIENT_ADDR_BYTES, Connect, DialFailure, EndReason, Ledger, TCP_LIMITS, TcpHandler, TcpLimits,
     bounded, dial,
@@ -505,8 +505,12 @@ async fn the_idle_timeout_also_ends_a_half_closed_session() {
     );
 }
 
+const STOPPED_LATE: &str = "did not stop within its grace time";
+
 #[tokio::test]
-async fn a_cancelled_session_ends_within_a_second() {
+async fn a_cancel_from_the_runtime_mid_splice_ends_the_session_by_itself_within_a_second() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
     let (address, listener) = manual_upstream().await;
     let setup = setup(&announcement(Some(&address), None), TCP_LIMITS);
     let (mut client, opened) = setup.connect("s-cancel").await;
@@ -525,8 +529,10 @@ async fn a_cancelled_session_ends_within_a_second() {
         .await
         .expect("the upstream connection was not closed within a second");
     assert!(read.is_err() || rest.is_empty());
+    closed(&mut client).await;
     assert!(cancelled_at.elapsed() < Duration::from_secs(1));
     opened.finished().await;
+    assert!(!logs.text().contains(STOPPED_LATE), "{}", logs.text());
     let (fields, end) = setup.ended("s-cancel");
     assert_eq!(
         (text(&fields, "reason"), int(&fields, "bytes_up")),
@@ -537,6 +543,8 @@ async fn a_cancelled_session_ends_within_a_second() {
 
 #[tokio::test]
 async fn the_granted_duration_ends_the_session_through_the_runtime() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
     let (address, listener) = manual_upstream().await;
     let setup = setup(&announcement(Some(&address), None), TCP_LIMITS);
     setup
@@ -577,6 +585,59 @@ async fn the_granted_duration_ends_the_session_through_the_runtime() {
     );
     assert_eq!(end.outcome, ServiceOutcome::MaxDuration);
     assert_eq!(setup.tcp.sessions_held(SERVICE), 0);
+    assert!(!logs.text().contains(STOPPED_LATE), "{}", logs.text());
+}
+
+#[tokio::test]
+async fn a_session_stuck_in_dial_stops_by_itself_at_a_cancel_or_the_granted_duration() {
+    let logs = LogCapture::default();
+    let _guard = logs.install();
+    let script = Arc::new(Script::default());
+    script.push(&[Step::Hang, Step::Hang]);
+    let limits = TcpLimits {
+        connect_timeout: Duration::from_secs(600),
+        ..TCP_LIMITS
+    };
+    let setup = scripted(
+        &announcement(Some("127.0.0.1:9"), None),
+        limits,
+        script.clone(),
+        vec![approved(TCP, SERVICE)],
+    );
+    let (mut client, opened) = setup.connect("s-dial-cancel").await;
+    wait_until("the dial to start", || script.dialed().len() == 1).await;
+    let cancelled_at = Instant::now();
+    opened.cancel.cancel();
+    closed(&mut client).await;
+    opened.finished().await;
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        setup.reason("s-dial-cancel"),
+        ("cancelled".to_owned(), ServiceOutcome::Closed)
+    );
+
+    setup
+        .harness
+        .control
+        .allow_by_default(ServiceAccess::Tcp, 90);
+    let clock = &setup.harness.clock;
+    let start = clock.now();
+    let (mut client, opened) = setup.connect("s-dial-deadline").await;
+    wait_until("the dial to start", || script.dialed().len() == 2).await;
+    clock
+        .wait_for_sleeper(start + Duration::from_secs(90))
+        .await;
+    let stopped_at = Instant::now();
+    clock.set(start + Duration::from_secs(90));
+    closed(&mut client).await;
+    opened.finished().await;
+    assert!(stopped_at.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        setup.reason("s-dial-deadline"),
+        ("max_duration".to_owned(), ServiceOutcome::MaxDuration)
+    );
+    assert_eq!(setup.tcp.sessions_held(SERVICE), 0);
+    assert!(!logs.text().contains(STOPPED_LATE), "{}", logs.text());
 }
 
 #[tokio::test]
@@ -891,7 +952,9 @@ fn ledger_session(harness: &Harness, session_id: &str) -> ServiceSession {
     ServiceSession {
         session_id: session_id.to_owned(),
         service: ServiceName::new(SERVICE).unwrap(),
+        dns_name: format!("{SERVICE}.tcp.example.test"),
         cancel: CancellationToken::new(),
+        reason: SessionEnd::default(),
         events: harness.events.session(session_id),
     }
 }
@@ -955,9 +1018,66 @@ async fn an_aborted_session_reports_cancelled_or_max_duration_and_a_panic_an_ups
         &ledger_session(&harness, "s-once"),
         CLIENT,
     );
-    closed_once.close(EndReason::Closed);
+    assert_eq!(
+        closed_once.finish(EndReason::Closed),
+        ServiceOutcome::Closed
+    );
     drop(closed_once);
     assert_eq!(end_reason(&harness, "s-once").await, "closed");
+}
+
+#[tokio::test]
+async fn the_end_reason_follows_the_decision_of_the_runtime_when_it_came_first() {
+    let harness = Harness::new();
+    for (session_id, decided, natural, expected, outcome) in [
+        (
+            "s-stop-deadline",
+            Some(ServiceOutcome::MaxDuration),
+            EndReason::Cancelled,
+            "max_duration",
+            ServiceOutcome::MaxDuration,
+        ),
+        (
+            "s-stop-cancel",
+            Some(ServiceOutcome::Closed),
+            EndReason::Cancelled,
+            "cancelled",
+            ServiceOutcome::Closed,
+        ),
+        (
+            "s-stop-tunnel",
+            None,
+            EndReason::Cancelled,
+            "cancelled",
+            ServiceOutcome::Closed,
+        ),
+        (
+            "s-raced-deadline",
+            Some(ServiceOutcome::MaxDuration),
+            EndReason::Closed,
+            "max_duration",
+            ServiceOutcome::MaxDuration,
+        ),
+        (
+            "s-first-writer",
+            None,
+            EndReason::IdleTimeout,
+            "idle_timeout",
+            ServiceOutcome::IdleTimeout,
+        ),
+    ] {
+        let session = ledger_session(&harness, session_id);
+        if let Some(decided) = decided {
+            session.reason.decide(decided);
+        }
+        session.cancel.cancel();
+        let mut ledger = Ledger::open(harness.clock.clone(), &session, CLIENT);
+        assert_eq!(ledger.finish(natural), outcome, "{session_id}");
+        drop(ledger);
+        assert_eq!(end_reason(&harness, session_id).await, expected);
+        let written = (natural != EndReason::Cancelled).then_some(outcome);
+        assert_eq!(session.reason.peek(), decided.or(written), "{session_id}");
+    }
 }
 
 #[test]

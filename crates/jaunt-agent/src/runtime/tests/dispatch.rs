@@ -14,9 +14,9 @@ use super::support::{
 };
 use crate::clock::Clock;
 use crate::keys::TlsKey;
-use crate::runtime::MAX_GRANT_DURATION;
 use crate::runtime::events::{SINK_LIMITS, SessionEvent};
 use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
+use crate::runtime::{HANDLER_STOP_GRACE, MAX_GRANT_DURATION};
 use crate::testkit::{LogCapture, NODE_ID};
 
 const TCP: StreamKind = StreamKind::Tcp;
@@ -571,6 +571,44 @@ async fn a_session_longer_than_its_grant_is_ended_at_the_deadline() {
 }
 
 #[tokio::test]
+async fn a_handler_that_ignores_the_stop_signal_is_aborted_after_its_grace_time() {
+    for max_duration in [false, true] {
+        let harness = Harness::with(HarnessOptions {
+            behaviour: Behaviour::Stubborn,
+            ..HarnessOptions::default()
+        });
+        harness.control.allow_by_default(ServiceAccess::Tcp, 90);
+        let mut opened = harness.open(TCP, "grafana", "s-stubborn");
+        let config = harness.client_config(Some(&harness.user()), &[]);
+        let _stream = handshake(opened.take(), &dns_name(TCP, "grafana"), config)
+            .await
+            .unwrap();
+        wait_until("the session to start", || {
+            harness.handler.served().len() == 1
+        })
+        .await;
+        let stopped = std::time::Instant::now();
+        if max_duration {
+            let deadline = later(&harness.clock, Duration::from_secs(90));
+            harness.clock.wait_for_sleeper(deadline).await;
+            harness.clock.advance(Duration::from_secs(90));
+        } else {
+            opened.cancel.cancel();
+        }
+        tokio::task::yield_now().await;
+        assert!(!opened.serving.is_finished(), "{max_duration}");
+        opened.finished().await;
+        assert!(stopped.elapsed() >= HANDLER_STOP_GRACE, "{max_duration}");
+        let expected = if max_duration {
+            ServiceOutcome::MaxDuration
+        } else {
+            ServiceOutcome::Closed
+        };
+        assert_eq!(harness.control.ends()[0].outcome, expected);
+    }
+}
+
+#[tokio::test]
 async fn every_grant_is_cut_at_twenty_four_hours() {
     for granted in [u64::MAX, 25 * 3600] {
         let harness = Harness::with(HarnessOptions {
@@ -620,6 +658,7 @@ fn the_documented_limits_are_the_built_in_ones() {
     assert_eq!(SERVICE_LIMITS.connections_per_service, 512);
     assert_eq!(SERVICE_LIMITS.authorize_timeout, Duration::from_secs(10));
     assert_eq!(MAX_GRANT_DURATION, Duration::from_secs(24 * 3600));
+    assert_eq!(HANDLER_STOP_GRACE, Duration::from_secs(1));
     assert_eq!(SERVICE_LIMITS.event_flush_timeout, Duration::from_secs(2));
     assert_eq!(
         (SINK_LIMITS.queue_events, SINK_LIMITS.queue_bytes),

@@ -34,12 +34,13 @@ use crate::accounts::{
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
+use crate::kube::{KUBE_LIMITS, KubeHandler, KubeParts, KubernetesUpstream, declares_kubernetes};
 use crate::recording::{RecordingParts, Recordings};
 use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller, ApprovalTiming};
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
 use crate::runtime::directory::{Approvals, ServiceDirectory};
 use crate::runtime::events::{EventSink, SINK_LIMITS, follow_connections};
-use crate::runtime::handler::{HandlerRegistry, NotAServiceKind};
+use crate::runtime::handler::{HandlerRegistry, NotAServiceKind, ServiceHandler};
 use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
 use crate::runtime::tcp::{TCP_LIMITS, TcpHandler};
 use crate::runtime::x509::UserX509Trust;
@@ -130,6 +131,7 @@ pub struct RunSettings {
     pub service_limits: ServiceLimits,
     pub service_certificate_backoff: BackoffPolicy,
     pub approval_timing: ApprovalTiming,
+    pub kube_upstream: KubernetesUpstream,
 }
 
 impl RunSettings {
@@ -156,6 +158,7 @@ impl RunSettings {
             service_limits: SERVICE_LIMITS,
             service_certificate_backoff: SERVICE_CERTIFICATE_BACKOFF,
             approval_timing: APPROVAL_TIMING,
+            kube_upstream: KubernetesUpstream::default(),
         }
     }
 }
@@ -387,7 +390,13 @@ pub async fn run(
         settings.service_certificate_backoff,
     ));
     let local_services = Arc::new(settings.services.clone());
-    let handlers = Arc::new(service_handlers(&local_services, env.clock.clone())?);
+    let mut handlers = service_handlers(&local_services, env.clock.clone())?;
+    if let Some(kube) = kube_handler(&settings, env.clock.clone())
+        && let Err(error) = handlers.register(StreamKind::Kube, kube)
+    {
+        tracing::error!(target: "jaunt::agent", error = %error, "cannot register the Kubernetes handler");
+    }
+    let handlers = Arc::new(handlers);
     let audit_events = EventSink::new(
         api.clone(),
         env.clock.clone(),
@@ -539,6 +548,29 @@ pub async fn run(
         Ok(Ok(())) => Err(RunError::TunnelTask),
         Ok(Err(error)) => Err(RunError::Tunnel(error)),
         Err(_) => Err(RunError::TunnelTask),
+    }
+}
+
+fn kube_handler(settings: &RunSettings, clock: Arc<dyn Clock>) -> Option<Arc<dyn ServiceHandler>> {
+    if !declares_kubernetes(&settings.services) {
+        return None;
+    }
+    let parts = KubeParts {
+        upstream: &settings.kube_upstream,
+        services: &settings.services,
+        clock,
+        limits: KUBE_LIMITS,
+    };
+    match KubeHandler::new(parts) {
+        Ok(handler) => Some(Arc::new(handler)),
+        Err(error) => {
+            tracing::error!(
+                target: "jaunt::agent",
+                error = %error,
+                "the Kubernetes API server settings are not usable; Kubernetes connections are refused"
+            );
+            None
+        }
     }
 }
 

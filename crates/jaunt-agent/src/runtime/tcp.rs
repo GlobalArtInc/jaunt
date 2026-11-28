@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::{SessionEvent, SessionEvents};
 use super::handler::{
-    HandlerError, ServiceConnection, ServiceGrant, ServiceHandler, ServiceSession, ServiceStream,
+    EndReason as SessionEnd, HandlerError, ServiceConnection, ServiceGrant, ServiceHandler,
+    ServiceSession, ServiceStream,
 };
 use crate::clock::Clock;
 
@@ -292,23 +293,26 @@ impl Inner {
                     "a TCP session names a service that has no address in the agent configuration; the session is closed"
                 );
             }
-            ledger.close(EndReason::UpstreamError);
+            ledger.finish(EndReason::UpstreamError);
             return Err(HandlerError);
         };
         let Ok(_slot) = self.sessions.try_acquire(service.to_owned()) else {
             self.refused(&session, upstream, EndReason::ServiceLimit);
-            return Ok(ledger.close(EndReason::ServiceLimit));
+            return Ok(ledger.finish(EndReason::ServiceLimit));
         };
         if self.paused(service) {
             self.refused(&session, upstream, EndReason::UpstreamUnavailable);
-            return Ok(ledger.close(EndReason::UpstreamUnavailable));
+            return Ok(ledger.finish(EndReason::UpstreamUnavailable));
         }
-        let dialed = dial(
-            self.connect.connect(upstream.address.as_str()),
-            &self.limits,
-            self.clock.as_ref(),
-        )
-        .await;
+        let dialed = tokio::select! {
+            biased;
+            () = session.cancel.cancelled() => return Ok(ledger.finish(EndReason::Cancelled)),
+            dialed = dial(
+                self.connect.connect(upstream.address.as_str()),
+                &self.limits,
+                self.clock.as_ref(),
+            ) => dialed,
+        };
         let upstream_stream = match dialed {
             Ok(upstream_stream) => {
                 self.dial_succeeded(service);
@@ -317,13 +321,14 @@ impl Inner {
             Err(failure) => {
                 let failures = self.dial_failed(service);
                 self.dial_logged(&session, upstream, failure, failures);
-                return Ok(ledger.close(EndReason::UpstreamError));
+                return Ok(ledger.finish(EndReason::UpstreamError));
             }
         };
         let reason = splice(
             stream,
             upstream_stream,
             &Splicing {
+                cancel: &session.cancel,
                 clock: self.clock.as_ref(),
                 idle_timeout: upstream.idle_timeout,
                 grace: self.limits.half_close_grace,
@@ -331,7 +336,7 @@ impl Inner {
             },
         )
         .await;
-        Ok(ledger.close(reason))
+        Ok(ledger.finish(reason))
     }
 
     fn health(&self) -> std::sync::MutexGuard<'_, HashMap<String, DialHealth>> {
@@ -439,6 +444,7 @@ pub struct Ledger {
     session_id: String,
     clock: Arc<dyn Clock>,
     cancel: CancellationToken,
+    decided: SessionEnd,
     service: String,
     started: SystemTime,
     moved: Moved,
@@ -464,15 +470,41 @@ impl Ledger {
             started: clock.now(),
             clock,
             cancel: session.cancel.clone(),
+            decided: session.reason.clone(),
             service,
             moved: Moved::default(),
             closed: false,
         }
     }
 
-    pub fn close(&mut self, reason: EndReason) -> ServiceOutcome {
+    pub fn finish(&mut self, natural: EndReason) -> ServiceOutcome {
+        let reason = match natural {
+            EndReason::Cancelled | EndReason::MaxDuration => self.stopped(),
+            natural => {
+                let outcome = natural.outcome();
+                let decided = self.decided.decide(outcome);
+                if decided == outcome {
+                    natural
+                } else {
+                    decided_reason(decided)
+                }
+            }
+        };
+        self.record(reason);
+        reason.outcome()
+    }
+
+    fn stopped(&self) -> EndReason {
+        match self.decided.peek() {
+            Some(decided) => decided_reason(decided),
+            None if self.cancel.is_cancelled() => EndReason::Cancelled,
+            None => EndReason::MaxDuration,
+        }
+    }
+
+    fn record(&mut self, reason: EndReason) {
         if self.closed {
-            return reason.outcome();
+            return;
         }
         self.closed = true;
         let bytes_up = self.moved.up.load(Ordering::Acquire);
@@ -516,20 +548,27 @@ impl Ledger {
             duration_ms,
             "a TCP session ended"
         );
-        reason.outcome()
+    }
+}
+
+const fn decided_reason(decided: ServiceOutcome) -> EndReason {
+    match decided {
+        ServiceOutcome::Closed => EndReason::Cancelled,
+        ServiceOutcome::IdleTimeout => EndReason::IdleTimeout,
+        ServiceOutcome::MaxDuration => EndReason::MaxDuration,
+        ServiceOutcome::ProtocolError => EndReason::ClientError,
+        ServiceOutcome::UpstreamError => EndReason::UpstreamError,
     }
 }
 
 impl Drop for Ledger {
     fn drop(&mut self) {
-        let reason = if std::thread::panicking() {
-            EndReason::UpstreamError
-        } else if self.cancel.is_cancelled() {
-            EndReason::Cancelled
-        } else {
-            EndReason::MaxDuration
+        let reason = match self.decided.peek() {
+            Some(decided) => decided_reason(decided),
+            None if std::thread::panicking() => EndReason::UpstreamError,
+            None => self.stopped(),
         };
-        self.close(reason);
+        self.record(reason);
     }
 }
 
@@ -585,6 +624,7 @@ impl Fault {
 }
 
 struct Splicing<'a> {
+    cancel: &'a CancellationToken,
     clock: &'a dyn Clock,
     idle_timeout: Duration,
     grace: Duration,
@@ -620,6 +660,7 @@ async fn splice(client: ServiceStream, upstream: TcpStream, splicing: &Splicing<
     tokio::pin!(up, down, idle);
     let first = tokio::select! {
         biased;
+        () = splicing.cancel.cancelled() => return EndReason::Cancelled,
         pumped = &mut up => pumped.map(|()| First::Up),
         pumped = &mut down => pumped.map(|()| First::Down),
         () = &mut idle => return EndReason::IdleTimeout,
@@ -643,6 +684,7 @@ where
     let deadline = later(splicing.clock.now(), splicing.grace);
     tokio::select! {
         biased;
+        () = splicing.cancel.cancelled() => EndReason::Cancelled,
         pumped = other => match pumped {
             Ok(()) => EndReason::Closed,
             Err(fault) => fault.reason(),

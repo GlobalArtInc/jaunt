@@ -5,6 +5,7 @@ mod enroll;
 mod fsio;
 mod installer;
 mod keys;
+mod kube;
 mod paths;
 mod pin;
 mod recording;

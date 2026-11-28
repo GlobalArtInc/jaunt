@@ -35,14 +35,15 @@ use control::{ServiceControl, may_have_started};
 use directory::{ServiceDirectory, ServiceEntry, service_kind};
 use events::EventSink;
 use handler::{
-    ByteCounts, Counted, HandlerRegistry, ServiceConnection, ServiceGrant, ServiceSession,
-    Transport,
+    ByteCounts, Counted, EndReason, HandlerRegistry, ServiceConnection, ServiceGrant,
+    ServiceSession, Transport,
 };
 use limits::{Gauges, Refusal, RefusalLog, ServiceLimits};
 use x509::{CertRefusal, UserVerifier, UserX509Trust, VerifiedUser};
 
 const ALPN_KUBE: [&[u8]; 2] = [b"h2", b"http/1.1"];
 pub const MAX_GRANT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+pub const HANDLER_STOP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct FixedCertificate(Arc<CertifiedKey>);
@@ -90,6 +91,7 @@ struct Accepted {
     stream: TlsStream<Transport>,
     user: VerifiedUser,
     alpn: Option<Vec<u8>>,
+    dns_name: String,
 }
 
 enum Decided {
@@ -187,6 +189,7 @@ impl ServiceRuntime {
             return;
         };
         let counts = Arc::new(ByteCounts::default());
+        let dns_name = accepted.dns_name;
         let mut connection = ServiceConnection {
             stream: Counted::new(accepted.stream, Arc::clone(&counts)),
             alpn: accepted.alpn,
@@ -308,10 +311,14 @@ impl ServiceRuntime {
                 .then(|| entry.address.clone())
                 .flatten(),
         };
+        let reason = EndReason::default();
+        let stop = cancel.child_token();
         let session = ServiceSession {
             session_id: session_id.clone(),
             service: name.clone(),
-            cancel: cancel.child_token(),
+            dns_name,
+            cancel: stop.clone(),
+            reason: reason.clone(),
             events: self.events.session(&session_id),
         };
         let deadline = self.deadline(max_duration);
@@ -327,13 +334,9 @@ impl ServiceRuntime {
             },
             () = self.sleep_until(deadline) => Ended::MaxDuration,
         };
-        if !task.is_finished() {
-            task.abort();
-            drop(task.await);
-        }
         let outcome = match ended {
-            Ended::Handler(outcome) => outcome,
-            Ended::Failed => ServiceOutcome::UpstreamError,
+            Ended::Handler(outcome) => reason.decide(outcome),
+            Ended::Failed => reason.decide(ServiceOutcome::UpstreamError),
             Ended::Panicked => {
                 tracing::error!(
                     target: "jaunt::agent",
@@ -341,11 +344,37 @@ impl ServiceRuntime {
                     service = %name,
                     "the service handler failed unexpectedly; the session is ended"
                 );
-                ServiceOutcome::UpstreamError
+                reason.decide(ServiceOutcome::UpstreamError)
             }
-            Ended::Cancelled => ServiceOutcome::Closed,
-            Ended::MaxDuration => ServiceOutcome::MaxDuration,
+            Ended::Cancelled | Ended::MaxDuration => {
+                let decided = reason.decide(if matches!(ended, Ended::MaxDuration) {
+                    ServiceOutcome::MaxDuration
+                } else {
+                    ServiceOutcome::Closed
+                });
+                stop.cancel();
+                match tokio::time::timeout(HANDLER_STOP_GRACE, &mut task).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) => tracing::error!(
+                        target: "jaunt::agent",
+                        session_id = session_id.as_str(),
+                        service = %name,
+                        "the service handler failed unexpectedly while it was stopping"
+                    ),
+                    Err(_) => tracing::debug!(
+                        target: "jaunt::agent",
+                        session_id = session_id.as_str(),
+                        service = %name,
+                        "the service handler did not stop within its grace time; it is aborted"
+                    ),
+                }
+                decided
+            }
         };
+        if !task.is_finished() {
+            task.abort();
+            drop(task.await);
+        }
         let flushed = self
             .events
             .flush(&session_id, self.deadline(self.limits.event_flush_timeout))
@@ -451,7 +480,12 @@ impl ServiceRuntime {
             None => return Err(Refusal::Certificate(CertRefusal::Malformed)),
         };
         let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-        Ok(Accepted { stream, user, alpn })
+        Ok(Accepted {
+            stream,
+            user,
+            alpn,
+            dns_name: issued.dns_name().to_owned(),
+        })
     }
 
     fn server_config(

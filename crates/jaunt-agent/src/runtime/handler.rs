@@ -1,8 +1,8 @@
 use std::fmt;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -114,11 +114,26 @@ pub struct ServiceGrant {
     pub target: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EndReason(Arc<OnceLock<ServiceOutcome>>);
+
+impl EndReason {
+    pub fn decide(&self, outcome: ServiceOutcome) -> ServiceOutcome {
+        *self.0.get_or_init(|| outcome)
+    }
+
+    pub fn peek(&self) -> Option<ServiceOutcome> {
+        self.0.get().copied()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ServiceSession {
     pub session_id: String,
     pub service: ServiceName,
+    pub dns_name: String,
     pub cancel: CancellationToken,
+    pub reason: EndReason,
     pub events: SessionEvents,
 }
 
