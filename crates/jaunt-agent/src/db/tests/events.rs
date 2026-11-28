@@ -225,7 +225,7 @@ async fn statements_that_name_a_password_are_written_masked_without_digest_or_le
         [
             "AlTeR RoLe app PASSWORD '?'",
             "SELECT dblink_connect('?')",
-            "FAIL ALTER ROLE app PASSWORD hunter2",
+            "FAIL ALTER ROLE app PASSWORD '?'",
             "FAIL plain",
             "SELECT 1",
             "DROP TABLE payments",
@@ -399,4 +399,123 @@ async fn a_one_mebibyte_query_streams_through_and_is_cut_for_the_audit() {
     );
     let seen = harness.pg.seen();
     assert_eq!(seen.messages[0].1.len(), statement.len() + 1);
+}
+
+fn bind(portal: &str, statement: &str) -> Vec<u8> {
+    let mut body = cstr(portal);
+    body.extend(cstr(statement));
+    body.extend(0_i16.to_be_bytes());
+    body.extend(0_i16.to_be_bytes());
+    body.extend(0_i16.to_be_bytes());
+    message(b'B', &body)
+}
+
+fn execute(portal: &str) -> Vec<u8> {
+    let mut body = cstr(portal);
+    body.extend(0_i32.to_be_bytes());
+    message(b'E', &body)
+}
+
+fn sync() -> Vec<u8> {
+    message(b'S', &[])
+}
+
+async fn exchange(client: &mut PgClient, parts: &[Vec<u8>]) {
+    client.send(&parts.concat()).await;
+    client.until_ready().await;
+}
+
+#[tokio::test]
+async fn each_use_of_a_password_statement_hides_the_message_of_its_error() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-uses").await;
+    let secret = "ALTER ROLE app PASSWORD hunter2";
+    exchange(
+        &mut client,
+        &[parse("", &format!("EXECFAIL {secret}")), sync()],
+    )
+    .await;
+    exchange(
+        &mut client,
+        &[
+            parse("", "EXECFAIL plain"),
+            bind("", ""),
+            execute(""),
+            sync(),
+        ],
+    )
+    .await;
+    exchange(
+        &mut client,
+        &[
+            parse("s", &format!("EXECFAIL {secret}")),
+            bind("p", "s"),
+            sync(),
+        ],
+    )
+    .await;
+    exchange(&mut client, &[execute("p"), sync()]).await;
+    exchange(
+        &mut client,
+        &[parse("b", &format!("BINDFAIL {secret}")), sync()],
+    )
+    .await;
+    exchange(&mut client, &[bind("", "b"), sync()]).await;
+    exchange(&mut client, &[parse("c", "BINDFAIL plain"), sync()]).await;
+    exchange(&mut client, &[bind("", "c"), sync()]).await;
+    exchange(
+        &mut client,
+        &[parse("d", &format!("DESCFAIL {secret}")), sync()],
+    )
+    .await;
+    exchange(&mut client, &[message(b'D', b"Sd\0"), sync()]).await;
+    finish(&harness, &mut client, "s-uses").await;
+    let (_, errors) = fields_and_errors(&harness, "s-uses").await;
+    assert_eq!(errors, [true, false, false, true, false]);
+}
+
+#[tokio::test]
+async fn the_reading_of_backslashes_follows_neither_the_setting_nor_a_guess() {
+    let harness = DbHarness::new().await;
+    harness.pg.set_mode(super::fake_pg::Mode::ScsOff);
+    let (_opened, mut client, _) = harness.login("s-scs").await;
+    let clear = "ALTER ROLE app PASSWORD 'a\\b'";
+    let doubtful = "ALTER ROLE app PASSWORD 'a\\' hunter2 '";
+    for statement in [
+        clear,
+        doubtful,
+        "SET scs on",
+        clear,
+        doubtful,
+        "SET scs off",
+        clear,
+    ] {
+        client.send(&query(statement)).await;
+        client.until_ready().await;
+    }
+    finish(&harness, &mut client, "s-scs").await;
+    let texts: Vec<Option<String>> = harness
+        .named("s-scs", "db.query")
+        .iter()
+        .map(|fields| text(fields, "text"))
+        .collect();
+    let masked = Some("ALTER ROLE app PASSWORD '?'".to_owned());
+    let set = |value: &str| Some(format!("SET scs {value}"));
+    assert_eq!(
+        texts,
+        [
+            masked.clone(),
+            None,
+            set("on"),
+            masked.clone(),
+            None,
+            set("off"),
+            masked
+        ]
+    );
+    for fields in harness.named("s-scs", "db.query") {
+        for value in fields.values() {
+            assert!(!matches!(value, AgentEventValue::Text(text) if text.contains("hunter2")));
+        }
+    }
 }

@@ -96,6 +96,8 @@ pub enum Mode {
     Silent,
     NoTls,
     Greeting(usize),
+    ScsOff,
+    Encoding(&'static str),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -316,7 +318,12 @@ async fn serve(mut tcp: TcpStream, shared: Arc<Shared>, index: usize) {
             shared.record(|seen| seen.closed += 1);
             return;
         }
-        Mode::Normal | Mode::Password(_) | Mode::Refuse(_) | Mode::Greeting(_) => {}
+        Mode::Normal
+        | Mode::Password(_)
+        | Mode::Refuse(_)
+        | Mode::Greeting(_)
+        | Mode::ScsOff
+        | Mode::Encoding(_) => {}
     }
     if tcp.write_all(b"S").await.is_err() {
         return;
@@ -379,11 +386,24 @@ async fn serve(mut tcp: TcpStream, shared: Arc<Shared>, index: usize) {
             drop(tls.write_all(&out).await);
             return;
         }
-        Mode::Normal | Mode::Silent | Mode::NoTls | Mode::Greeting(_) => {}
+        Mode::Normal
+        | Mode::Silent
+        | Mode::NoTls
+        | Mode::Greeting(_)
+        | Mode::ScsOff
+        | Mode::Encoding(_) => {}
     }
     out.extend(message(b'R', &0_i32.to_be_bytes()));
     out.extend(parameter("server_version", "17.2"));
-    out.extend(parameter("client_encoding", "UTF8"));
+    let encoding = if let Mode::Encoding(encoding) = mode {
+        encoding
+    } else {
+        "UTF8"
+    };
+    out.extend(parameter("client_encoding", encoding));
+    if mode == Mode::ScsOff {
+        out.extend(parameter("standard_conforming_strings", "off"));
+    }
     let visible = out.len();
     out.extend(parameter("jaunt_internal_hint", "10.9.8.7"));
     let mut key = FakePg::process_id(index).to_be_bytes().to_vec();
@@ -436,7 +456,7 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
     let mut skipping = false;
     let mut prepared: std::collections::HashMap<Vec<u8>, Vec<u8>> =
         std::collections::HashMap::new();
-    let mut bound: Vec<u8> = Vec::new();
+    let mut portals: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
     while let Some((tag, body)) = read_message(tls, shared).await {
         let mut out = Vec::new();
         if skipping && tag != b'S' && tag != b'X' {
@@ -491,8 +511,14 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                         if cancelled {
                             break;
                         }
-                        if changes.changed().await.is_err() {
-                            return;
+                        tokio::select! {
+                            changed = changes.changed() => if changed.is_err() {
+                                return;
+                            },
+                            interrupted = read_message(tls, shared) => match interrupted {
+                                Some((b'X', _)) | None => return,
+                                Some(_) => {}
+                            },
                         }
                     }
                     out.extend(message(
@@ -505,6 +531,12 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                     out.extend(message(b'K', &[0, 0, 0, 9, 1, 2, 3, 4]));
                 } else if text == "SEND v" {
                     out.extend(message(b'v', &[0, 3, 0, 0, 0, 0, 0, 0]));
+                } else if let Some(value) = text.strip_prefix("SET scs ") {
+                    out.extend(parameter("standard_conforming_strings", value));
+                    out.extend(complete("SET"));
+                } else if let Some(value) = text.strip_prefix("SET encoding ") {
+                    out.extend(parameter("client_encoding", value));
+                    out.extend(complete("SET"));
                 } else if text == "SET hint" {
                     out.extend(parameter("jaunt_internal_hint", "10.9.8.7"));
                     out.extend(parameter("application_name", "report"));
@@ -530,10 +562,19 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                 }
             }
             b'B' => {
-                let name = body.split(|byte| *byte == 0).nth(1).unwrap_or_default();
+                let mut parts = body.split(|byte| *byte == 0);
+                let portal = parts.next().unwrap_or_default().to_vec();
+                let name = parts.next().unwrap_or_default();
                 match prepared.get(name) {
+                    Some(statement) if statement.starts_with(b"BINDFAIL") => {
+                        skipping = true;
+                        out.extend(message(
+                            b'E',
+                            &notice("ERROR", "42601", "syntax error at or near \"hunter2\""),
+                        ));
+                    }
                     Some(statement) => {
-                        bound = statement.clone();
+                        portals.insert(portal, statement.clone());
                         out.extend(message(b'2', &[]));
                     }
                     None => {
@@ -555,8 +596,29 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                 }
                 out.extend(message(b'3', &[]));
             }
-            b'D' => out.extend(message(b'n', &[])),
+            b'D' => {
+                let name = body[1..]
+                    .split(|byte| *byte == 0)
+                    .next()
+                    .unwrap_or_default();
+                let described = if body.first() == Some(&b'S') {
+                    prepared.get(name)
+                } else {
+                    portals.get(name)
+                };
+                if described.is_some_and(|statement| statement.starts_with(b"DESCFAIL")) {
+                    skipping = true;
+                    out.extend(message(
+                        b'E',
+                        &notice("ERROR", "42601", "syntax error at or near \"hunter2\""),
+                    ));
+                } else {
+                    out.extend(message(b'n', &[]));
+                }
+            }
             b'E' => {
+                let portal = body.split(|byte| *byte == 0).next().unwrap_or_default();
+                let bound = portals.get(portal).cloned().unwrap_or_default();
                 if bound.starts_with(b"EXECFAIL") {
                     skipping = true;
                     out.extend(message(

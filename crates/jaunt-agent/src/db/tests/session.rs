@@ -289,10 +289,11 @@ async fn the_grant_duration_ends_the_session_and_its_database_connection() {
     let deadline = later(&harness.clock, Duration::from_secs(60));
     harness.clock.wait_for_sleeper(deadline).await;
     harness.clock.advance(Duration::from_secs(60));
-    harness
+    let seen = harness
         .pg
         .wait("the database connection to close", |seen| seen.closed == 1)
         .await;
+    assert_eq!(seen.messages.last().map(|(tag, _)| *tag), Some(b'X'));
     opened.finished().await;
     assert_eq!(
         harness.ended("s-long").await.outcome,
@@ -329,4 +330,33 @@ async fn the_greeting_of_the_database_is_passed_on_up_to_sixty_four_kib() {
             Some("server_too_large")
         );
     }
+}
+
+#[tokio::test]
+async fn a_cancelled_stream_terminates_the_database_session_in_the_middle_of_a_query() {
+    let harness = DbHarness::new().await;
+    let (opened, mut client, _) = harness.login("s-stop").await;
+    client.send(&query("SLEEP")).await;
+    harness
+        .pg
+        .wait("the query to reach the database", |seen| {
+            !seen.messages.is_empty()
+        })
+        .await;
+    opened.cancel.cancel();
+    let seen = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness
+            .pg
+            .wait("the database connection to close", |seen| seen.closed == 1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(seen.messages.last().map(|(tag, _)| *tag), Some(b'X'));
+    opened.finished().await;
+    assert_eq!(
+        harness.ended("s-stop").await.outcome,
+        ServiceOutcome::Closed
+    );
+    assert_eq!(harness.named("s-stop", "db.session.end").len(), 1);
 }

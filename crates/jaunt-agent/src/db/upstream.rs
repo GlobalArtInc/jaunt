@@ -52,6 +52,13 @@ pub const SAFE_PARAMETERS: &[&str] = &[
 ];
 
 pub const STANDARD_CONFORMING_STRINGS: &str = "standard_conforming_strings";
+pub const CLIENT_ENCODING: &str = "client_encoding";
+
+pub fn is_utf8(encoding: &str) -> bool {
+    ["UTF8", "UTF-8", "UNICODE"]
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(encoding))
+}
 
 pub fn is_safe_parameter(name: &str) -> bool {
     SAFE_PARAMETERS.contains(&name)
@@ -338,6 +345,9 @@ pub async fn login(
                         return Err(LoginError::Refused(notice.clone()));
                     }
                     (true, BackendMessage::ParameterStatus(status)) => {
+                        if status.name == CLIENT_ENCODING && !is_utf8(&status.value) {
+                            return Err(LoginError::Protocol(ProtocolProblem::ClientEncoding));
+                        }
                         if status.name == STANDARD_CONFORMING_STRINGS {
                             backslash_escapes = status.value.eq_ignore_ascii_case("off");
                         }

@@ -64,6 +64,7 @@ async fn negotiation_requests_get_n_and_the_greeting_comes_from_the_agent_in_ord
             ("user".to_owned(), "app".to_owned()),
             ("database".to_owned(), "main".to_owned()),
             ("application_name".to_owned(), "psql".to_owned()),
+            ("client_encoding".to_owned(), "UTF8".to_owned()),
         ]
     );
 }

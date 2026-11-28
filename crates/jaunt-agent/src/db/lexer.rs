@@ -1,10 +1,20 @@
 const WORD_BYTES: usize = 11;
-const MAX_TAG_BYTES: usize = 4096;
-const TRIGGER_WORDS: [&[u8]; 4] = [b"password", b"sslpassword", b"pgpassword", b"passwd"];
+pub const MAX_TAG_BYTES: usize = 4096;
+const TRIGGER_WORDS: [&[u8]; 5] = [
+    b"password",
+    b"sslpassword",
+    b"pgpassword",
+    b"passwd",
+    b"uescape",
+];
 const NON_ASCII: u8 = 0x80;
 
 fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+fn is_newline(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r'
 }
 
 fn is_word(byte: u8) -> bool {
@@ -19,18 +29,52 @@ fn is_tag(byte: u8) -> bool {
     is_tag_start(byte) || byte.is_ascii_digit()
 }
 
+fn is_lead_byte(byte: u8) -> bool {
+    (0x81..=0xfe).contains(&byte)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reading {
+    pub backslash_escapes: bool,
+    pub multibyte_trail: bool,
+}
+
+#[derive(Default)]
+struct WordBuffer {
+    word: [u8; WORD_BYTES],
+    length: usize,
+    long: bool,
+}
+
+impl WordBuffer {
+    fn push(&mut self, byte: u8) {
+        if self.length < WORD_BYTES {
+            self.word[self.length] = byte.to_ascii_lowercase();
+            self.length += 1;
+        } else {
+            self.long = true;
+        }
+    }
+
+    fn take(&mut self) -> Option<bool> {
+        let ended = (self.length > 0 || self.long)
+            .then(|| !self.long && TRIGGER_WORDS.contains(&&self.word[..self.length]));
+        self.length = 0;
+        self.long = false;
+        ended
+    }
+}
+
 #[derive(Default)]
 struct Authority {
     active: bool,
-    length: usize,
     colon: bool,
 }
 
 #[derive(Default)]
 struct Trigger {
-    word: [u8; WORD_BYTES],
-    length: usize,
-    long: bool,
+    word: WordBuffer,
+    last_matched: bool,
     window: [u8; 3],
     authority: Authority,
     found: bool,
@@ -39,12 +83,7 @@ struct Trigger {
 impl Trigger {
     fn char(&mut self, byte: u8) {
         if is_word(byte) {
-            if self.length < WORD_BYTES {
-                self.word[self.length] = byte.to_ascii_lowercase();
-                self.length += 1;
-            } else {
-                self.long = true;
-            }
+            self.word.push(byte);
         } else {
             self.end_word();
         }
@@ -59,12 +98,10 @@ impl Trigger {
     }
 
     fn end_word(&mut self) {
-        let word = &self.word[..self.length];
-        if !self.long && TRIGGER_WORDS.contains(&word) {
-            self.found = true;
+        if let Some(matched) = self.word.take() {
+            self.last_matched = matched;
+            self.found |= matched;
         }
-        self.length = 0;
-        self.long = false;
     }
 
     fn uri(&mut self, byte: u8) {
@@ -75,18 +112,14 @@ impl Trigger {
                 authority.active = false;
             } else if byte == b'/' || is_space(byte) {
                 authority.active = false;
-            } else {
-                if byte == b':' && authority.length >= 1 {
-                    authority.colon = true;
-                }
-                authority.length += 1;
+            } else if byte == b':' {
+                authority.colon = true;
             }
         }
         self.window = [self.window[1], self.window[2], byte];
         if &self.window == b"://" {
             self.authority = Authority {
                 active: true,
-                length: 0,
                 colon: false,
             };
         }
@@ -159,6 +192,7 @@ enum Kind {
 enum Escape {
     None,
     Backslash,
+    Trail,
     Digits {
         radix: u32,
         value: u32,
@@ -166,6 +200,15 @@ enum Escape {
         max: u32,
         letter: u8,
     },
+}
+
+#[derive(Default)]
+struct Lookahead {
+    newline: bool,
+    dash: bool,
+    comment: bool,
+    spaced: bool,
+    side: Trigger,
 }
 
 enum State {
@@ -182,10 +225,15 @@ enum State {
         quote: bool,
         escape: Escape,
     },
+    AfterQuote {
+        kind: Kind,
+        ahead: Box<Lookahead>,
+    },
     Ident {
         unicode: bool,
         quote: bool,
         escape: Escape,
+        hidden: bool,
     },
     DollarOpen {
         tag: Vec<u8>,
@@ -194,15 +242,25 @@ enum State {
         pattern: Vec<u8>,
         matched: usize,
     },
-    Overflow,
+    Malformed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    Shown,
+    Armed,
+    Word,
+    UnicodePrefix,
 }
 
 pub struct Lexer {
     state: State,
-    backslash_escapes: bool,
+    reading: Reading,
     word_length: usize,
     word_first: u8,
     word_number: bool,
+    code_word: WordBuffer,
+    next: Next,
     after_unicode_prefix: bool,
     trigger: Trigger,
     masked: Masked,
@@ -211,6 +269,7 @@ pub struct Lexer {
 pub struct Scanned {
     pub masked: Masked,
     pub sensitive: bool,
+    pub malformed: bool,
 }
 
 enum Step {
@@ -219,13 +278,15 @@ enum Step {
 }
 
 impl Lexer {
-    pub fn new(capacity: usize, backslash_escapes: bool) -> Self {
+    pub fn new(capacity: usize, reading: Reading) -> Self {
         Self {
             state: State::Code,
-            backslash_escapes,
+            reading,
             word_length: 0,
             word_first: 0,
             word_number: false,
+            code_word: WordBuffer::default(),
+            next: Next::Shown,
             after_unicode_prefix: false,
             trigger: Trigger::default(),
             masked: Masked {
@@ -244,8 +305,14 @@ impl Lexer {
         }
     }
 
+    pub fn is_malformed(&self) -> bool {
+        matches!(self.state, State::Malformed)
+    }
+
     pub fn finish(mut self) -> Scanned {
+        let malformed = self.is_malformed();
         match std::mem::replace(&mut self.state, State::Code) {
+            State::Code => self.end_code_word(),
             State::Dash => self.masked.code(b'-'),
             State::Slash => self.masked.code(b'/'),
             State::DollarOpen { tag } => {
@@ -257,16 +324,33 @@ impl Lexer {
             State::Literal { escape, .. } | State::Ident { escape, .. } => {
                 self.flush_escape(escape);
             }
-            _ => {}
+            State::AfterQuote { mut ahead, .. } => {
+                self.trigger.char(b'\'');
+                self.trigger.found |= ahead.side.finish();
+                if ahead.dash {
+                    if ahead.spaced {
+                        self.masked.gap();
+                    }
+                    self.masked.code(b'-');
+                }
+            }
+            State::LineComment | State::Block { .. } | State::Dollar { .. } | State::Malformed => {}
         }
         Scanned {
             sensitive: self.trigger.finish(),
             masked: self.masked,
+            malformed,
         }
     }
 
     fn word_is(&self, letter: u8) -> bool {
         self.word_length == 1 && self.word_first == letter
+    }
+
+    fn end_code_word(&mut self) {
+        if self.code_word.take() == Some(true) {
+            self.next = Next::Armed;
+        }
     }
 
     fn step(&mut self, byte: u8) -> Step {
@@ -279,33 +363,33 @@ impl Lexer {
                 if byte == b'-' {
                     self.trigger.char(byte);
                     self.state = State::LineComment;
+                    self.end_masked_word();
                     self.masked.gap();
-                    Step::Done
                 } else {
-                    self.masked.code(b'-');
                     self.state = State::Code;
                     self.word_length = 0;
+                    self.punctuation(b'-');
                     self.code(byte);
-                    Step::Done
                 }
+                Step::Done
             }
             State::Slash => {
                 if byte == b'*' {
                     self.trigger.char(byte);
                     self.state = State::Block { depth: 1, last: 0 };
+                    self.end_masked_word();
                     self.masked.gap();
-                    Step::Done
                 } else {
-                    self.masked.code(b'/');
                     self.state = State::Code;
                     self.word_length = 0;
+                    self.punctuation(b'/');
                     self.code(byte);
-                    Step::Done
                 }
+                Step::Done
             }
             State::LineComment => {
                 self.trigger.char(byte);
-                if byte == b'\n' || byte == b'\r' {
+                if is_newline(byte) {
                     self.state = State::Code;
                     self.word_length = 0;
                 }
@@ -335,38 +419,100 @@ impl Lexer {
                 escape,
             } => {
                 let (kind, quoted, current) = (*kind, *quote, *escape);
-                if quoted {
-                    if byte == b'\'' {
-                        if let State::Literal { quote, .. } = &mut self.state {
-                            *quote = false;
-                        }
+                if !quoted {
+                    return self.literal_byte(kind, current, byte);
+                }
+                if byte == b'\'' {
+                    self.trigger.char(byte);
+                    if let State::Literal { quote, .. } = &mut self.state {
+                        *quote = false;
+                    }
+                    return Step::Done;
+                }
+                if is_space(byte) || byte == b'-' {
+                    let mut ahead = Box::new(Lookahead {
+                        newline: is_newline(byte),
+                        dash: byte == b'-',
+                        spaced: is_space(byte),
+                        ..Lookahead::default()
+                    });
+                    if is_space(byte) {
+                        ahead.side.char(byte);
+                    }
+                    self.state = State::AfterQuote { kind, ahead };
+                    return Step::Done;
+                }
+                self.trigger.char(b'\'');
+                self.state = State::Code;
+                self.word_length = 0;
+                Step::Again
+            }
+            State::AfterQuote { kind, ahead } => {
+                let kind = *kind;
+                if ahead.comment {
+                    ahead.side.char(byte);
+                    if is_newline(byte) {
+                        ahead.comment = false;
+                        ahead.newline = true;
+                    }
+                    return Step::Done;
+                }
+                if ahead.dash {
+                    if byte == b'-' {
+                        ahead.dash = false;
+                        ahead.comment = true;
+                        ahead.side.char(byte);
                         return Step::Done;
                     }
-                    self.state = State::Code;
-                    self.word_length = 0;
-                    return Step::Again;
+                    return self.end_lookahead();
                 }
-                self.literal_byte(kind, current, byte)
+                if is_space(byte) {
+                    ahead.spaced = true;
+                    ahead.newline |= is_newline(byte);
+                    ahead.side.char(byte);
+                    return Step::Done;
+                }
+                if byte == b'-' {
+                    ahead.dash = true;
+                    return Step::Done;
+                }
+                if byte == b'\'' && ahead.newline {
+                    let found = ahead.side.finish();
+                    self.trigger.found |= found;
+                    self.state = State::Literal {
+                        kind,
+                        quote: false,
+                        escape: Escape::None,
+                    };
+                    return Step::Done;
+                }
+                self.end_lookahead()
             }
             State::Ident {
                 unicode,
                 quote,
                 escape,
+                hidden,
             } => {
-                let (unicode, quoted, current) = (*unicode, *quote, *escape);
+                let (unicode, quoted, current, hidden) = (*unicode, *quote, *escape, *hidden);
                 if quoted {
                     if byte == b'"' {
-                        self.masked.put(byte);
+                        if !hidden {
+                            self.masked.put(byte);
+                        }
                         if let State::Ident { quote, .. } = &mut self.state {
                             *quote = false;
                         }
                         return Step::Done;
                     }
+                    if self.trigger.last_matched && !hidden {
+                        self.next = Next::Armed;
+                    }
                     self.state = State::Code;
                     self.word_length = 0;
                     return Step::Again;
                 }
-                self.ident_byte(unicode, current, byte)
+                self.ident_byte(unicode, current, hidden, byte)
             }
             State::DollarOpen { tag } => {
                 if byte == b'$' {
@@ -375,11 +521,11 @@ impl Lexer {
                     pattern.extend_from_slice(tag);
                     pattern.push(b'$');
                     self.trigger.char(byte);
-                    self.masked.literal();
                     self.state = State::Dollar {
                         pattern,
                         matched: 0,
                     };
+                    self.begin_literal();
                     return Step::Done;
                 }
                 let continues = if tag.is_empty() {
@@ -389,9 +535,7 @@ impl Lexer {
                 };
                 if continues {
                     if tag.len() >= MAX_TAG_BYTES {
-                        self.trigger.char(byte);
-                        self.masked.literal();
-                        self.state = State::Overflow;
+                        self.state = State::Malformed;
                     } else {
                         tag.push(byte);
                         self.trigger.char(byte);
@@ -399,14 +543,15 @@ impl Lexer {
                     return Step::Done;
                 }
                 let tag = std::mem::take(tag);
-                self.masked.code(b'$');
+                self.state = State::Code;
+                self.punctuation(b'$');
                 for part in &tag {
                     self.masked.code(*part);
+                    self.code_word.push(*part);
                 }
                 self.word_length = tag.len();
                 self.word_first = tag.first().map_or(0, u8::to_ascii_lowercase);
                 self.word_number = false;
-                self.state = State::Code;
                 self.code(byte);
                 Step::Done
             }
@@ -425,35 +570,74 @@ impl Lexer {
                 }
                 Step::Done
             }
-            State::Overflow => {
-                self.trigger.char(byte);
-                Step::Done
-            }
+            State::Malformed => Step::Done,
         }
+    }
+
+    fn end_lookahead(&mut self) -> Step {
+        let State::AfterQuote { mut ahead, .. } = std::mem::replace(&mut self.state, State::Code)
+        else {
+            return Step::Again;
+        };
+        self.trigger.char(b'\'');
+        self.trigger.char(b' ');
+        self.trigger.found |= ahead.side.finish();
+        if ahead.spaced || ahead.comment {
+            self.masked.gap();
+        }
+        self.word_length = 0;
+        if ahead.dash {
+            self.code(b'-');
+        }
+        Step::Again
+    }
+
+    fn begin_literal(&mut self) {
+        if !self.in_masked_word() {
+            self.masked.literal();
+        }
+        self.next = Next::Shown;
+    }
+
+    fn in_masked_word(&self) -> bool {
+        matches!(self.next, Next::Word | Next::UnicodePrefix)
+    }
+
+    fn end_masked_word(&mut self) {
+        if self.in_masked_word() {
+            self.next = Next::Shown;
+        }
+    }
+
+    fn punctuation(&mut self, byte: u8) {
+        match self.next {
+            Next::Word | Next::UnicodePrefix => self.next = Next::Shown,
+            Next::Armed if byte != b'=' => self.next = Next::Shown,
+            Next::Armed | Next::Shown => {}
+        }
+        self.masked.code(byte);
     }
 
     fn code(&mut self, byte: u8) {
         self.trigger.char(byte);
+        let continues_word = is_word(byte) || byte == b'$';
+        if !continues_word {
+            self.end_code_word();
+        }
         if self.after_unicode_prefix {
             self.after_unicode_prefix = false;
             if byte == b'\'' {
-                self.masked.literal();
                 self.word_length = 0;
                 self.state = State::Literal {
                     kind: Kind::Unicode,
                     quote: false,
                     escape: Escape::None,
                 };
+                self.begin_literal();
                 return;
             }
             if byte == b'"' {
-                self.masked.code(byte);
-                self.word_length = 0;
-                self.state = State::Ident {
-                    unicode: true,
-                    quote: false,
-                    escape: Escape::None,
-                };
+                self.open_ident(true);
                 return;
             }
         }
@@ -461,51 +645,81 @@ impl Lexer {
             b'-' => self.state = State::Dash,
             b'/' => self.state = State::Slash,
             b'\'' => {
-                let kind = if self.word_is(b'e') || self.backslash_escapes {
+                let kind = if self.word_is(b'e') || self.reading.backslash_escapes {
                     Kind::Escape
                 } else {
                     Kind::Standard
                 };
-                self.masked.literal();
                 self.word_length = 0;
                 self.state = State::Literal {
                     kind,
                     quote: false,
                     escape: Escape::None,
                 };
+                self.begin_literal();
             }
-            b'"' => {
-                self.masked.code(byte);
-                self.word_length = 0;
-                self.state = State::Ident {
-                    unicode: false,
-                    quote: false,
-                    escape: Escape::None,
-                };
-            }
+            b'"' => self.open_ident(false),
             b'$' if self.word_length == 0 || self.word_number => {
                 self.state = State::DollarOpen { tag: Vec::new() };
             }
             b'&' if self.word_is(b'u') => {
-                self.masked.code(byte);
+                if self.next == Next::Word {
+                    self.next = Next::UnicodePrefix;
+                } else {
+                    self.masked.code(byte);
+                }
                 self.word_length = 0;
                 self.after_unicode_prefix = true;
             }
-            _ => {
+            _ if is_space(byte) => {
+                self.word_length = 0;
+                self.end_masked_word();
                 self.masked.code(byte);
-                if is_word(byte) || byte == b'$' {
-                    let digit = byte.is_ascii_digit();
-                    if self.word_length == 0 || (self.word_number && !digit) {
-                        self.word_length = 0;
-                        self.word_first = byte.to_ascii_lowercase();
-                        self.word_number = digit;
-                    }
-                    self.word_length += 1;
-                } else {
+            }
+            _ if continues_word => {
+                let digit = byte.is_ascii_digit();
+                if self.word_length == 0 || (self.word_number && !digit) {
+                    let fresh = self.word_length == 0;
                     self.word_length = 0;
+                    self.word_first = byte.to_ascii_lowercase();
+                    self.word_number = digit;
+                    match self.next {
+                        Next::Armed => {
+                            self.masked.literal();
+                            self.next = Next::Word;
+                        }
+                        Next::UnicodePrefix if fresh => self.next = Next::Shown,
+                        Next::Word | Next::UnicodePrefix | Next::Shown => {}
+                    }
+                }
+                self.word_length += 1;
+                self.code_word.push(byte);
+                if self.next != Next::Word {
+                    self.masked.code(byte);
                 }
             }
+            _ => {
+                self.word_length = 0;
+                self.punctuation(byte);
+            }
         }
+    }
+
+    fn open_ident(&mut self, unicode: bool) {
+        let hidden = matches!(self.next, Next::Armed | Next::Word | Next::UnicodePrefix);
+        match self.next {
+            Next::Armed => self.masked.literal(),
+            Next::Shown => self.masked.code(b'"'),
+            Next::Word | Next::UnicodePrefix => {}
+        }
+        self.next = Next::Shown;
+        self.word_length = 0;
+        self.state = State::Ident {
+            unicode,
+            quote: false,
+            escape: Escape::None,
+            hidden,
+        };
     }
 
     fn set_escape(&mut self, next: Escape) {
@@ -520,7 +734,8 @@ impl Lexer {
             Escape::Digits {
                 got: 0, letter: 0, ..
             }
-            | Escape::None => {}
+            | Escape::None
+            | Escape::Trail => {}
             Escape::Backslash => self.trigger.char(b'\\'),
             Escape::Digits { got: 0, letter, .. } => self.trigger.char(letter),
             Escape::Digits { value, .. } => self.trigger.decoded(value),
@@ -530,6 +745,14 @@ impl Lexer {
     fn escape_byte(&mut self, kind: Kind, escape: Escape, byte: u8) -> Step {
         match escape {
             Escape::None => Step::Done,
+            Escape::Trail => {
+                self.set_escape(Escape::None);
+                if byte >= 0x40 {
+                    Step::Done
+                } else {
+                    Step::Again
+                }
+            }
             Escape::Backslash => {
                 let next = match (kind, byte) {
                     (Kind::Escape, b'x') => Some((16, 0, 0, 2, b'x')),
@@ -606,26 +829,33 @@ impl Lexer {
         }
         match byte {
             b'\'' => {
-                self.trigger.char(byte);
                 if let State::Literal { quote, .. } = &mut self.state {
                     *quote = true;
                 }
             }
             b'\\' if kind != Kind::Standard => self.set_escape(Escape::Backslash),
+            _ if kind == Kind::Escape && self.reading.multibyte_trail && is_lead_byte(byte) => {
+                self.trigger.char(NON_ASCII);
+                self.set_escape(Escape::Trail);
+            }
             _ => self.trigger.char(byte),
         }
         Step::Done
     }
 
-    fn ident_byte(&mut self, unicode: bool, escape: Escape, byte: u8) -> Step {
+    fn ident_byte(&mut self, unicode: bool, escape: Escape, hidden: bool, byte: u8) -> Step {
         if escape != Escape::None {
             let step = self.escape_byte(Kind::Unicode, escape, byte);
-            if let Step::Done = step {
+            if let Step::Done = step
+                && !hidden
+            {
                 self.masked.put(byte);
             }
             return step;
         }
-        self.masked.put(byte);
+        if !hidden {
+            self.masked.put(byte);
+        }
         match byte {
             b'"' => {
                 self.trigger.char(byte);
@@ -646,13 +876,32 @@ fn hex(byte: u8) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lexer, Scanned};
+    use super::{Lexer, MAX_TAG_BYTES, Reading, Scanned};
 
     const CAPACITY: usize = 1 << 20;
     const SECRET: &[u8] = b"qz#~^%";
+    const DEFAULT: Reading = Reading {
+        backslash_escapes: false,
+        multibyte_trail: false,
+    };
+    const READINGS: [Reading; 4] = [
+        DEFAULT,
+        Reading {
+            backslash_escapes: true,
+            multibyte_trail: false,
+        },
+        Reading {
+            backslash_escapes: false,
+            multibyte_trail: true,
+        },
+        Reading {
+            backslash_escapes: true,
+            multibyte_trail: true,
+        },
+    ];
 
-    fn scan_in(pieces: &[&[u8]]) -> Scanned {
-        let mut lexer = Lexer::new(CAPACITY, false);
+    fn scan_with(reading: Reading, pieces: &[&[u8]]) -> Scanned {
+        let mut lexer = Lexer::new(CAPACITY, reading);
         for piece in pieces {
             lexer.feed(piece);
         }
@@ -660,7 +909,7 @@ mod tests {
     }
 
     fn scan(text: &str) -> Scanned {
-        scan_in(&[text.as_bytes()])
+        scan_with(DEFAULT, &[text.as_bytes()])
     }
 
     fn masked(text: &str) -> String {
@@ -684,14 +933,19 @@ mod tests {
             "CREATE USER MAPPING FOR app SERVER s OPTIONS (U&\"\\0070assword\" 'secret')",
             "SELECT dblink_connect(U&'host=h \\0070assword=secret')",
             "SELECT dblink_connect(U&'host=h \\+000070assword=secret')",
+            "SELECT dblink_connect(U&'host=h !0070assword=secret' UESCAPE '!')",
             "SELECT dblink_connect(E'host=h \\x70assword=secret')",
             "SELECT dblink_connect(E'host=h \\160assword=secret')",
             "SELECT dblink_connect(E'host=h \\u0070assword=secret')",
             "SELECT dblink_connect(E'host=h \\U00000070assword=secret')",
             "SELECT dblink_connect(E'host=h password=secret')",
+            "SELECT dblink_connect('host=h pass'\n'word=secret')",
+            "SELECT dblink_connect('host=h pass' -- c\n'word=secret')",
+            "SELECT dblink_connect(E'host=h pass'\n'\\x77ord=secret')",
             "COPY t TO PROGRAM 'PGPASSWORD=hunter2 pg_dump'",
             "SELECT dblink_connect('postgresql://u:hunter2@h/db')",
             "SELECT dblink_connect('postgresql://u:@h/db')",
+            "SELECT dblink_connect('postgresql://:hunter2@h/db')",
             "SELECT $tag$passwd=secret$tag$",
             "UPDATE accounts SET password = 'x'",
             "SELECT 1 -- password",
@@ -706,6 +960,7 @@ mod tests {
             "SELECT passwordé FROM t",
             "ALTER ROLE x PASSWORDé 'y'",
             "SELECT 'pass word', E'\\x70ass word'",
+            "SELECT 'pass' 'word'",
             "SELECT 'http://example.com/a:b@c'",
             "SELECT 'mailto:user@host'",
             "SELECT 'http://host:5432/db'",
@@ -716,6 +971,8 @@ mod tests {
 
     #[test]
     fn literals_and_comments_are_masked_and_the_shape_is_kept() {
+        let tag = "t".repeat(100);
+        let long_tag = format!("SELECT ${tag}$secret${tag}$ FROM payments");
         for (statement, expected) in [
             (
                 "ALTER ROLE app PASSWORD 'hunter2'",
@@ -732,40 +989,157 @@ mod tests {
             ),
             ("SELECT a-b, c/d, e - -f", "SELECT a-b, c/d, e - -f"),
             ("SELECT a$b$ FROM t", "SELECT a$b$ FROM t"),
+            ("SELECT \"a\"\"b\" FROM t", "SELECT \"a\"\"b\" FROM t"),
+            ("/* c */ SELECT 1", "SELECT 1"),
+            ("SELECT $aa$$a$aa$ FROM t", "SELECT '?' FROM t"),
+            (long_tag.as_str(), "SELECT '?' FROM payments"),
             ("SELECT 'abc", "SELECT '?'"),
             ("SELECT E'ab\\", "SELECT E'?'"),
             ("SELECT $q$abc", "SELECT '?'"),
             ("SELECT 1 /* abc", "SELECT 1"),
+            ("SELECT \"abc", "SELECT \"abc"),
+            ("SELECT 'a'$$b$$, $$$$$$c$$", "SELECT '?' '?', '?' '?'"),
             ("SELECT 1E'a\\'b' , 2", "SELECT 1E'?' , 2"),
             ("SELECT 1$q$a$q$", "SELECT 1'?'"),
             ("SELECT 1.5E'a\\'b'", "SELECT 1.5E'?'"),
-            ("SELECT \"abc", "SELECT \"abc"),
-            ("SELECT 'a'$$b$$, $$$$$$c$$", "SELECT '?' '?', '?' '?'"),
         ] {
             assert_eq!(masked(statement), expected, "{statement}");
         }
-        let long_tag = format!("SELECT ${tag}$secret${tag}$", tag = "t".repeat(5000));
-        assert_eq!(masked(&long_tag), "SELECT '?'");
     }
 
     #[test]
-    fn plain_strings_follow_backslash_escapes_when_the_session_turned_them_on() {
-        let text = b"SELECT 'a\\' qz', '\\x70assword=x'";
-        let mut lexer = Lexer::new(CAPACITY, true);
-        lexer.feed(text);
+    fn continued_strings_are_one_literal_of_the_first_kind() {
+        for (statement, expected) in [
+            (
+                "CREATE ROLE x PASSWORD E'a'\n'b\\' hunter2'",
+                "CREATE ROLE x PASSWORD '?'",
+            ),
+            (
+                "SELECT E'a'\n'\\'';SELECT 1/0 AS zqx9; -- password",
+                "SELECT E'?';SELECT 1/0 AS zqx9;",
+            ),
+            ("SELECT E'x'\n'\\' ; DROP TABLE users; --'", "SELECT E'?'"),
+            ("SELECT 'a'\n'b' FROM t", "SELECT '?' FROM t"),
+            ("SELECT 'a'\r\n'b' FROM t", "SELECT '?' FROM t"),
+            ("SELECT 'a' -- c\n'b' FROM t", "SELECT '?' FROM t"),
+            ("SELECT 'a'\n  -- c\n\t'b' FROM t", "SELECT '?' FROM t"),
+            ("SELECT U&'a'\n'\\0062' FROM t", "SELECT U&'?' FROM t"),
+            ("SELECT 'a'\n'b\\' FROM t", "SELECT '?' FROM t"),
+            ("SELECT 'a' 'b' FROM t", "SELECT '?' '?' FROM t"),
+            ("SELECT 'a'/* c */\n'b' FROM t", "SELECT '?' '?' FROM t"),
+            ("SELECT 'a' -1", "SELECT '?' -1"),
+            ("SELECT 'a'\n-1", "SELECT '?' -1"),
+            ("SELECT 'a'\n", "SELECT '?'"),
+            ("SELECT 'a' -", "SELECT '?' -"),
+        ] {
+            assert_eq!(masked(statement), expected, "{statement:?}");
+        }
+        let leak = scan("CREATE ROLE x PASSWORD E'a'\n'b\\' hunter2'");
+        assert!(!String::from_utf8_lossy(&leak.masked.bytes).contains("hunter2"));
+    }
+
+    #[test]
+    fn the_token_after_a_password_word_is_masked_whatever_it_is() {
+        for (statement, expected) in [
+            (
+                "ALTER ROLE app PASSWORD hunter2",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD \"hunter2\" VALID UNTIL 'x'",
+                "ALTER ROLE app PASSWORD '?' VALID UNTIL '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD \"hunter2",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD 12345678",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD = hunter2",
+                "ALTER ROLE app PASSWORD = '?'",
+            ),
+            (
+                "ALTER ROLE app WITH PASSWORD E'x' LOGIN",
+                "ALTER ROLE app WITH PASSWORD '?' LOGIN",
+            ),
+            (
+                "ALTER ROLE app PASSWORD U&\"\\0068unter2\"",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD -- c\n hunter2",
+                "ALTER ROLE app PASSWORD '?'",
+            ),
+            (
+                "ALTER ROLE app PASSWORD/* c */hunter2;",
+                "ALTER ROLE app PASSWORD '?';",
+            ),
+            (
+                "ALTER ROLE app PASSWORD; SELECT 1",
+                "ALTER ROLE app PASSWORD; SELECT 1",
+            ),
+            (
+                "SELECT U&'x!0061' UESCAPE '!' FROM t",
+                "SELECT U&'?' UESCAPE '?' FROM t",
+            ),
+            (
+                "OPTIONS (sslpassword hunter2, passwd hunter3)",
+                "OPTIONS (sslpassword '?', passwd '?')",
+            ),
+            ("SELECT \"x\" FROM t", "SELECT \"x\" FROM t"),
+        ] {
+            assert_eq!(masked(statement), expected, "{statement:?}");
+        }
+    }
+
+    #[test]
+    fn a_dollar_tag_longer_than_four_kib_is_malformed_and_kept_small() {
+        let mut lexer = Lexer::new(CAPACITY, DEFAULT);
+        lexer.feed(b"SELECT $");
+        lexer.feed(&vec![b't'; MAX_TAG_BYTES]);
+        assert!(!lexer.is_malformed());
+        lexer.feed(b"t");
+        assert!(lexer.is_malformed());
+        for _ in 0..80 {
+            lexer.feed(&[b't'; 64 * 1024]);
+        }
+        lexer.feed(b"$secret$");
         let scanned = lexer.finish();
-        assert_eq!(scanned.masked.bytes, b"SELECT '?', '?'");
-        assert!(scanned.sensitive);
-        assert!(!scan_in(&[text]).sensitive);
+        assert!(scanned.malformed);
+        assert_eq!(scanned.masked.bytes, b"SELECT");
     }
 
     #[test]
     fn the_masked_length_counts_past_the_kept_bytes() {
-        let mut lexer = Lexer::new(10, false);
+        let mut lexer = Lexer::new(10, DEFAULT);
         lexer.feed(b"SELECT 'x' FROM payments");
         let scanned = lexer.finish();
         assert_eq!(scanned.masked.bytes, b"SELECT '?'");
         assert_eq!(scanned.masked.total, "SELECT '?' FROM payments".len());
+    }
+
+    #[test]
+    fn the_readings_disagree_exactly_on_the_hostile_forms() {
+        let shown = |reading: Reading, text: &[u8]| scan_with(reading, &[text]).masked.bytes;
+        let backslash = b"SELECT '\\' ;DROP TABLE users; --' /* password */";
+        assert_ne!(shown(READINGS[0], backslash), shown(READINGS[1], backslash));
+        let mut trail = b"SELECT E'".to_vec();
+        trail.extend_from_slice(&[0x83, 0x5c]);
+        trail.extend_from_slice(b"';DROP TABLE users; -- password '");
+        assert_ne!(shown(READINGS[0], &trail), shown(READINGS[2], &trail));
+        for plain in [
+            "SELECT 'C:\\path' FROM t".as_bytes(),
+            "SELECT E'\u{e9}' FROM t".as_bytes(),
+            "SELECT E'\u{20ac}' FROM t".as_bytes(),
+        ] {
+            let first = shown(READINGS[0], plain);
+            for reading in &READINGS[1..] {
+                assert_eq!(shown(*reading, plain), first, "{plain:?}");
+            }
+        }
     }
 
     struct Random(u64);
@@ -786,15 +1160,30 @@ mod tests {
         }
     }
 
+    fn push(text: &mut String, piece: &str) {
+        let first = piece.bytes().next();
+        let glued = text.bytes().last().is_some_and(|byte| {
+            super::is_word(byte)
+                || byte == b'$'
+                || (byte == b'-' && first == Some(b'-'))
+                || (byte == b'/' && first == Some(b'*'))
+        });
+        if glued {
+            text.push(' ');
+        }
+        text.push_str(piece);
+    }
+
     fn statement(random: &mut Random) -> String {
         let words = [
             "SELECT", "a", "1", "(", ")", ",", "=", "/", "password", "$1", "b$",
         ];
+        let gaps = ["\n", " -- c\n", "\n -- d\n ", "\r\n", " ", "/**/\n"];
+        let continuations = ["\n", " -- c\n", "\n -- d\n ", "\r\n"];
         let mut text = String::new();
         for _ in 0..random.next(12) + 1 {
-            let piece = match random.next(12) {
+            let piece = match random.next(15) {
                 0 => format!("'{}'", random.secret()),
-                10 => format!("'{}''{}'", random.secret(), random.secret()),
                 1 => format!("E'{}\\'{}'", random.secret(), random.secret()),
                 2 => format!("U&'{}\\0071'", random.secret()),
                 3 => format!("$qz${}$qz$", random.secret()),
@@ -804,6 +1193,20 @@ mod tests {
                 7 => "\"Col  1\"".to_owned(),
                 8 => " \t\n ".to_owned(),
                 9 => "-".to_owned(),
+                10 => format!("'{}''{}'", random.secret(), random.secret()),
+                11 => format!(
+                    "'{}'{}'{}'",
+                    random.secret(),
+                    gaps[random.next(gaps.len())],
+                    random.secret()
+                ),
+                12 => format!(
+                    "E'{}'{}'{}\\'{}'",
+                    random.secret(),
+                    continuations[random.next(continuations.len())],
+                    random.secret(),
+                    random.secret()
+                ),
                 _ => words[random.next(words.len())].to_owned(),
             };
             push(&mut text, &piece);
@@ -818,40 +1221,36 @@ mod tests {
         text
     }
 
-    fn push(text: &mut String, piece: &str) {
-        let glued = text
-            .bytes()
-            .last()
-            .is_some_and(|byte| super::is_word(byte) || byte == b'$');
-        if glued {
-            text.push(' ');
-        }
-        text.push_str(piece);
-    }
-
     #[test]
     fn masking_hides_every_literal_and_comment_is_idempotent_and_ignores_chunking() {
         let mut random = Random(7);
         for _ in 0..6000 {
             let text = statement(&mut random);
-            let whole = scan(&text);
-            let output = whole.masked.bytes.clone();
-            assert!(
-                !output.iter().any(|byte| SECRET.contains(byte)),
-                "{text:?} -> {:?}",
-                String::from_utf8_lossy(&output)
-            );
-            let again = scan_in(&[&output]);
-            assert_eq!(again.masked.bytes, output, "{text:?}");
             let bytes = text.as_bytes();
-            let split = random.next(bytes.len() + 1);
-            let chunked = scan_in(&[&bytes[..split], &bytes[split..]]);
-            let bytewise_pieces: Vec<&[u8]> = bytes.chunks(1).collect();
-            let bytewise = scan_in(&bytewise_pieces);
-            for other in [chunked, bytewise] {
-                assert_eq!(other.masked.bytes, output, "{text:?}");
-                assert_eq!(other.masked.total, whole.masked.total, "{text:?}");
-                assert_eq!(other.sensitive, whole.sensitive, "{text:?}");
+            for reading in READINGS {
+                let whole = scan_with(reading, &[bytes]);
+                let output = whole.masked.bytes.clone();
+                assert!(
+                    !output.iter().any(|byte| SECRET.contains(byte)),
+                    "{reading:?} {text:?} -> {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+                let again = scan_with(reading, &[&output]);
+                assert_eq!(again.masked.bytes, output, "{reading:?} {text:?}");
+                let bytewise_pieces: Vec<&[u8]> = bytes.chunks(1).collect();
+                let bytewise = scan_with(reading, &bytewise_pieces);
+                assert_eq!(bytewise.masked.bytes, output, "{reading:?} {text:?}");
+                assert_eq!(bytewise.masked.total, whole.masked.total);
+                assert_eq!(bytewise.sensitive, whole.sensitive);
+                if reading != DEFAULT {
+                    continue;
+                }
+                for split in 0..=bytes.len() {
+                    let chunked = scan_with(reading, &[&bytes[..split], &bytes[split..]]);
+                    assert_eq!(chunked.masked.bytes, output, "{split} {text:?}");
+                    assert_eq!(chunked.masked.total, whole.masked.total, "{split} {text:?}");
+                    assert_eq!(chunked.sensitive, whole.sensitive, "{split} {text:?}");
+                }
             }
         }
     }

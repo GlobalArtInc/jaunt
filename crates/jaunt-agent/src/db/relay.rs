@@ -11,9 +11,12 @@ use jaunt_proto::ServiceOutcome;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use super::audit::{ProtocolProblem, QueryCapture, SessionAudit};
-use super::upstream::{STANDARD_CONFORMING_STRINGS, deadline, is_safe_parameter, server_problem};
-use super::wire::{FUNCTION_CALLS, TERMINATE, error_response};
+use super::audit::{ProtocolProblem, QueryCapture, SessionAudit, cut};
+use super::upstream::{
+    CLIENT_ENCODING, STANDARD_CONFORMING_STRINGS, deadline, is_safe_parameter, is_utf8,
+    server_problem,
+};
+use super::wire::{ENCODING_REFUSED, FUNCTION_CALLS, TERMINATE, error_response};
 use crate::clock::Clock;
 
 pub const READ_CHUNK: usize = 16 * 1024;
@@ -74,6 +77,16 @@ fn client_problem(error: &DecodeError) -> ProtocolProblem {
 }
 
 const MAX_SECRET_NAMES: usize = 1024;
+const NAME_KEY_BYTES: usize = 63;
+pub const MAX_NAME_BYTES: usize = 64 * 1024;
+
+fn key(name: &str) -> &str {
+    cut(name, NAME_KEY_BYTES)
+}
+
+fn oversized(names: &[&str]) -> bool {
+    names.iter().any(|name| name.len() > MAX_NAME_BYTES)
+}
 
 #[derive(Default)]
 struct SecretNames {
@@ -84,10 +97,11 @@ struct SecretNames {
 
 impl SecretNames {
     fn remember(names: &mut HashSet<String>, saturated: &mut bool, name: &str) {
-        if names.len() >= MAX_SECRET_NAMES && !names.contains(name) {
+        let key = key(name);
+        if names.len() >= MAX_SECRET_NAMES && !names.contains(key) {
             *saturated = true;
         } else {
-            names.insert(name.to_owned());
+            names.insert(key.to_owned());
         }
     }
 
@@ -95,29 +109,40 @@ impl SecretNames {
         if sensitive {
             Self::remember(&mut self.statements, &mut self.saturated, statement);
         } else {
-            self.statements.remove(statement);
+            self.statements.remove(key(statement));
         }
     }
 
     fn bound(&mut self, portal: &str, statement: &str) -> bool {
-        let sensitive = self.saturated || self.statements.contains(statement);
+        let sensitive = self.saturated || self.statements.contains(key(statement));
         if sensitive {
             Self::remember(&mut self.portals, &mut self.saturated, portal);
         } else {
-            self.portals.remove(portal);
+            self.portals.remove(key(portal));
         }
         sensitive
     }
 
     fn executes(&self, portal: &str) -> bool {
-        self.saturated || self.portals.contains(portal)
+        self.saturated || self.portals.contains(key(portal))
+    }
+
+    fn describes(&self, target: &Target) -> bool {
+        self.saturated
+            || match target.kind {
+                TargetKind::Statement => self.statements.contains(key(&target.name)),
+                TargetKind::Portal => self.portals.contains(key(&target.name)),
+            }
     }
 
     fn closed(&mut self, target: &Target) {
         match target.kind {
-            TargetKind::Statement => self.statements.remove(&target.name),
-            TargetKind::Portal => self.portals.remove(&target.name),
+            TargetKind::Statement => self.statements.remove(key(&target.name)),
+            TargetKind::Portal => self.portals.remove(key(&target.name)),
         };
+        if self.statements.is_empty() && self.portals.is_empty() {
+            self.saturated = false;
+        }
     }
 }
 
@@ -172,31 +197,59 @@ where
                             });
                         }
                         FrontendMessage::Query(statement) => {
-                            audit.simple_query(
-                                &QueryCapture::of(statement.as_bytes(), audit.backslash_escapes())
-                                    .finish(),
-                            );
+                            let captured =
+                                QueryCapture::of(statement.as_bytes(), audit.backslash_escapes())
+                                    .finish();
+                            if captured.is_malformed() {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
+                            audit.simple_query(&captured);
                         }
                         FrontendMessage::Parse(parse) => {
+                            if oversized(&[&parse.name]) {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
                             let captured = QueryCapture::of(
                                 parse.statement.as_bytes(),
                                 audit.backslash_escapes(),
                             )
                             .finish();
+                            if captured.is_malformed() {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
                             secrets.parsed(&parse.name, captured.is_sensitive());
                             audit.extended_query(&captured);
                         }
                         FrontendMessage::Bind(bind) => {
+                            if oversized(&[&bind.portal, &bind.statement]) {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
                             if secrets.bound(&bind.portal, &bind.statement) {
                                 audit.sensitive_cycle();
                             }
                         }
                         FrontendMessage::Execute(execute) => {
+                            if oversized(&[&execute.portal]) {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
                             if secrets.executes(&execute.portal) {
                                 audit.sensitive_cycle();
                             }
                         }
-                        FrontendMessage::Close(target) => secrets.closed(target),
+                        FrontendMessage::Describe(target) => {
+                            if oversized(&[&target.name]) {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
+                            if secrets.describes(target) {
+                                audit.sensitive_cycle();
+                            }
+                        }
+                        FrontendMessage::Close(target) => {
+                            if oversized(&[&target.name]) {
+                                return Ending::Client(ProtocolProblem::ClientMalformed);
+                            }
+                            secrets.closed(target);
+                        }
                         FrontendMessage::Sync => audit.sync_sent(),
                         FrontendMessage::Terminate => terminate = true,
                         FrontendMessage::SslRequest
@@ -206,8 +259,7 @@ where
                         | FrontendMessage::Password(_) => {
                             return Ending::Client(ProtocolProblem::ClientUnexpected);
                         }
-                        FrontendMessage::Describe(_)
-                        | FrontendMessage::Flush
+                        FrontendMessage::Flush
                         | FrontendMessage::CopyData { .. }
                         | FrontendMessage::CopyDone
                         | FrontendMessage::CopyFail(_) => {}
@@ -222,11 +274,16 @@ where
                         let text = chunk.bytes();
                         if streamed.remaining == 0 {
                             streamed.capture.feed(&text[..text.len().saturating_sub(1)]);
-                            if let Some(done) = query.take() {
-                                audit.simple_query(&done.capture.finish());
-                            }
                         } else {
                             streamed.capture.feed(text);
+                        }
+                        if streamed.capture.is_malformed() {
+                            return Ending::Client(ProtocolProblem::ClientMalformed);
+                        }
+                        if streamed.remaining == 0
+                            && let Some(done) = query.take()
+                        {
+                            audit.simple_query(&done.capture.finish());
                         }
                     }
                     chunk.into_bytes()
@@ -288,6 +345,11 @@ where
                             if status.name == STANDARD_CONFORMING_STRINGS =>
                         {
                             audit.set_backslash_escapes(status.value.eq_ignore_ascii_case("off"));
+                        }
+                        BackendMessage::ParameterStatus(status)
+                            if status.name == CLIENT_ENCODING && !is_utf8(&status.value) =>
+                        {
+                            return Ending::Client(ProtocolProblem::ClientEncoding);
                         }
                         BackendMessage::ParameterStatus(status)
                             if !is_safe_parameter(&status.name) =>
@@ -396,9 +458,13 @@ where
         "the database session ended"
     );
     let terminate = ending.client_side() && to_server.boundary;
-    let answer = (ending == Ending::Client(ProtocolProblem::ClientFunctionCall)
-        && to_client.boundary)
-        .then(|| error_response(FUNCTION_CALLS.0, FUNCTION_CALLS.1));
+    let answer = match ending {
+        Ending::Client(ProtocolProblem::ClientFunctionCall) => Some(FUNCTION_CALLS),
+        Ending::Client(ProtocolProblem::ClientEncoding) => Some(ENCODING_REFUSED),
+        _ => None,
+    }
+    .filter(|_| to_client.boundary)
+    .map(|(code, message)| error_response(code, message));
     let close = async {
         if terminate && upstream_write.write_all(&TERMINATE).await.is_ok() {
             drop(upstream_write.flush().await);
@@ -422,4 +488,62 @@ where
         () = context.clock.sleep_until(close_by) => {}
     }
     ending.outcome()
+}
+
+#[cfg(test)]
+mod tests {
+    use jaunt_pgwire::{Target, TargetKind};
+
+    use super::SecretNames;
+
+    fn statement(name: &str) -> Target {
+        Target {
+            kind: TargetKind::Statement,
+            name: name.to_owned(),
+        }
+    }
+
+    fn portal(name: &str) -> Target {
+        Target {
+            kind: TargetKind::Portal,
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn at_most_1024_names_are_remembered_and_then_every_use_counts_until_all_are_closed() {
+        let mut names = SecretNames::default();
+        for index in 0..1024 {
+            names.parsed(&format!("s{index}"), true);
+        }
+        assert!(!names.saturated);
+        assert!(names.bound("p", "s1023"));
+        assert!(!names.bound("q", "plain"));
+        names.parsed("s1024", true);
+        assert!(names.saturated);
+        assert!(names.bound("q", "plain"));
+        assert!(names.executes("anything"));
+        for index in 0..1024 {
+            names.closed(&statement(&format!("s{index}")));
+        }
+        names.closed(&portal("p"));
+        assert!(names.saturated);
+        names.closed(&portal("q"));
+        assert!(!names.saturated);
+        assert!(!names.executes("anything"));
+        assert!(!names.describes(&statement("s1")));
+    }
+
+    #[test]
+    fn names_are_known_by_their_first_63_bytes() {
+        let mut names = SecretNames::default();
+        let ascii = "a".repeat(63);
+        names.parsed(&format!("{ascii}x"), true);
+        assert!(names.bound("", &format!("{ascii}y")));
+        assert!(names.describes(&statement(&format!("{ascii}z"))));
+        let prefix = "b".repeat(62);
+        names.parsed(&format!("{prefix}\u{e9}"), true);
+        assert!(names.bound("", &format!("{prefix}\u{436}")));
+        assert!(!names.bound("", &"c".repeat(63)));
+    }
 }

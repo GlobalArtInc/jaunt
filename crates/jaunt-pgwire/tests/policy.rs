@@ -284,7 +284,26 @@ fn forward_takes_the_given_names_and_keeps_only_allowed_parameters() {
             ("user", "reporting"),
             ("database", "analytics"),
             ("application_name", "psql"),
+            ("client_encoding", "UTF8"),
         ]
+    );
+    let unicode = decoded(&[("user", "app"), ("Client_Encoding", "unicode")]);
+    assert_eq!(
+        policy
+            .forward(&unicode, "app", "app")
+            .expect("allowed")
+            .parameters()
+            .collect::<Vec<_>>(),
+        [
+            ("user", "app"),
+            ("database", "app"),
+            ("client_encoding", "UTF8"),
+        ]
+    );
+    let sjis = decoded(&[("user", "app"), ("client_encoding", "SJIS")]);
+    assert_eq!(
+        policy.forward(&sjis, "app", "app"),
+        Err(StartupRefusal::ClientEncodingNotAllowed)
     );
     let long = "n".repeat(64);
     let cases: [(&str, &str, StartupRefusal); 4] = [

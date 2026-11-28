@@ -1,8 +1,9 @@
 use jaunt_pgwire::BackendMessage;
 use jaunt_proto::ServiceOutcome;
 
-use super::fake_pg::message;
-use super::harness::{DbHarness, fatal, query, text};
+use super::fake_pg::{Mode, message};
+use super::harness::{DbHarness, default_startup, fatal, query, startup, text};
+use crate::db::wire::ENCODING_REFUSED;
 
 type Case = (Vec<u8>, &'static str, &'static [u8], Option<&'static str>);
 
@@ -100,5 +101,91 @@ async fn authentication_key_data_or_negotiation_in_the_middle_of_a_session_ends_
             Some("server_unexpected_message"),
             "{statement}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_client_encoding_other_than_utf8_ends_the_session() {
+    let harness = DbHarness::new().await;
+    harness.pg.set_mode(Mode::Encoding("SJIS"));
+    let (opened, mut client) = harness.connect("s-sjis-login").await;
+    client.send(&startup(&default_startup())).await;
+    let answer = client.rest().await;
+    assert_eq!(
+        fatal(&answer),
+        Some((ENCODING_REFUSED.0.to_owned(), ENCODING_REFUSED.1.to_owned()))
+    );
+    opened.finished().await;
+    harness.ended("s-sjis-login").await;
+    let problems = harness.named("s-sjis-login", "db.protocol_error");
+    assert_eq!(
+        text(&problems[0], "reason").as_deref(),
+        Some("client_encoding")
+    );
+
+    let harness = DbHarness::new().await;
+    let (opened, mut client, _) = harness.login("s-sjis").await;
+    client.send(&query("SET encoding UNICODE")).await;
+    assert!(fatal(&client.until_ready().await).is_none());
+    client.send(&query("SET encoding SJIS")).await;
+    let answer = client.rest().await;
+    assert_eq!(
+        fatal(&answer).map(|(code, _)| code).as_deref(),
+        Some(ENCODING_REFUSED.0)
+    );
+    assert!(
+        !answer
+            .iter()
+            .any(|message| matches!(message, BackendMessage::ParameterStatus(_)))
+    );
+    opened.finished().await;
+    assert_eq!(
+        harness.ended("s-sjis").await.outcome,
+        ServiceOutcome::ProtocolError
+    );
+    let problems = harness.named("s-sjis", "db.protocol_error");
+    assert_eq!(
+        text(&problems[0], "reason").as_deref(),
+        Some("client_encoding")
+    );
+    let seen = harness
+        .pg
+        .wait("the database connection to close", |seen| seen.closed == 1)
+        .await;
+    assert_eq!(seen.messages.last().map(|(tag, _)| *tag), Some(b'X'));
+}
+
+#[tokio::test]
+async fn an_oversized_dollar_tag_or_statement_name_ends_the_session_before_it_runs() {
+    let tag = "t".repeat(4097);
+    let mut long_name = vec![b'n'; 64 * 1024 + 1];
+    long_name.push(0);
+    long_name.extend_from_slice(b"SELECT 1\0\0\0");
+    let cases: [(Vec<u8>, &[u8]); 2] = [
+        (query(&format!("SELECT ${tag}$x${tag}$")), b""),
+        (message(b'P', &long_name), b"X"),
+    ];
+    for (bytes, database_saw) in cases {
+        let harness = DbHarness::new().await;
+        let (opened, mut client, _) = harness.login("s-oversized").await;
+        client.send(&bytes).await;
+        assert!(client.rest().await.is_empty());
+        opened.finished().await;
+        assert_eq!(
+            harness.ended("s-oversized").await.outcome,
+            ServiceOutcome::ProtocolError
+        );
+        let problems = harness.named("s-oversized", "db.protocol_error");
+        assert_eq!(
+            text(&problems[0], "reason").as_deref(),
+            Some("client_malformed")
+        );
+        assert!(harness.named("s-oversized", "db.query").is_empty());
+        let seen = harness
+            .pg
+            .wait("the database connection to close", |seen| seen.closed == 1)
+            .await;
+        let tags: Vec<u8> = seen.messages.iter().map(|(tag, _)| *tag).collect();
+        assert_eq!(tags, database_saw);
     }
 }

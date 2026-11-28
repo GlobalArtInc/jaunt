@@ -1,10 +1,12 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 use jaunt_pgwire::{BackendDecoder, Event, FrontendDecoder, FrontendMessage, Limits};
 use jaunt_proto::{AgentEventBatch, AgentEventsAccepted, QueryAudit, ServiceOutcome};
 use jaunt_tunnel::BoxFuture;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -41,7 +43,38 @@ struct Wired {
     client: DuplexStream,
     database: DuplexStream,
     cancel: CancellationToken,
+    clock: Arc<ManualClock>,
     relaying: JoinHandle<ServiceOutcome>,
+}
+
+struct Unread(DuplexStream);
+
+impl AsyncRead for Unread {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Unread {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
 }
 
 fn after_startup() -> FrontendDecoder {
@@ -55,12 +88,22 @@ fn after_startup() -> FrontendDecoder {
 }
 
 fn wire() -> Wired {
-    let (client, client_end) = tokio::io::duplex(64 * 1024);
+    wire_with(|client_end| client_end)
+}
+
+fn wire_with<C, F>(client_end: F) -> Wired
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(DuplexStream) -> C,
+{
+    let (client, client_side) = tokio::io::duplex(64 * 1024);
     let (database, database_end) = tokio::io::duplex(64 * 1024);
-    let clock: Arc<dyn Clock> = ManualClock::new(SystemTime::now());
+    let manual = ManualClock::new(SystemTime::now());
+    let clock: Arc<dyn Clock> = manual.clone();
     let sink = EventSink::new(Arc::new(Accepting), clock.clone(), fixed(1.0), SINK_LIMITS);
     let cancel = CancellationToken::new();
     let token = cancel.clone();
+    let client_end = client_end(client_side);
     let relaying = tokio::spawn(async move {
         let audit = SessionAudit::start(
             sink.session("s-relay"),
@@ -98,6 +141,7 @@ fn wire() -> Wired {
         client,
         database,
         cancel,
+        clock: manual,
         relaying,
     }
 }
@@ -194,4 +238,25 @@ async fn a_function_call_answer_is_never_put_inside_a_message_of_the_database() 
             ServiceOutcome::ProtocolError
         );
     }
+}
+
+#[tokio::test]
+async fn a_cancelled_session_closes_within_half_a_second_when_the_client_reads_nothing() {
+    let mut wired = wire_with(Unread);
+    wired
+        .database
+        .write_all(&message(b'D', &[7; 100]))
+        .await
+        .unwrap();
+    wired.cancel.cancel();
+    let deadline = wired.clock.now() + DB_LIMITS.cancel_close_timeout;
+    wired.clock.wait_for_sleeper(deadline).await;
+    assert!(!wired.relaying.is_finished());
+    assert_eq!(until_closed(&mut wired.database).await, TERMINATE);
+    wired.clock.advance(DB_LIMITS.cancel_close_timeout);
+    assert_eq!(
+        soon("the relay to end", wired.relaying).await.unwrap(),
+        ServiceOutcome::Closed
+    );
+    assert_eq!(DB_LIMITS.cancel_close_timeout, Duration::from_millis(500));
 }

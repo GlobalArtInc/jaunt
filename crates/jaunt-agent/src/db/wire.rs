@@ -16,6 +16,8 @@ pub const PASSWORD_REQUESTED: (&str, &str) = (
     "the database asked for a password: configure the cert authentication method for Jaunt",
 );
 pub const DATABASE_REFUSED: &str = "the database refused the session";
+pub const ENCODING_REFUSED: (&str, &str) =
+    ("08P01", "the client encoding must stay UTF8 through Jaunt");
 pub const FUNCTION_CALLS: (&str, &str) = (
     "0A000",
     "fast-path function calls are not supported through Jaunt",

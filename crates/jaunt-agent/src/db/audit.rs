@@ -7,7 +7,7 @@ use jaunt_pgwire::{Excerpt, Notice, StatementKind};
 use jaunt_proto::{AgentEventValue, MAX_QUERY_BYTES, QueryAudit};
 use sha2::{Digest, Sha256};
 
-use super::lexer::Lexer;
+use super::lexer::{Lexer, Reading, Scanned};
 use crate::clock::Clock;
 use crate::runtime::events::{SessionEvent, SessionEvents};
 
@@ -62,6 +62,7 @@ pub enum ProtocolProblem {
     ClientTooLarge,
     ClientFunctionCall,
     ClientUnexpected,
+    ClientEncoding,
     ServerMalformed,
     ServerTooLarge,
     ServerUnexpected,
@@ -75,6 +76,7 @@ impl ProtocolProblem {
             Self::ClientTooLarge => "client_too_large",
             Self::ClientFunctionCall => "client_function_call",
             Self::ClientUnexpected => "client_unexpected_message",
+            Self::ClientEncoding => "client_encoding",
             Self::ServerMalformed => "server_malformed",
             Self::ServerTooLarge => "server_too_large",
             Self::ServerUnexpected => "server_unexpected_message",
@@ -82,11 +84,31 @@ impl ProtocolProblem {
     }
 }
 
+const READINGS: [Reading; 4] = [
+    Reading {
+        backslash_escapes: false,
+        multibyte_trail: false,
+    },
+    Reading {
+        backslash_escapes: true,
+        multibyte_trail: false,
+    },
+    Reading {
+        backslash_escapes: false,
+        multibyte_trail: true,
+    },
+    Reading {
+        backslash_escapes: true,
+        multibyte_trail: true,
+    },
+];
+
 pub struct QueryCapture {
     prefix: Vec<u8>,
     hasher: Sha256,
     length: usize,
-    lexer: Lexer,
+    lexers: Vec<Lexer>,
+    primary: usize,
 }
 
 impl Default for QueryCapture {
@@ -101,7 +123,11 @@ impl QueryCapture {
             prefix: Vec::new(),
             hasher: Sha256::new(),
             length: 0,
-            lexer: Lexer::new(CAPTURE_BYTES, backslash_escapes),
+            lexers: READINGS
+                .iter()
+                .map(|reading| Lexer::new(CAPTURE_BYTES, *reading))
+                .collect(),
+            primary: usize::from(backslash_escapes),
         }
     }
 
@@ -111,7 +137,13 @@ impl QueryCapture {
             .extend_from_slice(&bytes[..room.min(bytes.len())]);
         self.hasher.update(bytes);
         self.length = self.length.saturating_add(bytes.len());
-        self.lexer.feed(bytes);
+        for lexer in &mut self.lexers {
+            lexer.feed(bytes);
+        }
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        self.lexers.iter().any(Lexer::is_malformed)
     }
 
     pub fn of(bytes: &[u8], backslash_escapes: bool) -> Self {
@@ -121,17 +153,30 @@ impl QueryCapture {
     }
 
     pub fn finish(self) -> CapturedQuery {
-        let scanned = self.lexer.finish();
+        let mut scans: Vec<Scanned> = self.lexers.into_iter().map(Lexer::finish).collect();
+        let sensitive = scans.iter().any(|scan| scan.sensitive);
+        let malformed = scans.iter().any(|scan| scan.malformed);
+        let ambiguous = scans.windows(2).any(|pair| {
+            pair[0].masked.bytes != pair[1].masked.bytes
+                || pair[0].masked.total != pair[1].masked.total
+        });
+        let primary = scans.swap_remove(self.primary.min(scans.len().saturating_sub(1)));
         let digest = self.hasher.finalize();
         let mut sha256 = String::with_capacity(64);
         for byte in digest.as_slice() {
             sha256.push_str(&format!("{byte:02x}"));
         }
+        let shown = if ambiguous {
+            Shown::Command
+        } else if sensitive {
+            Shown::Masked(primary.masked.bytes, primary.masked.total)
+        } else {
+            Shown::Plain
+        };
         CapturedQuery {
             command: StatementKind::of(&self.prefix),
-            masked: scanned
-                .sensitive
-                .then_some((scanned.masked.bytes, scanned.masked.total)),
+            shown,
+            malformed,
             prefix: self.prefix,
             sha256,
             length: self.length,
@@ -139,17 +184,28 @@ impl QueryCapture {
     }
 }
 
+enum Shown {
+    Plain,
+    Masked(Vec<u8>, usize),
+    Command,
+}
+
 pub struct CapturedQuery {
     prefix: Vec<u8>,
     sha256: String,
     length: usize,
     command: StatementKind,
-    masked: Option<(Vec<u8>, usize)>,
+    shown: Shown,
+    malformed: bool,
 }
 
 impl CapturedQuery {
     pub fn is_sensitive(&self) -> bool {
-        self.masked.is_some()
+        !matches!(self.shown, Shown::Plain)
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
     }
 
     fn fields(
@@ -164,9 +220,10 @@ impl CapturedQuery {
             "command".to_owned(),
             text(self.command.as_str(), SHORT_LIMIT),
         );
-        let (kept, total) = match &self.masked {
-            Some((masked, total)) => (masked, *total),
-            None => {
+        let (kept, total) = match &self.shown {
+            Shown::Command => return fields,
+            Shown::Masked(masked, total) => (masked, *total),
+            Shown::Plain => {
                 fields.insert(
                     "length".to_owned(),
                     AgentEventValue::Int(i64::try_from(self.length).unwrap_or(i64::MAX)),
@@ -433,6 +490,43 @@ mod tests {
         let fields = one.fields(QueryAudit::Digest, 4096, Protocol::Simple);
         assert_eq!(keys(&fields), ["command", "length", "protocol", "sha256"]);
         assert_eq!(fields["length"], AgentEventValue::Int(8));
+    }
+
+    #[test]
+    fn a_statement_the_readings_disagree_on_is_written_with_its_command_only() {
+        let mut trail = b"SELECT E'".to_vec();
+        trail.extend_from_slice(&[0x83, 0x5c]);
+        trail.extend_from_slice(b"';DROP TABLE users; -- password '");
+        for backslash_escapes in [false, true] {
+            for text in [
+                b"SELECT 'a\\' x' FROM t".to_vec(),
+                b"SELECT '\\' ;DROP TABLE users; --' /* password */".to_vec(),
+                trail.clone(),
+            ] {
+                let captured = QueryCapture::of(&text, backslash_escapes).finish();
+                assert!(captured.is_sensitive(), "{text:?}");
+                let fields = captured.fields(QueryAudit::Text, 4096, Protocol::Simple);
+                assert_eq!(keys(&fields), ["command", "protocol"], "{text:?}");
+            }
+            let plain = QueryCapture::of(b"SELECT 'C:\\path' FROM t", backslash_escapes).finish();
+            assert!(!plain.is_sensitive());
+            let fields = plain.fields(QueryAudit::Text, 4096, Protocol::Simple);
+            assert_eq!(
+                fields["text"],
+                AgentEventValue::Text("SELECT 'C:\\path' FROM t".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn a_dollar_tag_over_the_limit_makes_the_statement_malformed() {
+        let mut capture = QueryCapture::default();
+        capture.feed(b"SELECT $");
+        capture.feed(&vec![b't'; super::super::lexer::MAX_TAG_BYTES]);
+        assert!(!capture.is_malformed());
+        capture.feed(b"t$x$");
+        assert!(capture.is_malformed());
+        assert!(capture.finish().is_malformed());
     }
 
     #[test]

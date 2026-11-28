@@ -21,6 +21,7 @@ const REPLICATION: &str = "replication";
 const APPLICATION_NAME: &str = "application_name";
 const CLIENT_ENCODING: &str = "client_encoding";
 const ALLOWED_CLIENT_ENCODINGS: &[&str] = &["UTF8", "UNICODE"];
+const UTF8: &str = "UTF8";
 const REPORTED_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -185,7 +186,14 @@ impl StartupPolicy {
                 });
             }
         }
-        Ok(self.rebuild(startup, user, database))
+        let rebuilt = self.rebuild(startup, user, database);
+        let mut parameters: Vec<(String, String)> = rebuilt
+            .parameters()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(CLIENT_ENCODING))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        parameters.push((CLIENT_ENCODING.to_owned(), UTF8.to_owned()));
+        Ok(StartupMessage::from_parts(startup.version(), parameters))
     }
 
     fn rebuild(&self, startup: &StartupMessage, user: &str, database: &str) -> StartupMessage {

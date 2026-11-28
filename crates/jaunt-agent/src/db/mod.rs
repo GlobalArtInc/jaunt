@@ -37,8 +37,8 @@ use cancel::{CancelMap, CancelTarget};
 use relay::{Relay, RelayContext};
 use upstream::{LoginError, UpstreamError};
 use wire::{
-    ACCESS_DENIED, DATABASE_REFUSED, INVALID_STARTUP, NO_ENCRYPTION, PASSWORD_REQUESTED,
-    PROTOCOL_VIOLATION, UNAVAILABLE, error_response, is_sqlstate,
+    ACCESS_DENIED, DATABASE_REFUSED, ENCODING_REFUSED, INVALID_STARTUP, NO_ENCRYPTION,
+    PASSWORD_REQUESTED, PROTOCOL_VIOLATION, UNAVAILABLE, error_response, is_sqlstate,
 };
 
 pub const MAX_STARTUP_BYTES: usize = 10 * 1024;
@@ -497,7 +497,12 @@ impl Inner {
                     "the database broke the protocol during the startup"
                 );
                 audit.protocol_error(problem);
-                self.tell(&mut client, UNAVAILABLE, &session.cancel).await;
+                let answer = if problem == ProtocolProblem::ClientEncoding {
+                    ENCODING_REFUSED
+                } else {
+                    UNAVAILABLE
+                };
+                self.tell(&mut client, answer, &session.cancel).await;
                 return Ok(ServiceOutcome::ProtocolError);
             }
             Err(LoginError::Upstream(error)) => {

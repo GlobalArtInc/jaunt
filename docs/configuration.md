@@ -198,7 +198,7 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 | `services[].kubernetes.audit` | string | `mutating` | `mutating` or `all` |
 | `services[].postgres.tls.ca_file` | absolute path | required for `postgres` | the CA that signs the database certificate, the only one the agent trusts for it (never the system roots); a path of at most 1024 bytes to at most 1 MiB of PEM certificates. TLS to the database is mandatory, so a `postgres` service without `ca_file` is refused |
 | `services[].postgres.tls.server_name` | DNS name or IP | the host of `address` | the name the database certificate must carry. The name is always checked; there is no mode that checks the chain alone |
-| `services[].postgres.audit.queries` | string | `text` | `text` or `digest`; a statement that may carry a credential is always written with its strings masked and without digest or length. See [operations.md](operations.md#databases-postgresql) |
+| `services[].postgres.audit.queries` | string | `text` | `text` or `digest`; a statement that may carry a credential is always written with its strings masked, and a statement whose reading depends on `standard_conforming_strings` or the encoding with its command only, both without digest or length. See [operations.md](operations.md#databases-postgresql) |
 | `services[].postgres.audit.max_query_bytes` | integer | 4096 | 1 to 8192: the longest query text written to `db.query` |
 | `services[].tcp.idle_timeout_secs` | integer | 3600 | 1 to 86400 |
 
