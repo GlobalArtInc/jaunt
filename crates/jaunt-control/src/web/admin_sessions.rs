@@ -46,6 +46,8 @@ struct SessionBody {
     recording: &'static str,
     origin: &'static str,
     audit_incomplete: bool,
+    target: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 impl From<SessionListing> for SessionBody {
@@ -69,6 +71,8 @@ impl From<SessionListing> for SessionBody {
             bytes_in: session.bytes_in,
             bytes_out: session.bytes_out,
             audit_incomplete: session.audit_incomplete,
+            target: session.target,
+            parent_session_id: session.parent_session_id,
         }
     }
 }
@@ -221,6 +225,9 @@ pub(crate) async fn terminate(
             return server_error();
         }
     };
+    if stored.parent_session_id.is_some() {
+        return conflict("child_session");
+    }
     if stored.state == SessionState::Ended && !is_terminated(&stored) {
         return conflict("already_ended");
     }
@@ -260,7 +267,9 @@ pub(crate) async fn terminate(
             }
         };
     };
-    session_audit::closed(session, SessionEndReason::Terminated);
+    for closed_session in &closed {
+        session_audit::closed(closed_session, SessionEndReason::Terminated);
+    }
     let delivery = control.killer.terminate(session).await;
     revocation_audit::session_terminated_by(session, &admin.principal.actor(), reason.as_deref());
     answer(delivery)

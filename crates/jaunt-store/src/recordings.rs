@@ -1,3 +1,4 @@
+use jaunt_proto::is_kube_child_session_id;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
@@ -13,6 +14,10 @@ pub fn is_session_id(value: &str) -> bool {
             8 | 13 | 18 | 23 => byte == b'-',
             _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
         })
+}
+
+pub fn is_recording_id(value: &str) -> bool {
+    is_session_id(value) || is_kube_child_session_id(value)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +87,9 @@ pub struct UploadTarget {
     pub record_input: Option<bool>,
     pub recording: Option<Recording>,
     pub kind: SessionKind,
+    pub parent_session_id: Option<String>,
+    pub parent_node_id: Option<String>,
+    pub record: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,9 +164,12 @@ macro_rules! recording_columns {
 const TARGET: &str = concat!(
     "SELECT s.id AS s_id, s.node_id AS s_node_id, s.user_id AS s_user_id, s.state AS s_state, \
      s.authorized_at AS s_authorized_at, s.ended_at AS s_ended_at, s.login AS s_login, \
-     s.pty AS s_pty, s.record_input AS s_record_input, s.kind AS s_kind, ",
+     s.pty AS s_pty, s.record_input AS s_record_input, s.kind AS s_kind, \
+     s.parent_session_id AS s_parent_session_id, s.record AS s_record, \
+     p.node_id AS s_parent_node_id, ",
     recording_columns!("r."),
-    " FROM sessions s LEFT JOIN recordings r ON r.session_id = s.id WHERE s.id = ?"
+    " FROM sessions s LEFT JOIN recordings r ON r.session_id = s.id \
+     LEFT JOIN sessions p ON p.id = s.parent_session_id WHERE s.id = ?"
 );
 
 const GET: &str = concat!(
@@ -411,6 +422,9 @@ fn target_from_row(row: &SqliteRow) -> Result<UploadTarget, StoreError> {
             None => None,
         },
         kind: SessionKind::parse(&kind)?,
+        parent_session_id: row.try_get("s_parent_session_id")?,
+        parent_node_id: row.try_get("s_parent_node_id")?,
+        record: row.try_get("s_record")?,
     })
 }
 

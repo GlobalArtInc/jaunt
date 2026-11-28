@@ -129,15 +129,17 @@ pub(crate) async fn abandon_unreachable(
         .close_active(&stale.id, stale.kind, SessionEndReason::AgentGone, now)
         .await
         .map_err(store_failure("closing an unreachable session"))?;
-    if let Some(closed) = closed {
-        session_audit::closed(&closed, SessionEndReason::AgentGone);
+    for session in &closed {
+        session_audit::closed(session, SessionEndReason::AgentGone);
         sessions
-            .mark_abandoned(&closed.id)
+            .mark_abandoned(&session.id)
             .await
             .map_err(store_failure("marking an unreachable session abandoned"))?;
+    }
+    if !closed.is_empty() {
         control
             .killer
-            .order(KillScope::Sessions, KillReason::AgentGone, &[closed])
+            .order(KillScope::Sessions, KillReason::AgentGone, &closed)
             .await;
     }
     Ok(true)

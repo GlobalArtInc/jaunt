@@ -9,6 +9,7 @@ pub mod ca_rotation;
 mod ca_snapshot;
 mod callback;
 mod cert_audit;
+mod child_sessions;
 mod client_config;
 mod clock;
 mod completion;

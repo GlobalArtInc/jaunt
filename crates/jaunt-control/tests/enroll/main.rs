@@ -6,6 +6,7 @@ mod audit_events;
 mod authorize;
 mod authorize_checks;
 mod ca_rotation;
+mod child_sessions;
 mod client_api;
 mod enroll;
 mod flow;

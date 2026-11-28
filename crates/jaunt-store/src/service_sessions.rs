@@ -1,14 +1,15 @@
+use jaunt_proto::is_kube_child_session_id;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
-use crate::StoreError;
 use crate::nodes::Labels;
 use crate::services::ServiceKind;
 use crate::sessions::{
     EndOutcome, EndRejection, Session, SessionEndReason, SessionKind, SessionState,
     session_columns, session_from_row,
 };
+use crate::{BEGIN_WRITE, StoreError};
 
 pub const MAX_SESSION_ROLES: usize = 32;
 pub const MAX_SESSION_LIST_BYTES: usize = 4096;
@@ -16,6 +17,7 @@ pub const MAX_SESSION_TARGET_LEN: usize = 320;
 pub const MAX_SESSION_OUTCOME_LEN: usize = 32;
 pub const ABANDONED_OUTCOME: &str = "abandoned";
 const DECISION_HASH_LEN: usize = 64;
+const CHILD_CLOSE_BATCH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewServiceRoute<'a> {
@@ -63,6 +65,8 @@ pub struct OpenKubeSession<'a> {
     pub roles: &'a [String],
     pub max_duration_secs: i64,
     pub decision_hash: &'a str,
+    pub record_exec: bool,
+    pub record_input: bool,
     pub max_per_user: i64,
     pub max_per_service: i64,
     pub now: i64,
@@ -75,6 +79,32 @@ pub enum KubeOpened {
     NodeInactive,
     ServiceGone,
     TooMany,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenChildSession<'a> {
+    pub id: &'a str,
+    pub parent_id: &'a str,
+    pub node_id: &'a str,
+    pub target: &'a str,
+    pub tty: bool,
+    pub max_per_parent: i64,
+    pub max_per_node: i64,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildOpened {
+    Opened(Box<Session>),
+    ParentNotLive,
+    TooManyForParent,
+    TooManyForNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnding {
+    pub outcome: EndOutcome,
+    pub children: Vec<Session>,
 }
 
 #[derive(Debug)]
@@ -124,6 +154,14 @@ pub struct LiveSshSession {
     pub node_labels: Labels,
 }
 
+macro_rules! live_parent {
+    () => {
+        "p.id = ? AND p.node_id = ? AND p.kind = 'kube' AND p.parent_session_id IS NULL \
+         AND p.state = 'active' AND p.authorized_at IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM nodes n WHERE n.id = p.node_id AND n.state = 'active')"
+    };
+}
+
 const ROUTE: &str = concat!(
     "INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at, kind, \
      service_id, service_name) \
@@ -147,15 +185,49 @@ const ACTIVATE: &str = concat!(
 
 const OPEN_KUBE: &str = concat!(
     "INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at, \
-     authorized_at, kind, service_id, service_name, roles, max_duration_secs, decision_hash) \
-     SELECT ?, ?, ?, ?, 'active', ?, ?, ?, 'kube', ?, ?, ?, ?, ? \
+     authorized_at, kind, service_id, service_name, roles, max_duration_secs, decision_hash, \
+     record, record_input) \
+     SELECT ?, ?, ?, ?, 'active', ?, ?, ?, 'kube', ?, ?, ?, ?, ?, ?, ? \
      WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ? AND state = 'active') \
      AND EXISTS (SELECT 1 FROM services WHERE id = ? AND state = 'approved') \
      AND (SELECT COUNT(*) FROM sessions o WHERE o.kind = 'kube' AND o.state = 'active' \
-     AND o.service_name = ? AND o.user_id = ?) < ? \
+     AND o.parent_session_id IS NULL AND o.service_name = ? AND o.user_id = ?) < ? \
      AND (SELECT COUNT(*) FROM sessions o WHERE o.kind = 'kube' AND o.state = 'active' \
-     AND o.service_name = ?) < ? \
+     AND o.parent_session_id IS NULL AND o.service_name = ?) < ? \
      ON CONFLICT (id) DO NOTHING RETURNING ",
+    session_columns!()
+);
+
+const OPEN_CHILD: &str = concat!(
+    "INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at, \
+     authorized_at, kind, service_id, service_name, target, roles, max_duration_secs, \
+     decision_hash, origin, pty, record, record_input, parent_session_id) \
+     SELECT ?, p.user_id, p.serial, p.node_id, 'active', ?, ?, ?, 'kube', p.service_id, \
+     p.service_name, ?, p.roles, p.max_duration_secs, p.decision_hash, p.origin, ?, \
+     COALESCE(p.record, 1), \
+     CASE WHEN COALESCE(p.record, 1) = 1 THEN COALESCE(p.record_input, 0) ELSE 0 END, p.id \
+     FROM sessions p WHERE ",
+    live_parent!(),
+    " AND (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = p.id \
+     AND c.state = 'active') < ? \
+     AND (SELECT COUNT(*) FROM sessions c WHERE c.node_id = p.node_id AND c.state = 'active' \
+     AND c.parent_session_id IS NOT NULL) < ? RETURNING ",
+    session_columns!()
+);
+
+const PARENT_LIVE: &str = concat!("SELECT 1 AS found FROM sessions p WHERE ", live_parent!());
+
+const LIVE_CHILDREN_OF_PARENT: &str =
+    "SELECT COUNT(*) AS live FROM sessions WHERE parent_session_id = ? AND state = 'active'";
+
+const CLOSE_ORPHANS: &str = concat!(
+    "UPDATE sessions SET state = 'ended', ended_at = ?, end_reason = COALESCE(\
+     (SELECT CASE WHEN p.end_reason IS NULL OR p.end_reason = 'closed' THEN 'parent_ended' \
+     ELSE p.end_reason END FROM sessions p \
+     WHERE p.id = sessions.parent_session_id AND p.state = 'ended'), 'parent_ended') \
+     WHERE state = 'active' AND parent_session_id IS NOT NULL \
+     AND NOT EXISTS (SELECT 1 FROM sessions p WHERE p.id = sessions.parent_session_id \
+     AND p.state = 'active') RETURNING ",
     session_columns!()
 );
 
@@ -175,7 +247,7 @@ const ACTIVE_OF_USER: &str = concat!(
     "SELECT ",
     session_columns!(),
     " FROM sessions WHERE user_id = ? AND kind = ? AND service_name = ? AND state = 'active' \
-     ORDER BY authorized_at, id"
+     AND parent_session_id IS NULL ORDER BY authorized_at, id"
 );
 
 const GET: &str = concat!("SELECT ", session_columns!(), " FROM sessions WHERE id = ?");
@@ -221,6 +293,7 @@ macro_rules! live_select {
          s.grant_ids AS grant_ids, s.db_client_serial AS db_client_serial, \
          s.outcome AS outcome, s.decision_hash AS decision_hash, \
          s.service_name AS service_name, s.audit_incomplete AS audit_incomplete, \
+         s.parent_session_id AS parent_session_id, s.record AS record, \
          u.email AS user_email, u.username AS user_username, u.groups AS user_groups, "
     };
 }
@@ -241,7 +314,8 @@ const LIVE: &str = concat!(
      LEFT JOIN services c ON c.node_id = s.node_id AND c.name = s.service_name \
      AND c.kind = CASE s.kind WHEN 'kube' THEN 'kubernetes' WHEN 'db' THEN 'postgres' \
      ELSE s.kind END AND c.state = 'approved' \
-     WHERE s.state = 'active' AND s.kind <> 'ssh' ORDER BY s.created_at, s.id"
+     WHERE s.state = 'active' AND s.kind <> 'ssh' AND s.parent_session_id IS NULL \
+     ORDER BY s.created_at, s.id"
 );
 
 #[derive(Clone)]
@@ -353,6 +427,8 @@ impl ServiceSessions {
             .bind(roles)
             .bind(open.max_duration_secs)
             .bind(open.decision_hash)
+            .bind(open.record_exec)
+            .bind(open.record_input)
             .bind(open.node_id)
             .bind(open.service_id)
             .bind(open.service_name)
@@ -375,6 +451,63 @@ impl ServiceSessions {
             return Ok(KubeOpened::ServiceGone);
         }
         Ok(KubeOpened::TooMany)
+    }
+
+    pub async fn open_child(&self, open: &OpenChildSession<'_>) -> Result<ChildOpened, StoreError> {
+        if !is_kube_child_session_id(open.id) {
+            return Err(StoreError::InvalidInput(
+                "a child session id is not in the child session id format",
+            ));
+        }
+        check_target(Some(open.target))?;
+        if open.max_per_parent <= 0 || open.max_per_node <= 0 {
+            return Err(StoreError::InvalidInput(
+                "the child session caps must be positive",
+            ));
+        }
+        let row = sqlx::query(OPEN_CHILD)
+            .bind(open.id)
+            .bind(open.now)
+            .bind(open.now)
+            .bind(open.now)
+            .bind(open.target)
+            .bind(open.tty)
+            .bind(open.parent_id)
+            .bind(open.node_id)
+            .bind(open.max_per_parent)
+            .bind(open.max_per_node)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            return Ok(ChildOpened::Opened(Box::new(session_from_row(&row)?)));
+        }
+        let parent_live = sqlx::query(PARENT_LIVE)
+            .bind(open.parent_id)
+            .bind(open.node_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !parent_live {
+            return Ok(ChildOpened::ParentNotLive);
+        }
+        let live: i64 = sqlx::query(LIVE_CHILDREN_OF_PARENT)
+            .bind(open.parent_id)
+            .fetch_one(&self.pool)
+            .await?
+            .try_get("live")?;
+        Ok(if live >= open.max_per_parent {
+            ChildOpened::TooManyForParent
+        } else {
+            ChildOpened::TooManyForNode
+        })
+    }
+
+    pub async fn close_orphans(&self, now: i64) -> Result<Vec<Session>, StoreError> {
+        let rows = sqlx::query(CLOSE_ORPHANS)
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(session_from_row).collect()
     }
 
     async fn found(&self, statement: &'static str, key: &str) -> Result<bool, StoreError> {
@@ -432,10 +565,11 @@ impl ServiceSessions {
         Ok(done.rows_affected() == 1)
     }
 
-    pub async fn end(&self, end: &EndService<'_>) -> Result<EndOutcome, StoreError> {
+    pub async fn end(&self, end: &EndService<'_>) -> Result<ServiceEnding, StoreError> {
         if end.outcome.is_empty() || end.outcome.len() > MAX_SESSION_OUTCOME_LEN {
             return Err(StoreError::InvalidInput("the outcome is out of range"));
         }
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
         let row = sqlx::query(END)
             .bind(end.now)
             .bind(end.outcome)
@@ -443,11 +577,32 @@ impl ServiceSessions {
             .bind(end.bytes_out)
             .bind(end.id)
             .bind(end.node_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if let Some(row) = row {
-            return Ok(EndOutcome::Ended(Box::new(session_from_row(&row)?)));
+            let ended = session_from_row(&row)?;
+            let children = close_children(
+                &mut tx,
+                std::slice::from_ref(&ended),
+                SessionEndReason::ParentEnded,
+                end.now,
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(ServiceEnding {
+                outcome: EndOutcome::Ended(Box::new(ended)),
+                children,
+            });
         }
+        tx.commit().await?;
+        let outcome = self.settle_end(end).await?;
+        Ok(ServiceEnding {
+            outcome,
+            children: Vec::new(),
+        })
+    }
+
+    async fn settle_end(&self, end: &EndService<'_>) -> Result<EndOutcome, StoreError> {
         let stored = sqlx::query(GET)
             .bind(end.id)
             .fetch_optional(&self.pool)
@@ -477,8 +632,12 @@ impl ServiceSessions {
                 .bind(end.node_id)
                 .fetch_optional(&self.pool)
                 .await?;
+            let identical = stored.outcome.as_deref() == Some(end.outcome)
+                && stored.bytes_in == Some(end.bytes_in)
+                && stored.bytes_out == Some(end.bytes_out);
             return Ok(match filled {
                 Some(row) => EndOutcome::Late(Box::new(session_from_row(&row)?)),
+                None if identical && stored.parent_session_id.is_some() => EndOutcome::Repeated,
                 None => EndOutcome::Rejected(EndRejection::ClosedByControl),
             });
         }
@@ -498,15 +657,25 @@ impl ServiceSessions {
         kind: SessionKind,
         reason: SessionEndReason,
         now: i64,
-    ) -> Result<Option<Session>, StoreError> {
+    ) -> Result<Vec<Session>, StoreError> {
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
         let row = sqlx::query(CLOSE_ACTIVE)
             .bind(now)
             .bind(reason.as_str())
             .bind(id)
             .bind(kind.as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
-        row.as_ref().map(session_from_row).transpose()
+        let mut closed = row
+            .as_ref()
+            .map(session_from_row)
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let children = close_children(&mut tx, &closed, reason, now).await?;
+        tx.commit().await?;
+        closed.extend(children);
+        Ok(closed)
     }
 
     pub async fn mark_abandoned(&self, id: &str) -> Result<Option<Session>, StoreError> {
@@ -529,6 +698,39 @@ impl ServiceSessions {
             .map(|row| entry(row, live_ssh_from_row))
             .collect()
     }
+}
+
+pub(crate) async fn close_children(
+    connection: &mut SqliteConnection,
+    closed: &[Session],
+    reason: SessionEndReason,
+    now: i64,
+) -> Result<Vec<Session>, StoreError> {
+    let parents: Vec<&str> = closed
+        .iter()
+        .filter(|session| session.kind == SessionKind::Kube && session.parent_session_id.is_none())
+        .map(|session| session.id.as_str())
+        .collect();
+    let mut children = Vec::new();
+    for batch in parents.chunks(CHILD_CLOSE_BATCH) {
+        let mut builder: QueryBuilder<Sqlite> =
+            QueryBuilder::new("UPDATE sessions SET state = 'ended', ended_at = ");
+        builder.push_bind(now);
+        builder.push(", end_reason = ");
+        builder.push_bind(reason.as_str());
+        builder.push(" WHERE state = 'active' AND parent_session_id IN (");
+        let mut separated = builder.separated(", ");
+        for id in batch {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(") RETURNING ");
+        builder.push(session_columns!());
+        let rows = builder.build().fetch_all(&mut *connection).await?;
+        for row in &rows {
+            children.push(session_from_row(row)?);
+        }
+    }
+    Ok(children)
 }
 
 fn service_kind_only(kind: SessionKind) -> Result<(), StoreError> {

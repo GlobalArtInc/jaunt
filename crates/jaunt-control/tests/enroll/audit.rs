@@ -66,6 +66,10 @@ pub fn install_recorder() {
     });
 }
 
+pub fn peek_recording() -> Vec<Captured> {
+    RECORDING.with(|recording| recording.borrow().clone().unwrap_or_default())
+}
+
 pub fn start_recording() {
     RECORDING.with(|recording| *recording.borrow_mut() = Some(Vec::new()));
 }

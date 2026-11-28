@@ -365,6 +365,11 @@ events! {
         [("reason", SHORT), ("events", INT), ("sessions", INT), ("suppressed", INT)]),
     SessionAuditIncomplete => ("session.audit_incomplete", "session.audit_incomplete", ActorRule::User("user_id"), NODE, SESSION, None,
         [("dropped_total", INT)]),
+    SessionChildCreated => ("session.child.created", "session.child.created", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("parent_session_id", ID), ("kind", SHORT), ("service", NAME), ("namespace", NAME), ("pod", HOST),
+         ("container", NAME), ("tty", BOOL), ("record", BOOL), ("record_input", BOOL), ("serial", INT)]),
+    SessionChildRefused => ("session.child.refused", "session.child.refused", ActorRule::Node("node_id"), NODE, None, None,
+        [("reason", SHORT), ("parent_session_id", ID), ("suppressed", INT)]),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &[

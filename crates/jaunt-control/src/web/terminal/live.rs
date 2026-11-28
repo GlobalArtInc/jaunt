@@ -417,6 +417,8 @@ mod tests {
             decision_hash: None,
             service_name: None,
             audit_incomplete: false,
+            parent_session_id: None,
+            record: None,
         }
     }
 }

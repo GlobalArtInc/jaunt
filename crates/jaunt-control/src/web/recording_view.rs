@@ -13,7 +13,7 @@ use axum::response::Response;
 use hyper::body::Frame;
 use jaunt_audit::{RecordingKey, RecordingStoreError, StoredRecording};
 use jaunt_record::SessionKind;
-use jaunt_store::{Recording, RecordingState, is_session_id};
+use jaunt_store::{Recording, RecordingState, is_recording_id};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 
@@ -250,7 +250,7 @@ struct Located {
 }
 
 async fn locate(control: &Control, id: &str) -> Result<Located, Unavailable> {
-    if !is_session_id(id) {
+    if !is_recording_id(id) {
         return Err(Unavailable::Missing);
     }
     let Some(uploads) = control.recordings.as_ref() else {

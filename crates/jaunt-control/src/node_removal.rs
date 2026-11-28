@@ -1,7 +1,7 @@
 use jaunt_store::{OpenSessions, SessionEndReason, StoreError};
 
 use crate::control::Control;
-use crate::killer::{KillReason, KillScope};
+use crate::killer::{KillReason, KillScope, connections};
 use crate::session_audit;
 
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +41,7 @@ pub(crate) async fn cut_off(control: &Control, node_id: &str) -> Result<usize, C
                 .killer
                 .order(scope, KillReason::NodeRemoved, &closed)
                 .await;
-            Ok(closed.len())
+            Ok(connections(&closed))
         }
         Err(err) => {
             control

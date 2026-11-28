@@ -10,7 +10,7 @@ use jaunt_store::{
 
 use crate::clock::{Clock, Moment};
 use crate::control::Control;
-use crate::killer::{KillReason, KillScope, KillerSlot};
+use crate::killer::{KillReason, KillScope, KillerSlot, connections};
 use crate::plane::store_failure;
 use crate::session_sweep::RevocationWatch;
 use crate::{node_audit, revocation_audit, session_audit};
@@ -286,7 +286,7 @@ impl RevocationAdmin {
             self.killer
                 .order(scope, KillReason::Revoked, &sessions)
                 .await;
-            terminated += sessions.len();
+            terminated += connections(&sessions);
         }
         match failure {
             Some(err) => Err(err),
@@ -422,7 +422,7 @@ impl RevocationAdmin {
             session_audit::closed(session, SessionEndReason::Revoked);
         }
         self.killer.order(scope, KillReason::Revoked, &closed).await;
-        Ok(closed.len())
+        Ok(connections(&closed))
     }
 
     async fn resolve(

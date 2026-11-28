@@ -72,12 +72,24 @@ pub(crate) enum Delivery {
     NoKiller,
 }
 
+fn is_connection(session: &Session) -> bool {
+    !session.is_child()
+}
+
+pub(crate) fn connections(sessions: &[Session]) -> usize {
+    sessions
+        .iter()
+        .filter(|session| is_connection(session))
+        .count()
+}
+
 fn order_of(scope: KillScope, reason: KillReason, sessions: &[Session]) -> KillOrder {
     KillOrder {
         scope,
         reason,
         sessions: sessions
             .iter()
+            .filter(|session| is_connection(session))
             .map(|session| KilledSession {
                 session_id: session.id.clone(),
                 node_id: session.node_id.clone(),
@@ -117,7 +129,7 @@ impl KillerSlot {
     ) -> bool {
         let dispatched = self.dispatch(scope, reason, sessions).await;
         if dispatched {
-            for session in sessions {
+            for session in sessions.iter().filter(|session| is_connection(session)) {
                 revocation_audit::session_terminated(session, reason);
             }
         }

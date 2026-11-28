@@ -2,7 +2,8 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
-use crate::StoreError;
+use crate::service_sessions::close_children;
+use crate::{BEGIN_WRITE, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -94,6 +95,7 @@ pub enum SessionEndReason {
     ServiceRemoved,
     AccessWithdrawn,
     AccessChanged,
+    ParentEnded,
 }
 
 impl SessionEndReason {
@@ -109,6 +111,7 @@ impl SessionEndReason {
             SessionEndReason::ServiceRemoved => "service_removed",
             SessionEndReason::AccessWithdrawn => "access_withdrawn",
             SessionEndReason::AccessChanged => "access_changed",
+            SessionEndReason::ParentEnded => "parent_ended",
         }
     }
 
@@ -124,6 +127,7 @@ impl SessionEndReason {
             "service_removed" => Ok(SessionEndReason::ServiceRemoved),
             "access_withdrawn" => Ok(SessionEndReason::AccessWithdrawn),
             "access_changed" => Ok(SessionEndReason::AccessChanged),
+            "parent_ended" => Ok(SessionEndReason::ParentEnded),
             other => Err(StoreError::Corrupt(format!("sessions.end_reason: {other}"))),
         }
     }
@@ -244,6 +248,14 @@ pub struct Session {
     pub decision_hash: Option<String>,
     pub service_name: Option<String>,
     pub audit_incomplete: bool,
+    pub parent_session_id: Option<String>,
+    pub record: Option<bool>,
+}
+
+impl Session {
+    pub fn is_child(&self) -> bool {
+        self.parent_session_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +331,8 @@ macro_rules! session_columns {
         "id, user_id, serial, node_id, state, created_at, expires_at, authorized_at, ended_at, \
          login, exit_status, bytes_in, bytes_out, recording_incomplete, end_reason, \
          max_duration_secs, origin, record_input, kind, service_id, target, roles, grant_ids, \
-         db_client_serial, outcome, decision_hash, service_name, audit_incomplete"
+         db_client_serial, outcome, decision_hash, service_name, audit_incomplete, \
+         parent_session_id, record"
     };
 }
 
@@ -421,7 +434,8 @@ const LISTING_SELECT: &str = "SELECT s.id AS id, s.user_id AS user_id, s.serial 
     s.target AS target, s.roles AS roles, s.grant_ids AS grant_ids, \
     s.db_client_serial AS db_client_serial, s.outcome AS outcome, \
     s.decision_hash AS decision_hash, s.service_name AS service_name, \
-    s.audit_incomplete AS audit_incomplete, \
+    s.audit_incomplete AS audit_incomplete, s.parent_session_id AS parent_session_id, \
+    s.record AS record, \
     u.email AS user_email, n.name AS node_name, \
     r.state AS recording_state, r.salvaged AS recording_salvaged \
     FROM sessions s JOIN users u ON u.id = s.user_id JOIN nodes n ON n.id = s.node_id \
@@ -431,7 +445,7 @@ const LISTING_SELECT: &str = "SELECT s.id AS id, s.user_id AS user_id, s.serial 
 const NODE_COUNTS: &str = "SELECT \
     COALESCE(SUM(CASE WHEN state IN ('routed', 'active') THEN 1 ELSE 0 END), 0) AS open, \
     COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS since \
-    FROM sessions WHERE node_id = ?";
+    FROM sessions WHERE node_id = ? AND parent_session_id IS NULL";
 
 macro_rules! recent_pairs {
     () => {
@@ -599,8 +613,16 @@ impl Sessions {
             OpenSessions::OfRevokedSubjects => closing(CLOSE_OF_REVOKED_SUBJECTS),
             OpenSessions::OfInactiveNodes => closing(CLOSE_OF_INACTIVE_NODES),
         };
-        let rows = query.fetch_all(&self.pool).await?;
-        rows.iter().map(session_from_row).collect()
+        let mut tx = self.pool.begin_with(BEGIN_WRITE).await?;
+        let rows = query.fetch_all(&mut *tx).await?;
+        let mut closed = rows
+            .iter()
+            .map(session_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let children = close_children(&mut tx, &closed, reason, now).await?;
+        tx.commit().await?;
+        closed.extend(children);
+        Ok(closed)
     }
 
     pub async fn any_open_of_revoked_subjects(&self) -> Result<bool, StoreError> {
@@ -804,6 +826,8 @@ pub(crate) fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
         decision_hash: row.try_get("decision_hash")?,
         service_name: row.try_get("service_name")?,
         audit_incomplete: row.try_get("audit_incomplete")?,
+        parent_session_id: row.try_get("parent_session_id")?,
+        record: row.try_get("record")?,
     })
 }
 

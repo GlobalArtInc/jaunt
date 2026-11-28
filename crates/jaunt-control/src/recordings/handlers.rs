@@ -5,7 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use jaunt_proto::{RecordingChunk, RecordingComplete, RecordingRefusal};
-use jaunt_store::is_session_id;
+use jaunt_store::is_recording_id;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinError;
@@ -66,7 +66,7 @@ async fn admit<T: DeserializeOwned>(
         return Err(Box::new(refused));
     }
     let session_id = match path {
-        Ok(Path(session_id)) if is_session_id(&session_id) => session_id,
+        Ok(Path(session_id)) if is_recording_id(&session_id) => session_id,
         _ => {
             flow::reject(control, &node_id, None, Reason::UnknownSession);
             return Err(Box::new(refusal_response(RecordingRefusal::SessionUnknown)));

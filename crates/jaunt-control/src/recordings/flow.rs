@@ -144,6 +144,36 @@ fn now_secs(control: &Control) -> Result<i64, Failure> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadKind {
+    Shell,
+    RecordedChild,
+    UnrecordedChild,
+    Other,
+}
+
+fn upload_kind(target: &UploadTarget, node_id: &str) -> UploadKind {
+    match (target.kind, target.parent_session_id.as_deref()) {
+        (StoredKind::Ssh, None) => UploadKind::Shell,
+        (StoredKind::Kube, Some(_)) if target.parent_node_id.as_deref() == Some(node_id) => {
+            if target.record == Some(true) {
+                UploadKind::RecordedChild
+            } else {
+                UploadKind::UnrecordedChild
+            }
+        }
+        _ => UploadKind::Other,
+    }
+}
+
+fn manifest_login(target: &UploadTarget) -> Option<&str> {
+    match (target.kind, target.parent_session_id.as_deref()) {
+        (StoredKind::Ssh, None) => target.login.as_deref(),
+        (StoredKind::Kube, Some(_)) => Some(""),
+        _ => None,
+    }
+}
+
 async fn load_target(
     control: &Control,
     node_id: &str,
@@ -165,8 +195,12 @@ async fn load_target(
     if target.node_id != node_id {
         return Err(refused(RecordingRefusal::SessionUnknown, Reason::WrongNode));
     }
-    if target.kind != StoredKind::Ssh {
-        return Err(refused(RecordingRefusal::SessionUnknown, Reason::WrongKind));
+    match upload_kind(&target, node_id) {
+        UploadKind::Shell | UploadKind::RecordedChild => {}
+        UploadKind::UnrecordedChild => return Err(not_recordable()),
+        UploadKind::Other => {
+            return Err(refused(RecordingRefusal::SessionUnknown, Reason::WrongKind));
+        }
     }
     let recordable = match target.state {
         SessionState::Routed => false,
@@ -304,7 +338,7 @@ async fn complete_flow(
     let same_identity = manifest.session_id == target.session_id
         && manifest.node == target.node_id
         && manifest.user == target.user_id
-        && target.login.as_deref() == Some(manifest.login.as_str());
+        && manifest_login(&target) == Some(manifest.login.as_str());
     if !same_identity {
         return Err(conflict());
     }
@@ -988,7 +1022,7 @@ fn salvaged_manifest(target: &UploadTarget, chunks: u64, raw_bytes: u64) -> Sess
         kind: SessionKind::Shell,
         node: target.node_id.clone(),
         user: target.user_id.clone(),
-        login: target.login.clone().unwrap_or_default(),
+        login: manifest_login(target).unwrap_or_default().to_owned(),
         started_at: target
             .authorized_at
             .and_then(|secs| u64::try_from(secs).ok())
@@ -1261,7 +1295,7 @@ async fn adopt(
         session_id: target.session_id.clone(),
         node: target.node_id.clone(),
         user: target.user_id.clone(),
-        login: target.login.clone(),
+        login: manifest_login(target).map(str::to_owned),
     };
     let found = match (resolve_existing(&identity, local, &found), found) {
         (Resolution::Nothing, _) => return Adoption::Absent,
@@ -1544,8 +1578,75 @@ fn session_manifest(manifest: RecordingManifest) -> SessionManifest {
 mod tests {
     use jaunt_proto::{RecordingKind, RecordingManifest};
     use jaunt_record::{MANIFEST_VERSION, SessionKind, SessionManifest};
+    use jaunt_store::{SessionKind as StoredKind, SessionState, UploadTarget};
 
-    use super::session_manifest;
+    use super::{UploadKind, manifest_login, session_manifest, upload_kind};
+
+    fn target(kind: StoredKind, parent: Option<&str>, record: Option<bool>) -> UploadTarget {
+        UploadTarget {
+            session_id: "s".to_owned(),
+            node_id: "n".to_owned(),
+            user_id: "u".to_owned(),
+            state: SessionState::Active,
+            authorized_at: Some(1),
+            ended_at: None,
+            login: (kind == StoredKind::Ssh).then(|| "deploy".to_owned()),
+            pty: Some(true),
+            record_input: Some(false),
+            recording: None,
+            kind,
+            parent_session_id: parent.map(|_| "k-parent".to_owned()),
+            parent_node_id: parent.map(str::to_owned),
+            record,
+        }
+    }
+
+    #[test]
+    fn only_shells_and_recording_children_of_the_uploading_node_take_a_recording() {
+        let cases = [
+            (
+                target(StoredKind::Ssh, None, None),
+                UploadKind::Shell,
+                Some("deploy"),
+            ),
+            (
+                target(StoredKind::Kube, Some("n"), Some(true)),
+                UploadKind::RecordedChild,
+                Some(""),
+            ),
+            (
+                target(StoredKind::Kube, Some("n"), Some(false)),
+                UploadKind::UnrecordedChild,
+                Some(""),
+            ),
+            (
+                target(StoredKind::Kube, Some("n"), None),
+                UploadKind::UnrecordedChild,
+                Some(""),
+            ),
+            (
+                target(StoredKind::Kube, Some("other"), Some(true)),
+                UploadKind::Other,
+                Some(""),
+            ),
+            (
+                target(StoredKind::Kube, None, Some(true)),
+                UploadKind::Other,
+                None,
+            ),
+            (target(StoredKind::Db, None, None), UploadKind::Other, None),
+            (target(StoredKind::Tcp, None, None), UploadKind::Other, None),
+            (
+                target(StoredKind::Ssh, Some("n"), Some(true)),
+                UploadKind::Other,
+                None,
+            ),
+        ];
+        for (target, kind, login) in cases {
+            assert_eq!(upload_kind(&target, "n"), kind, "{target:?}");
+            assert_eq!(manifest_login(&target), login, "{target:?}");
+        }
+    }
 
     #[test]
     fn the_transport_manifest_has_the_shape_of_the_recorder_manifest() {

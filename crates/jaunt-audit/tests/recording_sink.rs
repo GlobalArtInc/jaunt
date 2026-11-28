@@ -367,6 +367,41 @@ fn leftovers_of_a_previous_run_are_removed_but_stored_recordings_stay() {
 }
 
 #[test]
+fn leftovers_of_a_kubernetes_child_recording_are_removed_and_its_stored_recording_stays() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = sink(&dir);
+    let stored = "kx-ffffffffffffffffffffffffffffffff";
+    let mut kept = sink.begin(&key(stored)).unwrap();
+    kept.write(0, b"kept").unwrap();
+    kept.commit(&manifest(stored, 1, 4)).unwrap();
+    let month = month_dir(&dir);
+    let parent = "k-0123456789abcdef0123456789abcdef";
+    for name in [
+        "kx-0123456789abcdef0123456789abcdef.cast.part".to_owned(),
+        "kx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.cast".to_owned(),
+        format!("{parent}.cast.part"),
+    ] {
+        fs::write(month.join(name), b"x").unwrap();
+    }
+
+    assert_eq!(
+        sink.remove_leftovers().unwrap(),
+        Leftovers {
+            parts: 1,
+            orphan_casts: 1
+        }
+    );
+    assert_eq!(
+        names(&month),
+        [
+            format!("{parent}.cast.part"),
+            format!("{stored}.cast"),
+            format!("{stored}.manifest.json"),
+        ]
+    );
+}
+
+#[test]
 fn verification_catches_a_flipped_bit_a_changed_manifest_and_a_wrong_row() {
     let dir = tempfile::tempdir().unwrap();
     let sink = sink(&dir);

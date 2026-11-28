@@ -365,6 +365,8 @@ async fn kube(
         roles: &roles,
         max_duration_secs: recorded_duration(max_duration_secs),
         decision_hash: &decision_hash,
+        record_exec: decision.record_exec,
+        record_input: decision.record_input,
         max_per_user: MAX_KUBE_SESSIONS_PER_USER_AND_CLUSTER,
         max_per_service: MAX_KUBE_SESSIONS_PER_CLUSTER,
         now: now.secs,

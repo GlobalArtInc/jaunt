@@ -7,7 +7,7 @@ use std::fmt;
 use std::io::{self, Read};
 
 use jaunt_record::{SessionManifest, Sink, SinkError};
-use jaunt_store::is_session_id;
+use jaunt_store::is_recording_id;
 use sha2::{Digest, Sha256};
 
 use crate::time::{SECONDS_PER_DAY, civil_from_days};
@@ -48,7 +48,7 @@ pub enum RecordingKeyError {
 
 impl RecordingKey {
     pub fn new(session_id: &str, started_at: i64) -> Result<RecordingKey, RecordingKeyError> {
-        if !is_session_id(session_id) {
+        if !is_recording_id(session_id) {
             return Err(RecordingKeyError::SessionId);
         }
         if started_at < 0 {
@@ -93,7 +93,7 @@ impl RecordingKey {
         year: &str,
         month: &str,
     ) -> Result<RecordingKey, RecordingKeyError> {
-        if !is_session_id(session_id) {
+        if !is_recording_id(session_id) {
             return Err(RecordingKeyError::SessionId);
         }
         let digits = |text: &str, len: usize| {
@@ -315,10 +315,16 @@ mod tests {
             Err(RecordingKeyError::Date)
         );
         assert_eq!(RecordingKey::new(ID, -1), Err(RecordingKeyError::Date));
+        let child = "kx-0123456789abcdef0123456789abcdef";
+        let key = RecordingKey::new(child, 1_764_028_800).unwrap();
+        assert_eq!(key.location(), format!("2025/11/{child}"));
+        assert_eq!(RecordingKey::from_location(&key.location()), Ok(key));
         for bad in [
             "../../etc/passwd",
             "",
             "5F0C3A52-8A8E-4C55-9A51-2F6F0D1B8C11",
+            "k-0123456789abcdef0123456789abcdef",
+            "kx-0123456789ABCDEF0123456789ABCDEF",
         ] {
             assert_eq!(
                 RecordingKey::new(bad, 0),

@@ -1,7 +1,7 @@
 mod audit;
 mod catalog;
 mod ledger;
-mod notices;
+pub(crate) mod notices;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +17,7 @@ use jaunt_limits::{Decision, Rate, RateLimiter};
 use jaunt_proto::{
     AGENT_EVENTS_INVALID_SESSION, AGENT_EVENTS_MAX_BATCH, AGENT_EVENTS_MAX_DROPPED,
     AGENT_EVENTS_MAX_REFUSED_SESSIONS, AgentEventBatch, AgentEventsAccepted, AgentEventsRefusal,
-    is_kube_session_id,
+    is_kube_child_session_id, is_kube_session_id,
 };
 use jaunt_store::{MAX_AUDIT_LOOKUP, Session, SessionKind, SessionState, is_session_id};
 
@@ -186,7 +186,7 @@ fn shape(batch: &AgentEventBatch) -> Result<(), Refusal> {
     }
     let well_formed = session_ids(batch)
         .into_iter()
-        .all(|id| is_session_id(id) || is_kube_session_id(id));
+        .all(|id| is_session_id(id) || is_kube_session_id(id) || is_kube_child_session_id(id));
     if well_formed {
         Ok(())
     } else {
@@ -621,6 +621,8 @@ mod tests {
             decision_hash: None,
             service_name: None,
             audit_incomplete: false,
+            parent_session_id: None,
+            record: None,
         }
     }
 
@@ -739,6 +741,11 @@ mod tests {
             ],
         };
         assert_eq!(shape(&full), Ok(()));
+        let child = AgentEventBatch {
+            events: vec![event("kx-0123456789abcdef0123456789abcdef")],
+            dropped: Vec::new(),
+        };
+        assert_eq!(shape(&child), Ok(()));
         let mut over = full.clone();
         over.events.push(event(UUID));
         assert_eq!(shape(&over), Err(Refusal::TooManyEvents));
@@ -749,6 +756,7 @@ mod tests {
             "",
             "s-1",
             "k-0123",
+            "kx-0123",
             &UUID.to_uppercase(),
             "../x",
             &format!("{UUID}\n"),

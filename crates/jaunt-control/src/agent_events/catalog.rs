@@ -273,6 +273,8 @@ mod tests {
             decision_hash: None,
             service_name: Some("prod".to_owned()),
             audit_incomplete: false,
+            parent_session_id: None,
+            record: None,
         }
     }
 

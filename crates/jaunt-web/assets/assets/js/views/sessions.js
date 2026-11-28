@@ -86,7 +86,7 @@ function openTerminateDialog(ctx, session, onDone) {
       const text = singleLine(reason.value);
       await ctx.api.post(SESSIONS + "/" + encodeURIComponent(session.id) + "/terminate", text === "" ? {} : { reason: text });
     },
-    onError: (error) => S.sessions.terminateErrors[error.status],
+    onError: (error) => (error.code === "child_session" ? S.sessions.terminateChild : S.sessions.terminateErrors[error.status]),
     onDone,
   });
 }
@@ -157,7 +157,7 @@ export async function sessionsView(ctx) {
       time(session.created_at),
       session.ended_at ? time(session.ended_at) : S.none,
       outcome(session),
-      session.state === "active" && ctx.can("sessions.terminate") ? terminateButton(session) : null,
+      session.state === "active" && !session.parent_session_id && ctx.can("sessions.terminate") ? terminateButton(session) : null,
     ],
     empty: () => emptyState(filtered ? S.sessions.empty : S.sessions.emptyAll, null, null, "pulse"),
     fetchPage: async (cursor) => {

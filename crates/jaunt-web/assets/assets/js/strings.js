@@ -624,6 +624,7 @@ export const S = {
     ],
     terminateReason: "Reason (optional, stored in the audit log)",
     terminateDone: (id) => "Session " + id + " terminated.",
+    terminateChild: "This is one command inside another session; end the session it belongs to.",
     terminateErrors: {
       404: "This session no longer exists.",
       409: "This session has already ended.",

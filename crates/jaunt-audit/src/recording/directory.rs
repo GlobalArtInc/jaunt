@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jaunt_record::{Limits, SessionManifest};
-use jaunt_store::is_session_id;
+use jaunt_store::is_recording_id;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
@@ -324,10 +324,10 @@ fn leftover_kind(name: &str) -> Option<Leftover> {
         let id = stem
             .strip_suffix(CAST_SUFFIX)
             .or_else(|| stem.strip_suffix(MANIFEST_SUFFIX))?;
-        return is_session_id(id).then(|| Leftover::Part(id.to_owned()));
+        return is_recording_id(id).then(|| Leftover::Part(id.to_owned()));
     }
     let id = name.strip_suffix(CAST_SUFFIX)?;
-    is_session_id(id).then(|| Leftover::Cast(id.to_owned()))
+    is_recording_id(id).then(|| Leftover::Cast(id.to_owned()))
 }
 
 fn remove_leftovers_in(

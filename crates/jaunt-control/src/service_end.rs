@@ -1,5 +1,5 @@
 use jaunt_proto::{ControlError as PlaneError, NodeCaller, ServiceEnd, SessionEndOutcome};
-use jaunt_store::{EndOutcome, EndRejection, EndService};
+use jaunt_store::{EndOutcome, EndRejection, EndService, SessionEndReason};
 
 use crate::control::Control;
 use crate::plane::{check_fields, clock_failure, store_failure};
@@ -36,7 +36,7 @@ async fn end(
     let bytes_in = i64::try_from(request.bytes_in).map_err(|_| PlaneError::InvalidRequest)?;
     let bytes_out = i64::try_from(request.bytes_out).map_err(|_| PlaneError::InvalidRequest)?;
     let now = control.now().ok_or_else(clock_failure)?;
-    let outcome = control
+    let ending = control
         .store
         .service_sessions()
         .end(&EndService {
@@ -49,9 +49,12 @@ async fn end(
         })
         .await
         .map_err(store_failure("ending the service session"))?;
-    match outcome {
+    match ending.outcome {
         EndOutcome::Ended(session) => {
             service_session_audit::ended(&session, false);
+            for child in &ending.children {
+                session_audit::closed(child, SessionEndReason::ParentEnded);
+            }
             Ok(SessionEndOutcome::Recorded)
         }
         EndOutcome::Late(session) => {

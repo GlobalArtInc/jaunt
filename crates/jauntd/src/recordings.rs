@@ -19,7 +19,7 @@ use jaunt_recording_s3::{
     ConfigError as S3ConfigError, Credentials, DEFAULT_PART_SIZE, DEFAULT_PREFIX,
     DEFAULT_UPLOAD_DEADLINE, ProbeError, S3Config, S3Sink, Sse,
 };
-use jaunt_store::{Store, StoreError, is_session_id};
+use jaunt_store::{Store, StoreError, is_recording_id};
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use serde::Deserialize;
 
@@ -903,7 +903,7 @@ fn attempt_verify(
     session_id: &str,
     stdout: &mut dyn Write,
 ) -> Result<(), VerifyCommandError> {
-    if !is_session_id(session_id) {
+    if !is_recording_id(session_id) {
         return Err(VerifyCommandError::SessionId(session_id.to_owned()));
     }
     let config = config::load(config_path).map_err(VerifyCommandError::Config)?;
@@ -1466,6 +1466,62 @@ mod tests {
         (store, session.id, NOW + 1)
     }
 
+    async fn store_recording(store: &Store, root: &Path, session_id: &str, started: i64) -> String {
+        let sink = DirectorySink::create(
+            root,
+            DirectoryLimits {
+                min_free_bytes: 0,
+                max_total_raw: 1024,
+            },
+        )
+        .unwrap();
+        let key = RecordingKey::new(session_id, started).unwrap();
+        let mut staged = sink.begin(&key).unwrap();
+        let cast_line = b"[0.5,\"o\",\"hello\"]\n";
+        staged.write(0, cast_line).unwrap();
+        let written = manifest(session_id, u64::try_from(cast_line.len()).unwrap());
+        let committed = staged.commit(&written).unwrap();
+        store
+            .recordings()
+            .begin(session_id, NODE, NOW + 2)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .recordings()
+                .mark_complete(&StoredRecording {
+                    session_id,
+                    node_id: NODE,
+                    chunks: 1,
+                    raw_bytes: committed.cast_bytes,
+                    digest: written.digest.as_deref(),
+                    input_recorded: false,
+                    dropped_chunks: 0,
+                    location: &committed.location,
+                    cast_sha256: committed.cast_sha256.as_deref(),
+                    manifest_sha256: &committed.manifest_sha256,
+                    now: NOW + 3,
+                })
+                .await
+                .unwrap()
+        );
+        committed.location
+    }
+
+    fn directory_config(data_dir: &Path, root: &Path) -> PathBuf {
+        let config = data_dir.join("jauntd.yaml");
+        fs::write(
+            &config,
+            format!(
+                "data_dir: {}\nrecordings:\n  dir: {}\n",
+                data_dir.display(),
+                root.display()
+            ),
+        )
+        .unwrap();
+        config
+    }
+
     fn manifest(session_id: &str, raw_bytes: u64) -> SessionManifest {
         SessionManifest {
             version: MANIFEST_VERSION,
@@ -1530,54 +1586,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, session_id, started) = store_with_session(dir.path()).await;
         let root = dir.path().join("recordings");
-        let sink = DirectorySink::create(
-            &root,
-            DirectoryLimits {
-                min_free_bytes: 0,
-                max_total_raw: 1024,
-            },
-        )
-        .unwrap();
-        let key = RecordingKey::new(&session_id, started).unwrap();
-        let mut staged = sink.begin(&key).unwrap();
-        let cast_line = b"[0.5,\"o\",\"hello\"]\n";
-        staged.write(0, cast_line).unwrap();
-        let written = manifest(&session_id, u64::try_from(cast_line.len()).unwrap());
-        let committed = staged.commit(&written).unwrap();
-        store
-            .recordings()
-            .begin(&session_id, NODE, NOW + 2)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .recordings()
-                .mark_complete(&StoredRecording {
-                    session_id: &session_id,
-                    node_id: NODE,
-                    chunks: 1,
-                    raw_bytes: committed.cast_bytes,
-                    digest: written.digest.as_deref(),
-                    input_recorded: false,
-                    dropped_chunks: 0,
-                    location: &committed.location,
-                    cast_sha256: committed.cast_sha256.as_deref(),
-                    manifest_sha256: &committed.manifest_sha256,
-                    now: NOW + 3,
-                })
-                .await
-                .unwrap()
-        );
-        let config = dir.path().join("jauntd.yaml");
-        fs::write(
-            &config,
-            format!(
-                "data_dir: {}\nrecordings:\n  dir: {}\n",
-                dir.path().display(),
-                root.display()
-            ),
-        )
-        .unwrap();
+        let location = store_recording(&store, &root, &session_id, started).await;
+        let config = directory_config(dir.path(), &root);
 
         let run = |id: &str| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1595,7 +1605,7 @@ mod tests {
             "{out}"
         );
 
-        let cast = root.join(format!("{}.cast", committed.location));
+        let cast = root.join(format!("{location}.cast"));
         let mut bytes = fs::read(&cast).unwrap();
         bytes[7] ^= 0x04;
         fs::write(&cast, &bytes).unwrap();
@@ -1604,6 +1614,49 @@ mod tests {
         assert!(err.contains("does not match its stored sha256"), "{err}");
 
         let (code, _, err) = tokio::task::block_in_place(|| run("../etc/passwd"));
+        assert_eq!(code, 2, "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_verify_command_takes_the_recording_of_a_kubernetes_child_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, parent_id, started) = store_with_session(dir.path()).await;
+        let child = "kx-0123456789abcdef0123456789abcdef";
+        let raw = SqlitePool::connect_with(
+            SqliteConnectOptions::new().filename(dir.path().join("jaunt.db")),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at, \
+             authorized_at, kind, parent_session_id, record) SELECT ?, user_id, serial, node_id, \
+             'active', created_at, expires_at, authorized_at, 'kube', id, 1 FROM sessions WHERE id = ?",
+        )
+        .bind(child)
+        .bind(&parent_id)
+        .execute(&raw)
+        .await
+        .unwrap();
+        let root = dir.path().join("recordings");
+        store_recording(&store, &root, child, started).await;
+        let config = directory_config(dir.path(), &root);
+        let run = |id: &str| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = verify(&config, id, &mut out, &mut err);
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (code, out, err) = tokio::task::block_in_place(|| run(child));
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            out.contains(&format!("recording {child} verified")),
+            "{out}"
+        );
+        let (code, _, err) =
+            tokio::task::block_in_place(|| run("k-0123456789abcdef0123456789abcdef"));
         assert_eq!(code, 2, "{err}");
     }
 }

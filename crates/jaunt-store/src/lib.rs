@@ -54,7 +54,7 @@ pub use nodes::{
 };
 pub use recordings::{
     MAX_RECORDING_PAGE, Reconciled, Recording, RecordingCursor, RecordingState, Recordings,
-    SESSION_ID_LEN, StoredRecording, UploadTarget, is_session_id,
+    SESSION_ID_LEN, StoredRecording, UploadTarget, is_recording_id, is_session_id,
 };
 pub use revocations::{
     MAX_REVOCATION_PAGE, NewRevocation, Revocation, RevocationCursor, RevocationKind,
@@ -62,10 +62,10 @@ pub use revocations::{
 };
 pub use service_certificates::{NewServiceCertificate, ServiceCertificate, ServiceCertificates};
 pub use service_sessions::{
-    ABANDONED_OUTCOME, ActivateService, CurrentService, EndService, KubeOpened, LiveEntry,
-    LiveServiceSession, LiveSshSession, MAX_AUDIT_LOOKUP, MAX_SESSION_LIST_BYTES,
+    ABANDONED_OUTCOME, ActivateService, ChildOpened, CurrentService, EndService, KubeOpened,
+    LiveEntry, LiveServiceSession, LiveSshSession, MAX_AUDIT_LOOKUP, MAX_SESSION_LIST_BYTES,
     MAX_SESSION_OUTCOME_LEN, MAX_SESSION_ROLES, MAX_SESSION_TARGET_LEN, NewServiceRoute,
-    OpenKubeSession, ServiceRouted, ServiceSessions,
+    OpenChildSession, OpenKubeSession, ServiceEnding, ServiceRouted, ServiceSessions,
 };
 pub use services::{
     AnnounceOutcome, Announced, AnnouncedService, Announcement, ApprovedHolder, ApprovedService,
@@ -83,6 +83,8 @@ pub use sessions::{
 pub use user_pins::{PinOutcome, UserPins};
 pub use users::{NewUser, User, Users};
 pub use web_sessions::{NewWebSession, ValidWebSession, WebSession, WebSessions};
+
+pub(crate) const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 

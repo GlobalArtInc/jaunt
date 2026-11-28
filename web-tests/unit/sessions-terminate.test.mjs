@@ -67,6 +67,19 @@ test("Terminate is offered only on live sessions and only with the permission", 
   assert.equal(terminateButtons().length, 0);
 });
 
+test("a command inside another session offers no Terminate and a refusal for it names the session to end instead", async () => {
+  const child = sessionRow({ id: "kx-0123456789abcdef0123456789abcdef", login: null, parent_session_id: ID });
+  ui = await open({ "GET /v1/admin/sessions": page([ROWS[0], child]) });
+  assert.equal(terminateButtons().length, 1);
+  assert.equal(terminateButtons()[0].getAttribute("aria-label"), "Terminate session 5b1c0a42");
+  ui.stop();
+  ui = await open({ [ROUTE]: json(409, { error: "child_session" }) });
+  click(terminateButtons()[0]);
+  click(byText(dialog(), "button", "Terminate session"));
+  await settle();
+  assert.equal(dialog().querySelector(".inline-error").textContent, "This is one command inside another session; end the session it belongs to.");
+});
+
 test("the confirmation names the session and every consequence, the reason is optional and the request carries the CSRF header", async () => {
   const calls = [];
   ui = await open({ ["POST /v1/admin/sessions/" + CAROL + "/terminate"]: (request) => (calls.push(request), json(204)) });

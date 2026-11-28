@@ -9,7 +9,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::control::Control;
 use crate::error::ControlError;
-use crate::killer::{KillReason, KillScope};
+use crate::killer::{KillReason, KillScope, connections};
 use crate::session_audit;
 use crate::token::hex_digest;
 
@@ -243,11 +243,12 @@ impl Control {
                 continue;
             };
             match sessions.close_active(id, kind, reason, now.secs).await {
-                Ok(Some(closed)) => {
-                    session_audit::closed(&closed, reason);
-                    cuts.of(verdict).push(closed);
+                Ok(closed) => {
+                    for session in &closed {
+                        session_audit::closed(session, reason);
+                    }
+                    cuts.of(verdict).extend(closed);
                 }
-                Ok(None) => {}
                 Err(err) => {
                     cuts.failure.get_or_insert(err);
                 }
@@ -255,9 +256,9 @@ impl Control {
         }
         let review = AccessReview {
             checked: services.len() + shells.len(),
-            withdrawn: cuts.withdrawn.len(),
-            changed: cuts.changed.len(),
-            service_removed: cuts.removed.len(),
+            withdrawn: connections(&cuts.withdrawn),
+            changed: connections(&cuts.changed),
+            service_removed: connections(&cuts.removed),
         };
         for (closed, verdict) in [
             (&cuts.withdrawn, Verdict::Withdrawn),

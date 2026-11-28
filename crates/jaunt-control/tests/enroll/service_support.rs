@@ -121,19 +121,24 @@ pub async fn stand() -> Stand {
 }
 
 pub async fn stand_with_policy(roles: &[String]) -> Stand {
-    stand_built(roles, None).await
+    stand_built(roles, None, false).await
 }
 
 pub async fn recording_stand(roles: &[String]) -> Stand {
-    stand_built(roles, Some(RecordingOptions::default())).await
+    stand_built(roles, Some(RecordingOptions::default()), false).await
 }
 
-async fn stand_built(roles: &[String], recordings: Option<RecordingOptions>) -> Stand {
+pub async fn web_recording_stand(roles: &[String]) -> Stand {
+    stand_built(roles, Some(RecordingOptions::default()), true).await
+}
+
+async fn stand_built(roles: &[String], recordings: Option<RecordingOptions>, web: bool) -> Stand {
     let harness = Harness::with(Options {
         services_domain: Some(DOMAIN),
         user_x509_root_age: Some(Duration::ZERO),
         db_client_root_age: Some(Duration::ZERO),
         recordings,
+        web,
         ..Options::default()
     })
     .await;

@@ -8,7 +8,7 @@ use tokio::time::MissedTickBehavior;
 use crate::authorize::DEFAULT_MAX_SESSION_SECS;
 use crate::control::Control;
 use crate::error::ControlError;
-use crate::killer::{KillReason, KillScope};
+use crate::killer::{KillReason, KillScope, connections};
 use crate::{revocation_audit, session_audit};
 
 pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -68,6 +68,7 @@ pub struct SessionSweep {
     pub revoked: usize,
     pub node_removed: usize,
     pub pruned: usize,
+    pub orphaned: usize,
 }
 
 impl Control {
@@ -146,14 +147,28 @@ impl Control {
         for revocation in &pruned {
             revocation_audit::removed(revocation, PRUNED_BY);
         }
+        let orphaned = match self.store.service_sessions().close_orphans(now.secs).await {
+            Ok(orphaned) => orphaned,
+            Err(err) => {
+                failure.get_or_insert(err);
+                Vec::new()
+            }
+        };
+        for child in &orphaned {
+            session_audit::closed(
+                child,
+                child.end_reason.unwrap_or(SessionEndReason::ParentEnded),
+            );
+        }
         if let Some(err) = failure {
             return Err(ControlError::Sessions(err));
         }
         Ok(SessionSweep {
-            expired: expired.len(),
+            expired: connections(&expired),
             revoked,
-            node_removed: removed.len(),
+            node_removed: connections(&removed),
             pruned: pruned.len(),
+            orphaned: orphaned.len(),
         })
     }
 
@@ -236,7 +251,7 @@ impl Control {
         self.mark_abandoned(&closed)
             .await
             .map_err(ControlError::Sessions)?;
-        Ok(closed.len())
+        Ok(connections(&closed))
     }
 
     pub async fn agent_gone(&self, node_id: &str) -> Result<usize, ControlError> {
@@ -256,7 +271,7 @@ impl Control {
         self.mark_abandoned(&closed)
             .await
             .map_err(ControlError::Sessions)?;
-        Ok(closed.len())
+        Ok(connections(&closed))
     }
 
     pub async fn close_sessions_of_earlier_runs(&self) -> Result<usize, ControlError> {
@@ -277,7 +292,7 @@ impl Control {
         self.mark_abandoned(&closed)
             .await
             .map_err(ControlError::Sessions)?;
-        Ok(closed.len())
+        Ok(connections(&closed))
     }
 
     async fn mark_abandoned(&self, closed: &[Session]) -> Result<(), StoreError> {

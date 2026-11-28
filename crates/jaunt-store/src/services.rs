@@ -4,8 +4,8 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-use crate::StoreError;
 use crate::nodes::{Labels, labels_to_text};
+use crate::{BEGIN_WRITE, StoreError};
 
 pub const MAX_SERVICE_PAGE: u32 = 200;
 pub const MAX_SERVICE_HISTORY: i64 = 8;
@@ -188,8 +188,6 @@ macro_rules! service_columns {
          revision, announced, approved_by, approved_at, created_at, last_seen_at"
     };
 }
-
-const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
 
 const GET: &str = concat!("SELECT ", service_columns!(), " FROM services WHERE id = ?");
 

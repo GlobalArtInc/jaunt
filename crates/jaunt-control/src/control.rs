@@ -22,6 +22,7 @@ use crate::admin::NodeAdmin;
 use crate::agent_events;
 use crate::audit::{self, SessionEnd};
 use crate::ca_snapshot::CaSnapshot;
+use crate::child_sessions::ChildSessions;
 use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
 use crate::device::{DeviceSettings, DeviceState};
 use crate::error::ControlError;
@@ -119,6 +120,7 @@ pub struct Inner {
     pub(crate) service_user_authorizations: RateLimiter<(String, String)>,
     pub(crate) service_authorizations: RateLimiter<String>,
     pub(crate) agent_events: agent_events::AgentEvents,
+    pub(crate) child_sessions: ChildSessions,
 }
 
 #[derive(Clone)]
@@ -248,6 +250,7 @@ impl Control {
                 service_user_authorizations: service_authorize::user_authorization_limiter(),
                 service_authorizations: service_authorize::authorization_limiter(),
                 agent_events: agent_events::AgentEvents::new(),
+                child_sessions: ChildSessions::new(),
             }),
         })
     }
@@ -411,6 +414,7 @@ impl Control {
         self.service_user_authorizations.sweep(tick);
         self.service_authorizations.sweep(tick);
         self.agent_events.sweep_limits(tick);
+        self.child_sessions.sweep(tick);
         let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {

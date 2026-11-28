@@ -17,6 +17,7 @@ mod recording;
 mod service;
 mod service_session;
 mod session;
+mod session_child;
 mod ssh_login;
 mod whoami;
 
@@ -95,6 +96,12 @@ pub use service_session::{
 pub use session::{
     AuthorizeDecision, AuthorizeRequest, AuthorizeResponse, DenyReason, NodeCaller, RouteDecision,
     RouteRequest, SessionEnd, SessionEndOutcome, SessionPermissions,
+};
+pub use session_child::{
+    AGENT_SESSION_CHILD_PATH, ChildSessionGrant, ChildSessionKind, ChildSessionRefusal,
+    ChildSessionRequest, KUBE_CHILD_SESSION_ID_HEX_LEN, KUBE_CHILD_SESSION_ID_PREFIX,
+    MAX_KUBE_CONTAINER_LEN, MAX_KUBE_NAMESPACE_LEN, MAX_KUBE_POD_LEN, is_kube_child_session_id,
+    is_kube_container_name, is_kube_namespace, is_kube_pod_name,
 };
 pub use ssh_login::{is_portable_login, is_valid_substituted_login};
 pub use whoami::WhoamiResponse;
