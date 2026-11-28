@@ -30,7 +30,11 @@ impl<'a> Query<'a> {
     }
 
     pub(crate) fn is_watch(&self) -> bool {
-        self.first("watch")
+        self.flag("watch")
+    }
+
+    pub(crate) fn flag(&self, key: &str) -> bool {
+        self.first(key)
             .is_some_and(|value| value != b"0" && !folds_to_false(&value))
     }
 
@@ -38,6 +42,10 @@ impl<'a> Query<'a> {
         let selector = String::from_utf8(self.first("fieldSelector")?).ok()?;
         exact_match(&selector, NAME_FIELD)
     }
+}
+
+pub fn query_flag(query: Option<&str>, key: &str) -> bool {
+    Query::parse(query).is_some_and(|query| query.flag(key))
 }
 
 fn folds_to_false(value: &[u8]) -> bool {
@@ -175,6 +183,33 @@ mod tests {
                 "selector {selector:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_flag_follows_the_first_value_like_the_api_server() {
+        for (raw, set) in [
+            (None, false),
+            (Some(""), false),
+            (Some("follow=true"), true),
+            (Some("follow=f"), true),
+            (Some("follow=no"), true),
+            (Some("follow"), true),
+            (Some("follow="), true),
+            (Some("follow=1"), true),
+            (Some("follow=0"), false),
+            (Some("follow=false"), false),
+            (Some("follow=fAlSe"), false),
+            (Some("follow=fal%C5%BFe"), false),
+            (Some("follow=false&follow=true"), false),
+            (Some("follow=true&follow=false"), true),
+            (Some("container=c&follow=true"), true),
+            (Some("follow=true;x=1"), false),
+            (Some("followx=true"), false),
+        ] {
+            assert_eq!(query_flag(raw, "follow"), set, "{raw:?}");
+        }
+        let over_limit = vec!["follow=true"; MAX_QUERY_PARAMETERS + 1].join("&");
+        assert!(!query_flag(Some(&over_limit), "follow"));
     }
 
     #[test]

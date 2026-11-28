@@ -27,7 +27,7 @@ pub use impersonation::{
     strip_client_headers,
 };
 pub use path::{ApiRequest, Discovery, NonResourceRequest, ResourceRequest, Verb, classify};
-pub use query::MAX_QUERY_PARAMETERS;
+pub use query::{MAX_QUERY_PARAMETERS, query_flag};
 pub use websocket::{
     Direction, MAX_CONTROL_PAYLOAD_BYTES, Opcode, WsError, WsMessage, WsReader, encode_frame,
 };

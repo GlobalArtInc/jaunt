@@ -649,8 +649,9 @@ fn the_documented_limits_are_the_built_in_ones() {
     assert_eq!(KUBE_LIMITS.token_check_every, Duration::from_secs(1));
     assert_eq!(
         (KUBE_LIMITS.slots_per_user, KUBE_LIMITS.slots_per_connection),
-        (64, 32)
+        (256, 128)
     );
+    assert_eq!(KUBE_LIMITS.slot_wait, Duration::from_secs(60));
     assert_eq!(KUBE_LIMITS.api_connection_window(), 100 * 128 * 1024);
     for (streams, window) in [
         (100, 128 * 1024),
@@ -771,6 +772,9 @@ fn only_watches_and_followed_logs_wait_for_their_head_without_a_limit() {
         (Method::GET, log, Some("container=c&follow=1"), true),
         (Method::GET, log, Some("follow=%74rue"), true),
         (Method::GET, log, Some("follow"), true),
+        (Method::GET, log, Some("follow=f"), true),
+        (Method::GET, log, Some("follow=fAlSe"), false),
+        (Method::GET, log, Some("follow=false&follow=true"), false),
         (Method::GET, log, Some("follow=false"), false),
         (Method::GET, log, Some("follow=0"), false),
         (Method::GET, log, Some("follow=true;x=1"), false),

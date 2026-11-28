@@ -104,6 +104,7 @@ async fn an_unusable_api_gives_502_without_details() {
         trusted: &pki,
         alpn: &[b"http/1.1"],
         tls12_only: false,
+        resumption: false,
     })
     .await;
     let no_alpn = FakeApi::start_options(FakeOptions {
@@ -111,6 +112,7 @@ async fn an_unusable_api_gives_502_without_details() {
         trusted: &pki,
         alpn: &[],
         tls12_only: false,
+        resumption: false,
     })
     .await;
     for (upstream, kind) in [
@@ -196,6 +198,7 @@ async fn an_api_that_speaks_only_tls_1_2_is_reached() {
         trusted: &pki,
         alpn: &[b"h2"],
         tls12_only: true,
+        resumption: false,
     })
     .await;
     let kube_api = Kube::with(Options {
@@ -302,6 +305,39 @@ async fn client_trailers_never_reach_the_api() {
         kube_api.api.trailers().is_empty(),
         "{:?}",
         kube_api.api.trailers()
+    );
+    session.cancel.cancel();
+    session.finished().await;
+}
+
+#[tokio::test]
+async fn every_new_connection_to_the_api_does_a_full_handshake() {
+    let pki = TestPki::new();
+    let api = FakeApi::start_options(FakeOptions {
+        serving: &pki,
+        trusted: &pki,
+        alpn: &[b"h2"],
+        tls12_only: false,
+        resumption: true,
+    })
+    .await;
+    let kube_api = Kube::with(Options {
+        upstream: Some(api.upstream()),
+        ..Options::default()
+    })
+    .await;
+    let mut session = kube_api.open(alice(), Alpn::H2).await;
+    let mut client = h2(session.take()).await;
+    assert_eq!(fetch(&mut client, "c").await.0, StatusCode::OK);
+    api.drop_connections();
+    eventually("the agent to see the dropped connection", || {
+        kube_api.handler.open_upstream_connections() == 0
+    })
+    .await;
+    assert_eq!(fetch(&mut client, "c").await.0, StatusCode::OK);
+    assert_eq!(
+        api.handshakes(),
+        [rustls::HandshakeKind::Full, rustls::HandshakeKind::Full]
     );
     session.cancel.cancel();
     session.finished().await;

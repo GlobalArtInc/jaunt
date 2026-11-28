@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -44,15 +45,22 @@ pub(crate) struct RequestBody {
     clock: Arc<dyn Clock>,
     timeout: Duration,
     idle: Option<BoxFuture<'static, ()>>,
+    stalled: Arc<AtomicBool>,
 }
 
 impl RequestBody {
-    pub(crate) fn new(inner: Incoming, clock: Arc<dyn Clock>, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        inner: Incoming,
+        clock: Arc<dyn Clock>,
+        timeout: Duration,
+        stalled: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner,
             clock,
             timeout,
             idle: None,
+            stalled,
         }
     }
 }
@@ -86,6 +94,7 @@ impl Body for RequestBody {
                         Box::pin(async move { clock.sleep_until(deadline).await })
                     });
                     if idle.as_mut().poll(cx).is_ready() {
+                        this.stalled.store(true, Ordering::Release);
                         return Poll::Ready(Some(Err(BodyError::Stalled)));
                     }
                     return Poll::Pending;

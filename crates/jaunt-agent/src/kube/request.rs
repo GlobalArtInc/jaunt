@@ -1,6 +1,6 @@
 use http::header::{HOST, TRANSFER_ENCODING, UPGRADE};
 use http::{HeaderMap, Method, Request, Version};
-use jaunt_kube::{ApiRequest, Verb};
+use jaunt_kube::{ApiRequest, Verb, query_flag};
 
 const DEFAULT_PORT: &str = "443";
 
@@ -179,26 +179,7 @@ pub(crate) fn answers_late(classified: &ApiRequest, query: Option<&str>) -> bool
     };
     match resource.verb() {
         Verb::Watch => true,
-        Verb::Log => query.is_some_and(follows),
+        Verb::Log => query_flag(query, "follow"),
         _ => false,
     }
-}
-
-fn follows(query: &str) -> bool {
-    query
-        .split('&')
-        .filter(|pair| !pair.contains(';'))
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = percent_decode(&key.replace('+', " ").into_bytes())?;
-            let value = percent_decode(&value.replace('+', " ").into_bytes())?;
-            Some((key, value))
-        })
-        .any(|(key, value)| {
-            key == b"follow"
-                && !matches!(
-                    value.as_slice(),
-                    b"0" | b"f" | b"F" | b"false" | b"FALSE" | b"False"
-                )
-        })
 }

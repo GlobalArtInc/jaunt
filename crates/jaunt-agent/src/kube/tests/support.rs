@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -198,6 +199,7 @@ struct ApiState {
     download_total: AtomicU64,
     download_produced: Arc<AtomicU64>,
     connections: Mutex<Vec<tokio::task::AbortHandle>>,
+    handshakes: Mutex<Vec<rustls::HandshakeKind>>,
 }
 
 #[derive(Debug)]
@@ -220,6 +222,7 @@ pub struct FakeOptions<'a> {
     pub trusted: &'a TestPki,
     pub alpn: &'a [&'a [u8]],
     pub tls12_only: bool,
+    pub resumption: bool,
 }
 
 pub struct FakeApi {
@@ -262,6 +265,7 @@ impl FakeApi {
             trusted,
             alpn: &[b"h2", b"http/1.1"],
             tls12_only: false,
+            resumption: false,
         })
         .await
     }
@@ -285,8 +289,10 @@ impl FakeApi {
                 .with_no_client_auth()
                 .with_cert_resolver(certificate.clone());
         config.alpn_protocols = options.alpn.iter().map(|alpn| alpn.to_vec()).collect();
-        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-        config.send_tls13_tickets = 0;
+        if !options.resumption {
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+        }
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -302,6 +308,7 @@ impl FakeApi {
             download_total: AtomicU64::new(0),
             download_produced: Arc::new(AtomicU64::new(0)),
             connections: Mutex::new(Vec::new()),
+            handshakes: Mutex::new(Vec::new()),
         });
         let shared = Arc::clone(&state);
         let accepting = tokio::spawn(async move {
@@ -315,6 +322,9 @@ impl FakeApi {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
+                    if let Some(kind) = tls.get_ref().1.handshake_kind() {
+                        state.handshakes.lock().unwrap().push(kind);
+                    }
                     let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
                     let service = service_fn(move |request: Request<Incoming>| {
                         let state = Arc::clone(&state);
@@ -370,6 +380,10 @@ impl FakeApi {
         self.state.seen.lock().unwrap().clone()
     }
 
+    pub fn handshakes(&self) -> Vec<rustls::HandshakeKind> {
+        self.state.handshakes.lock().unwrap().clone()
+    }
+
     pub fn open_watches(&self) -> usize {
         self.state
             .watchers
@@ -398,7 +412,13 @@ impl FakeApi {
         let watchers = self.state.watchers.lock().unwrap().clone();
         assert!(!watchers.is_empty(), "no watch is open");
         for watcher in watchers {
-            drop(watcher.send(Bytes::from(format!("{event}\n"))).await);
+            drop(
+                soon(
+                    "a watch event to be queued",
+                    watcher.send(Bytes::from(format!("{event}\n"))),
+                )
+                .await,
+            );
         }
     }
 
@@ -768,7 +788,10 @@ impl Kube {
         let accepting = TlsAcceptor::from(Arc::new(server)).accept(Box::new(agent_io) as Transport);
         let connecting = TlsConnector::from(Arc::new(client))
             .connect(ServerName::try_from(DNS_NAME).unwrap(), client_io);
-        let (accepted, connected) = tokio::join!(accepting, connecting);
+        let (accepted, connected) = soon("the TLS handshake with the handler", async {
+            tokio::join!(accepting, connecting)
+        })
+        .await;
         let accepted = accepted.unwrap();
         let alpn = accepted.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         let connection = ServiceConnection {
@@ -813,36 +836,70 @@ impl Kube {
     }
 }
 
-pub type H2 = hyper::client::conn::http2::SendRequest<TestBody>;
-pub type H1 = hyper::client::conn::http1::SendRequest<TestBody>;
+#[derive(Clone)]
+pub struct H2(hyper::client::conn::http2::SendRequest<TestBody>);
+
+impl H2 {
+    pub fn send_request(
+        &mut self,
+        request: Request<TestBody>,
+    ) -> impl Future<Output = Result<Response<Incoming>, hyper::Error>> + use<> {
+        let sent = self.0.send_request(request);
+        async move { soon("a response head", sent).await }
+    }
+}
+
+pub struct H1(hyper::client::conn::http1::SendRequest<TestBody>);
+
+impl H1 {
+    pub fn send_request(
+        &mut self,
+        request: Request<TestBody>,
+    ) -> impl Future<Output = Result<Response<Incoming>, hyper::Error>> + use<> {
+        let sent = self.0.send_request(request);
+        async move { soon("a response head", sent).await }
+    }
+}
 
 pub async fn h2(tls: TlsStream<DuplexStream>) -> H2 {
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .initial_stream_window_size(256 * 1024)
-        .initial_connection_window_size(1024 * 1024)
-        .handshake(TokioIo::new(tls))
-        .await
-        .unwrap();
+    h2_windowed(tls, 256 * 1024).await
+}
+
+pub async fn h2_windowed(tls: TlsStream<DuplexStream>, stream_window: u32) -> H2 {
+    let (sender, connection) = soon(
+        "the HTTP/2 handshake",
+        hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .initial_stream_window_size(stream_window)
+            .initial_connection_window_size(1024 * 1024)
+            .handshake(TokioIo::new(tls)),
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move { drop(connection.await) });
-    sender
+    H2(sender)
 }
 
 pub async fn h2_watched(
     tls: TlsStream<DuplexStream>,
 ) -> (H2, JoinHandle<Result<(), hyper::Error>>) {
-    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake(TokioIo::new(tls))
-        .await
-        .unwrap();
-    (sender, tokio::spawn(connection))
+    let (sender, connection) = soon(
+        "the HTTP/2 handshake",
+        hyper::client::conn::http2::Builder::new(TokioExecutor::new()).handshake(TokioIo::new(tls)),
+    )
+    .await
+    .unwrap();
+    (H2(sender), tokio::spawn(connection))
 }
 
 pub async fn h1(tls: TlsStream<DuplexStream>) -> H1 {
-    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-        .await
-        .unwrap();
+    let (sender, connection) = soon(
+        "the HTTP/1.1 handshake",
+        hyper::client::conn::http1::handshake(TokioIo::new(tls)),
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move { drop(connection.await) });
-    sender
+    H1(sender)
 }
 
 pub fn h2_request(method: Method, path: &str, body: TestBody) -> Request<TestBody> {
@@ -880,9 +937,16 @@ pub fn message(body: &str) -> String {
 }
 
 pub async fn raw_exchange(tls: &mut TlsStream<DuplexStream>, request: &[u8]) -> (u16, String) {
-    tls.write_all(request).await.unwrap();
-    tls.flush().await.unwrap();
+    write_all(tls, request).await;
     read_response(tls).await
+}
+
+pub async fn write_all(tls: &mut TlsStream<DuplexStream>, bytes: &[u8]) {
+    soon("the request to be written", async {
+        tls.write_all(bytes).await.unwrap();
+        tls.flush().await.unwrap();
+    })
+    .await;
 }
 
 pub async fn read_response(tls: &mut TlsStream<DuplexStream>) -> (u16, String) {

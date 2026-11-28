@@ -1,23 +1,25 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use http::{Method, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use jaunt_proto::{ServiceAccess, ServiceOutcome, TrustRole};
+use jaunt_tunnel::BoxFuture;
 use jaunt_tunnel::{ServiceName, SessionId, StreamKind, StreamMeta};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncReadExt, DuplexStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use super::support::{
-    FakeApi, PODS, SESSION, TestBody, alice, body_text, h2, h2_request, h2_watched,
+    CONFIGMAPS, FakeApi, PODS, SESSION, TestBody, alice, body_text, h1, h1_request, h2, h2_request,
+    h2_watched, h2_windowed, write_all,
 };
-use crate::clock::Clock;
-use crate::clock::unix_secs;
-use crate::kube::{KUBE_LIMITS, KubeHandler, KubeParts, declares_kubernetes};
+use crate::clock::{Clock, unix_secs};
+use crate::kube::{KUBE_LIMITS, KubeHandler, KubeLimits, KubeParts, declares_kubernetes};
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
 use crate::runtime::directory::ServiceDirectory;
 use crate::runtime::events::{EventSink, SINK_LIMITS};
@@ -51,12 +53,38 @@ struct Opened {
     serving: JoinHandle<()>,
 }
 
+struct FailingClock {
+    inner: Arc<ManualClock>,
+    armed: AtomicBool,
+}
+
+impl Clock for FailingClock {
+    fn now(&self) -> SystemTime {
+        assert!(
+            !self.armed.swap(false, Ordering::SeqCst),
+            "the handler clock fails on purpose"
+        );
+        self.inner.now()
+    }
+
+    fn sleep_until(&self, deadline: SystemTime) -> BoxFuture<'_, ()> {
+        self.inner.sleep_until(deadline)
+    }
+}
+
 impl Stand {
     async fn new() -> Self {
+        let clock = ManualClock::new(SystemTime::now());
+        Self::with(clock.clone(), clock, KUBE_LIMITS).await
+    }
+
+    async fn with(
+        clock: Arc<ManualClock>,
+        handler_clock: Arc<dyn Clock>,
+        limits: KubeLimits,
+    ) -> Self {
         let api = FakeApi::start().await;
-        let start = SystemTime::now();
-        let now = unix_secs(start);
-        let clock = ManualClock::new(start);
+        let now = unix_secs(clock.now());
         let pki = Arc::new(TestPki::new());
         let ca = UserCa::new(now);
         let services = vec![
@@ -75,8 +103,8 @@ impl Stand {
         let handler = KubeHandler::new(KubeParts {
             upstream: &api.upstream(),
             services: &local,
-            clock: clock.clone(),
-            limits: KUBE_LIMITS,
+            clock: handler_clock,
+            limits,
         })
         .unwrap();
         let mut handlers = HandlerRegistry::default();
@@ -134,9 +162,12 @@ impl Stand {
         });
         let user = self.ca.issue(&UserSpec::valid(self.now));
         let config = client_config(&self.pki, Some(&user), &[alpn]);
-        let tls = handshake(client, &dns_name(StreamKind::Kube, "prod-eu"), config)
-            .await
-            .unwrap();
+        let tls = soon(
+            "the TLS handshake through the runtime",
+            handshake(client, &dns_name(StreamKind::Kube, "prod-eu"), config),
+        )
+        .await
+        .unwrap();
         Opened {
             tls,
             cancel,
@@ -249,7 +280,7 @@ async fn the_granted_duration_ends_a_watch_cleanly_and_both_reports_agree() {
         "GET {PODS}?watch=1 HTTP/1.1\r\nHost: {}\r\n\r\n",
         dns_name(StreamKind::Kube, "prod-eu")
     );
-    opened.tls.write_all(request.as_bytes()).await.unwrap();
+    write_all(&mut opened.tls, request.as_bytes()).await;
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -276,4 +307,85 @@ async fn the_granted_duration_ends_a_watch_cleanly_and_both_reports_agree() {
         .unwrap();
     assert_eq!(stand.control.ends()[0].outcome, ServiceOutcome::MaxDuration);
     assert_eq!(stand.end_reason().await, "max_duration");
+}
+
+#[tokio::test]
+async fn a_panicking_handler_reports_an_upstream_error_in_the_event_and_the_end() {
+    let clock = ManualClock::new(SystemTime::now());
+    let failing = Arc::new(FailingClock {
+        inner: clock.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let stand = Stand::with(clock, failing.clone(), KUBE_LIMITS).await;
+    let opened = stand.open(alice(), 600, b"http/1.1").await;
+    let mut client = h1(opened.tls).await;
+    failing.armed.store(true, Ordering::SeqCst);
+    let failed = client
+        .send_request(h1_request(
+            Method::GET,
+            &format!("{CONFIGMAPS}/c"),
+            TestBody::empty(),
+        ))
+        .await;
+    assert!(failed.is_err(), "{failed:?}");
+    soon("the runtime to end the session", opened.serving)
+        .await
+        .unwrap();
+    assert_eq!(
+        stand.control.ends()[0].outcome,
+        ServiceOutcome::UpstreamError
+    );
+    assert_eq!(stand.end_reason().await, "upstream_error");
+}
+
+#[tokio::test]
+async fn a_handler_cut_after_its_grace_time_still_reports_its_end_before_the_runtime() {
+    let clock = ManualClock::new(SystemTime::now());
+    let limits = KubeLimits {
+        shutdown_grace: Duration::from_secs(5),
+        ..KUBE_LIMITS
+    };
+    let stand = Stand::with(clock.clone(), clock, limits).await;
+    stand.api.serve_download(64 * 1024 * 1024);
+    let opened = stand.open(alice(), 600, b"h2").await;
+    let mut client = h2_windowed(opened.tls, 16 * 1024).await;
+    let response = client
+        .send_request(h2_request(
+            Method::GET,
+            &format!("{CONFIGMAPS}/big"),
+            TestBody::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cancelled = Instant::now();
+    opened.cancel.cancel();
+    soon("the runtime to end the session", opened.serving)
+        .await
+        .unwrap();
+    let waited = cancelled.elapsed();
+    assert!(
+        waited >= crate::runtime::HANDLER_STOP_GRACE && waited < limits.shutdown_grace,
+        "{waited:?}"
+    );
+    let calls = stand.control.calls();
+    let end_at = calls.iter().position(|call| *call == "end").unwrap();
+    let sent_before = calls[..end_at]
+        .iter()
+        .filter(|call| **call == "events")
+        .count();
+    let with_end = stand
+        .control
+        .batches()
+        .iter()
+        .position(|batch| {
+            batch
+                .events
+                .iter()
+                .any(|event| event.name == "kube.session.end")
+        })
+        .expect("no kube.session.end was sent");
+    assert!(with_end < sent_before, "{calls:?}");
+    assert_eq!(stand.end_reason().await, "closed");
+    drop(response);
 }

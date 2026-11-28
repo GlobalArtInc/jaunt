@@ -4,6 +4,7 @@ use std::future::{Future, pending};
 use std::net::IpAddr;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use http::header::AUTHORIZATION;
 use http::{Request, Response, Version};
@@ -62,9 +63,13 @@ struct SessionGuard {
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.stopping.cancel();
-        let outcome = self
-            .outcome
-            .unwrap_or_else(|| self.reason.decide(ServiceOutcome::Closed));
+        let outcome = self.outcome.unwrap_or_else(|| {
+            self.reason.decide(if std::thread::panicking() {
+                ServiceOutcome::UpstreamError
+            } else {
+                ServiceOutcome::Closed
+            })
+        });
         self.audit
             .end(outcome, self.counts.read(), self.counts.written());
     }
@@ -288,10 +293,12 @@ impl Connection {
         let Some(lease) = self.slots.lease(&shared.users) else {
             return status::too_many(shared.limits);
         };
+        let stalled = Arc::new(AtomicBool::new(false));
         let body = RequestBody::new(
             body,
             Arc::clone(&shared.clock),
             shared.limits.progress_timeout,
+            Arc::clone(&stalled),
         );
         let mut forwarded = Request::new(body);
         *forwarded.method_mut() = parts.method;
@@ -300,6 +307,20 @@ impl Connection {
         *forwarded.headers_mut() = headers;
         forwarded.headers_mut().insert(AUTHORIZATION, bearer);
         let clock = &shared.clock;
+        let now = clock.now();
+        let slot_deadline = now.checked_add(shared.limits.slot_wait).unwrap_or(now);
+        let reserved = tokio::select! {
+            biased;
+            () = self.stopping.cancelled() => return status::ending(),
+            () = clock.sleep_until(slot_deadline) => return status::busy(),
+            reserved = upstream.reserve() => match reserved {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    upstream.log_failure(&error);
+                    return status::unreachable();
+                }
+            },
+        };
         let now = clock.now();
         let deadline = now.checked_add(shared.limits.head_timeout).unwrap_or(now);
         let head_timeout = async {
@@ -313,7 +334,7 @@ impl Connection {
             biased;
             () = self.stopping.cancelled() => status::ending(),
             () = head_timeout => status::timeout(),
-            sent = upstream.send(forwarded) => match sent {
+            sent = upstream.send(reserved, forwarded) => match sent {
                 Ok((response, slot)) => {
                     let (mut head, body) = response.into_parts();
                     head.version = Version::HTTP_11;
@@ -328,6 +349,13 @@ impl Connection {
                             shared.limits.progress_timeout,
                         ),
                     )
+                }
+                Err(_) if stalled.load(Ordering::Acquire) => {
+                    tracing::debug!(
+                        target: "jaunt::agent",
+                        "a client stopped sending its request body for too long; the request was reset"
+                    );
+                    status::client_stalled()
                 }
                 Err(error) => {
                     upstream.log_failure(&error);

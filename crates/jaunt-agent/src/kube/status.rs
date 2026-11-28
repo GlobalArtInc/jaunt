@@ -1,4 +1,4 @@
-use http::header::{CONTENT_TYPE, HeaderValue};
+use http::header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use http::{Response, StatusCode};
 
 use super::KubeLimits;
@@ -17,6 +17,9 @@ const SEVERAL_USERS: &str = "only one user can be chosen with --as";
 const UNREACHABLE: &str = "the Kubernetes API server cannot be reached through the Jaunt agent";
 const TIMEOUT: &str = "the Kubernetes API server did not answer in time";
 const ENDING: &str = "the session is ending";
+const BUSY: &str =
+    "every connection from the Jaunt agent to the Kubernetes API server is busy; try again";
+const CLIENT_STALLED: &str = "the client stopped sending the request body for too long";
 
 fn status(code: StatusCode, reason: &str, message: &str) -> Response<ProxyBody> {
     let body = serde_json::json!({
@@ -101,12 +104,35 @@ pub(crate) fn refused(refused: Refused, decision: &Decision) -> Response<ProxyBo
     status(StatusCode::FORBIDDEN, "Forbidden", &message)
 }
 
+fn retry_soon(mut response: Response<ProxyBody>) -> Response<ProxyBody> {
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 pub(crate) fn too_many(limits: KubeLimits) -> Response<ProxyBody> {
     let message = format!(
         "too many requests are open at once through Jaunt: at most {} per user and {} per connection; finish or close some watches, log streams or downloads",
         limits.slots_per_user, limits.slots_per_connection
     );
-    status(StatusCode::TOO_MANY_REQUESTS, "TooManyRequests", &message)
+    retry_soon(status(
+        StatusCode::TOO_MANY_REQUESTS,
+        "TooManyRequests",
+        &message,
+    ))
+}
+
+pub(crate) fn busy() -> Response<ProxyBody> {
+    retry_soon(status(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable",
+        BUSY,
+    ))
+}
+
+pub(crate) fn client_stalled() -> Response<ProxyBody> {
+    status(StatusCode::REQUEST_TIMEOUT, "Timeout", CLIENT_STALLED)
 }
 
 pub(crate) fn unreachable() -> Response<ProxyBody> {

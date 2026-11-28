@@ -9,7 +9,7 @@ use jaunt_proto::ServiceOutcome;
 
 use super::support::{
     Alpn, CONFIGMAPS, Kube, Options, PODS, Session, TestBody, USER_B, alice, body_text, h1,
-    h1_request, h2, h2_request, pattern_sum,
+    h1_request, h2, h2_request, h2_windowed, pattern_sum,
 };
 use crate::clock::Clock;
 use crate::kube::{KUBE_LIMITS, KubeLimits};
@@ -266,7 +266,7 @@ async fn a_client_that_stops_sending_its_body_loses_the_request() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     eventually("the API to see the reset", || {
         kube_api.api.upload_failures() == 1
     })
@@ -304,6 +304,98 @@ async fn a_followed_log_waits_for_its_head_without_the_head_timeout() {
     let (status, body) = body_text(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "log line 1\n");
+    session.cancel.cancel();
+    session.finished().await;
+}
+
+#[tokio::test]
+async fn an_upload_with_pauses_shorter_than_the_progress_time_finishes() {
+    let limits = KubeLimits {
+        progress_timeout: Duration::from_secs(30),
+        head_timeout: Duration::from_secs(600),
+        ..KUBE_LIMITS
+    };
+    let kube_api = Kube::with(Options {
+        limits,
+        ..Options::default()
+    })
+    .await;
+    kube_api.api.open_uploads();
+    let mut session = kube_api.open(alice(), Alpn::H2).await;
+    let mut client = h2(session.take()).await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let sending = tokio::spawn(client.send_request(h2_request(
+        Method::PUT,
+        &format!("{CONFIGMAPS}/upload"),
+        TestBody::Channel(receiver),
+    )));
+    for part in 1..=5_u64 {
+        soon(
+            "a part to be queued",
+            sender.send(bytes::Bytes::from_static(b"0123456789")),
+        )
+        .await
+        .unwrap();
+        eventually("the part to reach the API", || {
+            kube_api.api.upload_received() == part * 10
+        })
+        .await;
+        let idle_deadline = kube_api.clock.now() + limits.progress_timeout;
+        kube_api.clock.wait_for_sleeper(idle_deadline).await;
+        kube_api.clock.advance(Duration::from_secs(20));
+    }
+    drop(sender);
+    let response = soon("the upload to finish", sending)
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, body) = body_text(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.starts_with("{\"bytes\":50,"), "{body}");
+    assert_eq!(kube_api.api.upload_failures(), 0);
+    session.cancel.cancel();
+    session.finished().await;
+}
+
+#[tokio::test]
+async fn a_slow_but_steady_reader_keeps_its_stream() {
+    let limits = KubeLimits {
+        progress_timeout: Duration::from_secs(30),
+        ..KUBE_LIMITS
+    };
+    let kube_api = Kube::with(Options {
+        limits,
+        ..Options::default()
+    })
+    .await;
+    kube_api.api.serve_download(TOTAL);
+    let mut session = kube_api.open(alice(), Alpn::H2).await;
+    let mut client = h2_windowed(session.take(), 16 * 1024).await;
+    let response = client
+        .send_request(h2_request(
+            Method::GET,
+            &format!("{CONFIGMAPS}/big"),
+            TestBody::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    for _ in 0..5 {
+        for _ in 0..2 {
+            let frame = soon("a frame", body.frame()).await;
+            assert!(
+                matches!(frame, Some(Ok(_))),
+                "the slow reader was cut: {frame:?}"
+            );
+        }
+        kube_api.clock.advance(Duration::from_secs(20));
+    }
+    let frame = soon("a frame", body.frame()).await;
+    assert!(
+        matches!(frame, Some(Ok(_))),
+        "the slow reader was cut: {frame:?}"
+    );
     session.cancel.cancel();
     session.finished().await;
 }

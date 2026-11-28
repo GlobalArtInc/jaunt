@@ -9,6 +9,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2::{Builder, SendRequest};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use jaunt_limits::LogThrottle;
+use rustls::client::Resumption;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::version::{TLS12, TLS13};
@@ -134,6 +135,8 @@ struct Lane {
     slots: Arc<Semaphore>,
 }
 
+pub(crate) struct Reserved(OwnedSemaphorePermit);
+
 pub(crate) struct Slot {
     _total: OwnedSemaphorePermit,
     _lane: OwnedSemaphorePermit,
@@ -256,24 +259,33 @@ impl Upstream {
         lanes.len()
     }
 
+    pub(crate) async fn reserve(&self) -> Result<Reserved, UpstreamError> {
+        Arc::clone(&self.pool.total)
+            .acquire_owned()
+            .await
+            .map(Reserved)
+            .map_err(|_| UpstreamError::PoolClosed)
+    }
+
     pub(crate) async fn send(
         &self,
+        reserved: Reserved,
         request: Request<RequestBody>,
     ) -> Result<(Response<Incoming>, Slot), UpstreamError> {
-        let (lane, slot) = self.acquire().await?;
+        let (lane, permit) = self.lane().await?;
         let mut sender = lane.sender.clone();
         match sender.try_send_request(request).await {
-            Ok(response) => Ok((response, slot)),
+            Ok(response) => Ok((response, slot(reserved.0, permit))),
             Err(mut failed) => {
                 let Some(request) = failed.take_message() else {
                     return Err(UpstreamError::Request(failed.into_error()));
                 };
                 self.pool.retire(&lane);
-                drop(slot);
-                let (lane, slot) = self.acquire().await?;
+                drop(permit);
+                let (lane, permit) = self.lane().await?;
                 let mut sender = lane.sender.clone();
                 match sender.try_send_request(request).await {
-                    Ok(response) => Ok((response, slot)),
+                    Ok(response) => Ok((response, slot(reserved.0, permit))),
                     Err(failed) => {
                         if sender.is_closed() {
                             self.pool.retire(&lane);
@@ -285,17 +297,13 @@ impl Upstream {
         }
     }
 
-    async fn acquire(&self) -> Result<(Arc<Lane>, Slot), UpstreamError> {
-        let total = Arc::clone(&self.pool.total)
-            .acquire_owned()
-            .await
-            .map_err(|_| UpstreamError::PoolClosed)?;
-        if let Some((lane, permit)) = self.pool.free_lane() {
-            return Ok((lane, slot(total, permit)));
+    async fn lane(&self) -> Result<(Arc<Lane>, OwnedSemaphorePermit), UpstreamError> {
+        if let Some(found) = self.pool.free_lane() {
+            return Ok(found);
         }
         let _opening = self.pool.opening.lock().await;
-        if let Some((lane, permit)) = self.pool.free_lane() {
-            return Ok((lane, slot(total, permit)));
+        if let Some(found) = self.pool.free_lane() {
+            return Ok(found);
         }
         if !self.pool.has_room() {
             return Err(UpstreamError::PoolFull);
@@ -309,7 +317,7 @@ impl Upstream {
             .try_acquire_owned()
             .map_err(|_| UpstreamError::PoolFull)?;
         self.pool.lanes().push(Arc::clone(&lane));
-        Ok((lane, slot(total, permit)))
+        Ok((lane, permit))
     }
 
     fn tls(&self) -> Result<Arc<ClientConfig>, UpstreamError> {
@@ -456,5 +464,6 @@ fn client_config(ca_file: &Path) -> Result<ClientConfig, UpstreamError> {
             .with_root_certificates(roots)
             .with_no_client_auth();
     config.alpn_protocols = vec![ALPN_H2.to_vec()];
+    config.resumption = Resumption::disabled();
     Ok(config)
 }
