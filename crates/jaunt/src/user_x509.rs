@@ -97,6 +97,8 @@ pub enum X509Error {
     TooLarge { path: PathBuf },
     #[error("{path} is not an Ed25519 key written by jaunt; remove it to have a new key made")]
     CorruptKey { path: PathBuf },
+    #[error("{path} is missing or does not match the key: run `jaunt login` again")]
+    UnusableCertificate { path: PathBuf },
     #[error("cannot generate a key: the system entropy source failed")]
     Entropy,
     #[error("this server does not issue X.509 certificates")]
@@ -213,6 +215,56 @@ pub struct Expected<'a> {
 pub struct IssuedCertificate {
     pub der: Vec<u8>,
     pub valid_before: i64,
+}
+
+pub struct X509Identity {
+    certificate_der: Vec<u8>,
+    key_pkcs8: Zeroizing<Vec<u8>>,
+}
+
+impl X509Identity {
+    pub fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    pub fn key_pkcs8(&self) -> &[u8] {
+        &self.key_pkcs8
+    }
+}
+
+impl fmt::Debug for X509Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("X509Identity")
+            .field("certificate_bytes", &self.certificate_der.len())
+            .field("key", &"[redacted]")
+            .finish()
+    }
+}
+
+pub fn load_identity(
+    store: &ProfileStore,
+    lock: &ProfileLock,
+    certificate: &UserCertificate,
+) -> Result<X509Identity, X509Error> {
+    if lock.path() != store.lock_path() {
+        return Err(X509Error::ForeignLock);
+    }
+    let key = load_key(&certificate.key_path)?.ok_or_else(|| X509Error::CorruptKey {
+        path: certificate.key_path.clone(),
+    })?;
+    let unusable = || X509Error::UnusableCertificate {
+        path: certificate.certificate_path.clone(),
+    };
+    let pem = read_file(&certificate.certificate_path, Secrecy::Public)?.ok_or_else(unusable)?;
+    let der = pem_decode(CERTIFICATE_LABEL, &pem).ok_or_else(unusable)?;
+    let (rest, parsed) = X509Certificate::from_der(&der).map_err(|_| unusable())?;
+    if !rest.is_empty() || parsed.public_key().raw != key.spki_der() {
+        return Err(unusable());
+    }
+    Ok(X509Identity {
+        certificate_der: der.to_vec(),
+        key_pkcs8: key.pkcs8.clone(),
+    })
 }
 
 pub fn ensure_x509(
@@ -811,6 +863,42 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_loaded_identity_needs_this_profile_lock_and_a_certificate_for_the_stored_key() {
+        let fixture = Fixture::new(SSH_END);
+        let issued = fixture
+            .ensure(&Scripted::shaped(Shape::honest(SSH_END)))
+            .unwrap();
+
+        let identity = super::load_identity(&fixture.store, &fixture.lock, &issued).unwrap();
+
+        assert!(!identity.certificate_der().is_empty());
+        assert_eq!(identity.key_pkcs8().len(), 48);
+        assert!(format!("{identity:?}").contains("[redacted]"));
+        let home = fixture.store.home();
+        let other = ProfileLock::acquire(
+            home,
+            &home.join(".other.lock"),
+            Instant::now() + Duration::from_secs(5),
+            &mut || {},
+        )
+        .unwrap();
+        assert!(matches!(
+            super::load_identity(&fixture.store, &other, &issued),
+            Err(X509Error::ForeignLock)
+        ));
+        fs::remove_file(fixture.key_path()).unwrap();
+        super::install_key(
+            &fixture.store.x509_dir(),
+            super::UserKey::generate().unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::load_identity(&fixture.store, &fixture.lock, &issued),
+            Err(X509Error::UnusableCertificate { .. })
+        ));
     }
 
     #[test]

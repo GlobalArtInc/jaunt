@@ -69,6 +69,23 @@ impl TestCa {
         self.issuer.der().to_vec()
     }
 
+    pub fn key_der(&self) -> Vec<u8> {
+        self.issuer.key().serialize_der()
+    }
+
+    pub fn client_leaf(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("urn:jaunt:user:{}", crate::support::USER_ID)
+                .try_into()
+                .unwrap(),
+        )];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &*self.issuer).unwrap();
+        (certificate.der().to_vec(), key.serialize_der())
+    }
+
     pub fn pem(&self) -> String {
         self.issuer.pem()
     }
@@ -108,7 +125,7 @@ pub fn gate_config(ca: &TestCa, tls12_only: bool, alpn: &[&str]) -> ServerConfig
     leaf_config(ca.server_leaf(GATE_NAME), tls12_only, alpn)
 }
 
-fn leaf_config((chain, key): Leaf, tls12_only: bool, alpn: &[&str]) -> ServerConfig {
+pub fn leaf_config((chain, key): Leaf, tls12_only: bool, alpn: &[&str]) -> ServerConfig {
     let versions: &[&rustls::SupportedProtocolVersion] =
         if tls12_only { &[&TLS12] } else { &[&TLS13] };
     let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))

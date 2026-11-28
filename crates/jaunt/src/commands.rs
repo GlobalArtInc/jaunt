@@ -1,8 +1,10 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -18,7 +20,9 @@ use crate::agent::SshAgent;
 use crate::browser::SystemBrowser;
 use crate::client::{ApiClient, ApiError, is_missing_route};
 use crate::consent::TerminalPrompt;
+use crate::db::{self, ConnectRequest};
 use crate::ensure::{EnsureIo, EnsureRequest, RenewOptions, SIGN_IN_DEADLINE};
+use crate::local_listen::parse_loopback;
 use crate::login::{LoginOptions, LoginPorts, SshSetup, lock_profile, login};
 use crate::logout::logout;
 use crate::ls::{
@@ -29,10 +33,13 @@ use crate::profile::{ProfileName, resolve_home};
 use crate::proxy::proxy_ssh;
 use crate::secret::Secret;
 use crate::server_url::ServerUrl;
+use crate::service_dial::{ServiceDialer, ServiceName, service_gate_for};
+use crate::service_identity::ProfileIdentity;
 use crate::ssh_config::{EnsureCommand, validate};
 use crate::ssh_include::{IncludeTarget, include_line};
 use crate::status::{Session, agent_view, check_online, render, ssh_view};
 use crate::store::ProfileStore;
+use crate::tcp_service::proxy_tcp;
 
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -158,6 +165,112 @@ pub enum ProxyCommand {
         about = "Connect standard input and output to the SSH gateway over TLS (ssh runs this through the generated ssh_config)"
     )]
     Ssh(ProxySshArgs),
+    #[command(
+        about = "Listen on 127.0.0.1 and ::1 and pass each connection to a TCP service through the gateway"
+    )]
+    Tcp(ProxyTcpArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProxyTcpArgs {
+    #[arg(
+        value_name = "SERVICE",
+        help = "The TCP service, as `jaunt ls --kind tcp` names it"
+    )]
+    pub service: ServiceName,
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(
+        long,
+        value_name = "PORT",
+        help = "The local port (default: one the system picks, printed at start)"
+    )]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DbCommand {
+    #[command(about = "List the databases you may reach (the same as `jaunt ls --kind db`)")]
+    Ls(DbLsArgs),
+    #[command(
+        about = "Listen on a private socket (or loopback with --tcp) and pass each connection to a database through the gateway"
+    )]
+    Proxy(DbProxyArgs),
+    #[command(about = "Run psql against a database through the gateway")]
+    Connect(DbConnectArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DbLsArgs {
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct DbProxyArgs {
+    #[arg(value_name = "NAME", help = "The database, as `jaunt db ls` names it")]
+    pub name: ServiceName,
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(
+        long,
+        value_name = "PORT",
+        num_args = 0..=1,
+        default_missing_value = "127.0.0.1:0",
+        value_parser = parse_loopback,
+        help = "Listen on 127.0.0.1 or ::1 instead of the private socket (every local user can connect)"
+    )]
+    pub tcp: Option<SocketAddr>,
+}
+
+#[derive(Debug, Args)]
+pub struct DbConnectArgs {
+    #[arg(value_name = "NAME", help = "The database, as `jaunt db ls` names it")]
+    pub name: ServiceName,
+    #[arg(
+        long,
+        value_name = "NAME",
+        env = "JAUNT_PROFILE",
+        default_value = "default"
+    )]
+    pub profile: ProfileName,
+    #[arg(
+        long,
+        value_name = "DB_USER",
+        value_parser = non_empty,
+        help = "The database role (default: psql's own)"
+    )]
+    pub user: Option<String>,
+    #[arg(
+        long,
+        value_name = "DB",
+        value_parser = non_empty,
+        help = "The database name (default: psql's own)"
+    )]
+    pub database: Option<String>,
+    #[arg(
+        last = true,
+        value_name = "PSQL_ARGS",
+        help = "More arguments for psql, after --, passed as they are"
+    )]
+    pub psql_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -303,6 +416,14 @@ pub struct LogoutArgs {
         default_value = "default"
     )]
     pub profile: ProfileName,
+}
+
+fn non_empty(text: &str) -> Result<String, String> {
+    if text.is_empty() {
+        Err("must not be empty: leave the option out to use psql's default".to_owned())
+    } else {
+        Ok(text.to_owned())
+    }
 }
 
 fn usage_error(message: impl std::fmt::Display) -> ExitCode {
@@ -579,6 +700,109 @@ pub fn run_ensure(args: &EnsureArgs, environment: &Environment) -> ExitCode {
 pub fn run_proxy(command: &ProxyCommand, environment: &Environment) -> ExitCode {
     match command {
         ProxyCommand::Ssh(args) => run_proxy_ssh(args, environment),
+        ProxyCommand::Tcp(args) => run_proxy_tcp(args, environment),
+    }
+}
+
+fn profile_identity(
+    environment: &Environment,
+    home: &Path,
+    profile: &ProfileName,
+    interactive: bool,
+) -> ProfileIdentity {
+    ProfileIdentity {
+        renew: RenewOptions {
+            ssh: ensure_ssh_setup(environment, home),
+            custom_home: custom_home(environment, home).is_some(),
+            home: home.to_owned(),
+            profile: profile.clone(),
+            deadline: SIGN_IN_DEADLINE,
+        },
+        interactive,
+        ssh_auth_sock: environment.ssh_auth_sock.clone(),
+        clock: SystemTime::now,
+    }
+}
+
+struct ServiceSetup {
+    store: ProfileStore,
+    dialer: Arc<ServiceDialer>,
+}
+
+fn service_setup(
+    profile: &ProfileName,
+    environment: &Environment,
+    interactive_later: bool,
+) -> Result<ServiceSetup, ExitCode> {
+    let home = home_for(environment)?;
+    let store = ProfileStore::new(&home, profile);
+    service_gate_for(&store, profile, now_secs()?).map_err(failure)?;
+    let interactive = io::stdin().is_terminal();
+    profile_identity(environment, &home, profile, interactive)
+        .load_at_start()
+        .map_err(failure)?;
+    let identity = profile_identity(
+        environment,
+        &home,
+        profile,
+        interactive && interactive_later,
+    );
+    Ok(ServiceSetup {
+        store,
+        dialer: Arc::new(ServiceDialer::new(Arc::new(identity))),
+    })
+}
+
+fn run_proxy_tcp(args: &ProxyTcpArgs, environment: &Environment) -> ExitCode {
+    let setup = match service_setup(&args.profile, environment, true) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    match proxy_tcp(setup.dialer, &args.service, args.port.unwrap_or(0)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => failure(err),
+    }
+}
+
+pub fn run_db(command: &DbCommand, environment: &Environment) -> ExitCode {
+    match command {
+        DbCommand::Ls(args) => run_ls(
+            &LsArgs {
+                profile: args.profile.clone(),
+                format: args.format,
+                kind: ListKind::Db,
+            },
+            environment,
+        ),
+        DbCommand::Proxy(args) => run_db_proxy(args, environment),
+        DbCommand::Connect(args) => run_db_connect(args, environment),
+    }
+}
+
+fn run_db_proxy(args: &DbProxyArgs, environment: &Environment) -> ExitCode {
+    let setup = match service_setup(&args.profile, environment, true) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    match db::proxy(&setup.store, setup.dialer, &args.name, args.tcp) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => failure(err),
+    }
+}
+
+fn run_db_connect(args: &DbConnectArgs, environment: &Environment) -> ExitCode {
+    let setup = match service_setup(&args.profile, environment, false) {
+        Ok(setup) => setup,
+        Err(code) => return code,
+    };
+    let request = ConnectRequest {
+        user: args.user.clone(),
+        database: args.database.clone(),
+        psql_args: args.psql_args.clone(),
+    };
+    match db::connect(&setup.store, setup.dialer, &args.name, &request) {
+        Ok(code) => ExitCode::from(code),
+        Err(err) => failure(err),
     }
 }
 

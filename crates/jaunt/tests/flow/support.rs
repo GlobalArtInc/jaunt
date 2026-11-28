@@ -163,6 +163,11 @@ pub enum X509Reply {
     Issue {
         valid_before: i64,
     },
+    IssueUnder {
+        valid_before: i64,
+        root_der: Vec<u8>,
+        root_key_der: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -578,19 +583,41 @@ async fn x509_handler(
             let request: X509CertificateRequest = serde_json::from_slice(&body).unwrap();
             Json(user_certificate(&request.public_key, valid_before)).into_response()
         }
+        X509Reply::IssueUnder {
+            valid_before,
+            ref root_der,
+            ref root_key_der,
+        } => {
+            let request: X509CertificateRequest = serde_json::from_slice(&body).unwrap();
+            let key = rcgen::KeyPair::try_from(root_key_der.as_slice()).unwrap();
+            let issuer = rcgen::Issuer::from_ca_cert_der(&root_der.clone().into(), key).unwrap();
+            Json(user_certificate_under(
+                &request.public_key,
+                valid_before,
+                &issuer,
+            ))
+            .into_response()
+        }
     }
 }
 
 pub fn user_certificate(public_key: &str, valid_before: i64) -> X509CertificateResponse {
-    use base64::engine::general_purpose::STANDARD;
-    use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
-        KeyPair, SanType, SubjectPublicKeyInfo,
-    };
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 
     let mut root = CertificateParams::new(Vec::<String>::new()).unwrap();
     root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let issuer = CertifiedIssuer::self_signed(root, KeyPair::generate().unwrap()).unwrap();
+    user_certificate_under(public_key, valid_before, &issuer)
+}
+
+pub fn user_certificate_under(
+    public_key: &str,
+    valid_before: i64,
+    issuer: &rcgen::Issuer<'_, rcgen::KeyPair>,
+) -> X509CertificateResponse {
+    use base64::engine::general_purpose::STANDARD;
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, SanType, SubjectPublicKeyInfo};
+
     let spki = STANDARD.decode(public_key).unwrap();
     let subject = SubjectPublicKeyInfo::from_der(&spki).unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -603,7 +630,7 @@ pub fn user_certificate(public_key: &str, valid_before: i64) -> X509CertificateR
     let now = i64::try_from(now_secs()).unwrap();
     params.not_before = epoch + Duration::from_secs(u64::try_from(now - 60).unwrap());
     params.not_after = epoch + Duration::from_secs(u64::try_from(valid_before).unwrap());
-    let certificate = params.signed_by(&subject, &issuer).unwrap();
+    let certificate = params.signed_by(&subject, issuer).unwrap();
     X509CertificateResponse {
         certificate_der: STANDARD.encode(certificate.der()),
         serial: 9,

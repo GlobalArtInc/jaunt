@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -14,7 +14,7 @@ use crate::gate_config::GateServices;
 use crate::profile::{ProfileName, profile_dir};
 use crate::secret::Secret;
 use crate::server_url::ServerUrl;
-use crate::ssh_config::validate;
+use crate::ssh_config::{is_dns_label, validate};
 
 const SERVER_FILE: &str = "server";
 const PUBLIC_KEY_FILE: &str = "id_ed25519.pub";
@@ -42,6 +42,11 @@ pub(crate) const X509_DIR: &str = "x509";
 pub(crate) const X509_KEY_FILE: &str = "key.pem";
 pub(crate) const X509_CERT_FILE: &str = "cert.pem";
 const X509_OWNED_FILES: [&str; 2] = [X509_KEY_FILE, X509_CERT_FILE];
+pub const DB_DIR: &str = "db";
+pub const DB_SOCKET_FILE: &str = ".s.PGSQL.5432";
+pub const DB_LOCK_FILE: &str = ".lock";
+pub const RUN_DIR_PREFIX: &str = ".connect-";
+pub const RUN_DIR_RANDOM_HEX: usize = 16;
 const MAX_MARKER_BYTES: u64 = 64;
 const DIR_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
@@ -450,6 +455,13 @@ impl ProfileStore {
                 let (removed, first_error) = remove_owned(&self.dir);
                 removed_any |= removed;
                 let first_error = match remove_x509(&self.dir.join(X509_DIR)) {
+                    Ok(removed) => {
+                        removed_any |= removed;
+                        first_error
+                    }
+                    Err(err) => first_error.or(Some(err)),
+                };
+                let first_error = match remove_db(&self.dir.join(DB_DIR)) {
                     Ok(removed) => {
                         removed_any |= removed;
                         first_error
@@ -880,6 +892,69 @@ fn remove_x509(dir: &Path) -> Result<bool, StoreError> {
     }
 }
 
+pub fn is_run_dir_name(name: &str) -> bool {
+    name.strip_prefix(RUN_DIR_PREFIX).is_some_and(|random| {
+        random.len() == RUN_DIR_RANDOM_HEX
+            && random
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn is_db_owned_dir(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|text| is_run_dir_name(text) || is_dns_label(text))
+}
+
+fn remove_socket_dir(dir: &Path) -> Result<bool, StoreError> {
+    let mut removed = false;
+    let socket = dir.join(DB_SOCKET_FILE);
+    match fs::symlink_metadata(&socket) {
+        Ok(meta) if meta.file_type().is_socket() => removed |= remove_if_present(&socket)?,
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error("inspect", &socket, err)),
+    }
+    let lock = dir.join(DB_LOCK_FILE);
+    match fs::symlink_metadata(&lock) {
+        Ok(meta) if meta.is_file() => removed |= remove_if_present(&lock)?,
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error("inspect", &lock, err)),
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(removed),
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(removed),
+        Err(err) => Err(io_error("remove", dir, err)),
+    }
+}
+
+fn remove_db(dir: &Path) -> Result<bool, StoreError> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return remove_if_present(dir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io_error("inspect", dir, err)),
+    }
+    let mut removed = false;
+    let entries = fs::read_dir(dir).map_err(|err| io_error("list", dir, err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error("list", dir, err))?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|err| io_error("inspect", &path, err))?;
+        if meta.is_dir() && is_db_owned_dir(&entry.file_name()) {
+            removed |= remove_socket_dir(&path)?;
+        }
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(removed),
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(removed),
+        Err(err) => Err(io_error("remove", dir, err)),
+    }
+}
+
 fn line_bytes(text: &str) -> Vec<u8> {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(b'\n');
@@ -1145,6 +1220,60 @@ mod tests {
         let cleared = store.clear().unwrap();
         assert!(cleared.directory_kept);
         assert_eq!(names(&x509), ["notes.txt"]);
+    }
+
+    #[test]
+    fn a_logout_removes_the_socket_directories_of_jaunt_and_keeps_anything_else_under_db() {
+        let root = tempfile::Builder::new()
+            .prefix("js")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let store = ProfileStore::new(&root.path().join("s"), &ProfileName::default_name());
+        save(&store, "jt_first");
+        let db = store.dir().join("db");
+        let socket_dirs = [db.join("orders"), db.join(".connect-0123456789abcdef")];
+        for dir in &socket_dirs {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(".lock"), "").unwrap();
+            drop(std::os::unix::net::UnixListener::bind(dir.join(".s.PGSQL.5432")).unwrap());
+        }
+
+        let cleared = store.clear().unwrap();
+
+        assert!(!cleared.directory_kept);
+        assert!(!store.dir().exists());
+
+        save(&store, "jt_second");
+        for dir in &socket_dirs {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(db.join("orders").join("notes.txt"), "mine").unwrap();
+        fs::create_dir(db.join(".connect-xyz")).unwrap();
+
+        let cleared = store.clear().unwrap();
+
+        assert!(cleared.directory_kept);
+        assert_eq!(names(&db), [".connect-xyz", "orders"]);
+        assert_eq!(names(&db.join("orders")), ["notes.txt"]);
+
+        let foreign = root.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join(".lock"), "").unwrap();
+        drop(std::os::unix::net::UnixListener::bind(foreign.join(".s.PGSQL.5432")).unwrap());
+        fs::remove_file(db.join("orders").join("notes.txt")).unwrap();
+        fs::write(db.join("orders").join(".s.PGSQL.5432"), "a file").unwrap();
+        fs::remove_dir(db.join(".connect-xyz")).unwrap();
+        std::os::unix::fs::symlink(&foreign, db.join("billing")).unwrap();
+
+        let cleared = store.clear().unwrap();
+
+        assert!(cleared.directory_kept);
+        assert_eq!(names(&db), ["billing", "orders"]);
+        assert_eq!(
+            fs::read_to_string(db.join("orders").join(".s.PGSQL.5432")).unwrap(),
+            "a file"
+        );
+        assert_eq!(names(&foreign), [".lock", ".s.PGSQL.5432"]);
     }
 
     #[test]

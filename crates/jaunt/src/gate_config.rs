@@ -1,14 +1,15 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_proto::{
-    ClientConfig, ClientConfigV2, ClientTransport, GATE_ALPN_SSH, PinnedRoot, ServicesClient,
+    ClientConfig, ClientConfigV2, ClientTransport, GATE_ALPN_SSH, GATE_ALPN_SVC, PinnedRoot,
+    ServicesClient,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
-use crate::gate_tls::GateRoute;
+use crate::gate_tls::{GateRoute, ServiceGate};
 use crate::ssh_config::{SshConfigError, is_dns_name};
 
 pub const MAX_PINNED_ROOTS: usize = 8;
@@ -121,6 +122,10 @@ pub enum StoredGateError {
     Endpoint,
     #[error("the stored TLS settings of the gate do not offer SSH over TLS (jaunt-ssh/1)")]
     NoSsh,
+    #[error(
+        "the stored TLS settings of the gate do not offer database and TCP connections (jaunt-svc/1)"
+    )]
+    NoSvc,
     #[error("the stored TLS settings of the gate hold no pinned root, or more than 8")]
     RootCount,
     #[error("a stored pinned root is not base64 DER")]
@@ -152,9 +157,27 @@ impl From<SshConfigError> for StoredGateError {
 
 pub fn ssh_route(stored: &GateServices, now: i64) -> Result<GateRoute, StoredGateError> {
     check_endpoint(&stored.services, ClientTransport::Tls)?;
-    let mut roots = Vec::with_capacity(stored.services.roots.len());
+    usable_route(&stored.services, now)
+}
+
+pub fn service_gate(stored: &GateServices, now: i64) -> Result<ServiceGate, StoredGateError> {
+    check_endpoint(&stored.services, ClientTransport::Tcp)?;
+    if !stored
+        .services
+        .alpn
+        .iter()
+        .any(|name| name == GATE_ALPN_SVC)
+    {
+        return Err(StoredGateError::NoSvc);
+    }
+    let route = usable_route(&stored.services, now)?;
+    Ok(ServiceGate::new(route, stored.services.domain.clone()))
+}
+
+fn usable_route(services: &ServicesClient, now: i64) -> Result<GateRoute, StoredGateError> {
+    let mut roots = Vec::with_capacity(services.roots.len());
     let mut first_error = None;
-    for root in &stored.services.roots {
+    for root in &services.roots {
         match check_root(root, now) {
             Ok(der) => roots.push(der),
             Err(err) => {
@@ -166,8 +189,8 @@ pub fn ssh_route(stored: &GateServices, now: i64) -> Result<GateRoute, StoredGat
         return Err(first_error.map_or(StoredGateError::RootCount, StoredGateError::from));
     }
     Ok(GateRoute::new(
-        stored.services.gate_tls_name.clone(),
-        stored.services.port,
+        services.gate_tls_name.clone(),
+        services.port,
         roots,
     ))
 }
@@ -260,8 +283,8 @@ mod tests {
     use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair};
 
     use super::{
-        AcceptedServices, GateServices, StoredGateError, accept_services, check_root, sha256_hex,
-        ssh_route,
+        AcceptedServices, GateServices, StoredGateError, accept_services, check_root, service_gate,
+        sha256_hex, ssh_route,
     };
     use crate::ssh_config::SshConfigError;
 
@@ -496,6 +519,7 @@ mod tests {
         for err in [
             StoredGateError::Endpoint,
             StoredGateError::NoSsh,
+            StoredGateError::NoSvc,
             StoredGateError::RootCount,
             StoredGateError::RootUnreadable,
             StoredGateError::RootDigest,
@@ -504,6 +528,39 @@ mod tests {
             StoredGateError::RootOutsideValidity,
         ] {
             assert!(!err.to_string().contains("the server"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_service_route_needs_the_service_protocol_whatever_the_ssh_transport() {
+        let stored = |transport: ClientTransport, alpn: &[&str], roots: Vec<PinnedRoot>| {
+            let mut services = services(roots);
+            services.alpn = alpn.iter().map(|name| (*name).to_owned()).collect();
+            GateServices {
+                client_transport: transport,
+                services,
+            }
+        };
+        for transport in [ClientTransport::Tls, ClientTransport::Tcp] {
+            for alpn in [&[GATE_ALPN_SSH, GATE_ALPN_SVC][..], &[GATE_ALPN_SVC][..]] {
+                let gate = service_gate(&stored(transport, alpn, vec![root()]), NOW).unwrap();
+                assert_eq!(gate.domain, "svc.example.test");
+                assert_eq!(gate.route.host, "svc.example.test");
+                assert_eq!(gate.route.port, 443);
+                assert_eq!(gate.route.roots.len(), 1);
+            }
+            assert_eq!(
+                service_gate(&stored(transport, &[GATE_ALPN_SSH], vec![root()]), NOW).err(),
+                Some(StoredGateError::NoSvc)
+            );
+            assert_eq!(
+                service_gate(
+                    &stored(transport, &[GATE_ALPN_SVC], vec![expired_root()]),
+                    NOW
+                )
+                .err(),
+                Some(StoredGateError::RootOutsideValidity)
+            );
         }
     }
 

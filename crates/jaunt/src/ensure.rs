@@ -142,7 +142,7 @@ impl RenewOptions {
         login_hint(&self.home, self.custom_home, &self.profile)
     }
 
-    fn not_signed_in(&self, store: &ProfileStore) -> EnsureError {
+    pub fn not_signed_in(&self, store: &ProfileStore) -> EnsureError {
         EnsureError::NotSignedIn {
             profile: self.profile.clone(),
             dir: store.dir().to_owned(),
@@ -168,7 +168,7 @@ pub enum Renewed {
     SignedIn(LoginReport),
 }
 
-fn unix_now(clock: &dyn Fn() -> SystemTime) -> Result<i64, EnsureError> {
+pub fn unix_now(clock: &dyn Fn() -> SystemTime) -> Result<i64, EnsureError> {
     clock()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -177,17 +177,39 @@ fn unix_now(clock: &dyn Fn() -> SystemTime) -> Result<i64, EnsureError> {
 }
 
 pub fn renew(options: &RenewOptions, ports: &mut LoginPorts<'_>) -> Result<Renewed, EnsureError> {
-    let profile = &options.profile;
-    let store = ProfileStore::new(&options.home, profile);
-    let deadline = Instant::now()
+    let deadline = renew_deadline(options)?;
+    let lock = lock_renewal(options, deadline, ports.notices)?;
+    let outcome = renew_with_lock(options, ports, deadline, &lock);
+    drop(lock);
+    outcome
+}
+
+pub fn renew_deadline(options: &RenewOptions) -> Result<Instant, EnsureError> {
+    Instant::now()
         .checked_add(options.deadline)
         .ok_or_else(|| EnsureError::TimedOut {
-            profile: profile.clone(),
+            profile: options.profile.clone(),
             hint: options.login_hint(),
-        })?;
-    let lock = lock_profile(&options.home, profile, deadline, ports.notices)
-        .map_err(|err| EnsureError::from_login(err, options))?;
-    let outcome = renew_locked(options, ports, &store, deadline, &lock);
+        })
+}
+
+pub fn lock_renewal(
+    options: &RenewOptions,
+    deadline: Instant,
+    notices: &mut dyn Write,
+) -> Result<ProfileLock, EnsureError> {
+    lock_profile(&options.home, &options.profile, deadline, notices)
+        .map_err(|err| EnsureError::from_login(err, options))
+}
+
+pub fn renew_with_lock(
+    options: &RenewOptions,
+    ports: &mut LoginPorts<'_>,
+    deadline: Instant,
+    lock: &ProfileLock,
+) -> Result<Renewed, EnsureError> {
+    let store = ProfileStore::new(&options.home, &options.profile);
+    let outcome = renew_locked(options, ports, &store, deadline, lock);
     if let Err(err) = &outcome
         && !matches!(err, EnsureError::RecentFailure { .. })
         && let Ok(failed_at) = unix_now(ports.clock)
@@ -198,7 +220,6 @@ pub fn renew(options: &RenewOptions, ports: &mut LoginPorts<'_>) -> Result<Renew
             "jaunt: warning: cannot record the failed sign-in: {marker}"
         ));
     }
-    drop(lock);
     outcome
 }
 

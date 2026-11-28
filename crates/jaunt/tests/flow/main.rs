@@ -12,4 +12,7 @@ mod services;
 mod ssh_cli;
 mod ssh_setup;
 mod support;
+mod svc_cli;
+mod svc_dial;
+mod svc_fake;
 mod tls_setup;

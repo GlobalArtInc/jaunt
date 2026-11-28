@@ -2,10 +2,10 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jaunt_proto::GATE_ALPN_SSH;
-use rustls::client::Resumption;
+use jaunt_proto::{GATE_ALPN_SSH, GATE_ALPN_SVC};
+use rustls::client::{Resumption, WantsClientCert};
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{AlertDescription, CertificateError, ClientConfig, RootCertStore};
+use rustls::{AlertDescription, CertificateError, ClientConfig, ConfigBuilder, RootCertStore};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -13,6 +13,7 @@ use tokio_rustls::client::TlsStream;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const INNER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateRoute {
@@ -31,6 +32,45 @@ impl GateRoute {
             roots,
             connect_timeout: CONNECT_TIMEOUT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceGate {
+    pub route: GateRoute,
+    pub domain: String,
+    pub inner_handshake_timeout: Duration,
+}
+
+impl ServiceGate {
+    pub fn new(route: GateRoute, domain: String) -> ServiceGate {
+        ServiceGate {
+            route,
+            domain,
+            inner_handshake_timeout: INNER_HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateProtocol {
+    Ssh,
+    Svc,
+}
+
+impl GateProtocol {
+    pub const fn alpn(self) -> &'static str {
+        match self {
+            GateProtocol::Ssh => GATE_ALPN_SSH,
+            GateProtocol::Svc => GATE_ALPN_SVC,
+        }
+    }
+
+    const fn refused(self) -> GateError {
+        match self {
+            GateProtocol::Ssh => GateError::Alpn,
+            GateProtocol::Svc => GateError::SvcAlpn,
         }
     }
 }
@@ -63,13 +103,17 @@ pub enum GateError {
     Protocol,
     #[error("the gate does not accept SSH over TLS ({GATE_ALPN_SSH})")]
     Alpn,
+    #[error("the gate does not accept database and TCP connections over TLS ({GATE_ALPN_SVC})")]
+    SvcAlpn,
     #[error("the TLS handshake with the gate failed")]
     Handshake,
     #[error("the TLS handshake with the gate failed: {source}")]
     HandshakeIo { source: io::Error },
 }
 
-pub fn tls_config(roots: &[Vec<u8>]) -> Result<Arc<ClientConfig>, GateError> {
+pub fn pinned_config(
+    roots: &[Vec<u8>],
+) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, GateError> {
     let mut store = RootCertStore::empty();
     for root in roots {
         store
@@ -80,18 +124,35 @@ pub fn tls_config(roots: &[Vec<u8>]) -> Result<Arc<ClientConfig>, GateError> {
         return Err(GateError::Roots);
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
+    Ok(ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| GateError::Roots)?
-        .with_root_certificates(store)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![GATE_ALPN_SSH.as_bytes().to_vec()];
+        .with_root_certificates(store))
+}
+
+pub fn finish_config(mut config: ClientConfig, alpn: Option<&str>) -> Arc<ClientConfig> {
+    config.alpn_protocols = alpn
+        .map(|name| name.as_bytes().to_vec())
+        .into_iter()
+        .collect();
     config.resumption = Resumption::disabled();
-    Ok(Arc::new(config))
+    Arc::new(config)
+}
+
+pub fn tls_config(roots: &[Vec<u8>]) -> Result<Arc<ClientConfig>, GateError> {
+    let config = pinned_config(roots)?.with_no_client_auth();
+    Ok(finish_config(config, Some(GATE_ALPN_SSH)))
 }
 
 pub async fn connect(route: &GateRoute) -> Result<TlsStream<TcpStream>, GateError> {
-    let config = tls_config(&route.roots)?;
+    connect_with(route, tls_config(&route.roots)?, GateProtocol::Ssh).await
+}
+
+pub async fn connect_with(
+    route: &GateRoute,
+    config: Arc<ClientConfig>,
+    protocol: GateProtocol,
+) -> Result<TlsStream<TcpStream>, GateError> {
     let name = ServerName::try_from(route.host.clone()).map_err(|_| GateError::Name)?;
     let tcp = match timeout(
         route.connect_timeout,
@@ -126,34 +187,45 @@ pub async fn connect(route: &GateRoute) -> Result<TlsStream<TcpStream>, GateErro
     .await
     {
         Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => return Err(classify(err)),
+        Ok(Err(err)) => return Err(classify(err, protocol)),
         Err(_) => return Err(GateError::HandshakeTimeout),
     };
-    if stream.get_ref().1.alpn_protocol() != Some(GATE_ALPN_SSH.as_bytes()) {
-        return Err(GateError::Alpn);
+    if stream.get_ref().1.alpn_protocol() != Some(protocol.alpn().as_bytes()) {
+        return Err(protocol.refused());
     }
     Ok(stream)
 }
 
-fn classify(err: io::Error) -> GateError {
-    let Some(tls) = err
-        .get_ref()
+pub fn tls_error(err: &io::Error) -> Option<&rustls::Error> {
+    err.get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
-    else {
-        return GateError::HandshakeIo { source: err };
-    };
+}
+
+pub fn certificate_problem(tls: &rustls::Error) -> Option<GateError> {
     match tls {
         rustls::Error::InvalidCertificate(
             CertificateError::Expired
             | CertificateError::ExpiredContext { .. }
             | CertificateError::NotValidYet
             | CertificateError::NotValidYetContext { .. },
-        ) => GateError::CertificateTime,
-        rustls::Error::InvalidCertificate(_) => GateError::Intercepted,
+        ) => Some(GateError::CertificateTime),
+        rustls::Error::InvalidCertificate(_) => Some(GateError::Intercepted),
+        _ => None,
+    }
+}
+
+fn classify(err: io::Error, protocol: GateProtocol) -> GateError {
+    let Some(tls) = tls_error(&err) else {
+        return GateError::HandshakeIo { source: err };
+    };
+    if let Some(problem) = certificate_problem(tls) {
+        return problem;
+    }
+    match tls {
         rustls::Error::AlertReceived(AlertDescription::ProtocolVersion)
         | rustls::Error::PeerIncompatible(_) => GateError::Protocol,
         rustls::Error::AlertReceived(AlertDescription::NoApplicationProtocol)
-        | rustls::Error::NoApplicationProtocol => GateError::Alpn,
+        | rustls::Error::NoApplicationProtocol => protocol.refused(),
         _ => GateError::Handshake,
     }
 }

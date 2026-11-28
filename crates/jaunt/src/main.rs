@@ -4,8 +4,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use jaunt::commands::{
-    AdminArgs, EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, ProxyCommand, StatusArgs,
-    run_admin, run_ensure, run_login, run_logout, run_ls, run_proxy, run_status,
+    AdminArgs, DbCommand, EnsureArgs, Environment, LoginArgs, LogoutArgs, LsArgs, ProxyCommand,
+    StatusArgs, run_admin, run_db, run_ensure, run_login, run_logout, run_ls, run_proxy,
+    run_status,
 };
 
 use crate::policy::PolicyCommand;
@@ -36,10 +37,15 @@ enum Command {
     Ensure(EnsureArgs),
     #[command(about = "Administrator commands, sent as requests signed by the session key")]
     Admin(AdminArgs),
-    #[command(about = "Connect through the gateway over TLS (used by ssh)")]
+    #[command(about = "Connect through the gateway over TLS: SSH (used by ssh) and TCP services")]
     Proxy {
         #[command(subcommand)]
         command: ProxyCommand,
+    },
+    #[command(about = "Reach databases through the gateway")]
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
     },
 }
 
@@ -54,6 +60,7 @@ fn main() -> ExitCode {
         Command::Ensure(args) => run_ensure(&args, &Environment::from_process()),
         Command::Admin(args) => run_admin(&args, &Environment::from_process()),
         Command::Proxy { command } => run_proxy(&command, &Environment::from_process()),
+        Command::Db { command } => run_db(&command, &Environment::from_process()),
     }
 }
 
