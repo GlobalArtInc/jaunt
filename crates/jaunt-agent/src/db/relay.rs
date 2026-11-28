@@ -1,16 +1,18 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use jaunt_pgwire::{
-    BackendDecoder, BackendMessage, DecodeError, Event, FrontendDecoder, FrontendMessage,
+    BackendDecoder, BackendMessage, DecodeError, Event, FrontendDecoder, FrontendMessage, Target,
+    TargetKind,
 };
 use jaunt_proto::ServiceOutcome;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use super::audit::{ProtocolProblem, QueryCapture, SessionAudit};
-use super::upstream::{deadline, is_safe_parameter, server_problem};
+use super::upstream::{STANDARD_CONFORMING_STRINGS, deadline, is_safe_parameter, server_problem};
 use super::wire::{FUNCTION_CALLS, TERMINATE, error_response};
 use crate::clock::Clock;
 
@@ -71,6 +73,54 @@ fn client_problem(error: &DecodeError) -> ProtocolProblem {
     }
 }
 
+const MAX_SECRET_NAMES: usize = 1024;
+
+#[derive(Default)]
+struct SecretNames {
+    statements: HashSet<String>,
+    portals: HashSet<String>,
+    saturated: bool,
+}
+
+impl SecretNames {
+    fn remember(names: &mut HashSet<String>, saturated: &mut bool, name: &str) {
+        if names.len() >= MAX_SECRET_NAMES && !names.contains(name) {
+            *saturated = true;
+        } else {
+            names.insert(name.to_owned());
+        }
+    }
+
+    fn parsed(&mut self, statement: &str, sensitive: bool) {
+        if sensitive {
+            Self::remember(&mut self.statements, &mut self.saturated, statement);
+        } else {
+            self.statements.remove(statement);
+        }
+    }
+
+    fn bound(&mut self, portal: &str, statement: &str) -> bool {
+        let sensitive = self.saturated || self.statements.contains(statement);
+        if sensitive {
+            Self::remember(&mut self.portals, &mut self.saturated, portal);
+        } else {
+            self.portals.remove(portal);
+        }
+        sensitive
+    }
+
+    fn executes(&self, portal: &str) -> bool {
+        self.saturated || self.portals.contains(portal)
+    }
+
+    fn closed(&mut self, target: &Target) {
+        match target.kind {
+            TargetKind::Statement => self.statements.remove(&target.name),
+            TargetKind::Portal => self.portals.remove(&target.name),
+        };
+    }
+}
+
 struct StreamedQuery {
     remaining: usize,
     capture: QueryCapture,
@@ -103,6 +153,7 @@ where
 {
     let mut buffer = vec![0_u8; READ_CHUNK];
     let mut query: Option<StreamedQuery> = None;
+    let mut secrets = SecretNames::default();
     loop {
         loop {
             let event = match decoder.next_event() {
@@ -117,17 +168,35 @@ where
                         FrontendMessage::QueryText { length } => {
                             query = Some(StreamedQuery {
                                 remaining: *length,
-                                capture: QueryCapture::default(),
+                                capture: QueryCapture::new(audit.backslash_escapes()),
                             });
                         }
                         FrontendMessage::Query(statement) => {
-                            audit.simple_query(&QueryCapture::of(statement.as_bytes()).finish());
-                        }
-                        FrontendMessage::Parse(parse) => {
-                            audit.extended_query(
-                                &QueryCapture::of(parse.statement.as_bytes()).finish(),
+                            audit.simple_query(
+                                &QueryCapture::of(statement.as_bytes(), audit.backslash_escapes())
+                                    .finish(),
                             );
                         }
+                        FrontendMessage::Parse(parse) => {
+                            let captured = QueryCapture::of(
+                                parse.statement.as_bytes(),
+                                audit.backslash_escapes(),
+                            )
+                            .finish();
+                            secrets.parsed(&parse.name, captured.is_sensitive());
+                            audit.extended_query(&captured);
+                        }
+                        FrontendMessage::Bind(bind) => {
+                            if secrets.bound(&bind.portal, &bind.statement) {
+                                audit.sensitive_cycle();
+                            }
+                        }
+                        FrontendMessage::Execute(execute) => {
+                            if secrets.executes(&execute.portal) {
+                                audit.sensitive_cycle();
+                            }
+                        }
+                        FrontendMessage::Close(target) => secrets.closed(target),
                         FrontendMessage::Sync => audit.sync_sent(),
                         FrontendMessage::Terminate => terminate = true,
                         FrontendMessage::SslRequest
@@ -137,10 +206,7 @@ where
                         | FrontendMessage::Password(_) => {
                             return Ending::Client(ProtocolProblem::ClientUnexpected);
                         }
-                        FrontendMessage::Bind(_)
-                        | FrontendMessage::Execute(_)
-                        | FrontendMessage::Describe(_)
-                        | FrontendMessage::Close(_)
+                        FrontendMessage::Describe(_)
                         | FrontendMessage::Flush
                         | FrontendMessage::CopyData { .. }
                         | FrontendMessage::CopyDone
@@ -219,6 +285,11 @@ where
                         BackendMessage::ErrorResponse(notice) => audit.error(notice),
                         BackendMessage::ReadyForQuery(_) => audit.ready(),
                         BackendMessage::ParameterStatus(status)
+                            if status.name == STANDARD_CONFORMING_STRINGS =>
+                        {
+                            audit.set_backslash_escapes(status.value.eq_ignore_ascii_case("off"));
+                        }
+                        BackendMessage::ParameterStatus(status)
                             if !is_safe_parameter(&status.name) =>
                         {
                             continue;
@@ -271,6 +342,7 @@ pub struct RelayContext<'a> {
     pub cancel: &'a CancellationToken,
     pub clock: &'a Arc<dyn Clock>,
     pub close_timeout: Duration,
+    pub cancel_close_timeout: Duration,
     pub session_id: &'a str,
 }
 
@@ -339,7 +411,12 @@ where
         }
         drop(client_write.shutdown().await);
     };
-    let close_by = deadline(context.clock, context.close_timeout);
+    let bound = if ending == Ending::Cancelled {
+        context.cancel_close_timeout
+    } else {
+        context.close_timeout
+    };
+    let close_by = deadline(context.clock, bound);
     tokio::select! {
         () = close => {}
         () = context.clock.sleep_until(close_by) => {}

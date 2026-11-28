@@ -301,3 +301,32 @@ async fn the_grant_duration_ends_the_session_and_its_database_connection() {
     let ends = harness.named("s-long", "db.session.end");
     assert_eq!(ends.len(), 1);
 }
+
+#[tokio::test]
+async fn the_greeting_of_the_database_is_passed_on_up_to_sixty_four_kib() {
+    for (size, works) in [(64 * 1024, true), (64 * 1024 + 1, false)] {
+        let harness = DbHarness::new().await;
+        harness.pg.set_mode(Mode::Greeting(size));
+        let (opened, mut client) = harness.connect("s-greeting").await;
+        client.send(&startup(&default_startup())).await;
+        if works {
+            let greeting = client.until_ready().await;
+            assert!(fatal(&greeting).is_none());
+            continue;
+        }
+        assert_eq!(
+            fatal(&client.rest().await),
+            Some((UNAVAILABLE.0.to_owned(), UNAVAILABLE.1.to_owned()))
+        );
+        opened.finished().await;
+        assert_eq!(
+            harness.ended("s-greeting").await.outcome,
+            ServiceOutcome::ProtocolError
+        );
+        let problems = harness.named("s-greeting", "db.protocol_error");
+        assert_eq!(
+            text(&problems[0], "reason").as_deref(),
+            Some("server_too_large")
+        );
+    }
+}

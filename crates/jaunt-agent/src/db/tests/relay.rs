@@ -14,7 +14,7 @@ use crate::clock::Clock;
 use crate::db::DB_LIMITS;
 use crate::db::audit::{QuerySettings, SessionAudit, SessionStart};
 use crate::db::relay::{Relay, RelayContext, relay};
-use crate::db::wire::TERMINATE;
+use crate::db::wire::{FUNCTION_CALLS, TERMINATE, error_response};
 use crate::run::api::{ApiError, EventsAnswer};
 use crate::runtime::events::{EventSink, EventTransport, SINK_LIMITS};
 use crate::runtime::tests::support::fixed;
@@ -88,6 +88,7 @@ fn wire() -> Wired {
                 cancel: &token,
                 clock: &clock,
                 close_timeout: DB_LIMITS.close_timeout,
+                cancel_close_timeout: DB_LIMITS.cancel_close_timeout,
                 session_id: "s-relay",
             },
         )
@@ -154,6 +155,43 @@ async fn a_client_that_vanishes_inside_a_message_adds_nothing_to_the_database_st
         assert_eq!(
             soon("the relay to end", wired.relaying).await.unwrap(),
             ServiceOutcome::Closed
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_function_call_answer_is_never_put_inside_a_message_of_the_database() {
+    let row = message(b'D', &[7; 100]);
+    for (sent, answered) in [(row[..15].to_vec(), false), (row.clone(), true)] {
+        let mut wired = wire();
+        wired.database.write_all(&sent).await.unwrap();
+        let mut forwarded = vec![0_u8; sent.len()];
+        soon(
+            "the row to reach the client",
+            wired.client.read_exact(&mut forwarded),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forwarded, sent);
+        wired
+            .client
+            .write_all(&message(b'F', &[0; 10]))
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), wired.client.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = if answered {
+            error_response(FUNCTION_CALLS.0, FUNCTION_CALLS.1)
+        } else {
+            Vec::new()
+        };
+        assert_eq!(rest, expected);
+        assert_eq!(
+            soon("the relay to end", wired.relaying).await.unwrap(),
+            ServiceOutcome::ProtocolError
         );
     }
 }

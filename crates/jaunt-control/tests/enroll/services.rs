@@ -189,6 +189,14 @@ async fn announcements_are_validated_bounded_and_rate_limited() {
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_settings",
         ),
+        (
+            set(&[
+                json!({"kind": "postgres", "name": "lk", "address": "127.0.0.1:5432",
+                         "postgres": {"tls": {"server_name": "db-01"}}}),
+            ]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_settings",
+        ),
         (set(&[unknown]), StatusCode::BAD_REQUEST, "invalid_request"),
         (
             set(&[json!({"kind": "ssh", "name": "x"})]),

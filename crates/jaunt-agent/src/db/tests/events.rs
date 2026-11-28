@@ -176,15 +176,16 @@ fn keys(names: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn statements_that_name_a_password_carry_no_text_and_no_digest() {
+async fn statements_that_name_a_password_are_written_masked_without_digest_or_length() {
     let harness = DbHarness::new().await;
     let (_opened, mut client, _) = harness.login("s-secret").await;
     for statement in [
         "AlTeR/**/RoLe app\n\tPASSWORD 'hunter2'",
-        "SELECT dblink_connect('host=h password=hunter2')",
+        "SELECT dblink_connect('postgresql://u:hunter2@h/db')",
         "FAIL ALTER ROLE app PASSWORD hunter2",
         "FAIL plain",
         "SELECT 1",
+        "DROP TABLE payments -- password",
     ] {
         client.send(&query(statement)).await;
         client.until_ready().await;
@@ -195,7 +196,7 @@ async fn statements_that_name_a_password_carry_no_text_and_no_digest() {
     client.until_ready().await;
     finish(&harness, &mut client, "s-secret").await;
     let (queries, errors) = fields_and_errors(&harness, "s-secret").await;
-    let secret = keys(&["command", "length", "protocol"]);
+    let secret = keys(&["command", "protocol", "text", "truncated"]);
     let plain = keys(&[
         "command",
         "length",
@@ -212,16 +213,31 @@ async fn statements_that_name_a_password_carry_no_text_and_no_digest() {
             secret.clone(),
             plain.clone(),
             plain,
+            secret.clone(),
             secret
         ]
     );
     assert_eq!(errors, [false, true]);
-    let select = &harness.named("s-secret", "db.query")[4];
-    assert_eq!(text(select, "sha256"), Some(sha256_hex(b"SELECT 1")));
+    let events = harness.named("s-secret", "db.query");
+    let texts: Vec<Option<String>> = events.iter().map(|fields| text(fields, "text")).collect();
+    assert_eq!(
+        texts,
+        [
+            "AlTeR RoLe app PASSWORD '?'",
+            "SELECT dblink_connect('?')",
+            "FAIL ALTER ROLE app PASSWORD hunter2",
+            "FAIL plain",
+            "SELECT 1",
+            "DROP TABLE payments",
+            "CREATE ROLE ops PASSWORD '?'",
+        ]
+        .map(|expected| Some(expected.to_owned()))
+    );
+    assert_eq!(text(&events[4], "sha256"), Some(sha256_hex(b"SELECT 1")));
 }
 
 #[tokio::test]
-async fn a_password_after_more_than_eight_kib_of_padding_is_still_found() {
+async fn a_password_after_eight_kib_is_masked_the_same_through_query_and_parse() {
     let harness = DbHarness::new().await;
     let (_opened, mut client, _) = harness.login("s-padded").await;
     let statement = format!(
@@ -234,15 +250,36 @@ async fn a_password_after_more_than_eight_kib_of_padding_is_still_found() {
     client.until_ready().await;
     finish(&harness, &mut client, "s-padded").await;
     let (queries, _) = fields_and_errors(&harness, "s-padded").await;
-    let secret = keys(&["command", "length", "protocol"]);
+    let secret = keys(&["command", "protocol", "text", "truncated"]);
     assert_eq!(queries, [secret.clone(), secret]);
+    let texts: Vec<Option<String>> = harness
+        .named("s-padded", "db.query")
+        .iter()
+        .map(|fields| text(fields, "text"))
+        .collect();
+    let masked = Some("SELECT dblink_connect('?')".to_owned());
+    assert_eq!(texts, [masked.clone(), masked]);
 }
 
-fn parse(statement: &str) -> Vec<u8> {
-    let mut body = cstr("");
+fn parse(name: &str, statement: &str) -> Vec<u8> {
+    let mut body = cstr(name);
     body.extend(cstr(statement));
     body.extend(0_i16.to_be_bytes());
     message(b'P', &body)
+}
+
+fn bind_execute_sync(statement: &str) -> Vec<u8> {
+    let mut bind = cstr("");
+    bind.extend(cstr(statement));
+    bind.extend(0_i16.to_be_bytes());
+    bind.extend(0_i16.to_be_bytes());
+    bind.extend(0_i16.to_be_bytes());
+    let mut execute = cstr("");
+    execute.extend(0_i32.to_be_bytes());
+    let mut out = message(b'B', &bind);
+    out.extend(message(b'E', &execute));
+    out.extend(message(b'S', &[]));
+    out
 }
 
 #[tokio::test]
@@ -253,7 +290,7 @@ async fn the_error_that_answers_a_password_statement_loses_its_message_when_pipe
         .send(&extended("FAIL ALTER ROLE app PASSWORD hunter2", "x"))
         .await;
     client.until_ready().await;
-    let mut batch = parse("SELECT 1");
+    let mut batch = parse("", "SELECT 1");
     batch.extend(message(b'S', &[]));
     batch.extend(query("FAIL ALTER ROLE app PASSWORD hunter2"));
     batch.extend(query("FAIL plain"));
@@ -264,6 +301,33 @@ async fn the_error_that_answers_a_password_statement_loses_its_message_when_pipe
     finish(&harness, &mut client, "s-pipelined").await;
     let (_, errors) = fields_and_errors(&harness, "s-pipelined").await;
     assert_eq!(errors, [false, false, true]);
+}
+
+#[tokio::test]
+async fn an_error_of_a_password_statement_executed_in_a_later_cycle_loses_its_message() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-later").await;
+    for (name, statement) in [
+        ("secret", "EXECFAIL ALTER ROLE app PASSWORD hunter2"),
+        ("", "EXECFAIL CREATE ROLE ops PASSWORD 'hunter2'"),
+        ("plain", "EXECFAIL plain"),
+    ] {
+        let mut prepare = parse(name, statement);
+        prepare.extend(message(b'S', &[]));
+        client.send(&prepare).await;
+        client.until_ready().await;
+        client.send(&bind_execute_sync(name)).await;
+        client.until_ready().await;
+    }
+    let mut closing = message(b'C', b"Ssecret\0");
+    closing.extend(message(b'S', &[]));
+    client.send(&closing).await;
+    client.until_ready().await;
+    client.send(&bind_execute_sync("secret")).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-later").await;
+    let (_, errors) = fields_and_errors(&harness, "s-later").await;
+    assert_eq!(errors, [false, false, true, true]);
 }
 
 #[tokio::test]

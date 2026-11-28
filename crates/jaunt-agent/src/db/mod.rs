@@ -1,5 +1,6 @@
 mod audit;
 mod cancel;
+mod lexer;
 mod relay;
 #[cfg(test)]
 mod tests;
@@ -22,6 +23,7 @@ use jaunt_proto::{
 use jaunt_tunnel::BoxFuture;
 use rustls::crypto::CryptoProvider;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::clock::Clock;
 use crate::keys::TlsKey;
@@ -48,6 +50,7 @@ pub struct DbLimits {
     pub connect_timeout: Duration,
     pub startup_timeout: Duration,
     pub close_timeout: Duration,
+    pub cancel_close_timeout: Duration,
     pub cancel_entries: usize,
     pub frontend: Limits,
 }
@@ -56,6 +59,7 @@ pub const DB_LIMITS: DbLimits = DbLimits {
     connect_timeout: Duration::from_secs(10),
     startup_timeout: Duration::from_secs(10),
     close_timeout: Duration::from_secs(5),
+    cancel_close_timeout: Duration::from_millis(500),
     cancel_entries: SERVICE_LIMITS.connections_per_service * MAX_SERVICES_PER_AGENT,
     frontend: Limits {
         max_data_message: DEFAULT_MAX_DATA_MESSAGE,
@@ -164,9 +168,16 @@ impl DbHandler {
 }
 
 impl Inner {
-    async fn tell(&self, stream: &mut ServiceStream, (code, message): (&str, &str)) {
+    async fn tell(
+        &self,
+        stream: &mut ServiceStream,
+        (code, message): (&str, &str),
+        cancel: &CancellationToken,
+    ) {
         let by = upstream::deadline(&self.clock, self.limits.close_timeout);
         tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
             () = write_fatal(stream, code, message) => {}
             () = self.clock.sleep_until(by) => {}
         }
@@ -368,7 +379,7 @@ impl Inner {
                 error = %UpstreamError::NotConfigured,
                 "the database session cannot start"
             );
-            self.tell(&mut client, UNAVAILABLE).await;
+            self.tell(&mut client, UNAVAILABLE, &session.cancel).await;
             return Ok(ServiceOutcome::UpstreamError);
         };
         let audit = SessionAudit::start(
@@ -403,55 +414,50 @@ impl Inner {
         };
         let Ok(forwarded) = self.policy.forward(&startup, &access.user, &access.name) else {
             failed(UpstreamError::GrantedNames);
-            self.tell(&mut client, UNAVAILABLE).await;
+            self.tell(&mut client, UNAVAILABLE, &session.cancel).await;
             return Ok(ServiceOutcome::UpstreamError);
         };
-        let prepared = upstream::load_trust(&target.tls, &target.address)
+        let starting = async {
+            let (server_name, session_config, cancel_config) =
+                upstream::load_trust(&target.tls, &target.address)
+                    .await
+                    .and_then(|trust| {
+                        let session = upstream::session_config(
+                            &self.provider,
+                            &trust.roots,
+                            &access.certificate_der,
+                            &key,
+                        )?;
+                        let cancel = upstream::cancel_config(&self.provider, &trust.roots)?;
+                        Ok((trust.server_name, session, cancel))
+                    })
+                    .map_err(LoginError::Upstream)?;
+            let mut connection = upstream::open(
+                &target.address,
+                &server_name,
+                session_config,
+                &self.clock,
+                self.limits.connect_timeout,
+            )
             .await
-            .and_then(|trust| {
-                let session = upstream::session_config(
-                    &self.provider,
-                    &trust.roots,
-                    &access.certificate_der,
-                    &key,
-                )?;
-                let cancel = upstream::cancel_config(&self.provider, &trust.roots)?;
-                Ok((trust.server_name, session, cancel))
-            });
+            .map_err(LoginError::Upstream)?;
+            let login = upstream::login(
+                &mut connection,
+                &forwarded,
+                &self.clock,
+                self.limits.startup_timeout,
+            )
+            .await?;
+            Ok::<_, LoginError>((server_name, cancel_config, connection, login))
+        };
+        let started = tokio::select! {
+            biased;
+            () = session.cancel.cancelled() => return Ok(ServiceOutcome::Closed),
+            started = starting => started,
+        };
         drop(key);
-        let (server_name, session_config, cancel_config) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                failed(error);
-                self.tell(&mut client, UNAVAILABLE).await;
-                return Ok(ServiceOutcome::UpstreamError);
-            }
-        };
-        let mut upstream = match upstream::open(
-            &target.address,
-            &server_name,
-            session_config,
-            &self.clock,
-            self.limits.connect_timeout,
-        )
-        .await
-        {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                failed(error);
-                self.tell(&mut client, UNAVAILABLE).await;
-                return Ok(ServiceOutcome::UpstreamError);
-            }
-        };
-        let login = match upstream::login(
-            &mut upstream,
-            &forwarded,
-            &self.clock,
-            self.limits.startup_timeout,
-        )
-        .await
-        {
-            Ok(login) => login,
+        let (server_name, cancel_config, upstream, login) = match started {
+            Ok(started) => started,
             Err(LoginError::Password) => {
                 tracing::warn!(
                     target: "jaunt::agent",
@@ -460,7 +466,8 @@ impl Inner {
                     "the database asked for a password; configure the cert authentication method for the agent"
                 );
                 audit.protocol_error(ProtocolProblem::PasswordRequested);
-                self.tell(&mut client, PASSWORD_REQUESTED).await;
+                self.tell(&mut client, PASSWORD_REQUESTED, &session.cancel)
+                    .await;
                 return Ok(ServiceOutcome::UpstreamError);
             }
             Err(LoginError::Refused(notice)) => {
@@ -477,7 +484,8 @@ impl Inner {
                     "the database refused the session"
                 );
                 audit.error(&notice);
-                self.tell(&mut client, (code, DATABASE_REFUSED)).await;
+                self.tell(&mut client, (code, DATABASE_REFUSED), &session.cancel)
+                    .await;
                 return Ok(ServiceOutcome::UpstreamError);
             }
             Err(LoginError::Protocol(problem)) => {
@@ -489,12 +497,12 @@ impl Inner {
                     "the database broke the protocol during the startup"
                 );
                 audit.protocol_error(problem);
-                self.tell(&mut client, UNAVAILABLE).await;
+                self.tell(&mut client, UNAVAILABLE, &session.cancel).await;
                 return Ok(ServiceOutcome::ProtocolError);
             }
             Err(LoginError::Upstream(error)) => {
                 failed(error);
-                self.tell(&mut client, UNAVAILABLE).await;
+                self.tell(&mut client, UNAVAILABLE, &session.cancel).await;
                 return Ok(ServiceOutcome::UpstreamError);
             }
         };
@@ -514,6 +522,7 @@ impl Inner {
             }
             registered
         });
+        audit.set_backslash_escapes(login.backslash_escapes);
         if client.write_all(&login.client_bytes).await.is_err() || client.flush().await.is_err() {
             return Ok(ServiceOutcome::Closed);
         }
@@ -535,6 +544,7 @@ impl Inner {
                 cancel: &session.cancel,
                 clock: &self.clock,
                 close_timeout: self.limits.close_timeout,
+                cancel_close_timeout: self.limits.cancel_close_timeout,
                 session_id,
             },
         )

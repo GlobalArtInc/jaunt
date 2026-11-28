@@ -95,6 +95,7 @@ pub enum Mode {
     Refuse(&'static str),
     Silent,
     NoTls,
+    Greeting(usize),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -315,7 +316,7 @@ async fn serve(mut tcp: TcpStream, shared: Arc<Shared>, index: usize) {
             shared.record(|seen| seen.closed += 1);
             return;
         }
-        Mode::Normal | Mode::Password(_) | Mode::Refuse(_) => {}
+        Mode::Normal | Mode::Password(_) | Mode::Refuse(_) | Mode::Greeting(_) => {}
     }
     if tcp.write_all(b"S").await.is_err() {
         return;
@@ -378,17 +379,26 @@ async fn serve(mut tcp: TcpStream, shared: Arc<Shared>, index: usize) {
             drop(tls.write_all(&out).await);
             return;
         }
-        Mode::Normal | Mode::Silent | Mode::NoTls => {}
+        Mode::Normal | Mode::Silent | Mode::NoTls | Mode::Greeting(_) => {}
     }
     out.extend(message(b'R', &0_i32.to_be_bytes()));
     out.extend(parameter("server_version", "17.2"));
     out.extend(parameter("client_encoding", "UTF8"));
+    let visible = out.len();
     out.extend(parameter("jaunt_internal_hint", "10.9.8.7"));
     let mut key = FakePg::process_id(index).to_be_bytes().to_vec();
     key.extend(
         (0..shared.key_bytes).map(|offset| u8::try_from((index * 31 + offset) % 251).unwrap()),
     );
-    out.extend(message(b'K', &key));
+    let key = message(b'K', &key);
+    if let Mode::Greeting(target) = mode {
+        let rest = visible + key.len() + ready().len();
+        let mut body = b"SNOTICE\0VNOTICE\0C00000\0M".to_vec();
+        body.resize(target - rest - 5 - 2, b'n');
+        body.extend_from_slice(b"\0\0");
+        out.extend(message(b'N', &body));
+    }
+    out.extend(key);
     out.extend(ready());
     if tls.write_all(&out).await.is_err() {
         return;
@@ -424,6 +434,9 @@ async fn read_message(tls: &mut TlsStream<TcpStream>, shared: &Shared) -> Option
 
 async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: usize) {
     let mut skipping = false;
+    let mut prepared: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut bound: Vec<u8> = Vec::new();
     while let Some((tag, body)) = read_message(tls, shared).await {
         let mut out = Vec::new();
         if skipping && tag != b'S' && tag != b'X' {
@@ -502,7 +515,9 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                 out.extend(ready());
             }
             b'P' => {
-                let statement = body.split(|byte| *byte == 0).nth(1).unwrap_or_default();
+                let mut parts = body.split(|byte| *byte == 0);
+                let name = parts.next().unwrap_or_default().to_vec();
+                let statement = parts.next().unwrap_or_default();
                 if statement.starts_with(b"FAIL") {
                     skipping = true;
                     out.extend(message(
@@ -510,12 +525,48 @@ async fn queries(tls: &mut TlsStream<TcpStream>, shared: &Arc<Shared>, index: us
                         &notice("ERROR", "42601", "syntax error at or near \"hunter2\""),
                     ));
                 } else {
+                    prepared.insert(name, statement.to_vec());
                     out.extend(message(b'1', &[]));
                 }
             }
-            b'B' => out.extend(message(b'2', &[])),
+            b'B' => {
+                let name = body.split(|byte| *byte == 0).nth(1).unwrap_or_default();
+                match prepared.get(name) {
+                    Some(statement) => {
+                        bound = statement.clone();
+                        out.extend(message(b'2', &[]));
+                    }
+                    None => {
+                        skipping = true;
+                        out.extend(message(
+                            b'E',
+                            &notice("ERROR", "26000", "prepared statement does not exist"),
+                        ));
+                    }
+                }
+            }
+            b'C' => {
+                if body.first() == Some(&b'S') {
+                    let name = body[1..]
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .unwrap_or_default();
+                    prepared.remove(name);
+                }
+                out.extend(message(b'3', &[]));
+            }
             b'D' => out.extend(message(b'n', &[])),
-            b'E' => out.extend(complete("SELECT 0")),
+            b'E' => {
+                if bound.starts_with(b"EXECFAIL") {
+                    skipping = true;
+                    out.extend(message(
+                        b'E',
+                        &notice("ERROR", "42601", "syntax error at or near \"hunter2\""),
+                    ));
+                } else {
+                    out.extend(complete("SELECT 0"));
+                }
+            }
             b'S' => {
                 skipping = false;
                 out.extend(ready());
