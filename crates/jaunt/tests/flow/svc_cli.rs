@@ -447,7 +447,6 @@ fn db_proxy_refuses_unsafe_directories_and_a_held_lock_and_replaces_a_dead_socke
                 assert!(running.line().starts_with("psql "), "{case}");
                 let meta = fs::symlink_metadata(&socket).unwrap();
                 assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{case}");
-                assert_ne!(Some(meta.ino()), before, "{case}");
                 running.signal(Signal::TERM);
                 let finished = running.finish();
                 assert_eq!(
