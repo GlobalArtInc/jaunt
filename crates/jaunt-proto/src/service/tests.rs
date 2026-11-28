@@ -65,7 +65,7 @@ fn settings_are_refused_by_rule() {
         (
             pg(
                 json!({"postgres": {"tls": {"ca_file": "/x", "server_name": "10.0.0.1"},
-                                   "audit": {"queries": "digest", "max_query_bytes": 65536}}}),
+                                   "audit": {"queries": "digest", "max_query_bytes": 8192}}}),
             ),
             None,
         ),
@@ -129,7 +129,7 @@ fn settings_are_refused_by_rule() {
         ),
         (
             pg(
-                json!({"postgres": {"tls": {"server_name": "x"}, "audit": {"max_query_bytes": 65537}}}),
+                json!({"postgres": {"tls": {"server_name": "x"}, "audit": {"max_query_bytes": 8193}}}),
             ),
             Some(ServiceProblem::InvalidMaxQueryBytes),
         ),

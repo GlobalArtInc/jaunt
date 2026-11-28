@@ -9,13 +9,15 @@ use h2::{Ping, PingPong};
 use http::header::{ACCEPT, CONTENT_TYPE, DATE, RETRY_AFTER};
 use http::{HeaderMap, Method, Request, StatusCode};
 use jaunt_proto::{
-    AGENT_CAPABILITIES_PATH, AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH,
-    AGENT_SERVICE_END_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH,
-    AccountReport, AgentCapabilities, AgentTrust, AgentTrustV2, AgentTrustV3, AuthorizeRequest,
-    AuthorizeResponse, ErrorBody, NodeServices, RecordingAck, RecordingChunk, RecordingComplete,
-    RecordingReceipt, RenewRequest, RenewResponse, ServiceAnnouncement, ServiceAuthorizeRequest,
-    ServiceAuthorizeResponse, ServiceCertificateRequest, ServiceCertificateResponse, ServiceEnd,
-    SessionEnd, SessionEndOutcome, TrustedX509Root, recording_chunks_path, recording_complete_path,
+    AGENT_CAPABILITIES_PATH, AGENT_EVENTS_INVALID_SESSION, AGENT_EVENTS_PATH,
+    AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH, AGENT_SERVICE_END_PATH,
+    AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH, AccountReport,
+    AgentCapabilities, AgentEventBatch, AgentEventsAccepted, AgentEventsRefusal, AgentTrust,
+    AgentTrustV2, AgentTrustV3, AuthorizeRequest, AuthorizeResponse, ErrorBody, NodeServices,
+    RecordingAck, RecordingChunk, RecordingComplete, RecordingReceipt, RenewRequest, RenewResponse,
+    ServiceAnnouncement, ServiceAuthorizeRequest, ServiceAuthorizeResponse,
+    ServiceCertificateRequest, ServiceCertificateResponse, ServiceEnd, SessionEnd,
+    SessionEndOutcome, TrustedX509Root, recording_chunks_path, recording_complete_path,
 };
 use jaunt_tunnel::{ALPN_AGENT_API, Keepalive};
 use rustls::ClientConfig;
@@ -266,6 +268,19 @@ impl AgentApi {
     pub async fn end_service(&self, end: &ServiceEnd) -> Result<SessionEndOutcome, ApiError> {
         self.post_json(AGENT_SERVICE_END_PATH, end, Retry::Idempotent)
             .await
+    }
+
+    pub async fn agent_events(&self, batch: &AgentEventBatch) -> Result<EventsAnswer, ApiError> {
+        let payload = Bytes::from(serde_json::to_vec(batch).map_err(|_| ApiError::Request)?);
+        let answer = self
+            .answer(
+                Method::POST,
+                AGENT_EVENTS_PATH,
+                Some(payload),
+                Retry::Idempotent,
+            )
+            .await?;
+        events_answer(answer.status, &answer.body, answer.retry_after)
     }
 
     pub async fn service_certificate(
@@ -639,6 +654,31 @@ fn with_retry_after(error: ApiError, after: Option<Duration>) -> ApiError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventsAnswer {
+    Accepted(AgentEventsAccepted),
+    SessionsRefused(Vec<String>),
+}
+
+fn events_answer(
+    status: StatusCode,
+    body: &[u8],
+    retry_after: Option<Duration>,
+) -> Result<EventsAnswer, ApiError> {
+    if status.is_success() {
+        return serde_json::from_slice(body)
+            .map(EventsAnswer::Accepted)
+            .map_err(|_| ApiError::BadResponse);
+    }
+    if status == StatusCode::BAD_REQUEST
+        && let Ok(refusal) = serde_json::from_slice::<AgentEventsRefusal>(body)
+        && refusal.error == AGENT_EVENTS_INVALID_SESSION
+    {
+        return Ok(EventsAnswer::SessionsRefused(refusal.sessions));
+    }
+    Err(with_retry_after(refusal(status, body), retry_after))
+}
+
 fn interpret<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> Result<T, ApiError> {
     if status.is_success() {
         return serde_json::from_slice(body).map_err(|_| ApiError::BadResponse);
@@ -677,8 +717,8 @@ mod tests {
     use jaunt_proto::{
         AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH, AGENT_SERVICE_END_PATH,
         AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH, AccountEvent,
-        AccountReference, AccountReport, AgentTrust, AgentTrustV2, AuthorizeRequest,
-        AuthorizeResponse, RenewRequest, RenewResponse, ServiceAuthorizeRequest,
+        AccountReference, AccountReport, AgentEventsAccepted, AgentTrust, AgentTrustV2,
+        AuthorizeRequest, AuthorizeResponse, RenewRequest, RenewResponse, ServiceAuthorizeRequest,
         ServiceAuthorizeResponse, ServiceCertificateRequest, ServiceEnd, ServiceIdentity,
         ServiceKind, ServiceOutcome, SessionEnd, SessionEndOutcome, SessionPermissions,
     };
@@ -687,8 +727,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        API_KEEPALIVE, AgentApi, ApiError, ServedTrust, forget, interpret, retry_after,
-        with_retry_after,
+        API_KEEPALIVE, AgentApi, ApiError, EventsAnswer, ServedTrust, events_answer, forget,
+        interpret, retry_after, with_retry_after,
     };
     use crate::keys::HostKey;
     use crate::testkit::{
@@ -1377,6 +1417,67 @@ mod tests {
         assert!(matches!(
             with_retry_after(ApiError::CallTimeout, Some(Duration::from_secs(60))),
             ApiError::CallTimeout
+        ));
+    }
+
+    #[test]
+    fn an_events_answer_names_the_refused_sessions_only_for_an_invalid_session_refusal() {
+        let accepted = events_answer(
+            StatusCode::OK,
+            br#"{"accepted":2,"dropped":1,"withheld":1}"#,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(accepted, EventsAnswer::Accepted(body) if body.accepted == 2 && body.withheld == 1)
+        );
+        let refused = events_answer(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"invalid_session","sessions":["a","b"]}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            refused,
+            EventsAnswer::SessionsRefused(vec!["a".to_owned(), "b".to_owned()])
+        );
+        for (status, body, expected) in [
+            (
+                StatusCode::BAD_REQUEST,
+                &br#"{"error":"invalid_batch"}"#[..],
+                400,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"other","sessions":["a"]}"#,
+                400,
+            ),
+            (StatusCode::NOT_FOUND, b"", 404),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                br#"{"error":"too_many_requests"}"#,
+                429,
+            ),
+        ] {
+            match events_answer(status, body, Some(Duration::from_secs(3))) {
+                Err(ApiError::Status {
+                    status,
+                    retry_after,
+                    ..
+                }) => {
+                    assert_eq!(status, expected);
+                    assert_eq!(retry_after, Some(Duration::from_secs(3)));
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            events_answer(StatusCode::OK, b"{}", None),
+            Ok(EventsAnswer::Accepted(body)) if body == AgentEventsAccepted::default()
+        ));
+        assert!(matches!(
+            events_answer(StatusCode::OK, b"7", None),
+            Err(ApiError::BadResponse)
         ));
     }
 }

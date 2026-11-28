@@ -243,6 +243,7 @@ pub struct Session {
     pub outcome: Option<String>,
     pub decision_hash: Option<String>,
     pub service_name: Option<String>,
+    pub audit_incomplete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,7 +319,7 @@ macro_rules! session_columns {
         "id, user_id, serial, node_id, state, created_at, expires_at, authorized_at, ended_at, \
          login, exit_status, bytes_in, bytes_out, recording_incomplete, end_reason, \
          max_duration_secs, origin, record_input, kind, service_id, target, roles, grant_ids, \
-         db_client_serial, outcome, decision_hash, service_name"
+         db_client_serial, outcome, decision_hash, service_name, audit_incomplete"
     };
 }
 
@@ -420,6 +421,7 @@ const LISTING_SELECT: &str = "SELECT s.id AS id, s.user_id AS user_id, s.serial 
     s.target AS target, s.roles AS roles, s.grant_ids AS grant_ids, \
     s.db_client_serial AS db_client_serial, s.outcome AS outcome, \
     s.decision_hash AS decision_hash, s.service_name AS service_name, \
+    s.audit_incomplete AS audit_incomplete, \
     u.email AS user_email, n.name AS node_name, \
     r.state AS recording_state, r.salvaged AS recording_salvaged \
     FROM sessions s JOIN users u ON u.id = s.user_id JOIN nodes n ON n.id = s.node_id \
@@ -801,6 +803,7 @@ pub(crate) fn session_from_row(row: &SqliteRow) -> Result<Session, StoreError> {
         outcome: row.try_get("outcome")?,
         decision_hash: row.try_get("decision_hash")?,
         service_name: row.try_get("service_name")?,
+        audit_incomplete: row.try_get("audit_incomplete")?,
     })
 }
 

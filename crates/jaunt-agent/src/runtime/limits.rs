@@ -17,6 +17,7 @@ pub struct ServiceLimits {
     pub connections_per_service: usize,
     pub authorize_timeout: Duration,
     pub end_timeout: Duration,
+    pub event_flush_timeout: Duration,
     pub refusal_log_every: Duration,
 }
 
@@ -27,6 +28,7 @@ pub const SERVICE_LIMITS: ServiceLimits = ServiceLimits {
     connections_per_service: 512,
     authorize_timeout: Duration::from_secs(10),
     end_timeout: Duration::from_secs(10),
+    event_flush_timeout: Duration::from_secs(2),
     refusal_log_every: Duration::from_secs(60),
 };
 

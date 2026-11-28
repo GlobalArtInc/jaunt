@@ -38,6 +38,7 @@ use crate::recording::{RecordingParts, Recordings};
 use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller, ApprovalTiming};
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
 use crate::runtime::directory::{Approvals, ServiceDirectory};
+use crate::runtime::events::{EventSink, SINK_LIMITS, follow_connections};
 use crate::runtime::handler::HandlerRegistry;
 use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
 use crate::runtime::x509::UserX509Trust;
@@ -336,6 +337,7 @@ pub async fn run(
     let capability_events = tunnel_config.subscribe();
     let service_events = tunnel_config.subscribe();
     let approval_events = tunnel_config.subscribe();
+    let audit_connections = tunnel_config.subscribe();
     let announced = Arc::new(Notify::new());
     let service_sink = Arc::new(AnnouncedSink {
         inner: Arc::new(ControlServices::new(
@@ -368,6 +370,12 @@ pub async fn run(
         settings.service_certificate_backoff,
     ));
     let handlers = Arc::new(HandlerRegistry::default());
+    let audit_events = EventSink::new(
+        api.clone(),
+        env.clock.clone(),
+        random_sampler(),
+        SINK_LIMITS,
+    );
     let (directory, directory_changes) = watch::channel(Arc::new(ServiceDirectory::default()));
     let (served, served_changes) = watch::channel(None);
     tunnel_config.follow_served_kinds(served_changes);
@@ -398,6 +406,7 @@ pub async fn run(
             handlers,
             directory: directory_changes,
             limits: settings.service_limits,
+            events: audit_events.clone(),
         })),
     });
     let (host_ca, host_ca_changes) = watch::channel(None);
@@ -430,6 +439,12 @@ pub async fn run(
     let following = tokio::spawn(approvals.follow(approved_changes, stop.child_token()));
     let polling = tokio::spawn(poller.run(stop.child_token()));
     let renewing = tokio::spawn(certificates.run(stop.child_token()));
+    let following_connections = tokio::spawn(follow_connections(
+        audit_connections,
+        audit_events.clone(),
+        api_stop.clone(),
+    ));
+    let sending_events = tokio::spawn(audit_events.run(api_stop.clone()));
     let trust = tokio::spawn(loader.run(stop.child_token()));
     let mut tunnel = tokio::spawn(TunnelClient::run(tunnel_config, router, stop.child_token()));
     let event_log = tokio::spawn(log_tunnel_events(events, stop.child_token()));
@@ -494,6 +509,12 @@ pub async fn run(
     }
     if let Err(error) = renewing.await {
         tracing::error!(target: "jaunt::agent", error = %error, "the service certificate task failed");
+    }
+    if let Err(error) = sending_events.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the audit event task failed");
+    }
+    if let Err(error) = following_connections.await {
+        tracing::error!(target: "jaunt::agent", error = %error, "the audit event connection task failed");
     }
     match tunnel_result {
         Ok(Ok(())) if shutdown.is_cancelled() => Ok(()),

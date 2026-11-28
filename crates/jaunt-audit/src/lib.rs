@@ -14,12 +14,13 @@ mod spec;
 mod time;
 
 pub use capture::{
-    AUDIT_TARGET, AlreadyBound, AuditLayer, AuditLevelCompiledOut, AuditTap, TapSnapshot,
-    ensure_audit_level_compiled_in,
+    AUDIT_PRIVATE_TARGET, AUDIT_TARGET, AlreadyBound, AuditLayer, AuditLevelCompiledOut, AuditTap,
+    TapSnapshot, ensure_audit_level_compiled_in,
 };
 pub use clock::{Clock, ManualClock, SystemClock, system_clock};
 pub use event::{
     Actor, AuditEvent, BuildReport, EventError, FieldValue, RawValue, SCHEMA_VERSION, clean_text,
+    is_withheld, stored_char_len,
 };
 pub use pipeline::{
     DEFAULT_QUEUE, DEFAULT_RETRY_BACKOFF, LaneSnapshot, MAX_QUEUE, Pipeline, PipelineClosed,

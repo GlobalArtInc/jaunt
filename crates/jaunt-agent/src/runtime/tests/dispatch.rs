@@ -12,8 +12,10 @@ use super::support::{
     USER_ID, UserSpec, closed_without_data, dns_name, handshake, hello_then_read, later,
     service_id, wait_until,
 };
+use crate::clock::Clock;
 use crate::keys::TlsKey;
 use crate::runtime::MAX_GRANT_DURATION;
+use crate::runtime::events::{SINK_LIMITS, SessionEvent};
 use crate::runtime::limits::{SERVICE_LIMITS, ServiceLimits};
 use crate::testkit::{LogCapture, NODE_ID};
 
@@ -618,8 +620,29 @@ fn the_documented_limits_are_the_built_in_ones() {
     assert_eq!(SERVICE_LIMITS.connections_per_service, 512);
     assert_eq!(SERVICE_LIMITS.authorize_timeout, Duration::from_secs(10));
     assert_eq!(MAX_GRANT_DURATION, Duration::from_secs(24 * 3600));
+    assert_eq!(SERVICE_LIMITS.event_flush_timeout, Duration::from_secs(2));
+    assert_eq!(
+        (SINK_LIMITS.queue_events, SINK_LIMITS.queue_bytes),
+        (4096, 4 * 1024 * 1024)
+    );
+    assert_eq!(
+        (
+            SINK_LIMITS.batch_events,
+            SINK_LIMITS.batch_bytes,
+            SINK_LIMITS.batch_wait
+        ),
+        (256, 256 * 1024, Duration::from_secs(1))
+    );
+    assert_eq!(
+        (SINK_LIMITS.first_retry, SINK_LIMITS.max_retry),
+        (Duration::from_secs(1), Duration::from_secs(30))
+    );
     let docs = include_str!("../../../../../docs/operations.md");
     for documented in [
+        "4096 events or 4 MiB",
+        "256 events, 256 KiB or 1 s",
+        "from 1 s to 30 s",
+        "2 s for the audit events of a session",
         "64 unfinished TLS handshakes per service",
         "10 s for the handshake and 10 s more for the first protocol step",
         "32 connections per user and service",
@@ -797,4 +820,43 @@ async fn a_client_that_speaks_only_tls_1_2_is_refused() {
     );
     opened.finished().await;
     assert!(harness.control.authorizations().is_empty());
+}
+
+#[tokio::test]
+async fn the_events_of_a_session_reach_control_before_its_end_is_reported() {
+    let harness = Harness::new();
+    let start = SessionEvent {
+        name: "tcp.session.start",
+        fields: [(
+            "client_addr".to_owned(),
+            jaunt_proto::AgentEventValue::Text(CLIENT.to_owned()),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    harness.handler.emit_on_serve(vec![start]);
+    let mut opened = harness.open(TCP, "grafana", "s-events");
+    let config = harness.client_config(Some(&harness.user()), &[]);
+    let mut stream = handshake(opened.take(), &dns_name(TCP, "grafana"), config)
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    drop(stream.read_to_end(&mut rest).await);
+    opened.finished().await;
+
+    assert_eq!(harness.control.calls(), ["events", "end"]);
+    let batches = harness.control.batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].events.len(), 1);
+    assert_eq!(batches[0].events[0].session_id, "s-events");
+    assert_eq!(batches[0].events[0].name, "tcp.session.start");
+    let started = harness
+        .clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert_eq!(u128::from(batches[0].events[0].seq), started * 1000 + 1);
+    assert_eq!(harness.events.queue_len(), 0);
 }

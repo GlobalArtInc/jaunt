@@ -998,3 +998,137 @@ async fn live_ssh_sessions_carry_the_holder_and_the_current_node_labels() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn the_audit_flag_is_set_once_by_the_owner_and_never_on_an_ssh_session() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.service_sessions();
+    let db = fixture.active_db().await;
+    let ssh = active_ssh(&fixture).await;
+    assert!(!db.audit_incomplete && !ssh.audit_incomplete);
+
+    assert!(
+        !sessions
+            .mark_audit_incomplete(&db.id, OTHER_NODE)
+            .await
+            .unwrap()
+    );
+    assert!(!sessions.mark_audit_incomplete(&ssh.id, NODE).await.unwrap());
+    assert!(
+        !sessions
+            .mark_audit_incomplete("unknown", NODE)
+            .await
+            .unwrap()
+    );
+    assert!(sessions.mark_audit_incomplete(&db.id, NODE).await.unwrap());
+    assert!(!sessions.mark_audit_incomplete(&db.id, NODE).await.unwrap());
+
+    let read = sessions
+        .for_audit(&[&db.id, &ssh.id, "unknown"])
+        .await
+        .unwrap();
+    let flags: Vec<(String, bool)> = read
+        .iter()
+        .map(|session| (session.id.clone(), session.audit_incomplete))
+        .collect();
+    assert_eq!(flags.len(), 2);
+    assert!(flags.contains(&(db.id.clone(), true)));
+    assert!(flags.contains(&(ssh.id.clone(), false)));
+    let listed = fixture
+        .store
+        .sessions()
+        .listing(&db.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(listed.session.audit_incomplete);
+}
+
+#[tokio::test]
+async fn the_audit_lookup_is_bounded_and_an_empty_lookup_reads_nothing() {
+    let fixture = fixture().await;
+    let sessions = fixture.store.service_sessions();
+    assert!(sessions.for_audit(&[]).await.unwrap().is_empty());
+    let ids: Vec<String> = (0..=jaunt_store::MAX_AUDIT_LOOKUP)
+        .map(|index| format!("s-{index}"))
+        .collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    assert!(matches!(
+        sessions.for_audit(&refs).await,
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(
+        sessions
+            .for_audit(&refs[..jaunt_store::MAX_AUDIT_LOOKUP])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sessions_that_exist_before_the_audit_flag_migration_are_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jaunt.db");
+    let pool = SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&migrations)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    let (before, after): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|file| file.file_name().unwrap().to_str().unwrap() < "0020");
+    assert!(!after.is_empty());
+    for file in &before {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(std::fs::read_to_string(file).unwrap()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "INSERT INTO users (id, issuer, subject, email, username, display_name, groups, \
+         created_at, updated_at) VALUES ('u', 'i', 's', 'a@b', 'a', NULL, '[]', 1, 1)",
+        "INSERT INTO certificates (serial, user_id, kind, key_id, valid_after, valid_before, \
+         issued_at) VALUES (5, 'u', 'user', 'k', 1, 2, 1)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query(RAW_NODE)
+        .bind("n")
+        .bind("web")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (id, user_id, serial, node_id, state, created_at, expires_at, \
+         kind) VALUES ('old', 'u', 5, 'n', 'ended', 1, 2, 'db')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for file in &after {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(std::fs::read_to_string(file).unwrap()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let (flag,): (i64,) = sqlx::query_as("SELECT audit_incomplete FROM sessions WHERE id = 'old'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(flag, 0);
+    assert!(
+        sqlx::query("UPDATE sessions SET audit_incomplete = 2 WHERE id = 'old'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}

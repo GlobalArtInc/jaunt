@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tokio::time::MissedTickBehavior;
 
 use crate::admin::NodeAdmin;
+use crate::agent_events;
 use crate::audit::{self, SessionEnd};
 use crate::ca_snapshot::CaSnapshot;
 use crate::clock::{Clock, Moment, Ticker, monotonic_ticker, whole_secs};
@@ -117,6 +118,7 @@ pub struct Inner {
     pub(crate) db_client_user_issuance: RateLimiter<String>,
     pub(crate) service_user_authorizations: RateLimiter<(String, String)>,
     pub(crate) service_authorizations: RateLimiter<String>,
+    pub(crate) agent_events: agent_events::AgentEvents,
 }
 
 #[derive(Clone)]
@@ -245,6 +247,7 @@ impl Control {
                 db_client_user_issuance: db_client::user_issuance_limiter(),
                 service_user_authorizations: service_authorize::user_authorization_limiter(),
                 service_authorizations: service_authorize::authorization_limiter(),
+                agent_events: agent_events::AgentEvents::new(),
             }),
         })
     }
@@ -407,6 +410,7 @@ impl Control {
         self.db_client_user_issuance.sweep(tick);
         self.service_user_authorizations.sweep(tick);
         self.service_authorizations.sweep(tick);
+        self.agent_events.sweep_limits(tick);
         let polls = self.poll_limiter.sweep(tick);
         match self.now() {
             Some(now) => {
@@ -516,6 +520,34 @@ impl Control {
             audit::web_session_ended(user_id, SessionEnd::Expired);
         }
         Ok(ended.len())
+    }
+
+    pub async fn sweep_agent_events(&self) {
+        agent_events::sweep(self).await;
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn tracked_agent_event_sessions(&self) -> usize {
+        self.agent_events.tracked()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn agent_event_mark_attempts(&self) -> u64 {
+        self.agent_events.mark_attempts()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn agent_event_fittings(&self) -> u64 {
+        self.agent_events.fittings()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn settle_agent_event_mark_from_a_stale_row(&self, session_id: &str) -> bool {
+        agent_events::settle_stale(self, session_id).await.is_some()
     }
 
     pub async fn sweep_idle_recordings(&self) -> usize {
@@ -645,6 +677,7 @@ async fn sweep_forever(control: Control, sweep_interval: Duration) {
             tracing::warn!(target: "jaunt::control", error = %err, "purging expired service certificates failed");
         }
         control.sweep_idle_recordings().await;
+        control.sweep_agent_events().await;
     }
 }
 

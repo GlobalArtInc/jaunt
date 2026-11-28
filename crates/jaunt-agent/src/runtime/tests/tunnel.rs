@@ -27,6 +27,7 @@ use crate::run::api::API_KEEPALIVE;
 use crate::runtime::approvals::{APPROVAL_TIMING, ApprovalPoller};
 use crate::runtime::certs::{SERVICE_CERTIFICATE_BACKOFF, ServiceCertificates};
 use crate::runtime::directory::{Approvals, ApprovedService, ServiceDirectory};
+use crate::runtime::events::{EventSink, SINK_LIMITS};
 use crate::runtime::handler::HandlerRegistry;
 use crate::runtime::limits::SERVICE_LIMITS;
 use crate::runtime::x509::UserX509Trust;
@@ -157,6 +158,7 @@ async fn agent_with(
             None
         }
     };
+    let events = EventSink::new(control.clone(), clock.clone(), fixed(1.0), SINK_LIMITS);
     let runtime = Arc::new(ServiceRuntime::new(RuntimeParts {
         control: control.clone(),
         clock,
@@ -165,6 +167,7 @@ async fn agent_with(
         handlers,
         directory: directory_changes,
         limits: SERVICE_LIMITS,
+        events,
     }));
     let router = Arc::new(KindRouter {
         ssh: Arc::new(DropSsh),

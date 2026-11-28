@@ -1,5 +1,5 @@
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::StoreError;
@@ -166,6 +166,11 @@ const NODE_ACTIVE: &str = "SELECT 1 AS found FROM nodes WHERE id = ? AND state =
 const SERVICE_APPROVED: &str =
     "SELECT 1 AS found FROM services WHERE id = ? AND state = 'approved'";
 
+const MARK_AUDIT_INCOMPLETE: &str = "UPDATE sessions SET audit_incomplete = 1 \
+     WHERE id = ? AND node_id = ? AND kind <> 'ssh' AND audit_incomplete = 0";
+
+pub const MAX_AUDIT_LOOKUP: usize = 1024;
+
 const ACTIVE_OF_USER: &str = concat!(
     "SELECT ",
     session_columns!(),
@@ -215,7 +220,7 @@ macro_rules! live_select {
          s.kind AS kind, s.service_id AS service_id, s.target AS target, s.roles AS roles, \
          s.grant_ids AS grant_ids, s.db_client_serial AS db_client_serial, \
          s.outcome AS outcome, s.decision_hash AS decision_hash, \
-         s.service_name AS service_name, \
+         s.service_name AS service_name, s.audit_incomplete AS audit_incomplete, \
          u.email AS user_email, u.username AS user_username, u.groups AS user_groups, "
     };
 }
@@ -393,6 +398,38 @@ impl ServiceSessions {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(session_from_row).collect()
+    }
+
+    pub async fn for_audit(&self, ids: &[&str]) -> Result<Vec<Session>, StoreError> {
+        if ids.len() > MAX_AUDIT_LOOKUP {
+            return Err(StoreError::InvalidInput(
+                "too many sessions to look up at once",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(concat!(
+            "SELECT ",
+            session_columns!(),
+            " FROM sessions WHERE id IN ("
+        ));
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(")");
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        rows.iter().map(session_from_row).collect()
+    }
+
+    pub async fn mark_audit_incomplete(&self, id: &str, node_id: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query(MARK_AUDIT_INCOMPLETE)
+            .bind(id)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() == 1)
     }
 
     pub async fn end(&self, end: &EndService<'_>) -> Result<EndOutcome, StoreError> {

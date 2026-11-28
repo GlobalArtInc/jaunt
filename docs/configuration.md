@@ -199,7 +199,7 @@ The file is optional: without it every value has its default. `jaunt-agent insta
 | `services[].postgres.tls.ca_file` | absolute path | none | the CA that signs the database certificate; at most 1024 bytes. `ca_file` or `server_name` is required |
 | `services[].postgres.tls.server_name` | DNS name or IP | none | the name the database certificate must carry |
 | `services[].postgres.audit.queries` | string | `text` | `text` or `digest` |
-| `services[].postgres.audit.max_query_bytes` | integer | 4096 | 1 to 65536 |
+| `services[].postgres.audit.max_query_bytes` | integer | 4096 | 1 to 8192 |
 | `services[].tcp.idle_timeout_secs` | integer | 3600 | 1 to 86400 |
 
 Command-line flags:

@@ -416,6 +416,7 @@ mod tests {
             outcome: None,
             decision_hash: None,
             service_name: None,
+            audit_incomplete: false,
         }
     }
 }

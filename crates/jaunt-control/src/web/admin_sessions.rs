@@ -45,6 +45,7 @@ struct SessionBody {
     bytes_out: Option<i64>,
     recording: &'static str,
     origin: &'static str,
+    audit_incomplete: bool,
 }
 
 impl From<SessionListing> for SessionBody {
@@ -67,6 +68,7 @@ impl From<SessionListing> for SessionBody {
             exit_status: session.exit_status,
             bytes_in: session.bytes_in,
             bytes_out: session.bytes_out,
+            audit_incomplete: session.audit_incomplete,
         }
     }
 }

@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
+use super::events::SessionEvents;
 use super::x509::VerifiedUser;
 
 pub trait ServiceIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -120,6 +121,7 @@ pub struct ServiceSession {
     pub session_id: String,
     pub service: ServiceName,
     pub cancel: CancellationToken,
+    pub events: SessionEvents,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

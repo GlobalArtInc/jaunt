@@ -63,9 +63,9 @@ pub use revocations::{
 pub use service_certificates::{NewServiceCertificate, ServiceCertificate, ServiceCertificates};
 pub use service_sessions::{
     ABANDONED_OUTCOME, ActivateService, CurrentService, EndService, KubeOpened, LiveEntry,
-    LiveServiceSession, LiveSshSession, MAX_SESSION_LIST_BYTES, MAX_SESSION_OUTCOME_LEN,
-    MAX_SESSION_ROLES, MAX_SESSION_TARGET_LEN, NewServiceRoute, OpenKubeSession, ServiceRouted,
-    ServiceSessions,
+    LiveServiceSession, LiveSshSession, MAX_AUDIT_LOOKUP, MAX_SESSION_LIST_BYTES,
+    MAX_SESSION_OUTCOME_LEN, MAX_SESSION_ROLES, MAX_SESSION_TARGET_LEN, NewServiceRoute,
+    OpenKubeSession, ServiceRouted, ServiceSessions,
 };
 pub use services::{
     AnnounceOutcome, Announced, AnnouncedService, Announcement, ApprovedHolder, ApprovedService,

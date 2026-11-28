@@ -1,5 +1,6 @@
 mod admin_signature;
 mod admin_token;
+mod agent_events;
 mod agent_trust;
 mod audit_ref;
 mod client;
@@ -32,6 +33,12 @@ pub use admin_token::{
     ADMIN_TOKEN_MIN_TTL_SECS, ADMIN_TOKEN_NAME_MAX_LEN, ADMIN_TOKEN_PREFIX,
     ADMIN_TOKEN_SECRET_BYTES, ADMIN_TOKEN_SECRET_LEN, ADMIN_TOKENS_PATH, admin_token_id,
     admin_token_path, is_admin_token_id, is_admin_token_name,
+};
+pub use agent_events::{
+    AGENT_EVENT_NAMES, AGENT_EVENTS_INVALID_SESSION, AGENT_EVENTS_MAX_BATCH,
+    AGENT_EVENTS_MAX_BODY_BYTES, AGENT_EVENTS_MAX_DROPPED, AGENT_EVENTS_MAX_REFUSED_SESSIONS,
+    AGENT_EVENTS_PATH, AgentEvent, AgentEventBatch, AgentEventKind, AgentEventName,
+    AgentEventValue, AgentEventsAccepted, AgentEventsRefusal, DroppedEvents, agent_event_name,
 };
 pub use agent_trust::{
     AGENT_TRUST_V3_PATH, AgentTrust, AgentTrustV2, AgentTrustV3, TrustRole, TrustedX509Root,

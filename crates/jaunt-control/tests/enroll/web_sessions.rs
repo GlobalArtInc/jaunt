@@ -142,6 +142,18 @@ async fn a_session_detail_has_times_bytes_outcome_and_the_client_address_from_th
         .unwrap();
     let with = get(&harness, &path, &reader).await.json();
     assert_eq!(with["client_addr"], CLIENT);
+    assert_eq!(with["audit_incomplete"], false);
+    sqlx::query("UPDATE sessions SET audit_incomplete = 1 WHERE id = ?")
+        .bind(&session_id)
+        .execute(&crate::session_support::raw_pool(&harness).await)
+        .await
+        .unwrap();
+    assert_eq!(
+        get(&harness, &path, &reader).await.json()["audit_incomplete"],
+        true
+    );
+    let listed = sessions(&harness, &reader, "").await;
+    assert_eq!(listed["sessions"][0]["audit_incomplete"], true);
 
     for missing in [
         "/v1/admin/sessions/no-such-session",

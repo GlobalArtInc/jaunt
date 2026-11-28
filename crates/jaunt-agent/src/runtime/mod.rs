@@ -2,6 +2,7 @@ pub mod approvals;
 pub mod certs;
 pub mod control;
 pub mod directory;
+pub mod events;
 pub mod handler;
 pub mod limits;
 #[cfg(test)]
@@ -31,6 +32,7 @@ use crate::clock::Clock;
 use certs::{IssuedCertificate, ServiceCertificates};
 use control::{ServiceControl, may_have_started};
 use directory::{ServiceDirectory, ServiceEntry, service_kind};
+use events::EventSink;
 use handler::{
     ByteCounts, Counted, HandlerRegistry, ServiceConnection, ServiceGrant, ServiceSession,
     Transport,
@@ -66,6 +68,7 @@ pub struct RuntimeParts {
     pub handlers: Arc<HandlerRegistry>,
     pub directory: watch::Receiver<Arc<ServiceDirectory>>,
     pub limits: ServiceLimits,
+    pub events: EventSink,
 }
 
 pub struct ServiceRuntime {
@@ -79,6 +82,7 @@ pub struct ServiceRuntime {
     gauges: Gauges,
     refusals: RefusalLog,
     provider: Arc<CryptoProvider>,
+    events: EventSink,
 }
 
 struct Accepted {
@@ -115,6 +119,7 @@ impl ServiceRuntime {
             directory: parts.directory,
             limits: parts.limits,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
+            events: parts.events,
         }
     }
 
@@ -306,6 +311,7 @@ impl ServiceRuntime {
             session_id: session_id.clone(),
             service: name.clone(),
             cancel: cancel.child_token(),
+            events: self.events.session(&session_id),
         };
         let deadline = self.deadline(max_duration);
         let mut task = tokio::spawn(async move { handler.serve(connection, grant, session).await });
@@ -339,6 +345,18 @@ impl ServiceRuntime {
             Ended::Cancelled => ServiceOutcome::Closed,
             Ended::MaxDuration => ServiceOutcome::MaxDuration,
         };
+        let flushed = self
+            .events
+            .flush(&session_id, self.deadline(self.limits.event_flush_timeout))
+            .await;
+        self.events.session_ended(&session_id);
+        if !flushed {
+            tracing::debug!(
+                target: "jaunt::agent",
+                session_id = session_id.as_str(),
+                "the audit events of the session were not delivered before its end was reported; they stay queued"
+            );
+        }
         self.end(&session_id, outcome, &counts).await;
     }
 

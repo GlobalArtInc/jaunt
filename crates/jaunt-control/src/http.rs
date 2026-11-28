@@ -10,9 +10,10 @@ use axum::response::Response;
 use axum::routing::{get, post, put};
 use http_body_util::BodyExt;
 use jaunt_proto::{
-    AGENT_CAPABILITIES_PATH, AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH,
-    AGENT_SERVICE_END_PATH, AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH,
-    CLIENT_CONFIG_V2_PATH, ErrorBody, SERVICES_PATH, X509_CERTIFICATES_PATH,
+    AGENT_CAPABILITIES_PATH, AGENT_EVENTS_MAX_BODY_BYTES, AGENT_EVENTS_PATH,
+    AGENT_SERVICE_AUTHORIZE_PATH, AGENT_SERVICE_CERTIFICATE_PATH, AGENT_SERVICE_END_PATH,
+    AGENT_SERVICES_PATH, AGENT_SESSION_ACCOUNT_PATH, AGENT_TRUST_V3_PATH, CLIENT_CONFIG_V2_PATH,
+    ErrorBody, SERVICES_PATH, X509_CERTIFICATES_PATH,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -20,8 +21,9 @@ use serde::de::DeserializeOwned;
 use crate::control::Control;
 use crate::recordings::{self, MAX_COMPLETE_BODY_BYTES};
 use crate::{
-    agent_trust, callback, client_config, device, enroll, finish, host_accounts, limits, nodes,
-    poll, renew, service_cert, service_http, services, session_http, start, web, whoami, x509_cert,
+    agent_events, agent_trust, callback, client_config, device, enroll, finish, host_accounts,
+    limits, nodes, poll, renew, service_cert, service_http, services, session_http, start, web,
+    whoami, x509_cert,
 };
 
 pub(crate) const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -85,6 +87,10 @@ pub(crate) fn agent_router(control: Control) -> Router {
         .route(AGENT_SERVICE_CERTIFICATE_PATH, post(service_cert::handle))
         .route(AGENT_SERVICE_AUTHORIZE_PATH, post(service_http::authorize))
         .route(AGENT_SERVICE_END_PATH, post(service_http::end))
+        .route(
+            AGENT_EVENTS_PATH,
+            post(agent_events::handle).layer(DefaultBodyLimit::max(AGENT_EVENTS_MAX_BODY_BYTES)),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(response_headers))
         .with_state(control)

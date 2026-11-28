@@ -6,7 +6,7 @@ use jaunt_audit::{Classified, EventType};
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
 
-const AUDIT_TARGET: &str = "jaunt::audit";
+const AUDIT_TARGETS: &[&str] = &["jaunt::audit", "jaunt::audit::private"];
 const TRACING_MACROS: &[&str] = &["info", "warn", "error", "debug", "trace", "event"];
 
 #[derive(Default)]
@@ -100,7 +100,7 @@ impl Scan {
             Value::Computed => self.problems.push(format!(
                 "unsupported form: the target of a tracing macro is not a string literal ({place})"
             )),
-            Value::Literal(target) if target != AUDIT_TARGET => {}
+            Value::Literal(target) if !AUDIT_TARGETS.contains(&target.as_str()) => {}
             Value::Literal(_) => {
                 self.audit_macros += 1;
                 match event_of(&segments) {
@@ -139,7 +139,9 @@ impl Scan {
                     self.walk(group.stream(), place);
                 }
                 TokenTree::Literal(literal) => {
-                    if string_value(literal).as_deref() == Some(AUDIT_TARGET) {
+                    if string_value(literal)
+                        .is_some_and(|text| AUDIT_TARGETS.contains(&text.as_str()))
+                    {
                         self.audit_literals += 1;
                     }
                 }
@@ -164,7 +166,7 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-        if literal.value() == AUDIT_TARGET {
+        if AUDIT_TARGETS.contains(&literal.value().as_str()) {
             self.audit_literals += 1;
         }
     }
@@ -267,6 +269,7 @@ fn every_supported_spelling_is_found() {
         r#"fn f() { tracing::error!(event = "login.started", target: "jaunt::audit"); }"#,
         r#"fn f() { tokio::select! { _ = a => { tracing::info!(target: "jaunt::audit", event = "login.started"); } } }"#,
         r#"fn f() { if matches!(x, Some(_)) { debug!(target: "jaunt::audit", event = "login.started"); } }"#,
+        r#"fn f() { tracing::info!(target: "jaunt::audit::private", event = "login.started"); }"#,
     ] {
         assert_eq!(events_of(source), ["login.started"], "{source}");
     }
@@ -286,6 +289,14 @@ fn every_bypass_spelling_fails_the_scan() {
         (
             "target taken from a variable",
             r#"fn f(t: &str) { tracing::info!(target: t, event = "login.started"); }"#,
+        ),
+        (
+            "computed event name on the private target",
+            r#"fn f(n: &str) { tracing::info!(target: "jaunt::audit::private", event = n); }"#,
+        ),
+        (
+            "an unmapped name on the private target",
+            r#"fn f() { tracing::info!(target: "jaunt::audit::private", event = "revoke.nothing"); }"#,
         ),
         (
             "computed event name",

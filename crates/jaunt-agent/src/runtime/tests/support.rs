@@ -6,9 +6,10 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use jaunt_proto::{
-    AnnouncedService, DbAccessRequest, ServiceAccess, ServiceAnnouncement, ServiceAuthorizeRequest,
-    ServiceAuthorizeResponse, ServiceCertificateRequest, ServiceCertificateResponse, ServiceEnd,
-    ServiceKind, ServiceOutcome, SessionEndOutcome, TrustRole, TrustedX509Root,
+    AgentEventBatch, AgentEventsAccepted, AnnouncedService, DbAccessRequest, ServiceAccess,
+    ServiceAnnouncement, ServiceAuthorizeRequest, ServiceAuthorizeResponse,
+    ServiceCertificateRequest, ServiceCertificateResponse, ServiceEnd, ServiceKind, ServiceOutcome,
+    SessionEndOutcome, TrustRole, TrustedX509Root,
 };
 use jaunt_tunnel::{BoxFuture, ServiceName, SessionId, StreamKind, StreamMeta};
 use rcgen::string::Ia5String;
@@ -27,10 +28,11 @@ use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::clock::{Clock, unix_secs};
-use crate::run::api::ApiError;
+use crate::run::api::{ApiError, EventsAnswer};
 use crate::runtime::certs::ServiceCertificates;
 use crate::runtime::control::ServiceControl;
 use crate::runtime::directory::{ApprovedService, ServiceDirectory};
+use crate::runtime::events::{EventSink, EventTransport, SINK_LIMITS, SessionEvent};
 use crate::runtime::handler::{
     HandlerError, HandlerRegistry, Prepared, ServiceConnection, ServiceGrant, ServiceHandler,
     ServiceSession,
@@ -273,6 +275,8 @@ pub struct FakeServiceControl {
     certificate_gate: Mutex<Option<Arc<Notify>>>,
     lie: Mutex<Option<Lie>>,
     lifetime: i64,
+    calls: Mutex<Vec<&'static str>>,
+    batches: Mutex<Vec<AgentEventBatch>>,
 }
 
 impl FakeServiceControl {
@@ -298,7 +302,17 @@ impl FakeServiceControl {
             certificate_gate: Mutex::new(None),
             lie: Mutex::new(None),
             lifetime: 7 * DAY,
+            calls: Mutex::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub fn batches(&self) -> Vec<AgentEventBatch> {
+        self.batches.lock().unwrap().clone()
     }
 
     pub fn script(&self, step: AuthorizeStep) {
@@ -375,6 +389,7 @@ impl ServiceControl for FakeServiceControl {
         end: &'a ServiceEnd,
     ) -> BoxFuture<'a, Result<SessionEndOutcome, ApiError>> {
         self.ends.lock().unwrap().push(end.clone());
+        self.calls.lock().unwrap().push("end");
         Box::pin(async { Ok(SessionEndOutcome::Recorded) })
     }
 
@@ -431,6 +446,23 @@ impl ServiceControl for FakeServiceControl {
     }
 }
 
+impl EventTransport for FakeServiceControl {
+    fn send<'a>(
+        &'a self,
+        batch: &'a AgentEventBatch,
+    ) -> BoxFuture<'a, Result<EventsAnswer, ApiError>> {
+        self.calls.lock().unwrap().push("events");
+        self.batches.lock().unwrap().push(batch.clone());
+        let accepted = u64::try_from(batch.events.len()).unwrap();
+        Box::pin(async move {
+            Ok(EventsAnswer::Accepted(AgentEventsAccepted {
+                accepted,
+                ..AgentEventsAccepted::default()
+            }))
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Behaviour {
     Echo,
@@ -461,6 +493,7 @@ pub struct TestHandler {
     behaviour: Mutex<Behaviour>,
     preparing: Mutex<Preparing>,
     served: Mutex<Vec<Served>>,
+    emitting: Mutex<Vec<SessionEvent>>,
 }
 
 impl TestHandler {
@@ -469,7 +502,12 @@ impl TestHandler {
             behaviour: Mutex::new(behaviour),
             preparing: Mutex::new(Preparing::Nothing),
             served: Mutex::new(Vec::new()),
+            emitting: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn emit_on_serve(&self, events: Vec<SessionEvent>) {
+        *self.emitting.lock().unwrap() = events;
     }
 
     pub fn prepare_with(&self, preparing: Preparing) {
@@ -510,6 +548,9 @@ impl ServiceHandler for TestHandler {
             alpn: connection.alpn.clone(),
             client_addr: connection.client_addr.clone(),
         });
+        for event in self.emitting.lock().unwrap().iter() {
+            session.events.emit(event.clone());
+        }
         let behaviour = *self.behaviour.lock().unwrap();
         assert!(
             behaviour != Behaviour::PanicAtOnce,
@@ -593,6 +634,7 @@ pub struct Harness {
     pub pki: Arc<TestPki>,
     pub ca: UserCa,
     pub handler: Arc<TestHandler>,
+    pub events: EventSink,
     pub now: i64,
     _directory: watch::Sender<Arc<ServiceDirectory>>,
 }
@@ -655,6 +697,8 @@ impl Harness {
             fixed(1.0),
             crate::runtime::certs::SERVICE_CERTIFICATE_BACKOFF,
         ));
+        let events = EventSink::new(control.clone(), clock.clone(), fixed(1.0), SINK_LIMITS);
+        tokio::spawn(events.clone().run(CancellationToken::new()));
         let runtime = Arc::new(ServiceRuntime::new(RuntimeParts {
             control: control.clone(),
             clock: clock.clone(),
@@ -663,6 +707,7 @@ impl Harness {
             handlers: Arc::new(handlers),
             directory: directory_changes,
             limits: options.limits,
+            events: events.clone(),
         }));
         Self {
             runtime,
@@ -671,6 +716,7 @@ impl Harness {
             pki,
             ca,
             handler,
+            events,
             now,
             _directory: directory,
         }

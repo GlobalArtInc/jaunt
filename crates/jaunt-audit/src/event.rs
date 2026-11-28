@@ -164,15 +164,32 @@ fn looks_secret(value: &str) -> bool {
         || has_admin_token(value)
 }
 
-pub fn clean_text(value: &str, max_chars: usize) -> Option<String> {
-    let sanitized: String = value
+fn sanitize(value: &str) -> String {
+    value
         .chars()
         .map(|c| if is_invisible(c) { REPLACEMENT } else { c })
-        .collect();
-    if looks_secret(value) || looks_secret(&sanitized) {
+        .collect()
+}
+
+pub fn stored_char_len(c: char) -> usize {
+    if is_invisible(c) {
+        REPLACEMENT.len_utf8()
+    } else if matches!(c, '"' | '\\') {
+        2
+    } else {
+        c.len_utf8()
+    }
+}
+
+pub fn is_withheld(value: &str) -> bool {
+    looks_secret(value) || looks_secret(&sanitize(value))
+}
+
+pub fn clean_text(value: &str, max_chars: usize) -> Option<String> {
+    if is_withheld(value) {
         return None;
     }
-    Some(sanitized.chars().take(max_chars).collect())
+    Some(sanitize(value).chars().take(max_chars).collect())
 }
 
 fn envelope_text(raw: &[(&str, RawValue)], name: Option<&str>) -> Option<String> {
@@ -648,6 +665,31 @@ mod tests {
         assert!(event.fields.is_empty());
         assert_eq!(report.fields_dropped, 2);
         assert_eq!(clean_text("é".repeat(10).as_str(), 3).unwrap(), "ééé");
+    }
+
+    #[test]
+    fn the_stored_length_of_a_text_is_the_sum_of_the_stored_lengths_of_its_characters() {
+        let text = "a\"\\\t\u{1}\u{7f}é€😀\u{202e}\u{2028}/<>'";
+        let (event, _) = AuditEvent::from_raw(
+            EventType::DbQuery,
+            &[("text", RawValue::Text(text.to_owned()))],
+            "i".to_owned(),
+            at(),
+        );
+        let (empty, _) = AuditEvent::from_raw(
+            EventType::DbQuery,
+            &[("text", RawValue::Text(String::new()))],
+            "i".to_owned(),
+            at(),
+        );
+        let expected: usize = text.chars().map(super::stored_char_len).sum();
+        assert_eq!(
+            event.payload_json().len() - empty.payload_json().len(),
+            expected
+        );
+        assert_eq!(super::stored_char_len('"'), 2);
+        assert_eq!(super::stored_char_len('\t'), 3);
+        assert_eq!(super::stored_char_len('a'), 1);
     }
 
     #[test]

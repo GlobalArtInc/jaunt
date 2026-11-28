@@ -3,9 +3,10 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use jaunt_store::{Store, StoreError};
+use jaunt_store::{MAX_AUDIT_PAYLOAD_BYTES, Store, StoreError};
 use rustix::fs::{Mode, OFlags};
 
 use crate::event::AuditEvent;
@@ -146,11 +147,19 @@ impl AuditSink for JsonlSink {
 
 pub struct StoreSink {
     store: Store,
+    oversized: Arc<AtomicU64>,
 }
 
 impl StoreSink {
     pub fn new(store: Store) -> StoreSink {
-        StoreSink { store }
+        StoreSink {
+            store,
+            oversized: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn oversized(&self) -> u64 {
+        self.oversized.load(Ordering::Relaxed)
     }
 }
 
@@ -160,7 +169,25 @@ impl AuditSink for StoreSink {
     }
 
     async fn write(&self, batch: &[Arc<AuditEvent>]) -> Result<(), SinkError> {
-        let records: Vec<_> = batch.iter().map(|event| event.to_record()).collect();
+        let (records, oversized): (Vec<_>, Vec<_>) = batch
+            .iter()
+            .map(|event| event.to_record())
+            .partition(|record| record.payload.len() <= MAX_AUDIT_PAYLOAD_BYTES);
+        if !oversized.is_empty() {
+            let skipped = u64::try_from(oversized.len()).unwrap_or(u64::MAX);
+            let total = self.oversized.fetch_add(skipped, Ordering::Relaxed) + skipped;
+            let types: Vec<&str> = oversized
+                .iter()
+                .map(|record| record.event_type.as_str())
+                .collect();
+            tracing::error!(
+                target: "jaunt::daemon",
+                skipped,
+                total,
+                types = types.join(",").as_str(),
+                "audit events larger than the database payload limit were not stored; the rest of the batch was"
+            );
+        }
         self.store.audit_events().append(&records).await?;
         Ok(())
     }
@@ -220,6 +247,37 @@ mod tests {
             Timestamp::from_millis(1_700_000_000_000).unwrap(),
         );
         Arc::new(event)
+    }
+
+    #[tokio::test]
+    async fn one_record_over_the_payload_limit_is_skipped_and_the_rest_of_the_batch_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = jaunt_store::Store::open(&dir.path().join("jaunt.db"))
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let sink = super::StoreSink::new(store.clone());
+        let (wide, _) = AuditEvent::from_raw(
+            EventType::DbQuery,
+            &[("text", RawValue::Text("€".repeat(8192)))],
+            "wide".to_owned(),
+            Timestamp::from_millis(1_700_000_000_000).unwrap(),
+        );
+        assert!(wide.payload_json().len() > jaunt_store::MAX_AUDIT_PAYLOAD_BYTES);
+
+        sink.write(&[event("a"), Arc::new(wide), event("b")])
+            .await
+            .unwrap();
+
+        assert_eq!(sink.oversized(), 1);
+        let stored = store
+            .audit_events()
+            .query(&jaunt_store::AuditQuery::newest(10))
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = stored.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a", "b"]);
     }
 
     #[tokio::test]

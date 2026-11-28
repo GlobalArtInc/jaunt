@@ -50,6 +50,9 @@ const LIST: FieldKind = FieldKind::Text(512);
 const ACCOUNT_GROUPS: FieldKind = FieldKind::Text(1100);
 const NETWORKS: FieldKind = FieldKind::Text(720);
 const ERROR: FieldKind = FieldKind::Text(256);
+const QUERY: FieldKind = FieldKind::Text(jaunt_proto::MAX_QUERY_BYTES as usize);
+const DIGEST: FieldKind = FieldKind::Text(64);
+const DB_MESSAGE: FieldKind = FieldKind::Text(512);
 const INT: FieldKind = FieldKind::Int;
 const BOOL: FieldKind = FieldKind::Bool;
 
@@ -322,6 +325,46 @@ events! {
         [("login", NAME), ("reason", SHORT), ("ref", SHORT), ("suppressed", INT)], Class::Noisy),
     HostUserHelperFailed => ("host_user.helper_failed", "host_user.helper_failed", ActorRule::User("user_id"), NODE, SESSION, None,
         [("login", NAME), ("stage", SHORT), ("exit_status", INT), ("ref", SHORT)], Class::Noisy),
+    KubeSessionStart => ("kube.session.start", "kube.session.start", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("user", HOST), ("groups", LIST), ("client_addr", ADDR), ("observed_at", INT)]),
+    KubeSessionEnd => ("kube.session.end", "kube.session.end", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("requests_read", INT), ("requests_write", INT), ("requests_watch", INT),
+         ("requests_exec", INT), ("bytes_up", INT), ("bytes_down", INT), ("reason", SHORT), ("observed_at", INT)]),
+    KubeRequest => ("kube.request", "kube.request", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("verb", SHORT), ("api_group", NAME), ("api_version", SHORT), ("resource", NAME), ("subresource", NAME),
+         ("namespace", NAME), ("name", HOST), ("status", INT), ("duration_ms", INT), ("observed_at", INT)],
+        Class::Noisy),
+    KubeExecStart => ("kube.exec.start", "kube.exec.start", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("namespace", NAME), ("pod", HOST), ("container", NAME), ("tty", BOOL), ("exit_status", INT),
+         ("bytes", INT), ("observed_at", INT)]),
+    KubeExecEnd => ("kube.exec.end", "kube.exec.end", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("namespace", NAME), ("pod", HOST), ("container", NAME), ("tty", BOOL), ("exit_status", INT),
+         ("bytes", INT), ("observed_at", INT)]),
+    DbSessionStart => ("db.session.start", "db.session.start", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("db_user", NAME), ("db_name", NAME), ("application_name", NAME), ("server", HOST),
+         ("observed_at", INT)]),
+    DbQuery => ("db.query", "db.query", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("text", QUERY), ("truncated", BOOL), ("sha256", DIGEST), ("length", INT), ("protocol", SHORT),
+         ("command", SHORT), ("observed_at", INT)], Class::Noisy),
+    DbError => ("db.error", "db.error", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("sqlstate", SHORT), ("error_message", DB_MESSAGE), ("observed_at", INT)], Class::Noisy),
+    DbSessionEnd => ("db.session.end", "db.session.end", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("queries", INT), ("errors", INT), ("bytes", INT), ("duration_ms", INT),
+         ("observed_at", INT)]),
+    DbProtocolError => ("db.protocol_error", "db.protocol_error", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("reason", NAME), ("observed_at", INT)]),
+    TcpSessionStart => ("tcp.session.start", "tcp.session.start", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("client_addr", ADDR), ("bytes_up", INT), ("bytes_down", INT), ("duration_ms", INT),
+         ("reason", SHORT), ("observed_at", INT)]),
+    TcpSessionEnd => ("tcp.session.end", "tcp.session.end", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("service", NAME), ("client_addr", ADDR), ("bytes_up", INT), ("bytes_down", INT), ("duration_ms", INT),
+         ("reason", SHORT), ("observed_at", INT)]),
+    AgentEventsDropped => ("agent.events.dropped", "agent.events.dropped", ActorRule::Node("node_id"), NODE, SESSION, None,
+        [("count", INT), ("reason", SHORT), ("suppressed", INT)], Class::Noisy),
+    AgentEventsRefused => ("agent.events.refused", "agent.events.refused", ActorRule::Node("node_id"), NODE, None, None,
+        [("reason", SHORT), ("events", INT), ("sessions", INT), ("suppressed", INT)]),
+    SessionAuditIncomplete => ("session.audit_incomplete", "session.audit_incomplete", ActorRule::User("user_id"), NODE, SESSION, None,
+        [("dropped_total", INT)]),
 }
 
 pub const IGNORED_PREFIXES: &[&str] = &[
@@ -482,7 +525,11 @@ mod tests {
                 "gate.svc.stream",
                 "terminal.denied",
                 "host_user.refused",
-                "host_user.helper_failed"
+                "host_user.helper_failed",
+                "kube.request",
+                "db.query",
+                "db.error",
+                "agent.events.dropped"
             ]
         );
     }
@@ -507,6 +554,10 @@ mod tests {
         }
         assert_eq!(
             EventType::classify("kube.session.start"),
+            Classified::Mapped(EventType::KubeSessionStart)
+        );
+        assert_eq!(
+            EventType::classify("kube.session.begin"),
             Classified::Unknown
         );
         assert_eq!(
@@ -520,6 +571,53 @@ mod tests {
             Some(EventType::LoginWebStarted)
         );
         assert_eq!(EventType::from_name("web.login.started"), None);
+    }
+
+    #[test]
+    fn the_events_an_agent_may_send_are_exactly_the_kube_db_and_tcp_events_of_the_spec() {
+        let agent: HashSet<&str> = jaunt_proto::AGENT_EVENT_NAMES
+            .iter()
+            .map(|known| known.name)
+            .collect();
+        let spec: HashSet<&str> = EventType::ALL
+            .iter()
+            .map(|kind| kind.name())
+            .filter(|name| {
+                ["kube.", "db.", "tcp."]
+                    .iter()
+                    .any(|kind| name.starts_with(kind))
+            })
+            .collect();
+        assert_eq!(agent, spec);
+        for known in jaunt_proto::AGENT_EVENT_NAMES {
+            let kind = EventType::from_name(known.name).unwrap();
+            let spec = kind.spec();
+            let expected = if known.lifecycle {
+                super::Class::Critical
+            } else {
+                super::Class::Noisy
+            };
+            assert_eq!(spec.class, expected, "{}", known.name);
+            assert_eq!(
+                spec.actor,
+                super::ActorRule::User("user_id"),
+                "{}",
+                known.name
+            );
+            assert_eq!(
+                (spec.node, spec.session),
+                (Some("node_id"), Some("session_id"))
+            );
+            assert_eq!(spec.policy_hash, None, "{}", known.name);
+            assert_eq!(spec.emitted, spec.name);
+            assert!(
+                spec.fields
+                    .iter()
+                    .any(|field| field.name == "observed_at" && field.kind == FieldKind::Int),
+                "{}",
+                known.name
+            );
+        }
     }
 
     #[test]

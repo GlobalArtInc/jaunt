@@ -1,6 +1,7 @@
 mod access_review;
 mod admin;
 mod agent;
+mod agent_events;
 mod agent_trust;
 mod audit;
 mod authorize;

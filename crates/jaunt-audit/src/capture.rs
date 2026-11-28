@@ -17,6 +17,7 @@ use crate::reference::event_id;
 use crate::spec::{Classified, EventType};
 
 pub const AUDIT_TARGET: &str = "jaunt::audit";
+pub const AUDIT_PRIVATE_TARGET: &str = "jaunt::audit::private";
 
 const EVENT_FIELD: &str = "event";
 const REFERENCE_FIELD: &str = "ref";
@@ -97,7 +98,11 @@ impl AuditTap {
         AuditLayer {
             inner: Arc::clone(&self.inner),
         }
-        .with_filter(Targets::new().with_target(AUDIT_TARGET, Level::INFO))
+        .with_filter(
+            Targets::new()
+                .with_target(AUDIT_TARGET, Level::INFO)
+                .with_target(AUDIT_PRIVATE_TARGET, Level::INFO),
+        )
     }
 
     pub fn snapshot(&self) -> TapSnapshot {
@@ -157,7 +162,10 @@ impl Visit for Collector {
 
 impl<S: Subscriber> Layer<S> for AuditLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != AUDIT_TARGET {
+        if !matches!(
+            event.metadata().target(),
+            AUDIT_TARGET | AUDIT_PRIVATE_TARGET
+        ) {
             return;
         }
         let mut collector = Collector::default();
@@ -304,6 +312,25 @@ mod tests {
         assert_eq!(events[0].time.millis(), 1_700_000_000_123);
         assert!(events[0].id < events[1].id && events[1].id < events[2].id);
         assert_eq!(stand.tap.snapshot().captured, 3);
+    }
+
+    #[tokio::test]
+    async fn the_private_audit_target_is_captured_and_its_neighbours_are_not() {
+        let stand = stand();
+        let subscriber = Registry::default().with(stand.tap.layer());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "jaunt::audit::private", event = "login.started", login_id = "p-1");
+            tracing::info!(target: "jaunt::audit::privately", event = "login.started", login_id = "p-2");
+            tracing::info!(target: "jaunt::auditor", event = "login.started", login_id = "p-3");
+        });
+
+        let events = drained(&stand).await;
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event.text("login_id"))
+            .collect();
+        assert_eq!(ids, ["p-1"]);
     }
 
     #[tokio::test]
