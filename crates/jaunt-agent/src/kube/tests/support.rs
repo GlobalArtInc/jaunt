@@ -804,6 +804,7 @@ impl Kube {
                 issuer_fingerprint: "bb".to_owned(),
             },
             client_addr: CLIENT_ADDR.to_owned(),
+            prepared: None,
         };
         let cancel = CancellationToken::new();
         let session = ServiceSession {
