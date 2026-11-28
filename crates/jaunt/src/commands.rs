@@ -464,7 +464,7 @@ fn include_target(
     })
 }
 
-fn custom_home(environment: &Environment, home: &Path) -> Option<PathBuf> {
+pub(crate) fn custom_home(environment: &Environment, home: &Path) -> Option<PathBuf> {
     let default_home = resolve_home(None, environment.user_home.clone()).ok();
     if default_home.as_deref() == Some(home) {
         None
@@ -627,7 +627,7 @@ pub fn run_status(args: &StatusArgs, environment: &Environment) -> ExitCode {
     }
 }
 
-fn ensure_ssh_setup(environment: &Environment, home: &Path) -> Option<SshSetup> {
+pub(crate) fn ensure_ssh_setup(environment: &Environment, home: &Path) -> Option<SshSetup> {
     let user_home = environment
         .user_home
         .as_deref()
@@ -644,7 +644,10 @@ fn ensure_ssh_setup(environment: &Environment, home: &Path) -> Option<SshSetup> 
     })
 }
 
-fn explicit_home(home: Option<&PathBuf>, environment: &Environment) -> Result<PathBuf, String> {
+pub(crate) fn explicit_home(
+    home: Option<&PathBuf>,
+    environment: &Environment,
+) -> Result<PathBuf, String> {
     match home {
         Some(home) if home.is_absolute() => Ok(home.clone()),
         Some(_) => Err("--home must be an absolute path".to_owned()),

@@ -7,6 +7,7 @@ mod cli;
 mod client;
 mod ensure;
 mod gate;
+mod kube;
 mod login_flow;
 mod services;
 mod ssh_cli;

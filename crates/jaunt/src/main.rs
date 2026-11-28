@@ -8,6 +8,7 @@ use jaunt::commands::{
     StatusArgs, run_admin, run_db, run_ensure, run_login, run_logout, run_ls, run_proxy,
     run_status,
 };
+use jaunt::kube::{KubeCommand, run_kube};
 
 use crate::policy::PolicyCommand;
 
@@ -47,6 +48,11 @@ enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+    #[command(about = "Kubernetes: kubeconfig entries and client certificates for kubectl")]
+    Kube {
+        #[command(subcommand)]
+        command: KubeCommand,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,6 +67,7 @@ fn main() -> ExitCode {
         Command::Admin(args) => run_admin(&args, &Environment::from_process()),
         Command::Proxy { command } => run_proxy(&command, &Environment::from_process()),
         Command::Db { command } => run_db(&command, &Environment::from_process()),
+        Command::Kube { command } => run_kube(&command, &Environment::from_process()),
     }
 }
 

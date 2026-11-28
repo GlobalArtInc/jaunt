@@ -107,6 +107,8 @@ pub enum X509Error {
     Api(ApiError),
     #[error("the X.509 certificate from the server was refused: {0}")]
     Refused(#[from] IssuedError),
+    #[error("{path} cannot be used: it is damaged or does not belong to the stored key")]
+    DamagedCertificate { path: PathBuf },
 }
 
 fn io_error(action: &'static str, path: &Path, source: io::Error) -> X509Error {
@@ -606,7 +608,52 @@ fn temporary_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!(".{name}.{}.{serial}.tmp", std::process::id()))
 }
 
-fn pem_encode(label: &str, der: &[u8]) -> Zeroizing<String> {
+pub struct UserIdentity {
+    certificate_pem: String,
+    key_pem: Zeroizing<String>,
+    pub valid_before: i64,
+}
+
+impl UserIdentity {
+    pub fn certificate_pem(&self) -> &str {
+        &self.certificate_pem
+    }
+
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
+    }
+}
+
+impl fmt::Debug for UserIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserIdentity")
+            .field("valid_before", &self.valid_before)
+            .field("key", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn read_identity(issued: &UserCertificate) -> Result<UserIdentity, X509Error> {
+    let missing = |path: &Path| io_error("read", path, io::ErrorKind::NotFound.into());
+    let key = load_key(&issued.key_path)?.ok_or_else(|| missing(&issued.key_path))?;
+    let damaged = || X509Error::DamagedCertificate {
+        path: issued.certificate_path.clone(),
+    };
+    let stored = read_file(&issued.certificate_path, Secrecy::Public)?
+        .ok_or_else(|| missing(&issued.certificate_path))?;
+    let der = pem_decode(CERTIFICATE_LABEL, &stored).ok_or_else(damaged)?;
+    let (rest, certificate) = X509Certificate::from_der(&der).map_err(|_| damaged())?;
+    if !rest.is_empty() || certificate.public_key().raw != key.spki_der() {
+        return Err(damaged());
+    }
+    Ok(UserIdentity {
+        certificate_pem: pem_encode(CERTIFICATE_LABEL, &der).as_str().to_owned(),
+        key_pem: key.pem(),
+        valid_before: certificate.validity().not_after.timestamp(),
+    })
+}
+
+pub(crate) fn pem_encode(label: &str, der: &[u8]) -> Zeroizing<String> {
     let body = Zeroizing::new(STANDARD.encode(der));
     let mut text = Zeroizing::new(String::with_capacity(body.len() * 2 + 2 * label.len() + 64));
     text.push_str("-----BEGIN ");
@@ -1307,6 +1354,49 @@ mod tests {
         let foreign = ensure_x509_with(&fixture.store, &other.lock, &issuer, NOW);
         assert!(matches!(foreign, Err(X509Error::ForeignLock)));
         assert_eq!(issuer.calls.get(), 0);
+    }
+
+    #[test]
+    fn the_identity_is_read_back_and_a_damaged_or_foreign_certificate_is_refused() {
+        let fixture = Fixture::new(SSH_END);
+        let issued = fixture
+            .ensure(&Scripted::shaped(Shape::honest(SSH_END)))
+            .unwrap();
+
+        let identity = super::read_identity(&issued).unwrap();
+
+        assert_eq!(identity.valid_before, SSH_END);
+        assert_eq!(
+            identity.key_pem(),
+            fs::read_to_string(fixture.key_path()).unwrap()
+        );
+        assert_eq!(
+            identity.certificate_pem(),
+            fs::read_to_string(fixture.cert_path()).unwrap()
+        );
+        assert!(!format!("{identity:?}").contains("PRIVATE KEY"));
+        let mut foreign = Shape::honest(SSH_END);
+        foreign.other_key = true;
+        let der = STANDARD
+            .decode(certificate(&[], &foreign).certificate_der)
+            .unwrap();
+        let replacements = [
+            super::pem_encode("CERTIFICATE", &der).as_str().to_owned(),
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_owned(),
+        ];
+        for replacement in replacements {
+            fs::write(fixture.cert_path(), &replacement).unwrap();
+            let refused = super::read_identity(&issued);
+            assert!(
+                matches!(refused, Err(X509Error::DamagedCertificate { .. })),
+                "{refused:?}"
+            );
+        }
+        fs::remove_file(fixture.cert_path()).unwrap();
+        assert!(matches!(
+            super::read_identity(&issued),
+            Err(X509Error::Io { action: "read", .. })
+        ));
     }
 
     #[test]
