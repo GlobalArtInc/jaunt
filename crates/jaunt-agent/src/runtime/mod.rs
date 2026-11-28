@@ -36,7 +36,7 @@ use directory::{ServiceDirectory, ServiceEntry, service_kind};
 use events::EventSink;
 use handler::{
     ByteCounts, Counted, EndReason, HandlerRegistry, ServiceConnection, ServiceGrant,
-    ServiceSession, Transport,
+    ServiceHandler, ServiceSession, Transport, Unauthorized,
 };
 use limits::{Gauges, Refusal, RefusalLog, ServiceLimits};
 use x509::{CertRefusal, UserVerifier, UserX509Trust, VerifiedUser};
@@ -195,6 +195,7 @@ impl ServiceRuntime {
             alpn: accepted.alpn,
             user: accepted.user,
             client_addr: meta.client().to_owned(),
+            prepared: None,
         };
         let deadline = self.deadline(self.limits.handshake_timeout);
         let prepared = tokio::select! {
@@ -224,6 +225,15 @@ impl ServiceRuntime {
                 return;
             }
         };
+        if prepared.handled {
+            tracing::debug!(
+                target: "jaunt::agent",
+                session_id = session_id.as_str(),
+                service = %name,
+                "the service handler finished the connection without a session"
+            );
+            return;
+        }
         let Some(wire_kind) = service_kind(kind) else {
             return;
         };
@@ -260,6 +270,8 @@ impl ServiceRuntime {
                     kind = kind.as_str(),
                     "the control plane allowed a session with access of another kind; the connection is closed"
                 );
+                self.refuse(&handler, connection, Unauthorized::Unavailable, &cancel)
+                    .await;
                 self.end(&session_id, ServiceOutcome::UpstreamError, &counts)
                     .await;
                 return;
@@ -271,6 +283,8 @@ impl ServiceRuntime {
                     service = %name,
                     "the control plane denied the service session"
                 );
+                self.refuse(&handler, connection, Unauthorized::Denied, &cancel)
+                    .await;
                 return;
             }
             Decided::Answer(Err(error)) => {
@@ -281,6 +295,8 @@ impl ServiceRuntime {
                     error = %error,
                     "asking the control plane about a service session failed; the connection is closed"
                 );
+                self.refuse(&handler, connection, Unauthorized::Unavailable, &cancel)
+                    .await;
                 if may_have_started(&error) {
                     self.end(&session_id, ServiceOutcome::UpstreamError, &counts)
                         .await;
@@ -294,6 +310,8 @@ impl ServiceRuntime {
                     service = %name,
                     "the control plane did not answer about a service session in time; the connection is closed"
                 );
+                self.refuse(&handler, connection, Unauthorized::Unavailable, &cancel)
+                    .await;
                 self.end(&session_id, ServiceOutcome::UpstreamError, &counts)
                     .await;
                 return;
@@ -388,6 +406,22 @@ impl ServiceRuntime {
             );
         }
         self.end(&session_id, outcome, &counts).await;
+    }
+
+    async fn refuse(
+        &self,
+        handler: &Arc<dyn ServiceHandler>,
+        connection: ServiceConnection,
+        reason: Unauthorized,
+        cancel: &CancellationToken,
+    ) {
+        let deadline = self.deadline(self.limits.handshake_timeout);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = self.sleep_until(deadline) => {}
+            () = handler.refuse(connection, reason) => {}
+        }
     }
 
     async fn end(&self, session_id: &str, outcome: ServiceOutcome, counts: &ByteCounts) {

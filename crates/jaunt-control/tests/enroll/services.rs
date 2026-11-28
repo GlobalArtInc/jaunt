@@ -554,7 +554,7 @@ async fn the_service_list_returns_only_what_the_policy_allows_for_each_kind() {
     );
     let postgres = |name: &str, env: &str| {
         json!({"kind": "postgres", "name": name, "labels": {"env": env},
-               "address": "127.0.0.1:5432", "postgres": {"tls": {"server_name": "db-01"}}})
+               "address": "127.0.0.1:5432", "postgres": {"tls": {"ca_file": "/etc/jaunt/pg-ca.pem", "server_name": "db-01"}}})
     };
     let offered_set = vec![
         json!({"kind": "kubernetes", "name": "prod-eu", "labels": {"env": "prod"}}),

@@ -742,3 +742,74 @@ fn cancel_requests_match_backend_key_data() {
         assert_eq!(cancel(process_id, key).matches(&issued), expected);
     }
 }
+
+fn streamed(input: &[u8], step: usize) -> (Vec<(FrontendMessage, Vec<u8>)>, Option<DecodeError>) {
+    let mut decoder = FrontendDecoder::with_streamed_queries(small_limits()).expect("valid limits");
+    let outcome = run(&mut decoder, input, step);
+    (outcome.messages, outcome.error)
+}
+
+#[test]
+fn streamed_queries_pass_through_in_pieces_and_check_their_terminator() {
+    let long = "x".repeat(1500);
+    let valid = after_startup(&[&message(b'Q', &cstr(&long)), &message(b'S', &[])]);
+    let (whole, error) = streamed(&valid, valid.len());
+    assert_eq!(error, None);
+    assert!(matches!(
+        whole[1],
+        (FrontendMessage::QueryText { length: 1501 }, _)
+    ));
+    assert_eq!(whole[1].1, message(b'Q', &cstr(&long)));
+    assert!(matches!(whole[2].0, FrontendMessage::Sync));
+    let (bytewise, error) = streamed(&valid, 7);
+    assert_eq!(error, None);
+    assert_eq!(bytewise.len(), whole.len());
+    assert_eq!(bytewise[1].1, whole[1].1);
+
+    let mut inner = b"SELECT 1".to_vec();
+    inner.push(0);
+    inner.extend_from_slice(b"DROP TABLE t");
+    inner.push(0);
+    let unterminated = b"SELECT 1".to_vec();
+    let cases: [(Vec<u8>, DecodeError); 4] = [
+        (
+            message(b'Q', &inner),
+            malformed("Query", Problem::TrailingBytes),
+        ),
+        (
+            message(b'Q', &unterminated),
+            malformed("Query", Problem::MissingTerminator),
+        ),
+        (
+            message(b'Q', &[]),
+            malformed("Query", Problem::MissingTerminator),
+        ),
+        (
+            message(b'Q', &vec![b'x'; 2048]),
+            DecodeError::TooLarge {
+                message: "Query",
+                length: 2052,
+                limit: 2048,
+            },
+        ),
+    ];
+    for (bad, expected) in cases {
+        let input = after_startup(&[&bad]);
+        for step in [1, input.len()] {
+            let (messages, error) = streamed(&input, step);
+            assert_eq!(error.as_ref(), Some(&expected), "{bad:?}");
+            let passed: usize = messages.iter().map(|(_, bytes)| bytes.len()).sum();
+            assert!(!input[..passed].ends_with(b"DROP TABLE t\0"));
+        }
+    }
+}
+
+#[test]
+fn buffered_queries_stay_the_default() {
+    let input = after_startup(&[&message(b'Q', &cstr("SELECT 1"))]);
+    let messages = frontend(&input).only();
+    let FrontendMessage::Query(statement) = &messages[1] else {
+        panic!("expected a buffered query, got {:?}", messages[1]);
+    };
+    assert_eq!(statement.as_bytes(), b"SELECT 1");
+}

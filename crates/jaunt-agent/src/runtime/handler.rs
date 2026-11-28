@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt;
 use std::io;
 use std::pin::Pin;
@@ -95,6 +96,7 @@ pub struct ServiceConnection {
     pub alpn: Option<Vec<u8>>,
     pub user: VerifiedUser,
     pub client_addr: String,
+    pub prepared: Option<Box<dyn Any + Send>>,
 }
 
 impl fmt::Debug for ServiceConnection {
@@ -140,6 +142,22 @@ pub struct ServiceSession {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Prepared {
     pub db: Option<DbAccessRequest>,
+    pub handled: bool,
+}
+
+impl Prepared {
+    pub fn handled() -> Self {
+        Self {
+            db: None,
+            handled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unauthorized {
+    Denied,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -152,6 +170,14 @@ pub trait ServiceHandler: Send + Sync {
         _connection: &'a mut ServiceConnection,
     ) -> BoxFuture<'a, Result<Prepared, HandlerError>> {
         Box::pin(async { Ok(Prepared::default()) })
+    }
+
+    fn refuse(
+        &self,
+        _connection: ServiceConnection,
+        _reason: Unauthorized,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
     }
 
     fn serve(

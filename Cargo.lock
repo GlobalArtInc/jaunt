@@ -2238,6 +2238,7 @@ dependencies = [
  "jaunt-host-users",
  "jaunt-kube",
  "jaunt-limits",
+ "jaunt-pgwire",
  "jaunt-proto",
  "jaunt-record",
  "jaunt-ssh",

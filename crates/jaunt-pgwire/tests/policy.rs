@@ -262,3 +262,64 @@ fn parameter_names_are_matched_without_case_and_rewritten_canonically() {
         ]
     );
 }
+
+#[test]
+fn forward_takes_the_given_names_and_keeps_only_allowed_parameters() {
+    let policy = StartupPolicy::default();
+    let startup = decoded_version(
+        V3_2,
+        &[
+            ("user", "app"),
+            ("database", "orders"),
+            ("Application_Name", "psql"),
+        ],
+    );
+    let forwarded = policy
+        .forward(&startup, "reporting", "analytics")
+        .expect("allowed");
+    assert_eq!(forwarded.version(), ProtocolVersion::V3_2);
+    assert_eq!(
+        forwarded.parameters().collect::<Vec<_>>(),
+        [
+            ("user", "reporting"),
+            ("database", "analytics"),
+            ("application_name", "psql"),
+        ]
+    );
+    let long = "n".repeat(64);
+    let cases: [(&str, &str, StartupRefusal); 4] = [
+        (
+            "",
+            "analytics",
+            StartupRefusal::InvalidName { parameter: "user" },
+        ),
+        (
+            "rep\0replication\0true",
+            "analytics",
+            StartupRefusal::InvalidName { parameter: "user" },
+        ),
+        (
+            "reporting",
+            "a\0b",
+            StartupRefusal::InvalidName {
+                parameter: "database",
+            },
+        ),
+        (
+            "reporting",
+            &long,
+            StartupRefusal::NameTooLong {
+                parameter: "database",
+                limit: 63,
+            },
+        ),
+    ];
+    for (user, database, expected) in cases {
+        assert_eq!(policy.forward(&startup, user, database), Err(expected));
+    }
+    let replication = decoded(&[("user", "app"), ("replication", "database")]);
+    assert_eq!(
+        policy.forward(&replication, "app", "app"),
+        Err(StartupRefusal::Replication)
+    );
+}

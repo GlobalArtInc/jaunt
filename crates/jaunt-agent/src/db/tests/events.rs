@@ -1,0 +1,331 @@
+use jaunt_proto::{AgentEventValue, PostgresAudit, QueryAudit};
+use tokio::io::AsyncWriteExt;
+
+use super::fake_pg::{cstr, message};
+use super::harness::{DbHarness, DbOptions, PgClient, query, text};
+use crate::keys::sha256_hex;
+use crate::runtime::events::SINK_LIMITS;
+use crate::testkit::LogCapture;
+
+const BIND_VALUE: &str = "bind-value-7f3a91";
+
+fn extended(statement: &str, value: &str) -> Vec<u8> {
+    let mut parse = cstr("");
+    parse.extend(cstr(statement));
+    parse.extend(0_i16.to_be_bytes());
+    let mut bind = cstr("");
+    bind.extend(cstr(""));
+    bind.extend(0_i16.to_be_bytes());
+    bind.extend(1_i16.to_be_bytes());
+    bind.extend(i32::try_from(value.len()).unwrap().to_be_bytes());
+    bind.extend_from_slice(value.as_bytes());
+    bind.extend(0_i16.to_be_bytes());
+    let mut execute = cstr("");
+    execute.extend(0_i32.to_be_bytes());
+    let mut out = message(b'P', &parse);
+    out.extend(message(b'B', &bind));
+    out.extend(message(b'E', &execute));
+    out.extend(message(b'S', &[]));
+    out
+}
+
+async fn finish(harness: &DbHarness, client: &mut PgClient, session: &str) {
+    client.send(&message(b'X', &[])).await;
+    assert!(client.rest().await.is_empty());
+    harness.ended(session).await;
+}
+
+fn audit(queries: QueryAudit, max_query_bytes: u32) -> DbOptions {
+    DbOptions {
+        audit: PostgresAudit {
+            queries,
+            max_query_bytes,
+        },
+        ..DbOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn simple_extended_and_copy_statements_become_events_without_bind_values() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-events").await;
+    client.send(&query("SELECT 1")).await;
+    client.until_ready().await;
+    client.send(&extended("SELECT $1", BIND_VALUE)).await;
+    client.until_ready().await;
+    client.send(&query("COPY t FROM STDIN")).await;
+    assert!(client.next().await.is_some());
+    let mut rows = Vec::new();
+    for row in ["1\n", "2\n", "3\n"] {
+        rows.extend(message(b'd', row.as_bytes()));
+    }
+    rows.extend(message(b'c', &[]));
+    client.send(&rows).await;
+    client.until_ready().await;
+    client.send(&query("FAIL now")).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-events").await;
+    assert_eq!(harness.pg.seen().copied, b"1\n2\n3\n");
+
+    let events = harness.session_events("s-events");
+    let starts = harness.named("s-events", "db.session.start");
+    let ends = harness.named("s-events", "db.session.end");
+    assert_eq!((starts.len(), ends.len()), (1, 1));
+    let start = &starts[0];
+    assert_eq!(text(start, "db_user").as_deref(), Some("app"));
+    assert_eq!(text(start, "db_name").as_deref(), Some("main"));
+    assert_eq!(text(start, "application_name").as_deref(), Some("psql"));
+    assert_eq!(text(start, "server"), Some(harness.pg.address.clone()));
+    let queries = harness.named("s-events", "db.query");
+    let summary: Vec<(String, String, String)> = queries
+        .iter()
+        .map(|fields| {
+            (
+                text(fields, "text").unwrap(),
+                text(fields, "protocol").unwrap(),
+                text(fields, "command").unwrap(),
+            )
+        })
+        .collect();
+    let expected = [
+        ("SELECT 1", "simple", "select"),
+        ("SELECT $1", "extended", "select"),
+        ("COPY t FROM STDIN", "simple", "copy"),
+        ("FAIL now", "simple", "other"),
+    ];
+    assert_eq!(
+        summary,
+        expected.map(|(a, b, c)| (a.to_owned(), b.to_owned(), c.to_owned()))
+    );
+    assert_eq!(text(&queries[0], "sha256"), Some(sha256_hex(b"SELECT 1")));
+    assert_eq!(queries[0]["truncated"], AgentEventValue::Bool(false));
+    let errors = harness.named("s-events", "db.error");
+    assert_eq!(text(&errors[0], "sqlstate").as_deref(), Some("42601"));
+    assert!(
+        text(&errors[0], "error_message")
+            .unwrap()
+            .starts_with("syntax error")
+    );
+    let end = &ends[0];
+    assert_eq!(end["queries"], AgentEventValue::Int(4));
+    assert_eq!(end["errors"], AgentEventValue::Int(1));
+    assert!(matches!(end["bytes"], AgentEventValue::Int(bytes) if bytes > 100));
+    assert!(end.contains_key("duration_ms"));
+    for (name, fields) in &events {
+        assert!(
+            !fields.contains_key("service") && !fields.contains_key("observed_at"),
+            "{name}"
+        );
+        for value in fields.values() {
+            assert!(!matches!(value, AgentEventValue::Text(text) if text.contains(BIND_VALUE)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_text_is_cut_on_a_character_boundary_and_hashed_whole() {
+    let harness = DbHarness::with(audit(QueryAudit::Text, 10)).await;
+    let (_opened, mut client, _) = harness.login("s-cut").await;
+    let statement = "SELECT 'ééé'";
+    client.send(&query(statement)).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-cut").await;
+    let queries = harness.named("s-cut", "db.query");
+    assert_eq!(text(&queries[0], "text").as_deref(), Some("SELECT 'é"));
+    assert_eq!(queries[0]["truncated"], AgentEventValue::Bool(true));
+    assert_eq!(
+        text(&queries[0], "sha256"),
+        Some(sha256_hex(statement.as_bytes()))
+    );
+}
+
+#[tokio::test]
+async fn digest_mode_writes_the_command_and_digest_but_no_text() {
+    let harness = DbHarness::with(audit(QueryAudit::Digest, 4096)).await;
+    let (_opened, mut client, _) = harness.login("s-digest").await;
+    client.send(&query("SELECT 1")).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-digest").await;
+    let queries = harness.named("s-digest", "db.query");
+    let mut keys: Vec<&str> = queries[0].keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["command", "protocol", "sha256"]);
+}
+
+async fn fields_and_errors(harness: &DbHarness, session: &str) -> (Vec<Vec<String>>, Vec<bool>) {
+    harness.ended(session).await;
+    let queries = harness
+        .named(session, "db.query")
+        .into_iter()
+        .map(|fields| {
+            let mut keys: Vec<String> = fields.keys().cloned().collect();
+            keys.sort_unstable();
+            keys
+        })
+        .collect();
+    let errors = harness
+        .named(session, "db.error")
+        .iter()
+        .map(|fields| fields.contains_key("error_message"))
+        .collect();
+    (queries, errors)
+}
+
+fn keys(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[tokio::test]
+async fn statements_that_name_a_password_carry_no_text_and_no_digest() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-secret").await;
+    for statement in [
+        "AlTeR/**/RoLe app\n\tPASSWORD 'hunter2'",
+        "SELECT dblink_connect('host=h password=hunter2')",
+        "FAIL ALTER ROLE app PASSWORD hunter2",
+        "FAIL plain",
+        "SELECT 1",
+    ] {
+        client.send(&query(statement)).await;
+        client.until_ready().await;
+    }
+    client
+        .send(&extended("CREATE ROLE ops PASSWORD 'hunter2'", "x"))
+        .await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-secret").await;
+    let (queries, errors) = fields_and_errors(&harness, "s-secret").await;
+    let secret = keys(&["command", "protocol"]);
+    let plain = keys(&["command", "protocol", "sha256", "text", "truncated"]);
+    assert_eq!(
+        queries,
+        [
+            secret.clone(),
+            secret.clone(),
+            secret.clone(),
+            plain.clone(),
+            plain,
+            secret
+        ]
+    );
+    assert_eq!(errors, [false, true]);
+    let select = &harness.named("s-secret", "db.query")[4];
+    assert_eq!(text(select, "sha256"), Some(sha256_hex(b"SELECT 1")));
+}
+
+#[tokio::test]
+async fn a_password_after_more_than_eight_kib_of_padding_is_still_found() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-padded").await;
+    let statement = format!(
+        "SELECT /* {} */ dblink_connect('host=h password=hunter2')",
+        "x".repeat(9000)
+    );
+    client.send(&query(&statement)).await;
+    client.until_ready().await;
+    client.send(&extended(&statement, "x")).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-padded").await;
+    let (queries, _) = fields_and_errors(&harness, "s-padded").await;
+    let secret = keys(&["command", "protocol"]);
+    assert_eq!(queries, [secret.clone(), secret]);
+}
+
+fn parse(statement: &str) -> Vec<u8> {
+    let mut body = cstr("");
+    body.extend(cstr(statement));
+    body.extend(0_i16.to_be_bytes());
+    message(b'P', &body)
+}
+
+#[tokio::test]
+async fn the_error_that_answers_a_password_statement_loses_its_message_when_pipelined() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-pipelined").await;
+    client
+        .send(&extended("FAIL ALTER ROLE app PASSWORD hunter2", "x"))
+        .await;
+    client.until_ready().await;
+    let mut batch = parse("SELECT 1");
+    batch.extend(message(b'S', &[]));
+    batch.extend(query("FAIL ALTER ROLE app PASSWORD hunter2"));
+    batch.extend(query("FAIL plain"));
+    client.send(&batch).await;
+    for _ in 0..3 {
+        client.until_ready().await;
+    }
+    finish(&harness, &mut client, "s-pipelined").await;
+    let (_, errors) = fields_and_errors(&harness, "s-pipelined").await;
+    assert_eq!(errors, [false, false, true]);
+}
+
+#[tokio::test]
+async fn query_text_bind_values_and_database_errors_never_reach_the_log() {
+    let log = LogCapture::default();
+    let _guard = log.install();
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-log").await;
+    client.send(&query("SELECT 'log-canary-51c2'")).await;
+    client.until_ready().await;
+    client.send(&extended("SELECT $1", BIND_VALUE)).await;
+    client.until_ready().await;
+    client.send(&query("FAIL log")).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-log").await;
+    let written = log.text();
+    assert!(written.contains("s-log"));
+    for secret in ["log-canary-51c2", BIND_VALUE, "hunter2", "SELECT $1"] {
+        assert!(!written.contains(secret), "{secret}");
+    }
+}
+
+#[tokio::test]
+async fn events_beyond_a_full_queue_are_dropped_and_counted() {
+    let harness = DbHarness::with(DbOptions {
+        sink: crate::runtime::events::SinkLimits {
+            queue_events: 4,
+            ..SINK_LIMITS
+        },
+        ..DbOptions::default()
+    })
+    .await;
+    harness.control.stall_events();
+    let (_opened, mut client, _) = harness.login("s-flood").await;
+    for _ in 0..12 {
+        client.send(&query("SELECT 1")).await;
+        client.until_ready().await;
+    }
+    assert!(harness.events.counters().dropped >= 8);
+}
+
+#[tokio::test]
+async fn a_one_mebibyte_query_streams_through_and_is_cut_for_the_audit() {
+    let harness = DbHarness::new().await;
+    let (_opened, mut client, _) = harness.login("s-large").await;
+    let statement = format!("SELECT '{}'", "a".repeat(1024 * 1024));
+    let bytes = query(&statement);
+    let (head, tail) = bytes.split_at(256 * 1024);
+    client.stream.write_all(head).await.unwrap();
+    client.stream.flush().await.unwrap();
+    harness
+        .pg
+        .wait("the database to see the start of the query", |seen| {
+            seen.query_bytes >= 128 * 1024
+        })
+        .await;
+    assert!(harness.pg.seen().messages.is_empty());
+    client.send(tail).await;
+    client.until_ready().await;
+    finish(&harness, &mut client, "s-large").await;
+    let queries = harness.named("s-large", "db.query");
+    let kept = text(&queries[0], "text").unwrap();
+    assert_eq!(kept.len(), 4096);
+    assert!(statement.starts_with(&kept));
+    assert_eq!(queries[0]["truncated"], AgentEventValue::Bool(true));
+    assert_eq!(
+        text(&queries[0], "sha256"),
+        Some(sha256_hex(statement.as_bytes()))
+    );
+    let seen = harness.pg.seen();
+    assert_eq!(seen.messages[0].1.len(), statement.len() + 1);
+}

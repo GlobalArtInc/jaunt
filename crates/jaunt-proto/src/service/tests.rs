@@ -37,7 +37,7 @@ fn every_kind_has_documented_defaults_and_its_own_block() {
 
     let pg = service(json!({
         "kind": "postgres", "name": "lk", "address": "db.internal:5432",
-        "postgres": {"tls": {"server_name": "lk-01"}}
+        "postgres": {"tls": {"ca_file": "/etc/jaunt/pg-ca.pem", "server_name": "lk-01"}}
     }))
     .settings()
     .unwrap();
@@ -104,6 +104,10 @@ fn settings_are_refused_by_rule() {
             Some(ServiceProblem::PostgresTlsMissing),
         ),
         (
+            pg(json!({"postgres": {"tls": {"server_name": "db-01"}}})),
+            Some(ServiceProblem::PostgresTlsMissing),
+        ),
+        (
             pg(json!({"postgres": {"tls": {"ca_file": "relative.pem"}}})),
             Some(ServiceProblem::InvalidCaFile),
         ),
@@ -120,17 +124,15 @@ fn settings_are_refused_by_rule() {
             Some(ServiceProblem::InvalidCaFile),
         ),
         (
-            pg(json!({"postgres": {"tls": {"server_name": "bad name"}}})),
+            pg(json!({"postgres": {"tls": {"ca_file": "/x", "server_name": "bad name"}}})),
             Some(ServiceProblem::InvalidServerName),
         ),
         (
-            pg(json!({"postgres": {"tls": {"server_name": "x"}, "audit": {"max_query_bytes": 0}}})),
+            pg(json!({"postgres": {"tls": {"ca_file": "/x"}, "audit": {"max_query_bytes": 0}}})),
             Some(ServiceProblem::InvalidMaxQueryBytes),
         ),
         (
-            pg(
-                json!({"postgres": {"tls": {"server_name": "x"}, "audit": {"max_query_bytes": 8193}}}),
-            ),
+            pg(json!({"postgres": {"tls": {"ca_file": "/x"}, "audit": {"max_query_bytes": 8193}}})),
             Some(ServiceProblem::InvalidMaxQueryBytes),
         ),
         (

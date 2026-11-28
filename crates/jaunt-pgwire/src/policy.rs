@@ -46,6 +46,8 @@ pub enum StartupRefusal {
     UserMismatch,
     #[error("the requested database is not the authorized one")]
     DatabaseMismatch,
+    #[error("the {parameter} name cannot be sent in a startup message")]
+    InvalidName { parameter: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +164,34 @@ impl StartupPolicy {
         if request.database != database {
             return Err(StartupRefusal::DatabaseMismatch);
         }
+        Ok(self.rebuild(startup, request.user, request.database))
+    }
+
+    pub fn forward(
+        &self,
+        startup: &StartupMessage,
+        user: &str,
+        database: &str,
+    ) -> Result<StartupMessage, StartupRefusal> {
+        self.inspect(startup)?;
+        for (parameter, value) in [(USER, user), (DATABASE, database)] {
+            if value.is_empty() || value.contains('\0') {
+                return Err(StartupRefusal::InvalidName { parameter });
+            }
+            if value.len() > MAX_NAME_BYTES {
+                return Err(StartupRefusal::NameTooLong {
+                    parameter,
+                    limit: MAX_NAME_BYTES,
+                });
+            }
+        }
+        Ok(self.rebuild(startup, user, database))
+    }
+
+    fn rebuild(&self, startup: &StartupMessage, user: &str, database: &str) -> StartupMessage {
         let mut parameters = vec![
-            (USER.to_owned(), request.user.to_owned()),
-            (DATABASE.to_owned(), request.database.to_owned()),
+            (USER.to_owned(), user.to_owned()),
+            (DATABASE.to_owned(), database.to_owned()),
         ];
         parameters.extend(
             startup
@@ -175,7 +202,7 @@ impl StartupPolicy {
                         .map(|canonical| (canonical.to_owned(), value.to_owned()))
                 }),
         );
-        Ok(StartupMessage::from_parts(startup.version(), parameters))
+        StartupMessage::from_parts(startup.version(), parameters)
     }
 
     fn canonical<'a>(&'a self, name: &'a str) -> Option<&'a str> {

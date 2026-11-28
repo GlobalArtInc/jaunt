@@ -32,6 +32,7 @@ use crate::accounts::{
     ControlCapabilities, Getent, HostUsersPaths, PasswdLookup, announce_capabilities,
 };
 use crate::clock::{Clock, SystemClock, format_utc, unix_secs};
+use crate::db::DbHandler;
 use crate::endpoint::{AgentEndpoint, EndpointError};
 use crate::fsio::running_as_root;
 use crate::kube::{KUBE_LIMITS, KubeHandler, KubeParts, KubernetesUpstream, declares_kubernetes};
@@ -260,8 +261,11 @@ pub(crate) fn service_handlers(
     handlers
         .register(
             StreamKind::Tcp,
-            Arc::new(TcpHandler::new(local, clock, TCP_LIMITS)),
+            Arc::new(TcpHandler::new(local, clock.clone(), TCP_LIMITS)),
         )
+        .map_err(RunError::Handlers)?;
+    handlers
+        .register(StreamKind::Db, Arc::new(DbHandler::new(local, clock)))
         .map_err(RunError::Handlers)?;
     Ok(handlers)
 }

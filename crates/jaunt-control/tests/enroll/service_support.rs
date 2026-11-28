@@ -60,7 +60,7 @@ pub fn tcp_service(name: &str) -> Value {
 
 pub fn db_service(name: &str) -> Value {
     json!({"kind": "postgres", "name": name, "labels": {"env": "prod"},
-           "address": "127.0.0.1:5432", "postgres": {"tls": {"server_name": "db-01"}}})
+           "address": "127.0.0.1:5432", "postgres": {"tls": {"ca_file": "/etc/jaunt/pg-ca.pem", "server_name": "db-01"}}})
 }
 
 pub fn kube_service(name: &str) -> Value {

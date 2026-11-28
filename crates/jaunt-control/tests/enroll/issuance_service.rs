@@ -144,7 +144,7 @@ async fn an_approved_service_of_the_node_gets_a_server_certificate_named_from_it
             tcp("grafana"),
             json!({"kind": "kubernetes", "name": "prod-eu", "labels": {"env": "prod"}}),
             json!({"kind": "postgres", "name": "lk", "labels": {"env": "prod"},
-                   "address": "127.0.0.1:5432", "postgres": {"tls": {"server_name": "db-01"}}}),
+                   "address": "127.0.0.1:5432", "postgres": {"tls": {"ca_file": "/etc/jaunt/pg-ca.pem", "server_name": "db-01"}}}),
         ],
     )
     .await;

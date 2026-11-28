@@ -24,6 +24,7 @@ hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"
 jaunt-host-users = { workspace = true }
 jaunt-kube = { workspace = true }
 jaunt-limits = { workspace = true }
+jaunt-pgwire = { workspace = true }
 jaunt-proto = { workspace = true }
 jaunt-tunnel = { workspace = true }
 jaunt-ssh = { workspace = true }

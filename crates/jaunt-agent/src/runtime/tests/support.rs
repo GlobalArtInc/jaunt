@@ -549,7 +549,10 @@ impl ServiceHandler for TestHandler {
             match preparing {
                 Preparing::Nothing => Ok(Prepared::default()),
                 Preparing::Hang => std::future::pending().await,
-                Preparing::Db(db) => Ok(Prepared { db: Some(db) }),
+                Preparing::Db(db) => Ok(Prepared {
+                    db: Some(db),
+                    handled: false,
+                }),
             }
         })
     }

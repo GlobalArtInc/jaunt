@@ -186,7 +186,7 @@ pub enum ServiceProblem {
         "the address must be host:port with a DNS name or an IP address (IPv6 in brackets) and a port from 1 to 65535"
     )]
     InvalidAddress,
-    #[error("a postgres service needs a postgres block whose tls names a ca_file or a server_name")]
+    #[error("a postgres service needs a postgres block whose tls names a ca_file")]
     PostgresTlsMissing,
     #[error(
         "postgres.tls.ca_file must be an absolute path of at most {MAX_SERVICE_PATH_BYTES} bytes without control characters"
@@ -266,7 +266,7 @@ impl AnnouncedService {
 
 fn check_postgres(settings: &PostgresSettings) -> Result<(), ServiceProblem> {
     let tls = &settings.tls;
-    if tls.ca_file.is_none() && tls.server_name.is_none() {
+    if tls.ca_file.is_none() {
         return Err(ServiceProblem::PostgresTlsMissing);
     }
     if tls

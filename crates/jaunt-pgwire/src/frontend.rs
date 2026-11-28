@@ -41,6 +41,7 @@ pub enum FrontendMessage {
     Cancel(CancelRequest),
     Startup(StartupMessage),
     Query(Statement),
+    QueryText { length: usize },
     Parse(Parse),
     Bind(Bind),
     Execute(Execute),
@@ -184,6 +185,7 @@ enum Class {
     Empty(&'static str, EmptyMessage),
     Buffered(&'static str),
     Streamed,
+    StreamedQuery,
     Bind,
 }
 
@@ -202,11 +204,40 @@ struct BindScan {
     statement_end: Option<usize>,
 }
 
+#[derive(Debug)]
+struct QueryScan {
+    remaining: usize,
+}
+
+impl QueryScan {
+    fn check(&mut self, chunk: &[u8]) -> Result<(), DecodeError> {
+        self.remaining = self.remaining.saturating_sub(chunk.len());
+        let last = self.remaining == 0;
+        if let Some(position) = chunk.iter().position(|byte| *byte == 0)
+            && !(last && position + 1 == chunk.len())
+        {
+            return Err(DecodeError::Malformed {
+                message: QUERY,
+                problem: Problem::TrailingBytes,
+            });
+        }
+        if last && chunk.last() != Some(&0) {
+            return Err(DecodeError::Malformed {
+                message: QUERY,
+                problem: Problem::MissingTerminator,
+            });
+        }
+        Ok(())
+    }
+}
+
 pub struct FrontendDecoder {
     limits: Limits,
     stream: Stream,
     phase: Phase,
     bind: Option<BindScan>,
+    streamed_queries: bool,
+    query: Option<QueryScan>,
 }
 
 impl FrontendDecoder {
@@ -220,7 +251,15 @@ impl FrontendDecoder {
                 gss: false,
             },
             bind: None,
+            streamed_queries: false,
+            query: None,
         })
+    }
+
+    pub fn with_streamed_queries(limits: Limits) -> Result<Self, LimitsError> {
+        let mut decoder = Self::new(limits)?;
+        decoder.streamed_queries = true;
+        Ok(decoder)
     }
 
     pub fn push(&mut self, input: &[u8]) -> Result<(), DecodeError> {
@@ -235,6 +274,7 @@ impl FrontendDecoder {
         if result.is_err() {
             self.stream.poison();
             self.bind = None;
+            self.query = None;
         }
         result
     }
@@ -249,6 +289,12 @@ impl FrontendDecoder {
 
     fn decode(&mut self) -> Result<Option<Event<FrontendMessage>>, DecodeError> {
         if let Some(chunk) = self.stream.continuation() {
+            if let Some(scan) = &mut self.query {
+                scan.check(chunk.bytes())?;
+                if scan.remaining == 0 {
+                    self.query = None;
+                }
+            }
             return Ok(Some(Event::Continuation(chunk)));
         }
         if self.stream.in_continuation() {
@@ -330,7 +376,11 @@ impl FrontendDecoder {
         let Some(&tag) = buffered.first() else {
             return Ok(None);
         };
-        let class = classify(tag)?;
+        let class = if tag == b'Q' && self.streamed_queries {
+            Class::StreamedQuery
+        } else {
+            classify(tag)?
+        };
         if buffered.len() < HEADER {
             return Ok(None);
         }
@@ -374,6 +424,23 @@ impl FrontendDecoder {
                 self.check_data(COPY_DATA, length)?;
                 let raw = self.stream.split(HEADER, body_length);
                 let message = FrontendMessage::CopyData {
+                    length: body_length,
+                };
+                Ok(Some(Event::Frame(Frame::new(message, raw, body_length))))
+            }
+            Class::StreamedQuery => {
+                self.check_data(QUERY, length)?;
+                if body_length == 0 {
+                    return Err(DecodeError::Malformed {
+                        message: QUERY,
+                        problem: Problem::MissingTerminator,
+                    });
+                }
+                self.query = Some(QueryScan {
+                    remaining: body_length,
+                });
+                let raw = self.stream.split(HEADER, body_length);
+                let message = FrontendMessage::QueryText {
                     length: body_length,
                 };
                 Ok(Some(Event::Frame(Frame::new(message, raw, body_length))))
